@@ -3228,8 +3228,132 @@ def foreign_compile_environment(env, session, inv):
             "ForeignSessionEnvironment")
 
 
+FOREIGN_LZ4_ORDINARY_SOURCES = ("liblz4/lib/lz4.c", "liblz4/lib/lz4frame.c", "liblz4/lib/lz4hc.c", "liblz4/lib/xxhash.c")
+FOREIGN_LZ4_ORDINARY_FLAGS = ("-O3", "-ffunction-sections", "-fdata-sections", "-fPIC", "-g", "-gdwarf-2", "-fno-omit-frame-pointer", "-m64", "--target=x86_64-apple-macosx", "-mmacosx-version-min=26.5", "-Wall", "-Wextra")
+
+
+def foreign_lz4_lock_state(session, fd, expected=None):
+    """Control identity for the immutable pre-Cargo owner inode; no producer fact."""
+    path = session / "owner.json"; regular(path)
+    require(path.resolve() == path and path.stat().st_nlink == 1
+            and isinstance(fd, int) and not isinstance(fd, bool) and fd >= 0
+            and not os.get_inheritable(fd)
+            and fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY, "ForeignCompileSerialization")
+    def identity(st):
+        return [st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_nlink]
+    pre = os.fstat(fd); path_pre = path.stat()
+    require(stat.S_ISREG(pre.st_mode) and pre.st_nlink == 1 and identity(pre) == identity(path_pre), "ForeignCompileSerialization")
+    data = os.pread(fd, pre.st_size + 1, 0)
+    require(len(data) == pre.st_size and identity(pre) == identity(os.fstat(fd)) == identity(path.stat())
+            and digest(data) == file_hash(path), "ForeignCompileSerialization")
+    result = {"scope": "SerializationOnly", "path": str(path), "sha256": digest(data), "identity": identity(pre), "held_fd": fd}
+    if expected is not None: require(result == expected, "ForeignCompileSerializationChanged")
+    return result
+
+
+def foreign_lz4_serialized_operation(session, policy, owner, role, args, cwd, env):
+    fd = None; state = None; error = None
+    try:
+        fd = os.open(session / "owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        state = foreign_lz4_lock_state(session, fd)
+        require(strict_json(os.pread(fd, state["identity"][3] + 1, 0)) == owner, "ForeignCompileSerialization")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        foreign_lz4_lock_state(session, fd, state)
+    except (Refusal, OSError, ValueError, TypeError) as fault:
+        error = str(fault)
+    try:
+        # Publish refused raw facts even if open/acquire/identity validation failed.
+        return foreign_operation(session, policy, owner, role, args, cwd, env,
+                                 lz4_lock=(fd, state) if error is None else None, lz4_lock_error=error)
+    finally:
+        if fd is not None:
+            try: os.close(fd)
+            except OSError: pass
+
+
+def foreign_lz4_lock_quiescent(session):
+    fd = os.open(session / "owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        state = foreign_lz4_lock_state(session, fd)
+        try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: raise Refusal("ForeignCompileInFlight")
+        foreign_lz4_lock_state(session, fd, state)
+        return state
+    finally:
+        os.close(fd)
+
+
+def foreign_lz4_classify(role, args, context, session, *, current_call=None):
+    """Four fixed ordinary inputs; RecordingOnly CompileOnly objects."""
+    root = Path(context["manifest"])
+    require(role == "cc" and root == session / "vendor/lz4-sys", "ForeignRole")
+    require(len(args) == len(FOREIGN_LZ4_ORDINARY_FLAGS) + 4 and args[-4] == "-o"
+            and args[-2] == "-c", "ForeignCompileArgv")
+    source = args[-1]; require(source in FOREIGN_LZ4_ORDINARY_SOURCES, "ForeignCompileSource")
+    dirname = str(Path(source).parent); extension = Path(source).suffix[1:]
+    require((dirname, extension) == ("liblz4/lib", "c"), "ForeignObjectMap")
+    prefix = "efce31824dbf3730"
+    output = Path(context["out_dir"]) / (prefix + "-" + Path(source).with_suffix(".o").name)
+    require(args == [*FOREIGN_LZ4_ORDINARY_FLAGS, "-o", str(output), "-c", source], "ForeignCompileArgv")
+    require(output.is_absolute() and output.resolve() == output, "ForeignCompileOutputAlias")
+    for call in (session / "foreign-native-invocations").iterdir():
+        if call == current_call: continue
+        if not (call / "request.json").exists() and not (call / "receipt.json").exists(): continue
+        request = strict_json((call / "request.json").read_bytes())
+        cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        values = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+        for index, value in enumerate(values[:-1]):
+            if value == "-o": require((cwd / values[index + 1]).resolve() != output, "ForeignCompileOwnership")
+    return {"class": "CompilerObjectCompile", "scope": "CompileOnly", "source": str(root / source),
+            "raw_source": source, "output": str(output), "context_group": context["out_dir"],
+            "object_derivation": {"dirname": dirname, "extension": extension, "prefix": prefix}}
+
+
+def foreign_lz4_receipt(call, receipt, args, context, session, inv):
+    states = [receipt.get(key) for key in ("serialization_pre", "serialization_post", "serialization_return")]
+    require(all(isinstance(state, dict) for state in states) and states[0] == states[1] == states[2]
+            and set(states[0]) == {"scope", "path", "sha256", "identity", "held_fd"}
+            and isinstance(states[0].get("held_fd"), int) and not isinstance(states[0].get("held_fd"), bool)
+            and states[0]["held_fd"] >= 0, "ForeignCompileSerialization")
+    fd = os.open(session / "owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        observed = foreign_lz4_lock_state(session, fd)
+        require({k:v for k,v in observed.items() if k != "held_fd"}
+                == {k:v for k,v in states[0].items() if k != "held_fd"}, "ForeignCompileSerializationChanged")
+    finally: os.close(fd)
+    operation = foreign_lz4_classify(receipt["role"], args, context, session, current_call=call)
+    require(receipt["operation"] == operation, "ForeignFamilyClassification")
+    pins = foreign_compile_pins(session, inv, context)
+    require(all(receipt.get(key) == pins for key in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
+    for key in ("input_pre", "input_post", "input_return", "output_pre", "output_post", "output_return"):
+        require(isinstance(receipt.get(key), dict), "ForeignSnapshotFields")
+        native_state_check(call, receipt[key])
+    pre, post, returned = (receipt[key] for key in ("input_pre", "input_post", "input_return"))
+    require(native_state_key(pre) == native_state_key(post) == native_state_key(returned)
+            and pre["exists"] is True and pre["path"] == operation["source"]
+            and pre["sha256"] == pins["source_sha256"]["lz4-sys/" + operation["raw_source"]], "ForeignCompileSnapshot")
+    native_state_check(call, returned, live=True)
+    output = receipt["output_post"]
+    require(receipt["output_pre"] == {"exists": False, "path": operation["output"]}
+            and output["exists"] is True and output["path"] == operation["output"] and output["length"] > 0
+            and native_state_key(output) == native_state_key(receipt["output_return"]), "ForeignCompileSnapshot")
+    native_state_check(call, receipt["output_return"], live=True)
+    require(receipt["tool_result"] == 0 and receipt["source_semantics"]
+            == {"compiler_success": True, "object_observed": True}, "ForeignFamilySticky")
+
+
+def foreign_lz4_family(session, policy, owner, context, *, current_call=None):
+    require(native_control(session, policy, owner) == policy["inventory"], "ForeignFamilyControl")
+    rows, effective, helps, versions, flags = foreign_e_history(session, policy["inventory"], context, current_call=current_call)
+    require(len(effective) == len(helps) == len(versions) == 1 and not flags, "ForeignFamilyUnique")
+    return foreign_e_family_evidence(versions[0], versions[0], rows, context)
+
+
 def foreign_compile_inputs(inv, name):
     """Negative-only declaration for the closed ring/psm input set; no observation."""
+    if name == "lz4-sys":
+        members = FOREIGN_E_ONLY_INPUTS[name]
+        return {"state": "DeclaredOnly", "source_sha256": {m: FOREIGN_E_ONLY_SOURCE_PINS[m] for m in members}}
     require(name in FOREIGN_COMPILE_SOURCES, "ForeignCompileSource")
     sources = {name + "/" + member for member in FOREIGN_COMPILE_SOURCES[name]}
     if name == "ring":
@@ -3248,7 +3372,8 @@ def foreign_compile_pins(session, inv, context):
     if name == "ring":
         require(any(m.startswith("ring/include/") for m in inv["vendor"]["files"]), "ForeignCompileInclude")
     sources = foreign_compile_inputs(inv, name)["source_sha256"]
-    helpers = set(FOREIGN_COMPILE_CC_MEMBERS)
+    helpers = ({m for m in FOREIGN_E_ONLY_SOURCE_PINS if m.startswith("cc/")}
+               if name == "lz4-sys" else set(FOREIGN_COMPILE_CC_MEMBERS))
     source_pins, helper_pins = {}, {}
     for members, pins in ((sources, source_pins), (helpers, helper_pins)):
         for member in sorted(members):
@@ -3266,6 +3391,7 @@ def foreign_compile_pins(session, inv, context):
 def foreign_compile_classify(role, args, context, session, *, current_call=None):
     require(role == "cc", "ForeignRole")
     root = Path(context["manifest"]); name = root.name
+    if name == "lz4-sys": return foreign_lz4_classify(role, args, context, session, current_call=current_call)
     require(len(args) >= 5 and args[-4] == "-o" and args[-2] == "-c", "ForeignCompileArgv")
     raw_source = args[-1]
     member = next((m for m in FOREIGN_COMPILE_SOURCES[name]
@@ -3298,6 +3424,8 @@ def foreign_compile_classify(role, args, context, session, *, current_call=None)
 
 
 def foreign_compile_family(session, policy, owner, context, *, current_call=None, allow_archive=False):
+    if Path(context["manifest"]).name == "lz4-sys":
+        return foreign_lz4_family(session, policy, owner, context, current_call=current_call)
     inv = native_control(session, policy, owner); controls = foreign_controls(session, policy, owner, context)
     rows = []; prior_compiles = []; kinds = {"CompilerFamilyFileProbe", "CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe"}
     namespace = session / "foreign-native-invocations"
@@ -3724,7 +3852,12 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
     policy = strict_json(POLICY.read_bytes()); owner = strict_json((session / "owner.json").read_bytes())
     require(policy["inventory"] == inv, "ForeignFamilyControl")
     controls = foreign_controls(session, policy, owner, context)
-    rows = {}; namespace = session / "foreign-native-invocations"
+    rows = {}; ordinary = []; namespace = session / "foreign-native-invocations"
+    ordinary_current = False
+    if current_call is not None and Path(context["manifest"]).name == "lz4-sys":
+        current = strict_json((current_call / "request.json").read_bytes())
+        current_args = [os.fsdecode(bytes.fromhex(v)) for v in current["args_hex"]]
+        ordinary_current = len(current_args) >= 4 and current_args[-2] == "-c"
     for call in namespace.iterdir():
         if call == current_call: continue
         require(ID.fullmatch(call.name) and call.is_dir() and call.resolve() == call and not call.is_symlink(), "ForeignFamilyEvidenceAlias")
@@ -3737,6 +3870,12 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
                if isinstance(request, dict) else {})
         retained = receipt.get("context") if isinstance(receipt, dict) else None
         relevant = env.get("OUT_DIR") == context["out_dir"] or (isinstance(retained, dict) and retained.get("out_dir") == context["out_dir"])
+        if isinstance(request, dict) and Path(context["manifest"]).name == "lz4-sys":
+            raw_args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+            # A request-only ordinary output still selects its negative group if
+            # a malformed raw OUT_DIR tries to detach it from that same output.
+            relevant = relevant or any(value == "-o" and Path(raw_args[index + 1]).parent == Path(context["out_dir"])
+                                       for index, value in enumerate(raw_args[:-1]))
         if not relevant: continue
         require(isinstance(request, dict) and isinstance(receipt, dict), "ForeignFamilyPending")
         for path in (request_path, receipt_path):
@@ -3752,7 +3891,9 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
                 and all(receipt.get(k) == controls for k in ("controls_pre", "controls_post", "controls_return")), "ForeignFamilyControl")
         operation = receipt.get("operation"); require(isinstance(operation, dict), "ForeignFamilyClassification")
         kind = operation.get("class"); flagging = kind == "CompilerFlagProbe"
-        (foreign_compile_environment if flagging else foreign_environment)(env, session, inv)
+        compiling = kind == "CompilerObjectCompile" and Path(context["manifest"]).name == "lz4-sys"
+        (foreign_compile_environment if flagging or compiling else foreign_environment)(env, session, inv)
+        if compiling: require(env.get("NUM_JOBS") == "12", "ForeignCompileConfiguration")
         require(receipt["tool_sha256"] == inv["generators"]["CC"]["sha256"]
                 and receipt["argv_hex"] == [os.fsencode(inv["generators"]["CC"]["path"]).hex(), *request["args_hex"]], "ForeignFamilyTool")
         foreign_jobserver_binding(receipt["jobserver_identity"], env)
@@ -3761,6 +3902,9 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
             path = call / (stream + ".raw"); regular(path)
             require(path.resolve() == path and path.stat().st_nlink == 1 and file_hash(path) == receipt[stream + "_sha256"], "ForeignFamilyStream")
         require(foreign_semantics(call, receipt) == receipt["source_semantics"], "ForeignFamilySemantics")
+        if compiling:
+            foreign_lz4_receipt(call, receipt, args, context, session, inv)
+            ordinary.append(receipt); continue
         require(kind in {"CompilerFamilyFileProbe", "CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe", "CompilerFlagProbe"}, "ForeignFamilyClass")
         rows[call.name] = (call, receipt, args)
     files = {i: row for i, row in rows.items() if row[1]["operation"]["class"] == "CompilerFamilyFileProbe"}
@@ -3835,6 +3979,12 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
         call, receipt, _ = ordered_flags[-1]
         native_state_check(call, receipt["input_return"], live=True)
         if live_output: native_state_check(call, receipt["output_return"], live=True)
+    if ordinary:
+        require(current_call is None or ordinary_current, "ForeignFamilyOrder")
+        require(Path(context["manifest"]).name == "lz4-sys" and len(effective) == len(helps) == len(ordered) == 1
+                and not ordered_flags, "ForeignFamilyUnique")
+        family = foreign_e_family_evidence(ordered[0], ordered[0], rows, context)
+        require(all(receipt.get("family_pre") == receipt.get("family_return") == family for receipt in ordinary), "ForeignFamilyChanged")
     return rows, effective, helps, ordered, ordered_flags
 
 
@@ -3929,7 +4079,7 @@ def foreign_flag_stage(args, context, session, inv, *, current_call=None, live_o
     return operation, foreign_e_family_evidence(ordered[0], ordered[-1], rows, context), flags
 
 
-def foreign_operation(session, policy, owner, role, args, cwd, env):
+def foreign_operation(session, policy, owner, role, args, cwd, env, *, lz4_lock=None, lz4_lock_error=None):
     namespace = session / "foreign-native-invocations"
     namespace.mkdir(mode=0o700, exist_ok=True)
     require(namespace.resolve() == namespace and not namespace.is_symlink(), "ForeignNamespaceAlias")
@@ -3945,11 +4095,13 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
         inv = native_control(session, policy, owner)
         declaration = foreign_e_only_declaration(inv, cwd, args, env, session)
         if declaration is not None: receipt["e_only_input_declaration"] = declaration
+        require(lz4_lock_error is None, "ForeignCompileSerialization:" + str(lz4_lock_error))
         context = foreign_context(env, cwd, session, inv, args=args); receipt["context"] = context
         flagging = foreign_flag_argv(args, Path(context["out_dir"])) is not None and cwd == Path(context["out_dir"])
         if Path(context["manifest"]).name in FOREIGN_E_ONLY_PACKAGES:
             require(role == "cc" and (flagging or args in (["-?"], ["--version"]) or (len(args) == 2 and args[:1] == ["-E"])
-                    or (len(args) == 3 and args[:2] == ["-E", "--"])), "ForeignEOnlyArgv")
+                    or (len(args) == 3 and args[:2] == ["-E", "--"])
+                    or (Path(context["manifest"]).name == "lz4-sys" and len(args) >= 4 and args[-2] == "-c")), "ForeignEOnlyArgv")
         archiving = role == "ar"; compiling = "-c" in args and not archiving and not flagging
         if archiving:
             # Declarations are negative-only, retained before environment/pin refusal.
@@ -3966,6 +4118,10 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
                      else foreign_probe_classify(role, args, context, env, session, inv, current_call=call))
         receipt["operation"] = operation
         if compiling:
+            if Path(context["manifest"]).name == "lz4-sys":
+                require(env.get("NUM_JOBS") == "12", "ForeignCompileConfiguration")
+                require(isinstance(lz4_lock, tuple) and len(lz4_lock) == 2, "ForeignCompileSerialization")
+                receipt["serialization_pre"] = foreign_lz4_lock_state(session, *lz4_lock)
             # Retain expected input ownership before any pin validation may refuse.
             receipt["compile_input_declaration"] = foreign_compile_inputs(inv, Path(context["manifest"]).name)
             receipt["compile_pins_pre"] = foreign_compile_pins(session, inv, context)
@@ -4034,6 +4190,8 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
         if compiling or archiving:
             receipt["compile_pins_post"] = foreign_compile_pins(session, inv, post_context)
             require(receipt["compile_pins_post"] == receipt["compile_pins_pre"], "ForeignCompilePinChanged")
+            if compiling and Path(context["manifest"]).name == "lz4-sys":
+                receipt["serialization_post"] = foreign_lz4_lock_state(session, *lz4_lock)
         require(not receipt["failures"], "ForeignCaptureSticky")
         receipt["source_semantics"] = foreign_semantics(call, receipt)
         receipt["protocol_state"] = "Completed"
@@ -4073,6 +4231,10 @@ def foreign_operation(session, policy, owner, role, args, cwd, env):
                 require(returned == operation and family == receipt["family_pre"], "ForeignFamilyChanged")
             if compiling:
                 native_state_check(call, receipt["output_post"], live=True)
+                if Path(context["manifest"]).name == "lz4-sys":
+                    receipt["input_return"] = dict(receipt["input_post"])
+                    receipt["output_return"] = dict(receipt["output_post"])
+                    receipt["serialization_return"] = foreign_lz4_lock_state(session, *lz4_lock)
                 receipt["compile_pins_return"] = foreign_compile_pins(session, inv, context)
                 require(receipt["compile_pins_return"] == receipt["compile_pins_pre"], "ForeignCompilePinChanged")
                 receipt["family_return"] = foreign_compile_family(session, policy, owner, context, current_call=call)
@@ -4342,6 +4504,11 @@ def foreign_seal(session, policy):
                 early_request = strict_json((call / "request.json").read_bytes())
                 compile_requested = compile_requested or any(os.fsdecode(bytes.fromhex(v)) == "-c" for v in early_request["args_hex"])
                 archive_requested = archive_requested or early_request.get("role") == "ar"
+                early_args = [os.fsdecode(bytes.fromhex(v)) for v in early_request["args_hex"]]
+                if (early_request.get("role") == "cc" and "-c" in early_args and early_args[-1:]
+                        and early_args[-1] in FOREIGN_LZ4_ORDINARY_SOURCES
+                        and Path(os.fsdecode(bytes.fromhex(early_request["cwd_hex"]))) == session / "vendor/lz4-sys"):
+                    foreign_lz4_lock_quiescent(session)
                 for leaf in ("request", "receipt"):
                     path = call / (leaf + ".json"); regular(path)
                     require(path.resolve() == path and path.stat().st_nlink == 1, "ForeignEvidenceAlias")
@@ -4416,6 +4583,8 @@ def foreign_seal(session, policy):
                     # Full retained overwrite lineage was validated above.
                     pass
                 elif compiling:
+                    if Path(receipt["context"]["manifest"]).name == "lz4-sys":
+                        foreign_lz4_receipt(call, receipt, args, receipt["context"], session, inv)
                     pins = foreign_compile_pins(session, inv, receipt["context"])
                     require(all(receipt.get(k) == pins for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
                     # Sealing validates ALL published AR rows independently below,
@@ -4480,6 +4649,8 @@ def native_wrapper(session_id, role, args):
     cwd = Path.cwd(); env = dict(os.environ)
     # Only the actual canonical SQLite tree uses its unchanged native graph.
     operation = native_operation if cwd == session / "vendor/libsqlite3-sys" else foreign_operation
+    if role == "cc" and cwd == session / "vendor/lz4-sys" and "-c" in args and args[-1:] and args[-1] in FOREIGN_LZ4_ORDINARY_SOURCES:
+        operation = foreign_lz4_serialized_operation
     call,r=operation(session,policy,owner,role,args,cwd,env)
     if r["protocol_state"]!="Completed":
         raise Refusal("NativeProtocolRefused:"+call.name+":"+r["failures"][0])

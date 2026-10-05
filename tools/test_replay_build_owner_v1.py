@@ -2996,6 +2996,286 @@ emit({'reason':'build-finished','success':True})
 '''
 
 
+
+
+E7_NATIVE = r'''
+import json,os,pathlib,signal,stat,sys,uuid
+args=sys.argv[1:];env=dict(os.environ);session=pathlib.Path(env['E6_SESSION']);case=env['E6_CASE']
+pair=tuple(map(int,env['CARGO_MAKEFLAGS'].split('--jobserver-fds=')[1].split()[0].split(',')))
+hits=session/'e6-entry';hits.mkdir(exist_ok=True)
+(hits/uuid.uuid4().hex).write_text(json.dumps({'argv':args,'cwd':str(pathlib.Path.cwd()),'environment':env,
+    'stdin_eof':sys.stdin.buffer.read()==b'','fds':list(pair),'inodes':[os.fstat(fd).st_ino for fd in pair], 'regular_fds':[fd for fd in range(3,128) if pathlib.Path('/dev/fd/'+str(fd)).exists() and stat.S_ISREG(os.fstat(fd).st_mode)]}))
+if args==['-?']:
+    os.write(1,b'TEST_CODE help stdout\n');os.write(2,b'TEST_CODE help rejected\n');sys.exit(0 if case=='help_zero' and env.get('E6_CYCLE')=='2' else 1)
+if args==['--version']:
+    os.write(1,b'ziglang TEST_CODE\n' if case=='zig' and env.get('E6_CYCLE')=='2' else b'Apple clang TEST_CODE\n');sys.exit(2 if case=='version_nonzero' and env.get('E6_CYCLE')=='2' else 0)
+if args[:1]==['-E']:
+    if case in ('warning','warning0') and '--' not in args:
+        os.write(2,b'-Wslash-u-filename TEST_CODE\n');sys.exit(0 if case=='warning0' else 3)
+    os.write(1,b'"clang" "gcc" TEST_CODE family\n');sys.exit(0)
+if env.get('CARGO_PKG_NAME')=='lz4-sys' and args[-2:][:1]==['-c']:
+    case=env['E7_CASE'];output=pathlib.Path(args[-3]);source=pathlib.Path(args[-1])
+    if case!='missing_object':output.write_bytes(b'TEST_CODE lz4 object:'+source.name.encode())
+    os.write(1,b'TEST_CODE lz4 stdout:'+source.name.encode()+b'\n');os.write(2,b'TEST_CODE lz4 stderr:'+source.name.encode()+b'\n')
+    if case in ('header_post','helper_post'):
+        header=pathlib.Path('liblz4/lib/lz4.h' if case=='header_post' else '../cc/src/tool.rs');header.chmod(0o600);header.write_bytes(b'TEST_CODE changed pinned lz4 input/control')
+    if case=='nonzero':sys.exit(7)
+    if case=='signed':os.kill(os.getpid(),signal.SIGTERM)
+    sys.exit(0)
+assert args[-2]=='-c' and args[-4]=='-o'
+flag=args[9];output=pathlib.Path(args[-3]);source=pathlib.Path(args[-1])
+output.write_bytes(b'TEST_CODE flag output:'+flag.encode())
+os.write(1,b'TEST_CODE flag stdout:'+flag.encode()+b'\n')
+if case=='post_input':source.write_bytes(b'X'*28)
+if case=='unsupported' and flag=='-fdata-sections':os.write(2,b'TEST_CODE genuine unsupported warning\n')
+if case=='unsupported' and flag=='-fmerge-all-constants':os.kill(os.getpid(),signal.SIGTERM)
+sys.exit(0)
+'''
+
+E7_CARGO = r'''
+
+import concurrent.futures,hashlib,json,os,pathlib,subprocess,sys,threading,time
+CASE="normal";E7_CASE=__E7_CASE__;argv=sys.argv[1:];app=pathlib.Path(argv[argv.index('--manifest-path')+1]).parent;session=app.parent
+target=session/'target';host=target/'debug/deps';deps=target/'x86_64-apple-darwin/debug/deps'
+base=dict(os.environ,E4_SESSION=str(session),E4_CASE=CASE,D1_SESSION=str(session),D1_CASE='normal',CARGO_ENCODED_RUSTFLAGS='')
+def emit(e):print(json.dumps(e),flush=True)
+def compile(name,source,pkg,dest,extra=()):
+    root=source.parent.parent;env=dict(base,CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),
+        CARGO_PKG_NAME=name,CARGO_PKG_VERSION='1.2.59' if name=='cc' else '0.0.0',
+        DYLD_FALLBACK_LIBRARY_PATH=str(host)+':'+os.environ['DYLD_FALLBACK_LIBRARY_PATH'])
+    args=['--crate-name',name,'--edition=2021',str(source),'--crate-type','lib','--emit=dep-info,metadata,link','--out-dir',str(dest),*extra]
+    result=subprocess.run([env['RUSTC_WRAPPER'],env['RUSTC'],*args],cwd=root,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    assert result.returncode==0,result.stderr
+    emit({'reason':'compiler-artifact','package_id':pkg,'target':{'src_path':str(source),'name':name,'kind':['lib'],'crate_types':['lib']},
+          'features':[],'filenames':[str(dest/('lib'+name+'.rlib')),str(dest/('lib'+name+'.rmeta'))],'executable':None,'fresh':False})
+compile('cc',session/'vendor/cc/src/lib.rs','registry+https://github.com/rust-lang/crates.io-index#cc@1.2.59',host)
+read,write=os.pipe();other_read,other_write=os.pipe();opened=[read,write,other_read,other_write]
+original_stats=[os.fstat(fd).st_ino for fd in (read,write)]
+native_loader=':'.join(map(str,(target/'debug',host,pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH']).parent/'lib/rustlib/x86_64-apple-darwin/lib',pathlib.Path(os.environ['DYLD_FALLBACK_LIBRARY_PATH']))))
+E4_FACTS=__E4_FACTS__
+
+results=[];cut=None
+base.update(E6_SESSION=str(session),E6_CASE=CASE)
+E4_FACTS=__E4_FACTS__
+def environment(name):
+    version,components,features,links,count=E4_FACTS[name];root=session/'vendor'/name
+    out=target/'x86_64-apple-darwin/debug/build'/(name+'-0123456789abcdef')/'out';out.mkdir(parents=True,exist_ok=True)
+    env=dict(base,CARGO=os.environ.get('CARGO',sys.argv[0]),CARGO_MANIFEST_DIR=str(root),CARGO_MANIFEST_PATH=str(root/'Cargo.toml'),
+        CARGO_PKG_NAME=name,CARGO_PKG_VERSION=version,CARGO_PKG_VERSION_MAJOR=components[0],CARGO_PKG_VERSION_MINOR=components[1],
+        CARGO_PKG_VERSION_PATCH=components[2],CARGO_PKG_VERSION_PRE=components[3],CARGO_MANIFEST_LINKS=links,
+        HOST='x86_64-apple-darwin',TARGET='x86_64-apple-darwin',CARGO_CFG_TARGET_ARCH='x86_64',CARGO_CFG_TARGET_OS='macos',CARGO_CFG_TARGET_ENV='',
+        CARGO_CFG_TARGET_ENDIAN='little',CARGO_CFG_TARGET_VENDOR='apple',CARGO_CFG_TARGET_POINTER_WIDTH='64',CARGO_CFG_TARGET_FAMILY='unix',
+        CARGO_CFG_TARGET_ABI='',CARGO_CFG_UNIX='',CARGO_CFG_FEATURE=','.join(features),DEBUG='true',OPT_LEVEL='0',PROFILE='debug',
+        CARGO_CFG_TARGET_FEATURE='cmpxchg16b,fxsr,sse,sse2,sse3,sse4.1,ssse3',CARGO_CFG_TARGET_HAS_ATOMIC='128,16,32,64,8,ptr',
+        CARGO_CFG_DEBUG_ASSERTIONS='',CARGO_CFG_PANIC='unwind',OUT_DIR=str(out),LC_CTYPE='C.UTF-8',DYLD_FALLBACK_LIBRARY_PATH=native_loader,
+        CARGO_MAKEFLAGS=f'-j --jobserver-fds={read},{write} --jobserver-auth={read},{write}')
+    for k in ('LC_ALL','ZERO_AR_DATE'):env.pop(k,None)
+    env.update({'CARGO_FEATURE_'+f.upper().replace('-','_'):'1' for f in features})
+    return root,out,env
+def entries():return len(list((session/'e6-entry').iterdir())) if (session/'e6-entry').exists() else 0
+def execute(args,root,env):
+    result=subprocess.run([env['CC'],*args],cwd=root,env=env,pass_fds=tuple(opened),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    results.append({'name':env['CARGO_PKG_NAME'],'args':args,'status':result.returncode,'stdout_hex':result.stdout.hex(),'stderr_hex':result.stderr.hex()})
+    return result
+def receipts():return [(p,json.loads(p.read_bytes())) for p in (session/'foreign-native-invocations').glob('*/receipt.json')]
+def cycle(name,ordinal,cut_case=False):
+    global cut
+    root,out,env=environment(name);env['E6_CYCLE']=str(ordinal);source=out/(str(ordinal)+'detect_compiler_family.c')
+    source.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes())
+    result=execute(['-E',str(source)],root,env)
+    if CASE in ('warning','warning0'):assert result.returncode==(0 if CASE=='warning0' else 3);result=execute(['-E','--',str(source)],root,env)
+    assert result.returncode==0,result.stderr
+    if cut_case and CASE=='ambiguous':
+        twin=out/'99detect_compiler_family.c';twin.write_bytes(source.read_bytes())
+        before=entries();args=['-E',str(twin)];execute(args,root,env)
+        cut={'child_before':before,'child_after':entries(),'argv':args};return False
+    before=entries();result=execute(['-?'],root,env)
+    if cut_case and CASE=='help_zero':
+        assert result.returncode==0;before=entries();execute(['--version'],root,env);cut={'child_before':before,'child_after':entries(),'argv':['--version']};return False
+    assert result.returncode==1,result.stderr
+    if cut_case and CASE=='duplicate_help':
+        before=entries();execute(['-?'],root,env);cut={'child_before':before,'child_after':entries(),'argv':['-?']};return False
+    if cut_case and CASE=='duplicate_version':
+        result=execute(['--version'],root,env);assert result.returncode==0
+        before=entries();execute(['--version'],root,env);cut={'child_before':before,'child_after':entries(),'argv':['--version']};return False
+    result=execute(['--version'],root,env);assert result.returncode==(2 if cut_case and CASE=='version_nonzero' else 0),result.stderr
+    source.unlink();return True
+cycle('lz4-sys',1)
+if E7_CASE in ('normal','parallel'):
+    if CASE!='missing_base':cycle('zstd-sys',1)
+    flags=('-ffunction-sections','-fdata-sections','-fmerge-all-constants')
+    for index,flag in enumerate(flags):
+        if not cycle('zstd-sys',index+2,index==0):break
+        root,out,env=environment('zstd-sys');env['LC_ALL']='C';env.pop('LC_CTYPE')
+        src=out/'flag_check.c'
+        if not src.exists():src.write_bytes(b'int main(void) { return 0; }')
+        args=['-O0','-ffunction-sections','-fdata-sections','-fPIC','-m64','--target=x86_64-apple-macosx','-mmacosx-version-min=26.5','-Wall','-Wextra',flag,
+              '-Wno-unused-command-line-argument','-o',str(out/'flag_check'),'-c',str(src)]
+        cwd=out
+        if index==0:
+            if CASE=='flag_order':args[9]=flags[1]
+            if CASE=='dedup':args.pop(9)
+            if CASE=='extra':args.insert(0,'TEST_CODE_extra')
+            if CASE=='flag_cwd':cwd=root
+            if CASE=='flag_locale':env.pop('LC_ALL');env['LC_CTYPE']='C.UTF-8'
+            if CASE=='flag_literal':src.write_bytes(b'X'*28)
+            if CASE=='output_pre':(out/'flag_check').write_bytes(b'TEST_CODE foreign previous output')
+            if CASE in ('missing_receipt','raw_out','role','stream','snapshot'):
+                p,r=next((p,r) for p,r in receipts() if r.get('operation',{}).get('class')=='CompilerFamilyHelpProbe' and r.get('context',{}).get('out_dir')==str(out) and r['operation']['previous_version'] is not None)
+                if CASE=='missing_receipt':p.unlink()
+                if CASE in ('raw_out','role'):
+                    q=p.parent/'request.json';raw=json.loads(q.read_bytes())
+                    if CASE=='raw_out':raw['environment_hex'][os.fsencode('OUT_DIR').hex()]=os.fsencode(str(session/'TEST_CODE_other')).hex()
+                    else:raw['role']='ar'
+                    q.write_text(json.dumps(raw))
+                if CASE=='stream':(p.parent/'stdout.raw').write_bytes(b'TEST_CODE corrupt help stream')
+                if CASE=='snapshot':
+                    eid=r['operation']['predecessor'];ep,er=next((q,rr) for q,rr in receipts() if q.parent.name==eid)
+                    (ep.parent/'input-post.raw').write_bytes(b'TEST_CODE corrupt E snapshot')
+        before=entries();result=execute(args,cwd,env)
+        if CASE not in ('normal','unsupported','warning','warning0','operation_none','operation_list') and not CASE.startswith('copy_'):
+            cut={'child_before':before,'child_after':entries(),'argv':args}
+            if CASE in ('post_input','post_output','capture','forward','return_control','return_fd','return_output'):
+                following=out/'900detect_compiler_family.c';following.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes())
+                probe_env=dict(env,LC_CTYPE='C.UTF-8');probe_env.pop('LC_ALL')
+                before_follow=entries();followed=execute(['-E',str(following)],root,probe_env)
+                cut.update(next_child_before=before_follow,next_child_after=entries(),next_argv=['-E',str(following)],next_status=followed.returncode)
+            break
+        assert result.returncode in (0,143),result.stderr
+if cut is not None:(session/'e6-cut.json').write_text(json.dumps(cut))
+if CASE.startswith('copy_'):
+    kind,cut=CASE[len('copy_'):].split('_',1)
+    p,r=next((p,r) for p,r in receipts() if r.get('operation',{}).get('class')=='CompilerFlagProbe' and r['operation']['index']==(0 if cut=='retained' else 2))
+    body=((p.parent/'input-post.raw').read_bytes() if kind=='source' else (p.parent/'output-post.raw').read_bytes());digest=hashlib.sha256(body).hexdigest()
+    copy=target/'TEST_CODE_e6_copy.bin';copy.write_bytes(body)
+    cp,cc=next((p,json.loads(p.read_bytes())) for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_bytes()).get('source')==str(session/'vendor/cc/src/lib.rs'))
+    if kind=='source':next(o for o in cc['outputs'] if o['kind']=='dep-info')['dep_info']['paths'].append(str(copy))
+    if kind=='extern':cc['externs'].append({'name':'e6_copy','path':str(copy)})
+    if kind=='output':cc['declared_outputs'].append({'path':str(copy),'kind':'link'})
+    cp.write_text(json.dumps(cc))
+    if cut=='retained':
+        for q in (session/'foreign-native-invocations').glob('*/*.raw'):
+            if hashlib.sha256(q.read_bytes()).hexdigest()==digest:q.unlink()
+        if kind=='source':pathlib.Path(r['operation']['source']).write_bytes(b'X'*28)
+        (p.parent/'request.json').write_bytes(b'{TEST_CODE corrupt request')
+    if cut=='request_only':
+        p.unlink()
+        for q in p.parent.glob('*.raw'):q.unlink()
+    (session/'e6-copy.json').write_text(json.dumps({'copy':str(copy),'sha256':digest,'operation_id':p.parent.name,'cc_id':cp.parent.name,'cc_receipt_sha256':hashlib.sha256(cp.read_bytes()).hexdigest()}))
+if CASE in ('operation_none','operation_list'):
+    selected=[(p,r) for p,r in receipts() if isinstance(r.get('operation'),dict) and r['operation'].get('class')=='CompilerFlagProbe' and r['operation'].get('index')==2]
+    assert len(selected)==1;p,r=selected[0];assert (r['protocol_state'],r['tool_result'],r['failures'])==('Completed',0,[])
+    snapshot=p.parent/r['output_post']['snapshot'];body=snapshot.read_bytes();digest=hashlib.sha256(body).hexdigest()
+    assert digest==r['output_post']['sha256'];copy=target/'TEST_CODE_e6_operation_copy.bin';copy.write_bytes(body)
+    selected_cc=[(q,json.loads(q.read_bytes())) for q in (session/'invocations').glob('*/receipt.json') if json.loads(q.read_bytes()).get('source')==str(session/'vendor/cc/src/lib.rs')]
+    assert len(selected_cc)==1;cp,cc=selected_cc[0]
+    next(o for o in cc['outputs'] if o['kind']=='dep-info')['dep_info']['paths'].append(str(copy));cp.write_text(json.dumps(cc))
+    before=entries();r['operation']=None if CASE=='operation_none' else [];p.write_text(json.dumps(r))
+    (session/'e6-operation-cut.json').write_text(json.dumps({'operation_id':p.parent.name,'receipt_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),
+        'snapshot':str(snapshot),'copy':str(copy),'sha256':digest,'cc_id':cp.parent.name,'cc_receipt_sha256':hashlib.sha256(cp.read_bytes()).hexdigest(),
+        'child_before':before,'child_after':entries()}))
+root,out,env=environment('lz4-sys');env['LC_ALL']='C';env.pop('LC_CTYPE');env['E7_CASE']=E7_CASE;env['NUM_JOBS']='12'
+sources=('liblz4/lib/lz4.c','liblz4/lib/lz4frame.c','liblz4/lib/lz4hc.c','liblz4/lib/xxhash.c')
+flags=['-O3','-ffunction-sections','-fdata-sections','-fPIC','-g','-gdwarf-2','-fno-omit-frame-pointer','-m64','--target=x86_64-apple-macosx','-mmacosx-version-min=26.5','-Wall','-Wextra']
+def object_args(index):return [*flags,'-o',str(out/('efce31824dbf3730-'+pathlib.Path(sources[index]).with_suffix('.o').name)),'-c',sources[index]]
+def objects():return [(p,r) for p,r in receipts() if isinstance(r.get('operation'),dict) and r['operation'].get('scope')=='CompileOnly']
+def cut_execute(args,local_env=env,cwd=root):
+    before=entries();result=execute(args,cwd,local_env)
+    cut={'child_before':before,'child_after':entries(),'argv':args,'status':result.returncode}
+    selected=[(p,r) for p,r in receipts() if [os.fsdecode(bytes.fromhex(v)) for v in r['args_hex']]==args]
+    if E7_CASE=='crash':
+        assert result.returncode==19 and selected==[]
+        raw=[q for q in (session/'foreign-native-invocations').glob('*/request.json') if json.loads(q.read_bytes())['args_hex']==[os.fsencode(a).hex() for a in args]]
+        assert len(raw)==1;cut['operation_id']=raw[0].parent.name
+    else:assert len(selected)==1;cut['operation_id']=selected[0][0].parent.name
+    next_args=object_args(1);before=entries();following=execute(next_args,root,env)
+    cut.update(next_child_before=before,next_child_after=entries(),next_argv=next_args,next_status=following.returncode)
+    selected=[(p,r) for p,r in receipts() if [os.fsdecode(bytes.fromhex(v)) for v in r['args_hex']]==next_args]
+    assert len(selected)==1;cut['next_operation_id']=selected[0][0].parent.name
+    (session/'e7-cut.json').write_text(json.dumps(cut))
+if E7_CASE in ('normal','parallel') or E7_CASE.startswith('copy_'):
+    if E7_CASE=='parallel':
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future=pool.submit(execute,object_args(0),root,env)
+            deadline=time.monotonic()+15
+            while not (session/'e7-pending.json').exists():
+                assert time.monotonic()<deadline,'TEST_CODE pending ordinary request';time.sleep(0.01)
+            pending=json.loads((session/'e7-pending.json').read_bytes());call=session/'foreign-native-invocations'/pending['operation_id']
+            assert (call/'request.json').exists() and not (call/'receipt.json').exists() and list(call.glob('*.raw'))==[]
+            # The second real wrapper reaches the owner lock and queues before raw publication.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as second_pool:
+                second=second_pool.submit(execute,object_args(1),root,env)
+                before=entries();deadline=time.monotonic()+15
+                while not (session/'e7-waiting').exists():
+                    assert time.monotonic()<deadline,'TEST_CODE queued ordinary wrapper';time.sleep(0.01)
+                assert entries()==before and not second.done()
+                raw=[json.loads(q.read_bytes()) for q in (session/'foreign-native-invocations').glob('*/request.json')]
+                assert len([q for q in raw if q['args_hex'][-1]==os.fsencode(sources[1]).hex()])==0
+                (session/'e7-release').write_bytes(b'TEST_CODE release');result=future.result(timeout=30);assert result.returncode==0,result.stderr
+                result=second.result(timeout=30);assert result.returncode==0,result.stderr
+                (session/'e7-serialization.json').write_text(json.dumps({'queued_before':before,'queued_after':entries()}))
+        for index in (2,3):result=execute(object_args(index),root,env);assert result.returncode==0,result.stderr
+    else:
+        for index in range(4):result=execute(object_args(index),root,env);assert result.returncode==0,result.stderr
+    # Other ordinary domains remain denied even with genuine E/H/V/flag history.
+    zr,zo,ze=environment('zstd-sys');ze['LC_ALL']='C';ze.pop('LC_CTYPE')
+    denied=[*flags,'-o',str(zo/'TEST_CODE-denied-zstd.o'),'-c','zstd/lib/common/debug.c']
+    before=entries();execute(denied,zr,ze)
+    (session/'e7-zstd-cut.json').write_text(json.dumps({'child_before':before,'child_after':entries(),'argv':denied}))
+elif E7_CASE.startswith('prior_'):
+    result=execute(object_args(0),root,env);assert result.returncode==0,result.stderr
+    selected=objects();assert len(selected)==1;p,r=selected[0]
+    if E7_CASE=='prior_raw_out':
+        q=p.parent/'request.json';raw=json.loads(q.read_bytes());raw['environment_hex'][os.fsencode('OUT_DIR').hex()]=os.fsencode(str(session/'TEST_CODE_other')).hex();q.write_text(json.dumps(raw))
+    if E7_CASE=='prior_role':
+        q=p.parent/'request.json';raw=json.loads(q.read_bytes());raw['role']='ar';q.write_text(json.dumps(raw))
+    if E7_CASE=='prior_stream':(p.parent/'stdout.raw').write_bytes(b'TEST_CODE changed ordinary stream')
+    if E7_CASE=='prior_receipt':p.unlink()
+    if E7_CASE=='prior_snapshot':(p.parent/r['output_post']['snapshot']).write_bytes(b'TEST_CODE changed retained object')
+    if E7_CASE=='prior_output':pathlib.Path(r['operation']['output']).write_bytes(b'TEST_CODE changed live object')
+    before=entries();result=execute(object_args(1),root,env)
+    selected=[(p,r) for p,r in receipts() if [os.fsdecode(bytes.fromhex(v)) for v in r['args_hex']]==object_args(1)];assert len(selected)==1
+    (session/'e7-cut.json').write_text(json.dumps({'child_before':before,'child_after':entries(),'argv':object_args(1),'operation_id':selected[0][0].parent.name,'status':result.returncode}))
+else:
+    args=object_args(0);local_env=dict(env)
+    if E7_CASE=='argv':args.insert(0,'TEST_CODE_extra')
+    if E7_CASE=='source':args[-1]='liblz4/lib/TEST_CODE.c'
+    if E7_CASE=='locale':local_env.pop('LC_ALL');local_env['LC_CTYPE']='C.UTF-8'
+    if E7_CASE=='features':local_env['CARGO_FEATURE_STD']='1'
+    if E7_CASE=='jobs':local_env['NUM_JOBS']='11'
+    if E7_CASE=='invalid_fd':local_env['CARGO_MAKEFLAGS']='-j --jobserver-fds=999,998 --jobserver-auth=999,998'
+    if E7_CASE=='output_alias':pathlib.Path(args[-3]).symlink_to(out/'TEST_CODE aliased output')
+    if E7_CASE=='output_pre':pathlib.Path(args[-3]).write_bytes(b'TEST_CODE previous object')
+    if E7_CASE in ('header_pre','helper_pre'):
+        header=root/('liblz4/lib/lz4.h' if E7_CASE=='header_pre' else '../cc/src/tool.rs');header.chmod(0o600);header.write_bytes(b'TEST_CODE changed pinned lz4 input/control')
+    cut_execute(args,local_env)
+if E7_CASE.startswith('copy_'):
+    kind,cut=E7_CASE[len('copy_'):].split('_',1)
+    selected=[(p,r) for p,r in objects() if r['operation']['raw_source']==sources[0]];assert len(selected)==1;p,r=selected[0]
+    body=(p.parent/('stdout.raw' if cut=='stream' else r['output_post']['snapshot'])).read_bytes();digest=hashlib.sha256(body).hexdigest()
+    copy=target/'TEST_CODE_e7_copy.bin';copy.write_bytes(body)
+    selected_cc=[(q,json.loads(q.read_bytes())) for q in (session/'invocations').glob('*/receipt.json') if json.loads(q.read_bytes()).get('source')==str(session/'vendor/cc/src/lib.rs')]
+    assert len(selected_cc)==1;cp,cc=selected_cc[0]
+    if kind=='source':next(o for o in cc['outputs'] if o['kind']=='dep-info')['dep_info']['paths'].append(str(copy))
+    if kind=='extern':cc['externs'].append({'name':'e7_copy','path':str(copy)})
+    if kind=='output':cc['declared_outputs'].append({'path':str(copy),'kind':'link'})
+    cp.write_text(json.dumps(cc))
+    if cut=='retained':
+        for q in (session/'foreign-native-invocations').glob('*/*.raw'):
+            if hashlib.sha256(q.read_bytes()).hexdigest()==digest:q.unlink()
+        pathlib.Path(r['operation']['output']).write_bytes(b'TEST_CODE current differs from retained object')
+        (p.parent/'request.json').write_bytes(b'{TEST_CODE malformed raw ordinary request')
+    if cut=='request_only':
+        p.unlink()
+        for q in p.parent.glob('*.raw'):q.unlink()
+    (session/'e7-copy.json').write_text(json.dumps({'copy':str(copy),'sha256':digest,'operation_id':p.parent.name,'cc_id':cp.parent.name,'cc_receipt_sha256':hashlib.sha256(cp.read_bytes()).hexdigest()}))
+(session/'e7-forwarded.json').write_text(json.dumps(results))
+assert [os.fstat(fd).st_ino for fd in (read,write)]==original_stats
+for fd in opened:os.close(fd)
+(session/'e6-forwarded.json').write_text(json.dumps(results))
+emit({'reason':'build-finished','success':True})
+'''
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -7154,6 +7434,200 @@ class RecordingProtocolTests(unittest.TestCase):
                 self.assertTrue(any(row["path"] == str(session / "vendor" / owner.PROBE_LITERAL) for row in record["consumed_sources"]))
                 self.assertFalse(any(control["cc_id"] in row["producers"] for row in record["extern_edges"]))
                 self.assertEqual((record["selected_library"], foreign["native_producer_qualification"]), ([], "not_issued"))
+
+
+    def prepare_native_e7_lz4(self, case="normal"):
+        inventory = self.prepare_native_e4("normal")
+        cargo = write(self.root / "fake-cargo", "#!" + PYTHON + " -I\n" + E7_CARGO.replace("__E7_CASE__", repr(case)).replace("__E4_FACTS__", repr(E4_FACTS)))
+        native = write(self.root / "fake-native-cc", "#!" + PYTHON + " -I\n" + E7_NATIVE)
+        for path in (cargo, native): path.chmod(0o700)
+        inventory["cargo"]["sha256"] = sha(cargo); inventory["generators"]["CC"]["sha256"] = sha(native)
+        body = self.tool.read_text()
+        # Same closed fake-compiler map binding as E2; never a seal-success stub.
+        original = "FOREIGN_MAP_RUSTC_SHA256 = " + json.dumps(owner.FOREIGN_MAP_RUSTC_SHA256)
+        self.assertEqual(body.count(original), 1)
+        body = body.replace(original, "FOREIGN_MAP_RUSTC_SHA256 = " + json.dumps(inventory["rustc"]["sha256"]))
+        replacements = {
+            "capture": ('try:dest=open(call/(name+".raw"),"xb")', 'try:\n                if env.get("E7_CASE")=="capture" and "-c" in argv and name=="stderr":raise OSError("TEST_CODE E7 capture")\n                dest=open(call/(name+".raw"),"xb")'),
+            "forward": ('written = os.write(1 if stream == "stdout" else 2, view)', 'if env.get("E7_CASE")=="forward" and compiling:raise OSError("TEST_CODE E7 forward")\n                            written = os.write(1 if stream == "stdout" else 2, view)'),
+            "return_control": ('receipt["controls_return"] = foreign_controls(session, policy, owner, context)', 'receipt["controls_return"] = foreign_controls(session, policy, owner, context)\n            if env.get("E7_CASE")=="return_control" and compiling:receipt["controls_return"]["session_owner_sha256"]="0"*64'),
+            "return_fd": ('receipt["tool_result"] = code; receipt["failures"].extend(faults)', 'receipt["tool_result"] = code; receipt["failures"].extend(faults)\n        if env.get("E7_CASE")=="return_fd" and compiling:os.close(fds[0])'),
+            "return_output": ('if compiling:\n                native_state_check(call, receipt["output_post"], live=True)', 'if compiling:\n                if env.get("E7_CASE")=="return_output":Path(operation["output"]).write_bytes(b"TEST_CODE E7 return object drift")\n                native_state_check(call, receipt["output_post"], live=True)'),
+        }
+        if case in replacements:
+            needle, replacement = replacements[case]; self.assertEqual(body.count(needle), 1); body = body.replace(needle, replacement)
+        if case == "lock_fd":
+            needle = 'receipt["serialization_post"] = foreign_lz4_lock_state(session, *lz4_lock)'; self.assertEqual(body.count(needle), 1)
+            body = body.replace(needle, 'if env.get("E7_CASE")=="lock_fd":os.close(lz4_lock[0])\n                ' + needle)
+        if case == "crash":
+            needle = '    atomic_json(call / "request.json", request)'; self.assertEqual(body.count(needle), 1)
+            body = body.replace(needle, needle + '\n    if env.get("E7_CASE")=="crash" and args[-1:]==["liblz4/lib/lz4.c"]:os._exit(19)\n')
+        if case == "parallel":
+            # Filled by the fixed session-owner serialization seam; no fake receipt.
+            needle = '    atomic_json(call / "request.json", request)'; self.assertEqual(body.count(needle), 1)
+            pause = '\n    if env.get("E7_CASE")=="parallel" and args[-1:]==["liblz4/lib/lz4.c"]:\n        import time\n        (session/"e7-pending.json").write_text(json.dumps({"operation_id":call.name}))\n        deadline=time.monotonic()+15\n        while not (session/"e7-release").exists():\n            require(time.monotonic()<deadline,"TEST_CODE E7 pending release");time.sleep(0.01)\n'
+            body = body.replace(needle, needle + pause)
+            needle = '        fcntl.flock(fd, fcntl.LOCK_EX)'; self.assertEqual(body.count(needle), 1)
+            body = body.replace(needle, '        if env.get("E7_CASE")=="parallel" and args[-1:]==["liblz4/lib/lz4frame.c"]:(session/"e7-waiting").write_bytes(b"TEST_CODE lock wait")\n' + needle)
+        self.tool.write_text(body); inventory["owner_sha256"] = sha(self.tool)
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.BUNDLED_PROFILE, "inventory": inventory}))
+        return inventory
+
+    def native_e7_lz4_result(self, case="normal"):
+        inventory = self.prepare_native_e7_lz4(case)
+        run = subprocess.run([PYTHON, "-I", str(self.tool), "record"], env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
+        self.assertEqual(run.returncode, 2, run.stdout.decode(errors="replace") + run.stderr.decode(errors="replace"))
+        record = self.record_result(run); session = Path(json.loads(run.stdout)["record_path"]).parent
+        self.assertEqual(record["cargo_exit_code"], 0, (session / "cargo.stderr.raw").read_text(errors="replace"))
+        foreign = json.loads((session / "foreign-native-record.json").read_bytes())
+        calls = {p.parent.name: (p.parent, json.loads(p.read_bytes())) for p in (session / "foreign-native-invocations").glob("*/receipt.json")}
+        trace = json.loads((session / "e7-forwarded.json").read_bytes())
+        self.assertEqual(record["foreign_native_record_sha256"], sha(session / "foreign-native-record.json"))
+        stage = "StageCIncomplete" if case == "prior_role" else "StageBIncomplete"
+        self.assertEqual((foreign["stage"], foreign["native_producer_qualification"], record["selected_library"]), (stage, "not_issued", []))
+        self.assertEqual(foreign["artifact_selection"], "not_observed")
+        return inventory, session, record, foreign, calls, trace
+
+    def native_e7_lz4_private_negative_result(self, case):
+        self.assertIn(case, ("header_pre", "header_post", "helper_pre", "helper_post"))
+        from unittest import mock
+        inventory = self.prepare_native_e7_lz4(case); pending_root = self.root / ".replay-build-records"
+        before = set(pending_root.glob("pending-*"))
+        run = subprocess.run([PYTHON, "-I", str(self.tool), "record"], env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
+        self.assertEqual(run.returncode, 2, run.stderr.decode(errors="replace")); self.assertEqual(run.stdout, b"")
+        self.assertEqual(json.loads(run.stderr), {"schema": owner.SCHEMA, "state": "RecordingOnly", "reason": "Refused", "detail": "InventoryMismatch"})
+        pending = set(pending_root.glob("pending-*")) - before; self.assertEqual(len(pending), 1); session = pending.pop()
+        self.assertFalse((session / "record.json").exists()); self.assertFalse((session / "foreign-native-record.json").exists())
+        self.assertTrue((session / "e7-forwarded.json").is_file(), (session / "cargo.stderr.raw").read_text(errors="replace"))
+        calls = {p.parent.name: (p.parent, json.loads(p.read_bytes())) for p in (session / "foreign-native-invocations").glob("*/receipt.json")}
+        with mock.patch.object(owner, "POLICY", self.policy):
+            negative = owner.foreign_evidence_namespace(session)
+        return inventory, session, calls, negative
+
+    def test_native_e7_lz4_four_compile_only_objects_and_serialized_peers(self):
+        for case in ("normal", "parallel"):
+            with self.subTest(case=case):
+                _, session, record, foreign, calls, trace = self.native_e7_lz4_result(case)
+                compiles = [(call, receipt) for call, receipt in calls.values() if isinstance(receipt.get("operation"), dict) and receipt["operation"].get("scope") == "CompileOnly"]
+                self.assertEqual(len(compiles), 4)
+                self.assertEqual({r["operation"]["raw_source"] for _, r in compiles}, set(owner.FOREIGN_LZ4_ORDINARY_SOURCES))
+                for call, receipt in compiles:
+                    op = receipt["operation"]
+                    self.assertEqual((receipt["protocol_state"], receipt["tool_result"], receipt["failures"]), ("Completed", 0, []))
+                    self.assertEqual(op["object_derivation"], {"dirname": "liblz4/lib", "extension": "c", "prefix": "efce31824dbf3730"})
+                    self.assertEqual(op["output"], str(Path(receipt["context"]["out_dir"]) / ("efce31824dbf3730-" + Path(op["raw_source"]).with_suffix(".o").name)))
+                    self.assertEqual(receipt["source_semantics"], {"compiler_success": True, "object_observed": True})
+                    self.assertEqual(receipt["controls_pre"], receipt["controls_post"]); self.assertEqual(receipt["controls_pre"], receipt["controls_return"])
+                    self.assertEqual(receipt["compile_pins_pre"], receipt["compile_pins_post"]); self.assertEqual(receipt["compile_pins_pre"], receipt["compile_pins_return"])
+                    self.assertEqual(receipt["jobserver_identity"], receipt["jobserver_return"])
+                    self.assertEqual(receipt["serialization_pre"], receipt["serialization_post"]); self.assertEqual(receipt["serialization_pre"], receipt["serialization_return"])
+                    self.assertEqual((receipt["serialization_pre"]["scope"], receipt["serialization_pre"]["path"]), ("SerializationOnly", str(session / "owner.json")))
+                    self.assertEqual(receipt["family_pre"], receipt["family_return"])
+                    self.assertEqual((receipt["family_pre"]["mapping_rule"], receipt["family_pre"]["execution_edge"]), ("RecordingOnlySourceOrderedCapture", "not_observed"))
+                    self.assertEqual(receipt["family_pre"]["base"], receipt["family_pre"]["probe"])
+                    for kind in ("input", "output"):
+                        self.assertEqual({k:v for k,v in receipt[kind + "_post"].items() if k != "snapshot"}, {k:v for k,v in receipt[kind + "_return"].items() if k != "snapshot"})
+                        self.assertEqual(sha(call / receipt[kind + "_return"]["snapshot"]), receipt[kind + "_return"]["sha256"])
+                    self.assertFalse(receipt["output_pre"]["exists"]); self.assertGreater(receipt["output_post"]["length"], 0)
+                    for stream in ("stdout", "stderr"):
+                        self.assertEqual(sha(call / (stream + ".raw")), receipt[stream + "_sha256"])
+                        row = next(row for row in trace if row["args"] == [os.fsdecode(bytes.fromhex(v)) for v in receipt["args_hex"]])
+                        self.assertEqual(row[stream + "_hex"], (call / (stream + ".raw")).read_bytes().hex())
+                    self.assertFalse(any(row["path"] == op["source"] for row in record["consumed_sources"]))
+                    self.assertFalse(any(row["path"] == op["output"] and row["producers"] for row in record["extern_edges"]))
+                    self.assertFalse(any(blocker.startswith("ForeignOperation:" + call.name + ":") for blocker in foreign["blockers"]), foreign["blockers"])
+                denied = json.loads((session / "e7-zstd-cut.json").read_bytes()); self.assertEqual(denied["child_before"], denied["child_after"])
+                selected = [(call, receipt) for call, receipt in calls.values() if [os.fsdecode(bytes.fromhex(v)) for v in receipt["args_hex"]] == denied["argv"]]
+                self.assertEqual(len(selected), 1); _, receipt = selected[0]
+                self.assertEqual((receipt["protocol_state"], receipt["tool_result"]), ("ProtocolRefused", None)); self.assertIn("ForeignEOnlyArgv", receipt["failures"])
+                entries = [json.loads(path.read_bytes()) for path in (session / "e6-entry").iterdir()]
+                self.assertEqual(len(entries), len([r for _, r in calls.values() if r["tool_result"] is not None]))
+                self.assertTrue(all(e["stdin_eof"] and len(e["fds"]) == 2 and e["regular_fds"] == [] for e in entries))
+                if case == "parallel":
+                    queued = json.loads((session / "e7-serialization.json").read_bytes()); self.assertEqual(queued["queued_after"], queued["queued_before"] + 2)
+                if case == "normal":
+                    fd = os.open(session / "owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    try:
+                        owner.fcntl.flock(fd, owner.fcntl.LOCK_EX)
+                        specification = importlib.util.spec_from_file_location("record_owner_e7_private", self.tool)
+                        private_owner = importlib.util.module_from_spec(specification); specification.loader.exec_module(private_owner)
+                        held = private_owner.foreign_seal(session, json.loads(self.policy.read_bytes()))
+                        self.assertTrue(any("ForeignCompileInFlight" in reason for reason in held["blockers"]), held["blockers"])
+                    finally: os.close(fd)
+
+    def test_native_e7_lz4_exact_admission_and_post_faults_stay_sticky(self):
+        controls = {
+            "argv": "ForeignCompileArgv", "source": "ForeignCompileSource", "locale": "ForeignCompileEnvironment",
+            "features": "ForeignFeaturesLinks", "jobs": "ForeignCompileConfiguration", "invalid_fd": "InvalidJobserverDescriptors", "output_alias": "ForeignCompileOutputAlias", "output_pre": "ForeignCompileOwnership", "missing_object": "ForeignCompileObjectMissing",
+            "nonzero": "ForeignFamilySticky", "signed": "ForeignFamilySticky", "capture": "ForeignCaptureSticky", "forward": "ForeignForward:stdout:",
+            "return_control": "ForeignControlChanged", "return_fd": "InvalidJobserverDescriptors", "return_output": "NativeVersionChanged", "lock_fd": "Bad file descriptor", "crash": "ForeignFamilyPending",
+            "prior_raw_out": "ForeignFamilyReceiptBinding", "prior_role": "ForeignFamilyReceiptBinding", "prior_stream": "ForeignFamilyStream",
+            "prior_receipt": "ForeignFamilyPending", "prior_snapshot": "NativeSnapshotChanged", "prior_output": "NativeVersionChanged",
+        }
+        child_cases = {"missing_object", "nonzero", "signed", "capture", "forward", "return_control", "return_fd", "return_output", "lock_fd"}
+        for case, marker in controls.items():
+            with self.subTest(case=case):
+                _, session, _, foreign, calls, _ = self.native_e7_lz4_result(case)
+                cut = json.loads((session / "e7-cut.json").read_bytes())
+                if case == "crash":
+                    self.assertEqual(cut["status"], 19); self.assertNotIn(cut["operation_id"], calls)
+                    self.assertTrue((session / "foreign-native-invocations" / cut["operation_id"] / "request.json").is_file())
+                    self.assertEqual(cut["child_before"], cut["child_after"]); self.assertEqual(cut["next_child_before"], cut["next_child_after"])
+                    _, next_receipt = calls[cut["next_operation_id"]]
+                    self.assertEqual((next_receipt["protocol_state"], next_receipt["tool_result"]), ("ProtocolRefused", None))
+                    self.assertIn(marker, next_receipt["failures"]); continue
+                call, receipt = calls[cut["operation_id"]]
+                self.assertEqual(cut["child_after"], cut["child_before"] + (1 if case in child_cases else 0))
+                if case in ("nonzero", "signed"):
+                    self.assertEqual((receipt["protocol_state"], receipt["tool_result"], receipt["failures"]), ("Completed", 7 if case == "nonzero" else -15, []))
+                    self.assertFalse(receipt["source_semantics"]["compiler_success"])
+                    next_call, next_receipt = calls[cut["next_operation_id"]]
+                    self.assertIn(marker, next_receipt["failures"])
+                else:
+                    self.assertEqual(receipt["protocol_state"], "ProtocolRefused")
+                    self.assertTrue(any(marker in reason for reason in receipt["failures"]), receipt["failures"])
+                    self.assertEqual(receipt["tool_result"], 0 if case in child_cases else None)
+                if "next_operation_id" in cut:
+                    _, next_receipt = calls[cut["next_operation_id"]]
+                    self.assertEqual(cut["next_child_before"], cut["next_child_after"])
+                    self.assertEqual((next_receipt["protocol_state"], next_receipt["tool_result"]), ("ProtocolRefused", None))
+                self.assertTrue(any(b.startswith("ForeignProtocolSticky:") or b.startswith("ForeignOperation:") for b in foreign["blockers"]), foreign["blockers"])
+
+    def test_native_e7_lz4_negative_owned_objects_and_private_header_cuts(self):
+        for kind in ("source", "extern", "output"):
+            for cut in ("current", "retained", "request_only", "stream"):
+                with self.subTest(kind=kind, cut=cut):
+                    _, session, record, foreign, calls, _ = self.native_e7_lz4_result("copy_" + kind + "_" + cut)
+                    control = json.loads((session / "e7-copy.json").read_bytes()); copy = Path(control["copy"])
+                    self.assertEqual(sha(copy), control["sha256"]); self.assertIn(control["sha256"], foreign["quarantine"]["sha256"])
+                    self.assertIn("NativeOutputRole:" + (control["cc_id"] if kind == "output" else str(copy)), record["blockers"])
+                    self.assertFalse(any(c["path"] == str(copy) for c in record["consumed_sources"]))
+                    self.assertFalse(any(e["path"] == str(copy) and e["producers"] for e in record["extern_edges"]))
+                    self.assertFalse(any(control["cc_id"] in e["producers"] for e in record["extern_edges"]))
+                    self.assertFalse(any(a["producer_invocation"] == control["cc_id"] for a in record["build_script_associations"]))
+                    self.assertEqual(sha(session / "invocations" / control["cc_id"] / "receipt.json"), control["cc_receipt_sha256"])
+                    if cut == "retained": self.assertNotIn(control["sha256"], {sha(p) for p in (session / "foreign-native-invocations").glob("*/*.raw")})
+                    if cut == "request_only": self.assertFalse((session / "foreign-native-invocations" / control["operation_id"] / "receipt.json").exists())
+                    if kind == "output":
+                        cc = json.loads((session / "invocations" / control["cc_id"] / "receipt.json").read_bytes())
+                        self.assertIn("UnresolvedCargoArtifact:" + cc["source"], record["blockers"])
+        for case in ("header_pre", "header_post", "helper_pre", "helper_post"):
+            with self.subTest(case=case):
+                _, session, calls, negative = self.native_e7_lz4_private_negative_result(case)
+                paths, probes, hashes, blockers = negative; self.assertIsInstance(negative, tuple)
+                member = "cc/src/tool.rs" if case.startswith("helper_") else "lz4-sys/liblz4/lib/lz4.h"
+                header = session / "vendor" / member
+                if case.startswith("helper_"):
+                    self.assertNotIn(str(header), paths); self.assertNotIn(sha(header), hashes)
+                else:
+                    self.assertIn(str(header), paths); self.assertIn(sha(header), hashes)
+                    self.assertIn(owner.FOREIGN_E_ONLY_SOURCE_PINS[member], hashes)
+                cut = json.loads((session / "e7-cut.json").read_bytes()); _, receipt = calls[cut["operation_id"]]
+                self.assertEqual(cut["child_after"], cut["child_before"] + (1 if case.endswith("_post") else 0))
+                self.assertEqual((receipt["protocol_state"], receipt["tool_result"]), ("ProtocolRefused", 0 if case.endswith("_post") else None))
+                self.assertTrue(any("ForeignEOnlySourcePin" in reason or "ForeignCompileSourcePin" in reason for reason in receipt["failures"]), receipt["failures"])
+                self.assertEqual(cut["next_child_before"], cut["next_child_after"])
+                _, following = calls[cut["next_operation_id"]]; self.assertEqual((following["protocol_state"], following["tool_result"]), ("ProtocolRefused", None))
 
 
 if __name__ == "__main__":
