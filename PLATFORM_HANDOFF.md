@@ -468,3 +468,11 @@ Ring稳定FD单次读取primitive实际1完整方法通过；Root解析器漏识
 后续将原生记录超时限制为独立有界诊断，不阻挡可独立的新闻和财务开发。Catalog8数据投影/typed rowid、sqlite_sequence、REAL bits及双EOF比较的下一段计划已封、独审准备中；SQL持久发行/COMMIT/fsync/冷恢复与完整财务验收仍待完成。平台整体七类余项继续开放。
 
 本检查点仅本地分支提交及隔离验证；平台实际922源码、生产运行根和数据库未修改，没有远端push/合并。
+
+### 2026-10-05 15:20 八表数据核心提交与封存性能修正
+
+八表数据投影核心已在Task6隔离树本地提交 `e5bd5e60`：实际旧表rowid、类型、TEXT/BLOB字节、REAL位模式、sqlite_sequence与两新表EOF校验；真实owned6一次移交及累计RowsWork/TargetWork、两次上限和失败禁止重试已接通。第一次Root13527编译通过但2PASS/1FAIL，原因仅新cfg辅助代码假设audit存在，且失败在取得cap前；原失败日志保留。cfg修正仅把NotFound表示为不存在，其他I/O错误继续失败，前后存在状态和字节均比较。独审后Root92819重新3PASS，另两项相关旧Rows测试各1PASS；五项闭合EXIT0，diff --check通过，未追加全量/release/check/build/clippy。详情见隔离树TASK6_OWNED8_CORE_HANDOFF_20261005.md及Root closed receipt。真实存储prefix、WAL转换、只读发行与完整Financial仍待完成，下一片正在Source实现。
+
+Ring单次保留profile诊断已闭合：原240秒仍超时，Cargo fake build-finished成功但最终record未发布。独立DATA复核仅批准局部诊断，不升级原失败或native资格。180/210样本及源码DAG显示封存每C/AR反复检查整组F0/F1；不是已证实死循环，也不能把嵌套耗时相加。有限sealing-only复用方案v2已获独审PLAN_ACCEPTED，正在Source实现：完整成功group仅本次封存复用、逐ID原分类/pins/producer/ledger/首错保留、前后generation与两live tail复查；默认编译实时路径和240限制不变。新修正尚未执行或应用实际Tools，不宣称解决超时。
+
+新闻冻结365候选及旧生产状态不变，本轮未上线/重发/重启/替换activation；新闻诊断5e仍仅本地。平台整体未完成，无远端push或合并。
