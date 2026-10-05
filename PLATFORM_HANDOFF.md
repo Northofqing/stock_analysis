@@ -543,3 +543,23 @@ Root最终fresh新RO3+相关WAL3+exact projection1共7项通过，三个会话43
 首轮完整stat检查在停服务前退出；首次activation错取准备工具编译绑定的旧生产哈希17a3，启动门拒绝。原检查、错误候选、拒绝日志与后续eab56更正及重启全部保留；正确735输入安装后实际重算、未来激活并在生效后重启，未绕门。回退保留同根数据库，仅恢复六件备份。详细交接在新闻隔离树 `NEWS_ROLLOUT_HANDOFF_20261005.md`，文档本地提交 `53c54201`；完整部署证据目录 `/Users/zhangzhen/.local/share/stock-analysis-news-rollout-20261005/`。原冻结365包保持不变，没有远端push或合并。
 
 继续开发：Task6最终integrity/FK的A-only新Source已封包、Root全文与18payload/16named14ranges/3whole字节pin核对，非作者Source审查中，尚未应用/运行；使用第二个已真实打开的只读reader，在typed pair后固定完整性/FK检查，再实际close和来源/目标tail，不新增pair或预算。Task7真实迭代器所有权Source并行开发中，平台整体未完成。
+
+
+### 2026-10-05 最终完整性与外键检查完成
+
+Task6隔离树本地提交 `0be246d1`，工作树干净；A仅追加332行，旧164572字节前缀和其他六件保持。真Transformed/冷5或6的第二live reader在typed pair之后执行完整性strict TEXT ok+EOF与FK EOF，再真实close及完整来源/目标tail。首次错误保whole，真实Busy归还Connection，不增加第三pair/reader或预算。
+
+新增3+原RO3+exactprojection1共7项实际通过，Root67347/8417/30729均退出0；编译5m29，新组82.39秒，相关组复用产物127.16秒与1.65秒。Source83d3、独立Source6084、自核f49f、应用0afb、闭合回执dabbdc、执行坐标追加28c8与独立DATA89f1绑定，提交全部7件源码blob核对一致。仅同打印947c路径，未测binary SHA；diff检查通过，未追加例行check/build/clippy/全量/release。坏CHECK/FK仅固定SQL gate覆盖，真实owner由warm/cold/漂移/Busy/首错与相关RO对照覆盖。
+
+该结果为局部LocalIntegrityChecked，尚未发行业务operational schema8或完整Financial/native/provider/完整历史16MiB资格，未将Task6部署生产。接线调查确认真实record/read investment及funding API尚未接monitor，现paper_v6生产paths先拒；应在第二reader窗口关闭前接共享固定Financial读/重放，不能从已关闭局部owner硬铸VerifiedCatalog8或盲增来源loan。新financial接口仍需实际layout/付款边界闭合。Task7 iterator/pending Source整理中，尚未应用或运行。
+
+为推进独立剩余代码，已从DEVda451创建managed `evidence-outbox-20261005` 工作树与codex分支，当前仅基线/最小方案；后续只持久保存Unverified材料，远端存储厂商、真实保留/签名/恢复、资金批准和自然窗口分别仍待验收。新闻新版本已部署、首轮采集71的有限结论保持，实际新新闻投递尚无证据。平台整体未完成，无远端push或合并。
+
+
+### 2026-10-05 迭代器所有权与错误清理验证通过
+
+Task7仅G/Q/W新增真实Vec消费迭代与pending String同frame保留；未知next/hash返回先于首错误和terminal清理，实际空EOF仍保摘要后继。首编译Root84963退出101，四处新增cfg测试关联函数指针错误已用method-autoderef闭包修正；原失败59833与原Source包保留，修正Source c2b2/独审0f50批准，不改生产body或既有whole。
+
+fresh新增3+Sort3+exactCompileOptions2共8项通过，Root13341/79798及两次exact调用均退出0，闭合回执f8a24050含绝对DEV执行坐标和五源码/四raw日志。编译5m17，新组运行0.03秒，相关5复用产物；打印同lib harness1c34，binary SHA未测。diff检查通过，未追加check/build/fullsuite/release，未把局部机制测试当完整SHA/native/provider/付款/Financial资格。
+
+完整实际domain/count/hash/finalize/lower_hex/validator后继计划4266经独立PLAN5594批准，正隔离Source实现；C只计划最小三个helper可见性。Task8本地Unverified持久材料队列计划41e1/独立PLAN2fa3批准后并行实现，真实commit/close未知、冷恢复和两个coordinator是验收重点。尚未应用或运行这两个新实现，远端WORM与业务Financial仍未完成。本段8项结果经独立DATA `be4997d2` 核对通过，按G/Q/W与交接文档四个路径本地提交；未远端push或合并。

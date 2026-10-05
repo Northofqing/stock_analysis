@@ -1194,6 +1194,32 @@ impl FinancialCompileSortFrame<'_, '_> {
             &mut self.compile.options, &mut self.compile.prefix.capture.source_id)
     }
 }
+// One whole-frame move transfers the returned, sorted unique Vec into its
+// actual consuming iterator. No String, earlier owner or Work is cloned.
+struct FinancialCompileIteratorState {
+    iterator: Option<std::vec::IntoIter<String>>,
+    pending: Option<String>,
+}
+struct FinancialCompileIteratorFrame<'purpose, 'writer> {
+    sort: FinancialCompileSortFrame<'purpose, 'writer>,
+    iteration: FinancialCompileIteratorState,
+}
+impl<'purpose, 'writer> FinancialCompileSortFrame<'purpose, 'writer> {
+    fn begin_iteration(mut self) -> Result<FinancialCompileIteratorFrame<'purpose, 'writer>, Self> {
+        if self.compile.options.rows.is_none() || self.compile.prefix.capture.source_id.is_none()
+            || !self.compile.prefix.integrity.prefix.source.fields().begin_compile_iterator() { return Err(self); }
+        let rows = self.compile.options.rows.take().expect("same exclusive preflight owns the Vec");
+        Ok(FinancialCompileIteratorFrame { sort: self, iteration: FinancialCompileIteratorState {
+            iterator: Some(rows.into_iter()), pending: None,
+        } })
+    }
+}
+impl FinancialCompileIteratorFrame<'_, '_> {
+    fn iteration_loan(&mut self) -> replay_work::OriginalCompileIteratorLoan<'_> {
+        self.sort.compile.prefix.integrity.prefix.source.fields().compile_iterator(
+            &mut self.sort.compile.options, &mut self.sort.compile.prefix.capture.source_id, &mut self.iteration)
+    }
+}
 fn retain_capture_catalog_error(error: GlobalSchemaCatalogError) -> rows::original_source::SourceOperationError {
     rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source: error })
 }
@@ -2972,6 +2998,121 @@ mod financial_original_audit_acquisition_tests {
                     assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
                 else { assert_primary(&moved.compile.prefix.integrity.prefix.source.physical, allocation); }
                 assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            } }
+        }
+
+        fn fixed_compile_iterator_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter, trace: &Trace, values: Vec<String>) -> FinancialCompileIteratorFrame<'purpose, 'writer> {
+            let frame = fixed_compile_sort_frame(purpose, writer, trace, values);
+            let Err(mut frame) = frame.begin_iteration() else { panic!("unreturned sort refuses the whole-frame move"); };
+            frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
+            frame.sort_duplicate_loan().test_code_check_unique();
+            frame.begin_iteration().unwrap_or_else(|_| panic!("actual unique Vec enters its consuming iterator once"))
+        }
+        fn finish_compile_iterator_failure(frame: &mut FinancialCompileIteratorFrame<'_, '_>, trace: &Trace, terminal: bool) {
+            frame.iteration_loan().test_code_interrupted_drain();
+            finish_compile_options_failure(&mut frame.sort.compile, trace, terminal);
+        }
+        #[test]
+        fn history_original_compile_iterator_moves_vec_and_real_next() {
+            let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let values = vec![String::from("Z"), String::from("A"), String::from("M")];
+            let vector = values.as_ptr(); let capacity = values.capacity(); let first_string = values[1].as_ptr();
+            let mut frame = fixed_compile_iterator_frame(&purpose, &writer, &trace, values);
+            assert!(frame.sort.compile.options.rows.is_none()); assert!(frame.iteration.pending.is_none());
+            assert_eq!(frame.iteration.iterator.as_ref().unwrap().as_slice().as_ptr(), vector);
+            assert_eq!(frame.iteration.iterator.as_ref().unwrap().as_slice(), ["A", "M", "Z"]);
+            assert!(capacity >= frame.iteration.iterator.as_ref().unwrap().len());
+            assert!(!frame.sort.compile.prefix.integrity.prefix.source.fields().begin_compile_iterator());
+            let source = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
+            let integrity = frame.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+            let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+            frame.iteration_loan().test_code_next_body();
+            assert_eq!(frame.iteration.pending.as_deref(), Some("A"));
+            assert_eq!(frame.iteration.pending.as_ref().unwrap().as_ptr(), first_string);
+            assert_eq!(frame.iteration.iterator.as_ref().unwrap().as_slice(), ["M", "Z"]);
+            { let _short = frame.iteration_loan(); } let mut moved = frame;
+            moved.iteration_loan().test_code_next_return(); moved.iteration_loan().test_code_pending_held();
+            assert_eq!(moved.iteration.pending.as_ref().unwrap().as_ptr(), first_string);
+            assert_eq!(moved.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
+            assert_eq!(moved.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
+            assert!(std::ptr::eq(moved.sort.compile.prefix.integrity.prefix.initial.purpose, &purpose));
+            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            let first = moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+            let stopped = moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+            // Hash was never entered. Actual pending String and remaining
+            // iterator may drain once, before the old Stmt/source-id cleanup.
+            finish_compile_iterator_failure(&mut moved, &trace, true);
+            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), stopped);
+        }
+        #[test]
+        fn history_original_compile_iterator_eof_and_interrupted_drain() {
+            // A real empty iterator reaches EOF; nonempty cleanup cuts are
+            // before hash. No supplied boolean claims a hash call returned.
+            for cut in 0..3 { for terminal in [false, true] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let values = if cut == 2 { Vec::new() } else { vec![String::from("A"), String::from("B")] };
+                let mut frame = fixed_compile_iterator_frame(&purpose, &writer, &trace, values);
+                let source = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
+                if cut != 0 { frame.iteration_loan().test_code_next_body(); }
+                if cut == 2 { frame.iteration_loan().test_code_next_return(); frame.iteration_loan().test_code_empty_eof(); }
+                let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
+                let (primary, allocation) = fixed_primary();
+                let first = if terminal { drop(primary); Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
+                    else { frame.sort.compile.prefix.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
+                        frame.sort.compile.prefix.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first actual supplied error owner")); None };
+                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                { let _short = frame.iteration_loan(); } let mut moved = frame;
+                // Late failure cannot discard the acquired String or skip the
+                // independently reached next() return observation.
+                if cut == 1 { assert_eq!(moved.iteration.pending.as_ref().map(|s| s.as_ptr()), pending);
+                    moved.iteration_loan().test_code_barrier(); moved.iteration_loan().test_code_next_return(); }
+                assert_eq!(moved.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
+                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                finish_compile_iterator_failure(&mut moved, &trace, terminal);
+                if let Some(first) = first { assert!(moved.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+                    assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
+                else { assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            } }
+        }
+        #[test]
+        fn history_original_compile_iterator_unknown_hash_holds_first_failure() {
+            for cut in 0..3 { for terminal in [false, true] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let mut frame = fixed_compile_iterator_frame(&purpose, &writer, &trace,
+                    vec![String::from("A"), String::from("B")]);
+                let source = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
+                if cut == 0 { frame.iteration_loan().test_code_next_unknown(); }
+                else { frame.iteration_loan().test_code_next_body(); frame.iteration_loan().test_code_next_return();
+                    frame.iteration_loan().test_code_hash_unknown(cut == 2); }
+                let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
+                let remaining = frame.iteration.iterator.as_ref().unwrap().as_slice().as_ptr();
+                let count = frame.iteration.iterator.as_ref().unwrap().len();
+                let (primary, allocation) = fixed_primary();
+                let first = if terminal { drop(primary); Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
+                    else { frame.sort.compile.prefix.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
+                        frame.sort.compile.prefix.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("actual first supplied diagnostic")); None };
+                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                { let _short = frame.iteration_loan(); } let mut moved = frame;
+                moved.iteration_loan().test_code_no_drain();
+                assert_eq!(moved.iteration.pending.as_ref().map(|s| s.as_ptr()), pending);
+                assert_eq!(moved.iteration.iterator.as_ref().unwrap().as_slice().as_ptr(), remaining);
+                assert_eq!(moved.iteration.iterator.as_ref().unwrap().len(), count);
+                assert_eq!(moved.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                if let Some(first) = first { assert!(moved.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+                    assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
+                else { assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
             } }
         }
 

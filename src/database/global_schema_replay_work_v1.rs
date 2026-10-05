@@ -315,7 +315,7 @@ mod sql_rows;
 // Only G's fixed owning carriers may use the unqualified sibling-field port.
 pub(super) use sql_rows::original_native::{
     FixedDrainLedger, NativeOriginalOwner, OriginalOwnerFields, OriginalInitialReadLoan,
-    OriginalIntegrityReadLoan, OriginalCapturePrefixLoan, OriginalCompileOptionsLoan, OriginalCompileSortLoan,
+    OriginalIntegrityReadLoan, OriginalCapturePrefixLoan, OriginalCompileOptionsLoan, OriginalCompileSortLoan, OriginalCompileIteratorLoan,
 };
 #[cfg(test)]
 pub(super) use sql_rows::original_native::{CaptureErrorCase, CaptureTerminalCut, LifecycleA00Case, LifecycleConstructorCase};

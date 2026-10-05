@@ -854,6 +854,7 @@ pub(super) mod original_native {
         capture_prefix: CapturePrefixRecord,
         compile_options: CompileOptionsRecord,
         compile_sort: CompileSortRecord,
+        compile_iterator: CompileIteratorRecord,
         secondary: Option<FixedAdverse>,
         _thread: PhantomData<Rc<()>>,
     }
@@ -887,6 +888,7 @@ pub(super) mod original_native {
                 capture_prefix: CapturePrefixRecord::empty(),
                 compile_options: CompileOptionsRecord::empty(),
                 compile_sort: CompileSortRecord::empty(),
+                compile_iterator: CompileIteratorRecord::empty(),
                 secondary: None,
                 _thread: PhantomData,
             }
@@ -968,6 +970,8 @@ pub(super) mod original_native {
         DiscardCompileCatalogError, DiscardCompileSourceId, StopCompileOptions, CompileOptionsBeforeSort,
         SortCompileOptions, AwaitCompileSortReturn, AwaitCompileSortLexicalReturn, CheckCompileDuplicates,
         AcquireCompileDuplicateError, AwaitCompileDuplicateOwner, AwaitCompileDuplicateReturn, AwaitCompileDigestSuccessor,
+        NextCompileOption, AwaitCompileOptionNextReturn, BorrowCompileOptionHash, AwaitCompileOptionHashScope,
+        AwaitCompileOptionHashReturn, DiscardCompileOption, DiscardCompileIterator, StopCompileIterator,
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1825,7 +1829,7 @@ pub(super) mod original_native {
                 && self.statements.iter().all(|slot| slot.live().is_none())
                 && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
                 && self.integrity_read.stopped_clear() && self.capture_prefix.stopped_clear() && self.compile_options.stopped_clear()
-                && self.compile_sort.stopped_clear()
+                && self.compile_sort.stopped_clear() && self.compile_iterator.stopped_clear()
         }
     }
     impl<'a> OriginalOwnerFields<'a> {
@@ -1999,7 +2003,8 @@ pub(super) mod original_native {
                 || self.fields.native.integrity_read.blocks_early_primary()
                 || self.fields.native.capture_prefix.blocks_early_primary()
                 || self.fields.native.compile_options.blocks_early_primary()
-                || self.fields.native.compile_sort.blocks_early_primary() { return Err(error); }
+                || self.fields.native.compile_sort.blocks_early_primary()
+                || self.fields.native.compile_iterator.blocks_early_primary() { return Err(error); }
             self.fields.physical.primary = Some(error);
             self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
             Ok(())
@@ -4668,6 +4673,7 @@ pub(super) mod original_native {
     }
     impl NativeOriginalOwner {
         fn compile_options_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            if let Some(action) = self.compile_iterator_action(work, physical) { return Some(action); }
             if let Some(action) = self.compile_sort_action(work, physical) { return Some(action); }
             let r = &self.compile_options;
             if matches!(r.stage, CompileStage::Dormant | CompileStage::Stopped) { return None; }
@@ -5447,4 +5453,226 @@ pub(super) mod original_native {
         }
     }
 
+    // The owning iterator is in G. This record controls the same-frame loans;
+    // real next() is the only source of next_returned and pending_live.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompileIteratorPhase { Dormant, Next, NextReturn, Pending, HashScope, HashReturnUnknown, Eof, SuccessorHeld, Draining, Stopped }
+    struct CompileIteratorRecord {
+        phase: CompileIteratorPhase, next_returned: bool, pending_live: bool, iterator_live: bool,
+    }
+    impl CompileIteratorRecord {
+        fn empty() -> Self { Self { phase: CompileIteratorPhase::Dormant, next_returned: false, pending_live: false, iterator_live: false } }
+        fn blocks_early_primary(&self) -> bool { !matches!(self.phase, CompileIteratorPhase::Dormant | CompileIteratorPhase::Stopped) }
+        fn stopped_clear(&self) -> bool {
+            matches!(self.phase, CompileIteratorPhase::Dormant | CompileIteratorPhase::Stopped)
+                && !self.pending_live && !self.iterator_live
+        }
+    }
+    impl NativeOriginalOwner {
+        fn compile_iterator_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            use CompileIteratorPhase as Phase;
+            let stopped = work.terminal().is_some() || physical.primary.is_some();
+            Some(match self.compile_iterator.phase {
+                Phase::Dormant | Phase::Stopped | Phase::Draining => return None,
+                // An unrun/dropped next port and an unresolved hash call never
+                // become returned facts merely because first failure exists.
+                Phase::NextReturn => LifecycleAction::AwaitCompileOptionNextReturn,
+                Phase::HashScope => LifecycleAction::AwaitCompileOptionHashScope,
+                Phase::HashReturnUnknown => LifecycleAction::AwaitCompileOptionHashReturn,
+                Phase::Pending if stopped => LifecycleAction::DiscardCompileOption,
+                Phase::Pending => LifecycleAction::BorrowCompileOptionHash,
+                Phase::Next if stopped => LifecycleAction::DiscardCompileIterator,
+                Phase::Next => LifecycleAction::NextCompileOption,
+                Phase::Eof => LifecycleAction::DiscardCompileIterator,
+                Phase::SuccessorHeld if stopped => LifecycleAction::StopCompileIterator,
+                Phase::SuccessorHeld => LifecycleAction::AwaitCompileDigestSuccessor,
+            })
+        }
+    }
+    impl OriginalOwnerFields<'_> {
+        pub(in crate::database::global_schema_v1) fn begin_compile_iterator(&mut self) -> bool {
+            let n = &mut self.native; let r = &n.compile_options;
+            if self.work.terminal().is_some() || self.physical.primary.is_some() || !matches!(n.tx.phase, TxPhase::Active)
+                || n.compile_iterator.phase != CompileIteratorPhase::Dormant || n.compile_sort.phase != CompileSortPhase::DigestHeld
+                || r.stage != CompileStage::Ready || r.collect_return != CompileReturn::Ok || !r.vector_live || r.blocks_early_primary()
+                || r.runtime_return != CompileReturn::Unknown || r.catalog_return != CompileReturn::Unknown
+                || !n.statements[0].live().is_some_and(|s| s.action == FixedAction::CompileOptions && s.cursor == CursorPhase::NoCursor)
+                || !n.capture_prefix.value_live { return false; }
+            n.compile_iterator.phase = CompileIteratorPhase::Next;
+            n.compile_iterator.iterator_live = true;
+            n.compile_options.vector_live = false; true
+        }
+    }
+    pub(in crate::database::global_schema_v1) struct OriginalCompileIteratorLoan<'a> {
+        fields: OriginalOwnerFields<'a>, options: &'a mut super::super::super::FinancialCompileOptionsState,
+        source_id: &'a mut Option<String>, iteration: &'a mut super::super::super::FinancialCompileIteratorState,
+    }
+    struct OriginalCompileIteratorPort<'short, 'a, 'rules> {
+        loan: &'short mut OriginalCompileIteratorLoan<'a>, _rules: &'rules SelectedOriginalNativeRules,
+    }
+    struct OriginalCompileNextBodyPort<'short> {
+        iterator: &'short mut std::vec::IntoIter<String>, pending: &'short mut Option<String>, record: &'short mut CompileIteratorRecord,
+    }
+    // Only a real short String loan is represented here. Scope end is NOT a
+    // SHA callee return, digest, allocation/payment receipt or hash success.
+    struct OriginalCompileHashScope<'short> { _option: &'short String, record: &'short mut CompileIteratorRecord }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn compile_iterator(self,
+            options: &'a mut super::super::super::FinancialCompileOptionsState, source_id: &'a mut Option<String>,
+            iteration: &'a mut super::super::super::FinancialCompileIteratorState) -> OriginalCompileIteratorLoan<'a> {
+            OriginalCompileIteratorLoan { fields: self, options, source_id, iteration }
+        }
+    }
+    impl<'a> OriginalCompileIteratorLoan<'a> {
+        fn fixed_port<'short, 'rules>(&'short mut self, rules: &'rules SelectedOriginalNativeRules) -> OriginalCompileIteratorPort<'short, 'a, 'rules> {
+            OriginalCompileIteratorPort { loan: self, _rules: rules }
+        }
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.compile_options_action(&self.fields.work, self.fields.physical) }
+        fn parent_loan(&mut self) -> OriginalCompileOptionsLoan<'_> {
+            OriginalCompileOptionsLoan { fields: self.fields.reborrow(), options: &mut *self.options, source_id: &mut *self.source_id }
+        }
+        fn next_body_port(&mut self) -> Result<OriginalCompileNextBodyPort<'_>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::NextCompileOption) || self.iteration.pending.is_some() {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            let iterator = self.iteration.iterator.as_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            let record = &mut self.fields.native.compile_iterator;
+            record.phase = CompileIteratorPhase::NextReturn; record.next_returned = false;
+            Ok(OriginalCompileNextBodyPort { iterator, pending: &mut self.iteration.pending, record })
+        }
+        fn next_return(&mut self) -> Result<(), ProtocolFault> {
+            let r = &mut self.fields.native.compile_iterator;
+            if r.phase != CompileIteratorPhase::NextReturn || !r.next_returned || r.pending_live != self.iteration.pending.is_some() {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            r.phase = if self.iteration.pending.is_some() { CompileIteratorPhase::Pending } else { CompileIteratorPhase::Eof }; Ok(())
+        }
+        fn hash_scope(&mut self) -> Result<OriginalCompileHashScope<'_>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::BorrowCompileOptionHash) { return Err(ProtocolFault::UnexpectedObservation); }
+            let option = self.iteration.pending.as_ref().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            let record = &mut self.fields.native.compile_iterator; record.phase = CompileIteratorPhase::HashScope;
+            Ok(OriginalCompileHashScope { _option: option, record })
+        }
+        fn discard_pending(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardCompileOption) { return Err(ProtocolFault::UnexpectedObservation); }
+            drop(self.iteration.pending.take().ok_or(ProtocolFault::ResourceNotInstalled)?);
+            let r = &mut self.fields.native.compile_iterator;
+            r.pending_live = false; r.phase = CompileIteratorPhase::Next; Ok(())
+        }
+        fn discard_iterator(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::DiscardCompileIterator) { return Err(ProtocolFault::UnexpectedObservation); }
+            drop(self.iteration.iterator.take().ok_or(ProtocolFault::ResourceNotInstalled)?);
+            let stopped = self.fields.work.terminal().is_some() || self.fields.physical.primary.is_some();
+            let r = &mut self.fields.native.compile_iterator; r.iterator_live = false;
+            r.phase = if stopped { CompileIteratorPhase::Draining } else { CompileIteratorPhase::SuccessorHeld };
+            if stopped { self.fields.native.compile_sort.phase = CompileSortPhase::Draining; } Ok(())
+        }
+        fn stop_successor(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::StopCompileIterator) || self.iteration.iterator.is_some() || self.iteration.pending.is_some() {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            self.fields.native.compile_iterator.phase = CompileIteratorPhase::Draining;
+            self.fields.native.compile_sort.phase = CompileSortPhase::Draining; Ok(())
+        }
+        fn stop(&mut self) -> Result<(), ProtocolFault> {
+            if self.fields.native.compile_iterator.phase != CompileIteratorPhase::Draining { return Err(ProtocolFault::UnexpectedObservation); }
+            self.parent_loan().stop()?;
+            self.fields.native.compile_iterator.phase = CompileIteratorPhase::Stopped; Ok(())
+        }
+    }
+    impl OriginalCompileNextBodyPort<'_> {
+        fn run(self) {
+            // Acquired Some(String), or actual None, is installed before any
+            // caller can observe a later first primary or terminal condition.
+            *self.pending = self.iterator.next();
+            self.record.pending_live = self.pending.is_some(); self.record.next_returned = true;
+        }
+    }
+    impl OriginalCompileHashScope<'_> {
+        fn end_scope(self) {
+            // The actual String borrow ends once. No fixed hash callee has
+            // returned in this slice: Unknown remains Held even on failure.
+            self.record.phase = CompileIteratorPhase::HashReturnUnknown;
+        }
+    }
+    impl<'a> OriginalCompileIteratorPort<'_, 'a, '_> {
+        fn next_body(&mut self) -> Result<OriginalCompileNextBodyPort<'_>, ProtocolFault> { self.loan.next_body_port() }
+        fn next_return(&mut self) -> Result<(), ProtocolFault> { self.loan.next_return() }
+        fn hash_scope(&mut self) -> Result<OriginalCompileHashScope<'_>, ProtocolFault> { self.loan.hash_scope() }
+        fn discard_pending(&mut self) -> Result<(), ProtocolFault> { self.loan.discard_pending() }
+        fn discard_iterator(&mut self) -> Result<(), ProtocolFault> { self.loan.discard_iterator() }
+        fn stop_successor(&mut self) -> Result<(), ProtocolFault> { self.loan.stop_successor() }
+        fn finalize(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.parent_loan().observe_finalize(code) }
+        fn statement_drop_return(&mut self) -> Result<(), ProtocolFault> { self.loan.parent_loan().statement_drop_return() }
+        fn runtime_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.parent_loan().runtime_return(fact) }
+        fn catalog_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> { self.loan.parent_loan().catalog_return(fact) }
+        fn discard_owned(&mut self) -> Result<(), ProtocolFault> { self.loan.parent_loan().discard_owned() }
+        fn stop(&mut self) -> Result<(), ProtocolFault> { self.loan.stop() }
+    }
+
+    #[cfg(test)]
+    impl OriginalCompileIteratorLoan<'_> {
+        pub(in crate::database::global_schema_v1) fn test_code_barrier(&mut self) {
+            self.parent_loan().test_code_barrier(); assert!(!self.fields.native.compile_iterator.stopped_clear());
+            assert!(self.fields.native.compile_iterator.blocks_early_primary());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_next_body(&mut self) {
+            assert!(self.next_return().is_err()); self.next_body_port().unwrap().run();
+            assert!(self.next_body_port().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_next_return(&mut self) {
+            self.next_return().unwrap(); assert!(self.next_return().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_hash_unknown(&mut self, scope_ended: bool) {
+            if scope_ended { self.hash_scope().unwrap().end_scope(); }
+            else { drop(self.hash_scope().unwrap()); }
+            assert_eq!(self.next(), Some(if scope_ended { LifecycleAction::AwaitCompileOptionHashReturn } else { LifecycleAction::AwaitCompileOptionHashScope }));
+            self.test_code_no_drain();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_next_unknown(&mut self) {
+            drop(self.next_body_port().unwrap());
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCompileOptionNextReturn)); assert!(self.next_return().is_err());
+            self.test_code_no_drain();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_no_drain(&mut self) {
+            assert!(self.next_body_port().is_err()); assert!(self.hash_scope().is_err());
+            assert!(self.discard_pending().is_err()); assert!(self.discard_iterator().is_err());
+            assert!(self.stop_successor().is_err()); assert!(self.stop().is_err());
+            assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err());
+            assert!(self.parent_loan().runtime_return(CompileReturn::Ok).is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_pending_held(&mut self) {
+            assert_eq!(self.next(), Some(LifecycleAction::BorrowCompileOptionHash));
+            assert!(self.next_body_port().is_err()); assert!(self.discard_pending().is_err()); assert!(self.discard_iterator().is_err());
+            assert!(self.parent_loan().observe_finalize(rusqlite::ffi::SQLITE_OK).is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_empty_eof(&mut self) {
+            assert_eq!(self.next(), Some(LifecycleAction::DiscardCompileIterator)); assert!(self.iteration.pending.is_none());
+            assert!(self.iteration.iterator.as_ref().unwrap().as_slice().is_empty());
+            self.discard_iterator().unwrap(); assert!(self.discard_iterator().is_err());
+            assert_eq!(self.next(), Some(LifecycleAction::AwaitCompileDigestSuccessor)); self.test_code_no_drain();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_interrupted_drain(&mut self) {
+            if self.next() == Some(LifecycleAction::DiscardCompileOption) {
+                self.discard_pending().unwrap(); assert!(self.discard_pending().is_err());
+            }
+            if self.next() == Some(LifecycleAction::StopCompileIterator) {
+                self.stop_successor().unwrap(); assert!(self.stop_successor().is_err());
+            } else { self.discard_iterator().unwrap(); assert!(self.discard_iterator().is_err()); }
+            assert!(self.iteration.iterator.is_none()); assert!(self.iteration.pending.is_none());
+            assert!(self.fields.native.statements[0].live().is_some()); assert!(self.source_id.is_some());
+            assert_eq!(self.next(), Some(LifecycleAction::FinalizeCompileStatement)); self.test_code_barrier();
+            // Reuse the existing fixed Statement -> source-id mechanics. This
+            // test supplied native Result is not genuine SQL or paid cleanup.
+            OriginalCompileSortLoan { fields: self.fields.reborrow(), options: &mut *self.options, source_id: &mut *self.source_id }
+                .test_code_statement_before_source_id();
+            assert!(self.parent_loan().catalog_return(CompileReturn::Interrupted).is_err());
+            self.parent_loan().runtime_return(CompileReturn::Interrupted).unwrap();
+            assert!(self.parent_loan().runtime_return(CompileReturn::Interrupted).is_err()); assert!(self.stop().is_err());
+            self.parent_loan().catalog_return(CompileReturn::Interrupted).unwrap();
+            assert!(self.parent_loan().catalog_return(CompileReturn::Interrupted).is_err()); self.stop().unwrap(); assert!(self.stop().is_err());
+            assert!(self.fields.native.compile_iterator.stopped_clear()); assert!(self.fields.native.compile_sort.stopped_clear());
+            assert!(self.fields.native.compile_options.stopped_clear());
+        }
+    }
 }
