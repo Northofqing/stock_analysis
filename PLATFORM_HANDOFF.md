@@ -482,3 +482,14 @@ Ring单次保留profile诊断已闭合：原240秒仍超时，Cargo fake build-f
 只读核对生产stderr与实际notify调用链：13:02:43 `NewsFlashAggregated pushed=true sink=feishu`，event27c38380…；13:02:47收到Accepted终端且gate结算成功，aggregate=1。此前13:07“连接恢复后没有news”的概括不准确：投递决策表筛选没有覆盖这条NewsFlash终端。13:02确有新闻汇总被飞书接受；此后15:00缺消息原因仍未确认，不能宣称全时恢复。旧L4 counted-dedup报错发生在不可变终端之后，不覆盖该成功；manual_review_required审计错误在冻结365候选中已修但尚未上线。普通窗口9:30/11:30/13:00/15:00各300秒，Critical仍缺权威强度来源。只读3秒sample当时看到Tokio停驻，不构成卡点原因证明；无生产修改、重启或重发。
 
 有限原蓝图复核已封253a734b：原主线是数据→决策/paper→可靠投递，Ring逐CC/AR录制为后加受控构建/provider证明支线。它需要为真实Financial/native门闭合，但不应成为所有新闻和typed/storage开发的串行前置。五项已通过的数据核心独立推进，sealing-only修正仍Source实现/NOT_RUN；完整Financial的SqlProviderUnavailable与无issuer门仍开放，不以静态或局部测试跨过。
+
+
+### 2026-10-05 17:10 存储首段闭合与WAL继续实施
+
+真实Intent/Created/Copied存储首段已在Task6隔离树本地提交 `8f8b08ea`，工作树干净。新首段3项、相关projection3项、原cold-copy1项及codec2项共9项实际通过，四个Root会话均退出0且同947c lib测试产物；闭合回执655d5270、独立DATA报告85dd321a。仅执行相关lib测试与diff --check，没有追加check/build/clippy/全量或release。第一次Darwin variadic mode类型编译失败、第二次目录身份行为失败及两个PoisonError级联原样保留；最终修正使用目录稳定dev/ino/euid/mode，实时检查真实nlink>0与census前后stat，普通文件nlink1条件保持。该结果覆盖真实复制与冷prefix恢复，尚不覆盖WAL、只读八表发行、原生provider或完整Financial验收。
+
+下一段WAL事务计划已按最终目录Source重绑，Root全文20行及17文件/18字节范围自有核对，独立计划0c15f291接受；在9项闭合后已明确开始Source实现。范围为Copied→Started→真实BEGIN/固定DDL与数据验证/COMMIT/checkpoint/close→Transformed及冷阶段分派，失败继续持有writer、VM和sidecar，不把旧Copied入口条件放宽。尚未执行新WAL测试，不提前宣布持久转换完成。
+
+Ring是间接TLS/加密依赖；此前长时间停驻发生在新增构建记录封存校验。sealing-only减少本次完整成功组的重复扫描后，新关联行为1项实际通过204.228秒，原所有权完整方法的8场景实际通过896.828秒；原240秒是每个fixture限制，未放宽。整项仅结束后显示结果，因此同一方法名可持续约15分钟。剩余相关5项仍运行，未完成前不宣称全部校验通过，实际Tools/policy尚未应用；其运行与独立Rust验证曾并行，不用其总耗时证明性能。该支线不阻挡独立业务存储开发，真实Financial/native资格门仍保留。
+
+新闻冻结365与诊断5e仍仅本地；精确候选人工复核尚未批准，本检查点未修改生产、重启新版本、替换activation、重发消息、远端push或合并。平台整体未完成。
