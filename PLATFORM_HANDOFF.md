@@ -476,3 +476,9 @@ Ring稳定FD单次读取primitive实际1完整方法通过；Root解析器漏识
 Ring单次保留profile诊断已闭合：原240秒仍超时，Cargo fake build-finished成功但最终record未发布。独立DATA复核仅批准局部诊断，不升级原失败或native资格。180/210样本及源码DAG显示封存每C/AR反复检查整组F0/F1；不是已证实死循环，也不能把嵌套耗时相加。有限sealing-only复用方案v2已获独审PLAN_ACCEPTED，正在Source实现：完整成功group仅本次封存复用、逐ID原分类/pins/producer/ledger/首错保留、前后generation与两live tail复查；默认编译实时路径和240限制不变。新修正尚未执行或应用实际Tools，不宣称解决超时。
 
 新闻冻结365候选及旧生产状态不变，本轮未上线/重发/重启/替换activation；新闻诊断5e仍仅本地。平台整体未完成，无远端push或合并。
+
+### 2026-10-05 15:40 新闻回执纠正与原蓝图优先级
+
+只读核对生产stderr与实际notify调用链：13:02:43 `NewsFlashAggregated pushed=true sink=feishu`，event27c38380…；13:02:47收到Accepted终端且gate结算成功，aggregate=1。此前13:07“连接恢复后没有news”的概括不准确：投递决策表筛选没有覆盖这条NewsFlash终端。13:02确有新闻汇总被飞书接受；此后15:00缺消息原因仍未确认，不能宣称全时恢复。旧L4 counted-dedup报错发生在不可变终端之后，不覆盖该成功；manual_review_required审计错误在冻结365候选中已修但尚未上线。普通窗口9:30/11:30/13:00/15:00各300秒，Critical仍缺权威强度来源。只读3秒sample当时看到Tokio停驻，不构成卡点原因证明；无生产修改、重启或重发。
+
+有限原蓝图复核已封253a734b：原主线是数据→决策/paper→可靠投递，Ring逐CC/AR录制为后加受控构建/provider证明支线。它需要为真实Financial/native门闭合，但不应成为所有新闻和typed/storage开发的串行前置。五项已通过的数据核心独立推进，sealing-only修正仍Source实现/NOT_RUN；完整Financial的SqlProviderUnavailable与无issuer门仍开放，不以静态或局部测试跨过。
