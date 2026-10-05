@@ -510,3 +510,15 @@ Ring封存优化相关7项已全部实际通过：连接行为1项、包含8个�
 独立Source、Runtime及policy DATA复核通过后，Root应用了Tools owner、测试及owner版本policy三文件，应用回执57096f32。Root自有复核确认当前1100控制输入与回执一致，只有上述三文件发生变化；应用源码922项保持。git diff --check通过，复用已完成7项验证，不例行重跑或追加全量/release。该结果属于构建记录工具行为，不证明真实native/provider或完整Financial通过。
 
 真实存储WAL转换Source已完成且独立审查通过；下一步在Task6隔离树执行新3项及相关4项验证，尚未宣布事务转换运行通过。新闻等待修复63ae676d仍仅本地，生产未切换、重启或重发。平台整体未完成，无远端push或合并。
+
+### 2026-10-05 18:55 WAL转换完成与只读校验并行
+
+WAL转换已在Task6隔离树本地提交 `f76d95a3`，工作树干净。真实Copied→Started→BEGIN/固定两表与header8/目录和新表EOF→COMMIT→TRUNCATE checkpoint→消耗式close/侧车清理/fsync→Transformed及cold4/5阶段分派已接通；首次错误保留whole owner、必要时一次回滚，真实Busy返回Connection与一次finalize已覆盖。原Copied入口与零pair条件保持。
+
+初轮编译通过但行为0/3：扩展禁用检查先拒绝，Busy断言未展示首错，另外两项共享锁PoisonError级联；单独原正向方法定位该错误。只读本机库诊断确认默认测试链接的macOS SQLite已移除扩展加载功能而禁用接口返回不支持；分离内存诊断不替代实际writer事实。最终修补保留code/out，仅ERROR或MISUSE且out=-1时以固定linked FFI捕获真实OMIT_LOAD_EXTENSION并仅接受exact1；OK/out0原路不变，其他值拒绝，无SQL或提前schema/侧车边。原query方案从未应用或运行，两个原失败均保留。
+
+Root实际new3+prefix3+projection1共7项均通过，三会话退出0，同947c lib测试产物；new3编译5m55/运行45.16s，其余复用产物、运行154.53s及1.89s。闭合回执7024f124、独立DATA96fb0b9b，最终Source21830908/独立Source30cabb60、坐标修正4a1b962e与应用324c9ad8精确绑定。git diff --check通过，没有例行check/build/clippy/全量/release。仅普通WAL存储与cold分派闭合，未发行RO8/完整typed WAL比对/native/provider/Financial或完整16MiB资格。
+
+只读八表方案df5ab1f0/独立PLAN8fe4cc93接受；为减少串行等待，先明确授权在reviewed f6父件上做Source-only准备，最终封存/审查/应用仍等待parent7与独审。现在父件已闭合且本地提交，RO8首版A/R及三项连接用例正在静态资源核对与精确父件重绑，尚未应用或执行。范围为真实两次只读typed6/rowid/sequence/REAL bits/双EOF与新表EOF、每次actual close及tail、冷5/6只读恢复，同owner/Work与旧Copied/WAL不变。
+
+Ring7已应用并本地提交45ad075e，不重跑该组；真实native/Financial门仍保留。新闻63ae676d仍仅本地，冻结365审批与旧生产状态保持，本检查点未上线、重启、重发、远端push或合并。平台整体未完成。
