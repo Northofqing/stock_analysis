@@ -4698,3 +4698,128 @@ fn descriptor_reason(fields:&BTreeMap<&str, &str>, key:DescriptorField, w:&mut F
         _=>Err(w.error(Txt::Execution(fw::ExecutionText::FeeCoverageField))?)
     }
 }
+
+/// Fixed execution input owner. Original authorization/window objects are
+/// retained, not reconstructed from the ordinary cloned command record.
+pub(crate) struct RetainedExecutionInput<'a> {
+    account: &'a str,
+    command: PaperV2Command,
+    actual: Option<ActualExecutionBinding>,
+    sampled_at: Option<DateTime<Utc>>,
+    record: Option<CommandRecord>,
+    receipt: Option<PaperV2Receipt>,
+    binding: Option<SqlBinding>,
+    recorded_windows: Vec<WindowRecord>,
+}
+pub(crate) struct RetainedExecutionAcquired {
+    receipt: PaperV2Receipt,
+    binding: SqlBinding,
+    fresh_request: Option<CommandRecord>,
+}
+type RetainedExecutionOutcome<'db, 'a> =
+    crate::database::global_schema_v1::paper_v6::RetainedPaperWriteOutcome<
+        'db, RetainedExecutionInput<'a>, RetainedExecutionAcquired, LedgerError>;
+
+fn retained_execution_input(account: &str, command: PaperV2Command) -> RetainedExecutionInput<'_> {
+    RetainedExecutionInput { account, command, actual: None, sampled_at: None,
+        record: None, receipt: None, binding: None, recorded_windows: Vec::new() }
+}
+fn retained_execution_command_id(command: &PaperV2Command) -> &str {
+    match command {
+        PaperV2Command::Submit { command_id, .. }
+        | PaperV2Command::Evaluate { command_id, .. }
+        | PaperV2Command::Cancel { command_id, .. }
+        | PaperV2Command::Expire { command_id, .. }
+        | PaperV2Command::QualifiedMarks { command_id, .. } => command_id,
+    }
+}
+fn retained_execution_record(
+    input: &mut RetainedExecutionInput<'_>,
+    actual: &ActualExecutionBinding,
+    now: DateTime<Utc>,
+) -> Result<(), LedgerError> {
+    let record = match &input.command {
+        PaperV2Command::Submit { expected, approved, .. } => {
+            approved.require_binding(actual)?;
+            CommandRecord::Submit { expected: expected.clone(), intent: approved.record().clone() }
+        }
+        PaperV2Command::Evaluate { expected, parent_id, window, .. } => {
+            window.require_binding(actual)?;
+            CommandRecord::Evaluate { expected: expected.clone(), parent_id: parent_id.clone(), window: window.record().clone() }
+        }
+        PaperV2Command::Cancel { expected, parent_id, .. } =>
+            CommandRecord::Cancel { expected: expected.clone(), parent_id: parent_id.clone(), at: now },
+        PaperV2Command::Expire { expected, parent_id, .. } =>
+            CommandRecord::Expire { expected: expected.clone(), parent_id: parent_id.clone(), at: now },
+        PaperV2Command::QualifiedMarks { expected, windows, .. } => {
+            for window in windows {
+                window.require_binding(actual)?;
+                input.recorded_windows.push(window.record().clone());
+            }
+            CommandRecord::QualifiedMarks { expected: expected.clone(), windows: std::mem::take(&mut input.recorded_windows) }
+        }
+    };
+    input.record = Some(record);
+    require(budget::token(retained_execution_command_id(&input.command)), "command id invalid")?;
+    Ok(())
+}
+fn retained_execution_run<'db, 'a>(
+    db: &'db DatabaseManager,
+    input: RetainedExecutionInput<'a>,
+    test_now: Option<DateTime<Utc>>,
+) -> RetainedExecutionOutcome<'db, 'a> {
+    use crate::database::global_schema_v1::paper_v6::RetainedPaperWrite;
+    RetainedPaperWrite::open(db, input).run_once(
+        |conn, authority, _proof, input| {
+            let views = read_views_body_on(conn)?;
+            let view = views.get(input.account).ok_or(LedgerError::NotSeeded)?;
+            input.actual = Some(actual_binding(view, authority, db)?);
+            input.sampled_at = Some(operation_now(db, test_now)?);
+            let actual = input.actual.take().expect("actual binding retained");
+            let sampled_at = input.sampled_at.expect("actual time retained");
+            let record_result = retained_execution_record(input, &actual, sampled_at);
+            input.actual = Some(actual);
+            record_result?;
+            input.receipt = Some(append_on(conn, input.account,
+                retained_execution_command_id(&input.command),
+                input.record.as_ref().expect("actual record retained").clone(),
+                input.sampled_at.expect("actual time retained"))?);
+            input.binding = Some(SqlBinding::capture(conn)?);
+            #[cfg(test)]
+            if db.has_isolated_p05_consumer_origin() {
+                run_test_hook(TestPhase::AfterSql, conn);
+                run_test_hook(TestPhase::LastSqlBeforeCommit, conn);
+            }
+            let receipt = input.receipt.take().expect("actual receipt retained");
+            let fresh_request = if receipt.replayed { None } else { input.record.take() };
+            Ok(RetainedExecutionAcquired { receipt,
+                binding: input.binding.take().expect("actual SQL binding retained"), fresh_request })
+        },
+        |conn, _authority, _proof, input, acquired| {
+            acquired.binding.validate(conn)?;
+            acquired.binding.require_fresh_request(input.account,
+                acquired.fresh_request.as_ref(), operation_now(db, test_now)?)
+        },
+    )
+}
+/// Additive ownership route only. The original production refusal and approval
+/// rules remain in paper_catalog6_session; legacy borrowed routes are unchanged.
+pub(crate) fn apply_retained_actual<'a>(
+    account: &'a str,
+    command: PaperV2Command,
+) -> RetainedExecutionOutcome<'static, 'a> {
+    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWrite, RetainedPaperWriteOutcome};
+    let input = retained_execution_input(account, command);
+    match DatabaseManager::try_get() {
+        Some(db) => retained_execution_run(db, input, None),
+        None => RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(input, PaperCatalog6Error::Authority)),
+    }
+}
+
+/// Test observation borrows the actual nonClone command; it cannot mint one.
+#[cfg(test)]
+pub(crate) fn retained_execution_command_for_test<'i, 'a>(
+    input: &'i RetainedExecutionInput<'a>,
+) -> &'i PaperV2Command {
+    &input.command
+}

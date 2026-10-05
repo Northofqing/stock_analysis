@@ -643,3 +643,11 @@ Zstd 单次 seal 内成功组复用及 Lz4/相关控制已完成 fresh14：六�
 验证复用已通过 fresh14 `d1e15b1f`，没有重复测试、Cargo编译或 release。清单 DATA `01fcd9f8`、controller Source `6916998c` 及应用闭合证据齐全。此批仍是 RecordingOnly；真实构建 record、native producer/consumer graph issuer、业务 Financial 和平台生产接线尚未完成。
 
 新闻部署继续在独立工作树推进。FIX2 的新库测试实际1通过/6失败，原因是新夹具使用真实标的而被测试隔离门拒绝；发布构建另发现三处 monitor_config 作用域错误。两份失败原件保留，正在分别修正测试命名空间和变量接线。生产保持原新闻版本，尚未安装失败构建或宣称即时新闻送达已恢复。
+
+## 2026-10-06 07:36 CST 新闻上线与 retained writer 回归
+
+新闻隔离分支 Source `37ed8875` 已部署，monitor PID70479 / bridge56417；原 DB 路径与身份保持，activation hash979314e3，四源接纳69。最终18测试、release、61类dry-run及独立DATA通过，详情 docs/ops/2026-10-06-news-critical-score-rollout.md。Health仍Frozen/Unsafe，未声称远端Accepted或自然窗口已验收。
+
+资金 retained writer 两叶已加入普通资源 owner：callback返回T先入外槽，后续tail/真实COMMIT/reader错误保持原input/T/session/累计Work，不自动重跑；原borrowed/default路径不改。new4+related4真实8项PASS，Source/Data独立复核通过。直接apply_retained_actual只证普通singleton无constructor-origin时Unopened拒绝仍保原Cancel三个String buffer和首错；该切口尚未创建retained session/CopyWork，未证明fixed成功postCOMMIT或资金审批。generic另证真实COMMIT/reader与deferredFK callee错误。
+
+资金实现仅DEV，未部署资金/Financial/native资格；原NotIssued资料存储继续保持。当前下一业务主线是真实empty instruments宏观N01独立importance审计到同Gate/v8投递，共享现5次额度/40次检查/5槽，N02顺序与原日quota/threshold不变。宏观Source包未apply、未测试或上线。
