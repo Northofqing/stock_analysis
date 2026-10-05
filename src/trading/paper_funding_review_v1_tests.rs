@@ -17,12 +17,12 @@ const ACCOUNT: &str = "TEST_CODE_FUNDING_ACCOUNT";
 fn at() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 28, 1, 30, 0).unwrap()
 }
-struct Fixture {
+pub(super) struct Fixture {
     _dir: tempfile::TempDir,
     db: Arc<DatabaseManager>,
 }
 impl Fixture {
-    fn new(n: usize) -> Self {
+    pub(super) fn new(n: usize) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("TEST_CODE_funding_")
             .tempdir()
@@ -139,11 +139,11 @@ impl Fixture {
             )
             .unwrap()
     }
-    fn proposal(&self) -> Proposal {
+    pub(super) fn proposal(&self) -> Proposal {
         let (b, g) = self.inputs();
         make_proposal(&b, &g)
     }
-    fn review(&self, p: &Proposal) -> Result<ObservedFundingReviewV1, Error> {
+    pub(super) fn review(&self, p: &Proposal) -> Result<ObservedFundingReviewV1, Error> {
         review_funding_proposal(&self.db, ACCOUNT, &serde_json::to_vec(p).unwrap())
     }
     fn fingerprint(&self) -> String {

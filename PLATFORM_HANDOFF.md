@@ -622,3 +622,14 @@ Source manifest `7e552270`、独立 Source `f50bbc06`、Root own `552aae9e`；�
 结果仍明确 ContentHashesNotChecked：没有重算 audit/event/manifest/projection 内容哈希、完整经济/Genesis/Financial、VerifiedCatalog8 或 operational/native/provider/layout/rules/payment/funding 资格；本批没有部署平台或开启 paper。
 
 Native FIX1 Source `029799ab` 的新漂移 whole 和原 Zstd ownership whole 已闭合 PASS，后者完整执行 16 个隔离控制场景；正向协议 2 项正在运行，完整 fresh14/DATA/current APP+policy 应用仍未完成，实际 tools 尚未改。新闻已部署的 d9b 采集修复保持；新的 N01 实际评分与完整发送链正在隔离 Source 收尾，尚未实际应用或部署，不能称真实即时推送已恢复。资金只读梳理 `d31a09c3` 确认 V1 seed writer 已存在，但资金审核材料无持久 writer、V2 开账入口与正文仅 cfg(test)；普通 NotIssued 材料持久和真正批准资金 writer 是不同后继。
+
+
+## Task9：未批准资金复核材料持久化已验证（2026-10-06）
+
+新增私有资金材料保存接口，将真实 StoredFundingReviewV1 的完整原文、身份和失败所有权移入专用本地 outbox。冷启动读取、精确复用、同资金家族的不同政策/锚点冲突、generation CAS、提交结果未知和 consuming-close 失败均走现有真实持久化路径；不根据摘要或恢复声明生成资金批准。
+
+固定无时间分组哨兵 1970-01-01/[0,1) 只用于 Unverified 普通材料，材料始终是 HistoricalObservationOnly/NotIssued。资金批准、可花余额 B、seed/cutover、交易 intent 和 Financial 能力仍需后续真实授权链。
+
+验证：定向 `cargo test --lib funding_material_` 新3项，以及同一成功 harness 的相关3项，共6项 fresh whole 全通过；独立 Source 与 DATA 审查均 C0/I0/M0。没有追加全量测试、release 或生产部署。Source cf63d7df；Source peer104096db；fresh6 d61aaf52；DATA peer1c259f5d；Root现有原生构建14项另已通过，actual Tools/policy 仍待当前 APP 更新后应用。
+
+代码在 `src/trading/paper_funding_review_store_v1.rs` 与 review 的私有 owning seam；注册一处，既有 outbox/funding fixture 只调整必要 cfg(test) 可见性。生产数据库、批准接口与主分支均未修改。下一步：完成当前 APP 清单和构建策略更新、真实 record/issuer 接线；新闻 Source 独立修补并另行测试部署。

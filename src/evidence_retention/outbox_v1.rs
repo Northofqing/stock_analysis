@@ -554,7 +554,7 @@ impl PendingOutbox {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum TestCommitObservation { Normal, LoseResponse, ExitBeforeCommit, ExitAfterCommit }
+pub(crate) enum TestCommitObservation { Normal, LoseResponse, ExitBeforeCommit, ExitAfterCommit }
 #[cfg(test)]
 struct TestVm(*mut rusqlite::ffi::sqlite3_stmt);
 #[cfg(test)]
@@ -564,33 +564,33 @@ impl Drop for TestVm {
     }
 }
 #[cfg(test)]
-pub(super) struct OutboxFixture { root: tempfile::TempDir }
+pub(crate) struct OutboxFixture { root: tempfile::TempDir }
 #[cfg(test)]
 impl OutboxFixture {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let root = tempfile::Builder::new().prefix("retention-outbox-v1-").tempdir().unwrap();
         fs::create_dir(root.path().join("data")).unwrap();
         Self { root }
     }
-    pub(super) fn open(&self) -> Result<UnverifiedOutbox, HeldOutbox> { UnverifiedOutbox::open_fixed(self.root.path()) }
+    pub(crate) fn open(&self) -> Result<UnverifiedOutbox, HeldOutbox> { UnverifiedOutbox::open_fixed(self.root.path()) }
     pub(super) fn root(&self) -> &Path { self.root.path() }
-    pub(super) fn main(&self) -> PathBuf { self.root.path().join("data").join(DIR).join(MAIN) }
-    pub(super) fn directory(&self) -> PathBuf { self.root.path().join("data").join(DIR) }
+    pub(crate) fn main(&self) -> PathBuf { self.root.path().join("data").join(DIR).join(MAIN) }
+    pub(crate) fn directory(&self) -> PathBuf { self.root.path().join("data").join(DIR) }
 }
 #[cfg(test)]
 impl UnverifiedOutbox {
-    pub(super) fn test_observation(mut self, observation: TestCommitObservation) -> Self { self.frame.observation = observation; self }
-    pub(super) fn test_hold_transaction(&mut self) -> Result<(), OutboxFault> {
+    pub(crate) fn test_observation(mut self, observation: TestCommitObservation) -> Self { self.frame.observation = observation; self }
+    pub(crate) fn test_hold_transaction(&mut self) -> Result<(), OutboxFault> {
         FileExt::try_lock_shared(&self.frame.init_lock.as_ref().unwrap().file).map_err(|_| OutboxFault::Busy)?;
         self.frame.init_locked = true;
         self.frame.execute("BEGIN IMMEDIATE")?; self.frame.tx = TxState::Active; Ok(())
     }
-    pub(super) fn test_rollback(mut self) -> Result<(), HeldOutbox> {
+    pub(crate) fn test_rollback(mut self) -> Result<(), HeldOutbox> {
         let result = self.frame.execute("ROLLBACK");
         if let Err(fault) = result { self.frame.fault(fault); return Err(HeldOutbox { frame: self.frame }); }
         self.frame.tx = TxState::RolledBack; self.close()
     }
-    pub(super) fn test_busy_vm(mut self) -> Self {
+    pub(crate) fn test_busy_vm(mut self) -> Self {
         let mut statement = std::ptr::null_mut();
         // Public rusqlite handle, fixed owned SELECT 1, no private layout cast.
         let code = unsafe { rusqlite::ffi::sqlite3_prepare_v2(self.frame.conn().handle(), b"SELECT 1\0".as_ptr().cast(), -1, &mut statement, std::ptr::null_mut()) };
@@ -600,9 +600,9 @@ impl UnverifiedOutbox {
         self
     }
     pub(super) fn test_corrupt_sql(&mut self, sql: &str) { self.frame.execute(sql).unwrap(); }
-    pub(super) fn test_material_count(&mut self) -> i64 { self.frame.scalar("SELECT count(*) FROM material").unwrap() }
-    pub(super) fn test_conflict_count(&mut self) -> i64 { self.frame.scalar("SELECT count(*) FROM slot_conflict").unwrap() }
-    pub(super) fn test_spend_owned(&mut self, bytes: usize) -> Result<(), OutboxFault> {
+    pub(crate) fn test_material_count(&mut self) -> i64 { self.frame.scalar("SELECT count(*) FROM material").unwrap() }
+    pub(crate) fn test_conflict_count(&mut self) -> i64 { self.frame.scalar("SELECT count(*) FROM slot_conflict").unwrap() }
+    pub(crate) fn test_spend_owned(&mut self, bytes: usize) -> Result<(), OutboxFault> {
         self.frame.charge(bytes).map_err(|fault| self.frame.fault(fault))
     }
     pub(super) fn test_child(root: &Path, observation: TestCommitObservation, draft: UnverifiedEvidencePackageDraft) -> ! {
@@ -618,10 +618,10 @@ impl UnverifiedOutbox {
 }
 #[cfg(test)]
 impl HeldOutbox {
-    pub(super) fn test_connection_retained(&self) -> bool { self.frame.connection.is_some() }
-    pub(super) fn test_command_retained(&self) -> bool { self.frame.command.is_some() }
+    pub(crate) fn test_connection_retained(&self) -> bool { self.frame.connection.is_some() }
+    pub(crate) fn test_command_retained(&self) -> bool { self.frame.command.is_some() }
     pub(super) fn test_inventory_retained(&self) -> bool { !self.frame.inventory.is_empty() }
-    pub(super) fn test_finalize_then_drain(mut self) -> Self {
+    pub(crate) fn test_finalize_then_drain(mut self) -> Self {
         let mut vm = self.frame.vm.take().expect("real held VM");
         let code = unsafe { rusqlite::ffi::sqlite3_finalize(vm.0) };
         vm.0 = std::ptr::null_mut();
@@ -636,6 +636,6 @@ impl HeldOutbox {
 
 #[cfg(test)]
 impl PendingOutbox {
-    pub(super) fn test_connection_and_command_retained(&self) -> bool { self.frame.connection.is_some() && self.frame.command.is_some() }
-    pub(super) fn test_exhaust_same_work(&mut self) -> Result<(),OutboxFault> { self.frame.charge(8*MIB) }
+    pub(crate) fn test_connection_and_command_retained(&self) -> bool { self.frame.connection.is_some() && self.frame.command.is_some() }
+    pub(crate) fn test_exhaust_same_work(&mut self) -> Result<(),OutboxFault> { self.frame.charge(8*MIB) }
 }

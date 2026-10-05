@@ -665,3 +665,310 @@ fn validate_cash_partitions(c: &CashPartitions, w: &mut Work) -> Result<(), Erro
     let result = c.validate().map_err(|_| Error::Schema);
     w.finish(result)
 }
+
+
+// This sibling loan is an owning historical material, not an approval or a
+// recovered DatabaseConnectionAuthority. There is no caller-selected slot/time.
+pub(super) struct MaterialReviewSource {
+    original: StoredFundingReviewV1,
+    work: Work,
+    record: Option<Record>,
+    proposal_bytes: Option<Vec<u8>>,
+    proposal_hash: Option<String>,
+    review_hash: Option<String>,
+    tuple: Option<Vec<u8>>,
+    slot: Option<String>,
+    first: Option<Error>,
+    started: bool,
+    ready: bool,
+}
+impl MaterialReviewSource {
+    pub(super) fn new(original: StoredFundingReviewV1) -> Self {
+        // Move the whole genuine return before admission, decoding or copying.
+        Self { original, work: Work::new(), record: None, proposal_bytes: None,
+            proposal_hash: None, review_hash: None, tuple: None, slot: None,
+            first: None, started: false, ready: false }
+    }
+    pub(super) fn canonical(&self) -> &[u8] { self.original.canonical_bytes() }
+    pub(super) fn review_id(&self) -> &str { self.original.review_id() }
+    pub(super) fn proposal_id(&self) -> &str { self.original.proposal_id() }
+    pub(super) fn tuple(&self) -> Option<&[u8]> { self.tuple.as_deref() }
+    pub(super) fn slot(&self) -> Option<&str> { self.slot.as_deref() }
+    pub(super) fn first(&self) -> Option<Error> { self.first }
+    pub(super) fn prepare(&mut self) -> Result<(), Error> {
+        if self.started {
+            let error = self.first.unwrap_or(Error::ChangedObservation);
+            if self.first.is_none() { self.first = Some(error); }
+            self.ready = false;
+            return self.work.finish(Err(error));
+        }
+        self.started = true;
+        let result = self.prepare_inner();
+        let result = self.work.finish(result);
+        match result {
+            Ok(()) => { self.ready = true; Ok(()) }
+            Err(error) => { self.first = Some(error); Err(error) }
+        }
+    }
+    fn prepare_inner(&mut self) -> Result<(), Error> {
+        self.record = Some(codec::record(self.original.canonical_bytes(), &mut self.work)?);
+        // The actual owned decoder return remains in this frame on every cut.
+        let r = self.record.as_ref().unwrap();
+        validate_proposal(&r.proposal, &mut self.work)?;
+        validate_binding(&r.actual_binding, &mut self.work)?;
+        if r.schema != "paper-funding-review-v1" || r.version != 1
+            || r.authority_state != "HistoricalObservationOnly" || r.approval_state != "NotIssued" {
+            return Err(Error::Schema);
+        }
+        self.proposal_bytes = Some(codec::encode(&r.proposal, codec::PROPOSAL_LIMIT, &mut self.work)?);
+        self.proposal_hash = Some(codec::id("paper-funding-proposal-v1:",
+            b"stock_analysis.paper_funding.proposal.v1\0", self.proposal_bytes.as_ref().unwrap(), &mut self.work)?);
+        self.work.scan(8192)?;
+        if self.proposal_hash.as_deref() != Some(r.proposal_id.as_str())
+            || r.proposal_id != self.original.proposal_id() { return Err(Error::Schema); }
+        let expected = mismatch(&r.proposal, &r.actual_binding, &mut self.work)?;
+        match (r.outcome, expected, &r.initial_cash) {
+            (Outcome::ConsistentProposal, None, Some(c)) => {
+                validate_cash_partitions(c, &mut self.work)?;
+                if c.strategy_cash != r.proposal.budget.initial_strategy_cash_micro_cny
+                    || c.strategy_cash > r.proposal.budget.authorized_budget_micro_cny { return Err(Error::Schema); }
+            }
+            (Outcome::InconsistentProposal(FundingMismatchV1::AllocationAgainstGenesis), None, None) => {}
+            (Outcome::InconsistentProposal(a), Some(b), None) if a == b => {}
+            _ => return Err(Error::Schema),
+        }
+        if r.outcome != self.original.outcome || r.initial_cash.as_ref() != self.original.cash.as_ref() {
+            return Err(Error::Schema);
+        }
+        codec::canonical(r, self.original.canonical_bytes(), codec::REVIEW_LIMIT, &mut self.work)?;
+        self.review_hash = Some(codec::id("paper-funding-review-v1:",
+            b"stock_analysis.paper_funding.review.v1\0", self.original.canonical_bytes(), &mut self.work)?);
+        if self.review_hash.as_deref() != Some(self.original.review_id()) { return Err(Error::Schema); }
+        let version = r.version.to_le_bytes();
+        let fields: [&[u8]; 6] = [b"paper-funding-review-material-v1", r.schema.as_bytes(), &version,
+            r.proposal.account_id.as_bytes(), r.proposal.epoch_id.as_bytes(), r.proposal.budget.family_id.as_bytes()];
+        let size = fields.iter().try_fold(0usize, |n, field| n.checked_add(8).and_then(|n| n.checked_add(field.len())))
+            .ok_or(Error::OwnedBudget)?;
+        // All six length prefixes and bytes are reserved before the first copy.
+        self.work.own(size)?; self.work.scan(size)?;
+        self.tuple = Some(Vec::with_capacity(size));
+        let tuple = self.tuple.as_mut().unwrap();
+        for field in fields {
+            let length = u64::try_from(field.len()).map_err(|_| Error::ArithmeticOverflow)?;
+            tuple.extend_from_slice(&length.to_le_bytes()); tuple.extend_from_slice(field);
+        }
+        self.slot = Some(codec::id("paper-funding-review-material-v1:",
+            b"stock_analysis.paper_funding.material.slot.v1\0", tuple, &mut self.work)?);
+        Ok(())
+    }
+    #[cfg(test)]
+    fn exhaust_before_prepare(&mut self) {
+        assert!(!self.started);
+        self.work.own(8 * codec::MIB).unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod material_tests {
+    use super::*;
+    use super::tests::Fixture as FundingFixture;
+    use crate::trading::paper_funding_review_store_v1::*;
+    use crate::evidence_retention::{TrustState, ValueError};
+    use crate::evidence_retention::outbox_v1::{OutboxFixture, UnverifiedOutbox, LocalDisposition,
+        OutboxFault, RecoveredPresence, TestCommitObservation};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn actual(fixture: &FundingFixture, proposal: &Proposal) -> StoredFundingReviewV1 {
+        let observed = fixture.review(proposal).unwrap();
+        assert!(!observed.canonical_bytes().is_empty());
+        read_stored_funding_review(observed.canonical_bytes()).unwrap()
+    }
+    fn command(value: StoredFundingReviewV1) -> FundingMaterialCommand {
+        match prepare_review_material(value) {
+            Ok(value) => value, Err(value) => panic!("material prepare Held {:?}",value.first_fault()),
+        }
+    }
+    fn open(fixture: &OutboxFixture) -> UnverifiedOutbox {
+        match fixture.open() { Ok(value) => value, Err(value) => panic!("actual outbox open {:?}",value.first_fault()) }
+    }
+    fn close(value: UnverifiedOutbox) {
+        if let Err(value) = value.close() { panic!("actual close {:?}",value.first_fault()); }
+    }
+    fn stored(value: FundingMaterialOutcome) -> StoredFundingMaterial {
+        match value { FundingMaterialOutcome::Stored(value) => value,
+            FundingMaterialOutcome::Held(value) => panic!("material Held {:?}",value.first_fault()),
+            FundingMaterialOutcome::Pending(value) => panic!("material Pending {:?}",value.first_fault()),
+            _ => panic!("unexpected recovery"), }
+    }
+    fn held(value: FundingMaterialOutcome) -> HeldFundingMaterial {
+        match value { FundingMaterialOutcome::Held(value) => value, _ => panic!("expected actual Held") }
+    }
+    fn recovered(value: FundingMaterialOutcome) -> RecoveredFundingMaterial {
+        match value { FundingMaterialOutcome::Recovered(value) => value, _ => panic!("expected actual closed recovery") }
+    }
+
+    #[test]
+    fn funding_material_nonempty_cold_reuse_and_same_family_conflicts() {
+        let funding = FundingFixture::new(2);
+        let mut proposal = funding.proposal();
+        let review = actual(&funding,&proposal);
+        let raw = review.canonical_bytes().to_vec();
+        let original_pointer = review.canonical_bytes().as_ptr();
+        let review_id = review.review_id().to_owned();
+        let proposal_id = review.proposal_id().to_owned();
+        let first = command(review);
+        assert_eq!(first.canonical_review().as_ptr(),original_pointer);
+        assert_eq!((first.review_id(),first.proposal_id()),(review_id.as_str(),proposal_id.as_str()));
+        let slot = first.slot().to_owned(); let tuple = first.slot_tuple().to_vec();
+        let wire: serde_json::Value = serde_json::from_slice(first.test_draft().as_canonical_bytes()).unwrap();
+        assert_eq!(wire["owner_domain"],"PaperLedger");
+        assert_eq!(wire["owner_schema_claim"],"paper-funding-review-material-v1");
+        assert_eq!(wire["business_day_claim"],"1970-01-01");
+        assert_eq!(wire["window_start_claim"],serde_json::json!({"unix_seconds":0,"nanosecond":0}));
+        assert_eq!(wire["window_end_exclusive_claim"],serde_json::json!({"unix_seconds":1,"nanosecond":0}));
+        assert_eq!(wire["claimed_record_count"],1);
+        for key in ["source_chain_before_claim","source_chain_after_claim","artifact_sha256_claim","activation_id_claim"] {
+            assert!(wire[key].is_null());
+        }
+        assert_eq!(wire["body_length"].as_u64(),Some(u64::try_from(raw.len()).unwrap()));
+        let box_fixture = OutboxFixture::new();
+        let installed = stored(first.persist(open(&box_fixture),0));
+        assert_eq!((installed.generation(),installed.disposition(),installed.trust()),(1,LocalDisposition::Stored,TrustState::Unverified));
+        assert_eq!(installed.canonical_review(),raw);
+        assert_eq!((installed.review_id(),installed.proposal_id()),(review_id.as_str(),proposal_id.as_str()));
+        assert_eq!(installed.slot_tuple(),tuple);
+        // A newly opened actual connection observes the original attempt; no resend.
+        let cold = recovered(command(read_stored_funding_review(&raw).unwrap()).observe_previous(open(&box_fixture),1));
+        assert_eq!(cold.presence(),RecoveredPresence::ExactUnverified);
+        assert_eq!(cold.original_fault(),FundingMaterialFault::Outbox(OutboxFault::CommitUnknown));
+        assert_eq!((cold.canonical_review(),cold.trust()),(raw.as_slice(),TrustState::Unverified));
+        let reused = stored(command(read_stored_funding_review(&raw).unwrap()).persist(open(&box_fixture),1));
+        assert_eq!((reused.generation(),reused.disposition()),(2,LocalDisposition::ExactReuse));
+        proposal.budget.concentration_bps = 9_000;
+        let policy = command(actual(&funding,&proposal));
+        assert_eq!((policy.slot(),policy.slot_tuple()),(slot.as_str(),tuple.as_slice()));
+        assert_ne!(policy.canonical_review(),raw);
+        let policy_raw = policy.canonical_review().to_vec();
+        let changed_policy = stored(policy.persist(open(&box_fixture),2));
+        assert_eq!((changed_policy.generation(),changed_policy.disposition()),(3,LocalDisposition::Conflict));
+        proposal.genesis_event_hash = "b".repeat(64);
+        let anchored = command(actual(&funding,&proposal));
+        assert_eq!((anchored.slot(),anchored.slot_tuple()),(slot.as_str(),tuple.as_slice()));
+        assert_ne!(anchored.canonical_review(),policy_raw);
+        assert_eq!(stored(anchored.persist(open(&box_fixture),3)).disposition(),LocalDisposition::Conflict);
+        let mut inventory = open(&box_fixture);
+        assert_eq!((inventory.generation(),inventory.test_material_count(),inventory.test_conflict_count()),(4,3,3));
+        close(inventory);
+        let missing = OutboxFixture::new();
+        let absent = recovered(command(read_stored_funding_review(&raw).unwrap()).observe_previous(open(&missing),1));
+        assert_eq!(absent.presence(),RecoveredPresence::MissingFactsUnknown);
+        let mut empty = open(&missing);
+        assert_eq!((empty.generation(),empty.test_material_count()),(0,0)); close(empty);
+        assert!(crate::decision::approved_paper_intent_v1::require_production_approval().is_err());
+    }
+
+    #[test]
+    fn funding_material_actual_cas_unknown_and_consuming_close() {
+        let funding = FundingFixture::new(2); let proposal = funding.proposal();
+        let raw = actual(&funding,&proposal).canonical_bytes().to_vec();
+        let fixture = OutboxFixture::new();
+        let a = open(&fixture); let b = open(&fixture);
+        assert_eq!((a.generation(),b.generation()),(0,0));
+        assert_eq!(stored(command(read_stored_funding_review(&raw).unwrap()).persist(a,0)).generation(),1);
+        let stale = held(command(read_stored_funding_review(&raw).unwrap()).persist(b,0));
+        assert_eq!(stale.first_fault(),FundingMaterialFault::Outbox(OutboxFault::StaleGeneration));
+        assert_eq!(stale.canonical_review(),raw);
+        assert!(stale.test_outbox_held().unwrap().test_command_retained());
+        let stale = stale.drain_resources_once();
+        assert_eq!(stale.first_fault(),FundingMaterialFault::Outbox(OutboxFault::StaleGeneration)); drop(stale);
+        let mut a = open(&fixture); let b = open(&fixture); a.test_hold_transaction().unwrap();
+        let busy = held(command(read_stored_funding_review(&raw).unwrap()).persist(b,1));
+        assert_eq!(busy.first_fault(),FundingMaterialFault::Outbox(OutboxFault::Busy));
+        assert!(busy.test_outbox_held().unwrap().test_connection_retained()); drop(busy.drain_resources_once());
+        if let Err(value) = a.test_rollback() { panic!("actual rollback {:?}",value.first_fault()); }
+        let unknown = OutboxFixture::new();
+        let pending = match command(read_stored_funding_review(&raw).unwrap())
+            .persist(open(&unknown).test_observation(TestCommitObservation::LoseResponse),0) {
+            FundingMaterialOutcome::Pending(value) => value, _ => panic!("actual committed response loss"),
+        };
+        assert_eq!(pending.first_fault(),FundingMaterialFault::Outbox(OutboxFault::CommitUnknown));
+        assert_eq!(pending.canonical_review(),raw); assert!(pending.test_actual_owner_retained());
+        let observed = recovered(pending.observe());
+        assert_eq!(observed.presence(),RecoveredPresence::ExactUnverified);
+        assert_eq!(observed.original_fault(),FundingMaterialFault::Outbox(OutboxFault::CommitUnknown));
+        let close_fixture = OutboxFixture::new();
+        let failed = held(command(read_stored_funding_review(&raw).unwrap()).persist(open(&close_fixture).test_busy_vm(),0));
+        assert_eq!(failed.first_fault(),FundingMaterialFault::Outbox(OutboxFault::CloseHeld));
+        assert_eq!(failed.canonical_review(),raw);
+        assert!(failed.test_outbox_held().unwrap().test_connection_retained());
+        let failed = failed.test_finalize_then_drain();
+        assert_eq!(failed.first_fault(),FundingMaterialFault::Outbox(OutboxFault::CloseHeld));
+        assert!(!failed.test_outbox_held().unwrap().test_connection_retained());
+        assert_eq!(failed.drain_resources_once().canonical_review(),raw);
+        let cold = recovered(command(read_stored_funding_review(&raw).unwrap()).observe_previous(open(&close_fixture),1));
+        assert_eq!(cold.presence(),RecoveredPresence::ExactUnverified);
+    }
+
+    #[test]
+    fn funding_material_namespace_false_approval_and_same_work_short() {
+        let funding = FundingFixture::new(2); let proposal = funding.proposal();
+        let original = actual(&funding,&proposal);
+        let raw = original.canonical_bytes().to_vec(); let pointer = original.canonical_bytes().as_ptr();
+        let mut source = MaterialReviewSource::new(original); source.exhaust_before_prepare();
+        let mut failed = match prepare_exhausted_source(source) { Err(value) => value, Ok(_) => panic!("real short Work") };
+        assert_eq!(failed.first_fault(),FundingMaterialFault::Review(Error::OwnedBudget));
+        assert_eq!(failed.canonical_review().as_ptr(),pointer); assert_eq!(failed.canonical_review(),raw);
+        assert_eq!(failed.trust(),TrustState::Unverified); assert!(failed.slot_tuple().is_none());
+        // Drain is resource-only, never another prepare budget or command admission.
+        failed = failed.drain_resources_once();
+        assert_eq!(failed.first_fault(),FundingMaterialFault::Review(Error::OwnedBudget));
+        assert_eq!(failed.canonical_review().as_ptr(),pointer);
+        let mut once = MaterialReviewSource::new(read_stored_funding_review(&raw).unwrap());
+        let original_pointer = once.canonical().as_ptr();
+        once.prepare().unwrap(); let tuple_pointer = once.tuple().unwrap().as_ptr();
+        assert_eq!(once.prepare(),Err(Error::ChangedObservation));
+        assert_eq!(once.canonical().as_ptr(),original_pointer);
+        assert_eq!(once.tuple().unwrap().as_ptr(),tuple_pointer);
+        assert_eq!(once.first(),Some(Error::ChangedObservation));
+        let wrong = String::from_utf8(raw.clone()).unwrap().replace("NotIssued","Approved");
+        assert!(read_stored_funding_review(wrong.as_bytes()).is_err());
+        let wrong = String::from_utf8(raw.clone()).unwrap().replace("HistoricalObservationOnly","Approved");
+        assert!(read_stored_funding_review(wrong.as_bytes()).is_err());
+        let mut noncanonical = raw.clone(); noncanonical.push(b' ');
+        assert!(read_stored_funding_review(&noncanonical).is_err());
+        let budget = OutboxFixture::new(); let mut short = open(&budget);
+        assert_eq!(short.test_spend_owned(8 * codec::MIB),Err(OutboxFault::Work(ValueError::AllocationLimit)));
+        let original = read_stored_funding_review(&raw).unwrap(); let pointer = original.canonical_bytes().as_ptr();
+        let refused = held(command(original).persist(short,0));
+        assert_eq!(refused.first_fault(),FundingMaterialFault::Outbox(OutboxFault::Work(ValueError::AllocationLimit)));
+        assert_eq!(refused.canonical_review().as_ptr(),pointer); assert!(refused.test_outbox_held().unwrap().test_command_retained());
+        drop(refused.drain_resources_once());
+        let mut pending = match command(read_stored_funding_review(&raw).unwrap())
+            .persist(open(&budget).test_observation(TestCommitObservation::LoseResponse),0) {
+            FundingMaterialOutcome::Pending(value) => value, _ => panic!("actual response loss"),
+        };
+        pending.test_exhaust_same_work();
+        let refused = held(pending.observe());
+        assert_eq!(refused.first_fault(),FundingMaterialFault::Outbox(OutboxFault::CommitUnknown));
+        assert!(refused.test_outbox_held().unwrap().test_connection_retained());
+        assert_eq!(refused.canonical_review(),raw); drop(refused.drain_resources_once());
+        let foreign = OutboxFixture::new(); let outbox = open(&foreign);
+        fs::write(foreign.directory().join("foreign-entry"),b"unadmitted").unwrap();
+        let refused = held(command(read_stored_funding_review(&raw).unwrap()).persist(outbox,0));
+        assert_eq!(refused.first_fault(),FundingMaterialFault::Outbox(OutboxFault::ForeignShape));
+        assert_eq!(refused.canonical_review(),raw); assert!(refused.test_outbox_held().unwrap().test_command_retained());
+        drop(refused.drain_resources_once()); fs::remove_file(foreign.directory().join("foreign-entry")).unwrap();
+        let mut untouched = open(&foreign); assert_eq!((untouched.generation(),untouched.test_material_count()),(0,0)); close(untouched);
+        let swapped = OutboxFixture::new(); let outbox = open(&swapped);
+        let saved = swapped.directory().join("old-main"); fs::rename(swapped.main(),&saved).unwrap();
+        fs::copy(&saved,swapped.main()).unwrap(); fs::set_permissions(swapped.main(),fs::Permissions::from_mode(0o600)).unwrap();
+        let refused = held(command(read_stored_funding_review(&raw).unwrap()).persist(outbox,0));
+        assert_eq!(refused.first_fault(),FundingMaterialFault::Outbox(OutboxFault::RootBinding));
+        assert!(refused.test_outbox_held().unwrap().test_connection_retained());
+        assert_eq!(refused.canonical_review(),raw); drop(refused.drain_resources_once());
+        fs::remove_file(swapped.main()).unwrap(); fs::rename(saved,swapped.main()).unwrap();
+        close(open(&swapped));
+    }
+}
