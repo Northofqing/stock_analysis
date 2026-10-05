@@ -587,3 +587,16 @@ Root完成限定lib编译（5m19），fresh摘要3、队列3与相关retention3�
 Root56411 限定 lib 编译 5m35，新增三项运行 66.09 秒、全部退出0；覆盖真实非空 warm/cold、类型/关系/UTF8 固定 gate 与实际目标漂移、预算不足、Unknown/late 字段保留与实际 Busy。Root41837 复用同一新产物运行费用三项（98.44 秒）及原账户校验两项（0.04/0.03 秒），全部退出0，共 fresh8 不同整方法。回执 68778462/8024bcb1；22件相关源码与公共控制、二进制 SHA0aaf96f6 在新增三项后及相关五项前后实际核对。没有补造新增三项之前的二进制 SHA，不追加 check/build/clippy/全量/release。独立 DATA e57f44ac 全文核对通过，本地提交包含两件源码与本交接文档。
 
 生产仍运行新闻组合修复 d9b4aabb/49518b30，实际新新闻送达仍待推送窗口证据；这组平台改动未部署。完整 genesis/audit/Financial 重放、operational schema8、monitor 决策与资金持久化接线、真实 native/provider/layout/payment、远端长期留存及自然验收仍待完成。Lz4/Zstd 已有源码正在有限合成，保留已通过的 Ring 优化；Root 明确用新组合审查及 fresh13 提案替换旧分立运行先后门，但新源码及运行尚未批准，不复用未运行结果或旧 APP922 作为当前控制。
+
+
+### 2026-10-06 Genesis 原始字段读取完成
+
+在账户关联校验之后、第二个仍存活的只读连接中，新增固定 seq=1 事件七字段与当前账本头五字段的实际读取。字段数量、严格类型、UTF8/二进制长度与容量先检查，同一 TargetWork 预付后逐项持有；保留实际 EOF、资源结束、返回与首错。warm 与 cold5/6 均使用原 owner、原 reader/pair，成功仍须原 consuming close 和来源/目标 tail，没有新增连接或预算。仅普通 typed inputs，尚未执行完整 genesis 验证或金融重放。
+
+原初轮出现 2PASS/1FAIL，原因是新增目标漂移测试误以为来源 tail 尚未成功；实际顺序为 close 成功、来源 tail 成功、目标 tail 拒绝漂移，生产拒绝行为正确。仅修 cfg 断言，并验证重复 finish 保留首错、字段、已关闭与来源 tail 事实且不标 Complete。原失败回执 3bf1ac1d 与 raw495a2ef2 保留，不复用原两项 PASS。最终 Source e3290df7、独立 Source 9cd84a7b、应用 61d35491、执行计划 bb977713 精确绑定，旧生产前缀保持。
+
+Root86213 限定 lib 编译 4m52，新增三项运行 78.47 秒、相关账户关联三项复用同一产物运行 56.01 秒，fresh6 全部退出0。闭合回执 383b3a93、非作者 DATA 5f4cf5f3 核对通过；22 件源码、8 公共输入与同一 binary SHA9d964886 在新增三项结束后及相关三项前后保持，没有补造新增三项前 binary 证据。git diff --check 通过，未追加例行 check/build/clippy/全量/release。
+
+真实 Genesis 表约束为 seq=1/kind=Genesis，head version=1，原账户唯一性门正确并保留；合法后续多事件属于独立 execution_event 域。内存 head_later=3 只覆盖低权限 typed 采集，不证明真实 schema、多事件执行或完整账本。下一片为同 reader 的 V1 账本、审计与审计链原件读取，其计划已独立复核，完整重放、operational schema8、决策/资金接线及真实 native/provider/layout/payment 仍待完成。
+
+并行 native 组合的历史正向两项与负向两项通过，但首 ownership whole 的 copy_source_current 在原 360 秒预算内超时；其余 ownership 与 related7 未运行，组合未应用。随后有界 OS 诊断在外层 380 秒终止，只有等待与 SHA/lstat/open/JSON C 帧观察，无 whole 结果或完整根因证明。正在评审单次 seal 内成功 Zstd 组复用方案，保留所有实时输入/FD/控制/负隔离/尾检查，不提高超时或跳过用例。实际 APP 控制仍需另行刷新。生产部署保持新闻组合 d9b4aabb/49518b30 已核验启动与首轮采集的有限结论，实际新新闻送达仍待自然推送窗口证据；本平台批次未部署、未远端 push 或合并。

@@ -3839,3 +3839,470 @@ mod retained_owner_linkage_tests {
         });
     }
 }
+
+// Fixed ordinary Genesis/current-head inputs, never verified replay or authority.
+// The unfinished owner frame lends its existing second reader and one work pool.
+#[derive(Default)]
+struct GenesisInputRow {
+    account_id: Option<String>, sequence: Option<i64>, command_id: Option<String>,
+    previous_hash: Option<String>, event_hash: Option<String>, kind: Option<String>,
+    payload: Option<Vec<u8>>, version: Option<i64>, projection_bytes: Option<Vec<u8>>,
+    projection_hash: Option<String>,
+}
+#[derive(Default)]
+struct GenesisInputReadFacts {
+    started: bool, count: Option<i64>, types_checked: bool, extent: Option<u64>,
+    charged: bool, acquired: usize, eof: bool, scopes_ended: bool, returned: Option<bool>,
+}
+struct GenesisInputFields { rows: [Vec<GenesisInputRow>; 2] }
+impl Default for GenesisInputFields {
+    fn default() -> Self { Self { rows: std::array::from_fn(|_| Vec::new()) } }
+}
+#[derive(Clone, Copy)]
+enum GenesisInputQuery { Event, Head }
+impl GenesisInputQuery {
+    const ALL: [Self; 2] = [Self::Event, Self::Head];
+    fn slot(self) -> usize { match self { Self::Event => 0, Self::Head => 1 } }
+    fn sql(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::Event => (
+                "SELECT COUNT(*) FROM main.paper_book_v2_event WHERE seq=1",
+                "SELECT COUNT(*) FROM main.paper_book_v2_event WHERE seq=1 AND (typeof(account_id)!='text' OR typeof(seq)!='integer' OR typeof(command_id)!='text' OR typeof(previous_hash)!='text' OR typeof(event_hash)!='text' OR typeof(kind)!='text' OR typeof(payload)!='blob')",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(command_id AS BLOB))+length(CAST(previous_hash AS BLOB))+length(CAST(event_hash AS BLOB))+length(CAST(kind AS BLOB))+length(payload)),0) FROM main.paper_book_v2_event WHERE seq=1",
+                "SELECT account_id,seq,command_id,previous_hash,event_hash,kind,payload FROM main.paper_book_v2_event WHERE seq=1 ORDER BY account_id",
+            ),
+            Self::Head => (
+                "SELECT COUNT(*) FROM main.paper_book_v2_head",
+                "SELECT COUNT(*) FROM main.paper_book_v2_head WHERE typeof(account_id)!='text' OR typeof(version)!='integer' OR typeof(event_hash)!='text' OR typeof(projection_bytes)!='blob' OR typeof(projection_hash)!='text'",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(event_hash AS BLOB))+length(projection_bytes)+length(CAST(projection_hash AS BLOB))),0) FROM main.paper_book_v2_head",
+                "SELECT account_id,version,event_hash,projection_bytes,projection_hash FROM main.paper_book_v2_head ORDER BY account_id",
+            ),
+        }
+    }
+}
+#[derive(PartialEq, Eq)]
+enum GenesisInputPhase { Fresh, ReaderChecked, RowsReturned, InputsChecked, Complete, Refused }
+struct GenesisFieldsFrame {
+    owner: OwnerLinkageFrame, phase: GenesisInputPhase, fields: GenesisInputFields,
+    reads: [GenesisInputReadFacts; 2], returns: [Option<StorageResult<()>>; 2],
+    relations_returned: Option<bool>,
+}
+pub(super) struct AdditiveStorageRetainedGenesisInputs { frame: GenesisFieldsFrame }
+pub(super) struct AdditiveStorageGenesisInputsHeld { frame: GenesisFieldsFrame }
+impl AdditiveStorageGenesisInputsHeld {
+    pub(super) fn first_error(&self) -> &GlobalSchemaV1Error {
+        self.frame.owner.fee.local.readonly.transform.first.as_ref().unwrap()
+    }
+}
+impl AdditiveStorageTransformed {
+    pub(super) fn into_retained_genesis_inputs(self)
+        -> std::result::Result<AdditiveStorageRetainedGenesisInputs, AdditiveStorageGenesisInputsHeld> {
+        GenesisFieldsFrame::new(self.frame).run(false)
+    }
+}
+impl AdditiveStorageRetainedGenesisInputs {
+    pub(super) fn create_or_resume(source: rows::AdditiveRowsTargetSource)
+        -> std::result::Result<Self, AdditiveStorageGenesisInputsHeld> {
+        let base = AdditiveStorageCopied { source, managed: None, directory: None, anchor: None, fresh: false,
+            original: None, rows: None, records: std::array::from_fn(|_| None), pending: None,
+            target: None, target_node: None, copied: None, census_files: std::array::from_fn(|_| None),
+            codec: AdditiveRecordCodecState::new(), copy_issued: false, rejected_copy_return: None,
+            copy_return_failed: false, copy_return_error: None, copy_origin_return_error: None };
+        GenesisFieldsFrame::new(TransformFrame::new(base)).run(true)
+    }
+}
+impl GenesisFieldsFrame {
+    fn new(transform: TransformFrame) -> Self {
+        Self { owner: OwnerLinkageFrame::new(transform), phase: GenesisInputPhase::Fresh,
+            fields: GenesisInputFields::default(), reads: std::array::from_fn(|_| GenesisInputReadFacts::default()),
+            returns: std::array::from_fn(|_| None), relations_returned: None }
+    }
+    fn fail(&mut self, first: GlobalSchemaV1Error) {
+        self.owner.fail(first); self.phase = GenesisInputPhase::Refused;
+    }
+    fn run(mut self, cold: bool)
+        -> std::result::Result<AdditiveStorageRetainedGenesisInputs, AdditiveStorageGenesisInputsHeld> {
+        if !self.start(cold) || !self.finish() { return Err(AdditiveStorageGenesisInputsHeld { frame: self }); }
+        Ok(AdditiveStorageRetainedGenesisInputs { frame: self })
+    }
+    fn start(&mut self, cold: bool) -> bool {
+        if self.owner.fee.local.readonly.transform.first.is_some() { return false; }
+        if self.phase != GenesisInputPhase::Fresh { self.fail(storage_fail("additive genesis start phase differs")); return false; }
+        if !self.owner.start(cold) || !self.owner.advance_reads() { self.phase = GenesisInputPhase::Refused; return false; }
+        match self.owner.validate_fields() {
+            Ok(()) => { self.phase = GenesisInputPhase::ReaderChecked; true },
+            Err(first) => { self.fail(first); false },
+        }
+    }
+    fn read_fixed(&mut self, query: GenesisInputQuery) -> StorageResult<()> {
+        if self.owner.fee.local.readonly.transform.first.is_some() { return Err(storage_fail("additive genesis read after first error")); }
+        if self.phase != GenesisInputPhase::ReaderChecked || self.owner.phase != OwnerLinkagePhase::RelationsChecked
+            || self.owner.relations_returned != Some(true) || !self.owner.all_returns()
+            || self.owner.fee.local.readonly.active != Some(1) {
+            return Err(storage_fail("additive genesis lacks validated second reader"));
+        }
+        let Retained8Frame { transform, permit, reader, .. } = &mut self.owner.fee.local.readonly;
+        let (_, _, work, completed) = transform.base.source.retained8_parts(permit.as_ref().unwrap())?;
+        if completed != 2 { return Err(storage_fail("additive genesis pair count differs")); }
+        GenesisInputReadLoan { connection: reader.as_ref().unwrap(), work,
+            rows: &mut self.fields.rows[query.slot()], facts: &mut self.reads[query.slot()] }.read(query)
+    }
+    fn advance_reads(&mut self) -> bool {
+        if self.owner.fee.local.readonly.transform.first.is_some() { return false; }
+        if self.phase != GenesisInputPhase::ReaderChecked { self.fail(storage_fail("additive genesis read phase differs")); return false; }
+        for query in GenesisInputQuery::ALL {
+            let i = query.slot();
+            if self.returns[i].is_some() || self.reads[i].started { self.fail(storage_fail("additive genesis query already reached")); return false; }
+            // Owned field children land directly in this frame. The actual
+            // whole Result is parked before any first-error inspection.
+            self.returns[i] = Some(self.read_fixed(query));
+            if self.returns[i].as_ref().unwrap().is_err() {
+                let first = self.returns[i].take().unwrap().unwrap_err(); self.fail(first); return false;
+            }
+        }
+        self.phase = GenesisInputPhase::RowsReturned; true
+    }
+    fn all_returns(&self) -> bool {
+        self.returns.iter().all(|r| matches!(r, Some(Ok(()))))
+            && self.reads.iter().all(|r| r.returned == Some(true) && r.eof && r.scopes_ended && r.types_checked && r.charged)
+    }
+    fn validate_fields(&mut self) -> StorageResult<()> {
+        if self.owner.fee.local.readonly.transform.first.is_some() { return Err(storage_fail("additive genesis validation after first error")); }
+        if self.phase != GenesisInputPhase::RowsReturned || !self.all_returns() || self.relations_returned.is_some() {
+            return Err(storage_fail("additive genesis inputs before whole returns"));
+        }
+        self.owner.fee.local.readonly.loan()?.2.metadata(1024)?;
+        let actual = genesis_input_rosters(&self.owner.fields, &self.fields);
+        self.relations_returned = Some(actual.is_ok()); actual?;
+        self.phase = GenesisInputPhase::InputsChecked; Ok(())
+    }
+    fn close_and_tail(&mut self) -> StorageResult<()> {
+        if self.owner.fee.local.readonly.transform.first.is_some() { return Err(storage_fail("additive genesis close after first error")); }
+        if self.phase != GenesisInputPhase::InputsChecked || self.relations_returned != Some(true) || !self.all_returns() {
+            return Err(storage_fail("additive genesis close before inputs returned"));
+        }
+        self.owner.close_and_tail()?; self.phase = GenesisInputPhase::Complete; Ok(())
+    }
+    fn finish(&mut self) -> bool {
+        if self.owner.fee.local.readonly.transform.first.is_some() { return false; }
+        if !self.advance_reads() { return false; }
+        let actual = self.validate_fields().and_then(|()| self.close_and_tail());
+        match actual { Ok(()) => true, Err(first) => { self.fail(first); false } }
+    }
+}
+struct GenesisInputReadLoan<'a> {
+    connection: &'a Connection, work: &'a mut target::TargetWork,
+    rows: &'a mut Vec<GenesisInputRow>, facts: &'a mut GenesisInputReadFacts,
+}
+impl GenesisInputReadLoan<'_> {
+    fn read(mut self, query: GenesisInputQuery) -> StorageResult<()> {
+        if let Err(first) = self.preflight(query) {
+            self.facts.scopes_ended = true; self.facts.returned = Some(false); return Err(first);
+        }
+        self.acquire(query)
+    }
+    fn preflight(&mut self, query: GenesisInputQuery) -> StorageResult<()> {
+        if self.facts.started || !self.rows.is_empty() { return Err(storage_fail("additive genesis query already started")); }
+        let (count_sql, type_sql, extent_sql, fields_sql) = query.sql();
+        self.work.metadata(4096 + (count_sql.len() + type_sql.len() + extent_sql.len() + fields_sql.len()) as u64)?;
+        self.facts.started = true;
+        let count: i64 = self.connection.query_row(count_sql, [], |r| r.get(0))
+            .map_err(|e| transform_sql_error("count additive genesis rows", e))?;
+        self.facts.count = Some(count);
+        let count = u64::try_from(count).map_err(|_| storage_fail("additive genesis count overflow"))?;
+        let invalid: i64 = self.connection.query_row(type_sql, [], |r| r.get(0))
+            .map_err(|e| transform_sql_error("type additive genesis rows", e))?;
+        if invalid != 0 { return Err(storage_fail("additive genesis row types differ")); }
+        self.facts.types_checked = true;
+        let extent: i64 = self.connection.query_row(extent_sql, [], |r| r.get(0))
+            .map_err(|e| transform_sql_error("extent additive genesis rows", e))?;
+        let extent = u64::try_from(extent).map_err(|_| storage_fail("additive genesis extent overflow"))?;
+        self.facts.extent = Some(extent);
+        let slots = count.checked_mul(std::mem::size_of::<GenesisInputRow>() as u64)
+            .ok_or_else(|| storage_fail("additive genesis capacity overflow"))?;
+        self.work.metadata(slots.checked_add(extent).ok_or_else(|| storage_fail("additive genesis capacity overflow"))?)?;
+        self.facts.charged = true; Ok(())
+    }
+    fn acquire(self, query: GenesisInputQuery) -> StorageResult<()> {
+        let actual = (|| {
+            if !self.facts.started || !self.facts.charged || self.facts.returned.is_some() || !self.rows.is_empty() {
+                return Err(storage_fail("additive genesis acquire lacks fixed preflight"));
+            }
+            let count = usize::try_from(self.facts.count.unwrap()).map_err(|_| storage_fail("additive genesis count overflow"))?;
+            let mut remaining = self.facts.extent.unwrap();
+            self.rows.try_reserve_exact(count).map_err(|_| storage_fail("additive genesis row allocation failed"))?;
+            let mut statement = self.connection.prepare(query.sql().3).map_err(|e| transform_sql_error("prepare additive genesis rows", e))?;
+            let mut rows = statement.query([]).map_err(|e| transform_sql_error("query additive genesis rows", e))?;
+            while let Some(row) = rows.next().map_err(|e| transform_sql_error("step additive genesis rows", e))? {
+                if self.rows.len() == count { return Err(storage_fail("additive genesis extra row")); }
+                self.rows.push(GenesisInputRow::default()); self.facts.acquired = self.rows.len();
+                let slot = self.rows.last_mut().unwrap();
+                slot.account_id = Some(owner_linkage_text(row, 0, &mut remaining)?);
+                match query {
+                    GenesisInputQuery::Event => {
+                        slot.sequence = Some(owner_linkage_integer(row, 1)?);
+                        slot.command_id = Some(owner_linkage_text(row, 2, &mut remaining)?);
+                        slot.previous_hash = Some(owner_linkage_text(row, 3, &mut remaining)?);
+                        slot.event_hash = Some(owner_linkage_text(row, 4, &mut remaining)?);
+                        slot.kind = Some(owner_linkage_text(row, 5, &mut remaining)?);
+                        slot.payload = Some(owner_linkage_blob(row, 6, &mut remaining)?);
+                    },
+                    GenesisInputQuery::Head => {
+                        slot.version = Some(owner_linkage_integer(row, 1)?);
+                        slot.event_hash = Some(owner_linkage_text(row, 2, &mut remaining)?);
+                        slot.projection_bytes = Some(owner_linkage_blob(row, 3, &mut remaining)?);
+                        slot.projection_hash = Some(owner_linkage_text(row, 4, &mut remaining)?);
+                    },
+                }
+            }
+            self.facts.eof = true;
+            if self.rows.len() != count || remaining != 0 { return Err(storage_fail("additive genesis count/extent changed")); }
+            Ok(())
+        })();
+        // Actual Rows/Statement scopes end independently of this owned return.
+        // Their ignored Drop results are not converted to successful facts.
+        self.facts.scopes_ended = true; self.facts.returned = Some(actual.is_ok()); actual
+    }
+}
+fn genesis_input_rosters(owner: &OwnerLinkageFields, fields: &GenesisInputFields) -> StorageResult<()> {
+    let accounts = &owner.rows[2];
+    for rows in &fields.rows {
+        if rows.windows(2).any(|w| w[0].account_id.as_deref().unwrap() >= w[1].account_id.as_deref().unwrap()) {
+            return Err(storage_fail("additive genesis duplicate or unordered account"));
+        }
+        if rows.len() != accounts.len() || rows.iter().zip(accounts).any(|(a, b)| a.account_id != b.account_id) {
+            return Err(storage_fail("additive genesis input roster differs"));
+        }
+    }
+    // A selected seq1 row and current head stay independent. No head version,
+    // hash, payload, canonical replay or audit assertion is manufactured here.
+    if fields.rows[0].iter().any(|r| r.sequence != Some(1)) {
+        return Err(storage_fail("additive genesis sequence differs"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod retained_genesis_input_tests {
+    use super::*;
+    fn transformed(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> AdditiveStorageTransformed {
+        let copied = match AdditiveStorageCopied::create(original.into_additive_target_source().unwrap()) {
+            Ok(owner) => owner, Err(held) => panic!("genesis inputs real Copied: {}", held.first_error()),
+        };
+        match copied.into_transformed() { Ok(owner) => owner, Err(held) => panic!("genesis inputs real WAL: {}", held.first_error()) }
+    }
+    fn complete(frame: &mut GenesisFieldsFrame) {
+        assert!(frame.phase == GenesisInputPhase::Complete && frame.owner.phase == OwnerLinkagePhase::Complete);
+        assert!(frame.all_returns() && frame.relations_returned == Some(true));
+        assert!(frame.reads.iter().all(|r| r.started && r.types_checked && r.charged && r.eof && r.scopes_ended));
+        assert!(!frame.fields.rows[0].is_empty() && frame.fields.rows[0].len() == frame.owner.fields.rows[2].len());
+        for (i, r) in frame.fields.rows[0].iter().enumerate() {
+            assert!(r.account_id.is_some() && r.sequence == Some(1) && r.command_id.is_some());
+            assert!(r.previous_hash.is_some() && r.event_hash.is_some() && r.kind.is_some());
+            assert!(!r.payload.as_ref().unwrap().is_empty());
+            assert_eq!(r.kind.as_deref(), Some("Genesis"));
+            assert_eq!(r.previous_hash, frame.owner.fields.rows[2][i].v1_head_hash);
+        }
+        for (i, r) in frame.fields.rows[1].iter().enumerate() {
+            assert!(r.account_id.is_some() && r.version.is_some() && r.event_hash.is_some() && r.projection_hash.is_some());
+            assert!(!r.projection_bytes.as_ref().unwrap().is_empty());
+            assert_eq!(r.version, Some(1));
+            assert_eq!(r.event_hash, frame.fields.rows[0][i].event_hash);
+            assert_eq!(r.projection_hash, frame.owner.fields.rows[2][i].v1_projection_hash);
+        }
+        assert!(frame.owner.fee.local.readonly.reader.is_none() && frame.owner.fee.local.readonly.active.is_none());
+        assert!(frame.owner.fee.local.readonly.facts.iter().all(|r| r.closed && r.original_tail_validated));
+        assert_eq!(frame.owner.fee.local.readonly.loan().unwrap().3, 2);
+    }
+    fn fingerprint(frame: &GenesisFieldsFrame) -> (
+        Vec<(String, i64, String, String, String, String, Vec<u8>)>,
+        Vec<(String, i64, String, Vec<u8>, String)>,
+    ) {
+        // Test comparison only; this does not charge/mint production authority.
+        (frame.fields.rows[0].iter().map(|r| (r.account_id.as_ref().unwrap().clone(), r.sequence.unwrap(),
+            r.command_id.as_ref().unwrap().clone(), r.previous_hash.as_ref().unwrap().clone(),
+            r.event_hash.as_ref().unwrap().clone(), r.kind.as_ref().unwrap().clone(), r.payload.as_ref().unwrap().clone())).collect(),
+         frame.fields.rows[1].iter().map(|r| (r.account_id.as_ref().unwrap().clone(), r.version.unwrap(),
+            r.event_hash.as_ref().unwrap().clone(), r.projection_bytes.as_ref().unwrap().clone(), r.projection_hash.as_ref().unwrap().clone())).collect())
+    }
+    #[test]
+    fn task6_retained_genesis_input_same_reader_and_cold() {
+        super::super::tests::task6_with_cold_rows_backup_fixture_for_test(|original| {
+            let owner = transformed(original); let node = owner.frame.base.target_node.unwrap();
+            let prefix = owner.frame.base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>();
+            assert_eq!(prefix.len(), 5); drop(owner); (node, prefix)
+        }, |(node, prefix), original| {
+            let mut retained = match AdditiveStorageRetainedGenesisInputs::create_or_resume(original.into_additive_target_source().unwrap()) {
+                Ok(owner) => owner, Err(held) => panic!("genesis inputs cold5: {}", held.first_error()),
+            };
+            complete(&mut retained.frame);
+            assert_eq!(retained.frame.owner.fee.local.readonly.transform.base.target_node, Some(node));
+            assert_eq!(&retained.frame.owner.fee.local.readonly.transform.base.records.iter().flatten()
+                .map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>()[..5], prefix.as_slice());
+            assert!(retained.frame.owner.fee.local.readonly.transform.begin_return.is_none()); drop(retained);
+        });
+        super::super::tests::task6_with_cold_rows_backup_fixture_for_test(|original| {
+            let owner = transformed(original); let fd = owner.frame.base.target().unwrap().as_raw_fd();
+            let mut retained = match owner.into_retained_genesis_inputs() {
+                Ok(owner) => owner, Err(held) => panic!("genesis inputs warm: {}", held.first_error()),
+            };
+            complete(&mut retained.frame);
+            assert_eq!(retained.frame.owner.fee.local.readonly.transform.base.target().unwrap().as_raw_fd(), fd);
+            let saved = (retained.frame.owner.fee.local.readonly.transform.base.target_node.unwrap(), fingerprint(&retained.frame),
+                retained.frame.owner.fee.local.readonly.transform.base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>());
+            drop(retained); saved
+        }, |(node, fields, records), original| {
+            let mut retained = match AdditiveStorageRetainedGenesisInputs::create_or_resume(original.into_additive_target_source().unwrap()) {
+                Ok(owner) => owner, Err(held) => panic!("genesis inputs cold6: {}", held.first_error()),
+            };
+            complete(&mut retained.frame); assert_eq!(fingerprint(&retained.frame), fields);
+            assert_eq!(retained.frame.owner.fee.local.readonly.transform.base.target_node, Some(node));
+            assert_eq!(retained.frame.owner.fee.local.readonly.transform.base.records.iter().flatten()
+                .map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>(), records); drop(retained);
+        });
+    }
+    fn fixed_gate_connection() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE paper_book_v2_event(account_id,seq,command_id,previous_hash,event_hash,kind,payload);
+            CREATE TABLE paper_book_v2_head(account_id,version,event_hash,projection_bytes,projection_hash);
+            INSERT INTO paper_book_v2_event VALUES('a',1,'command','previous','event','Genesis',X'0102');
+            INSERT INTO paper_book_v2_head VALUES('a',1,'event',X'0304','projection');").unwrap(); c
+    }
+    fn gate_roster() -> OwnerLinkageFields {
+        let mut owner = OwnerLinkageFields::default();
+        owner.rows[2].push(OwnerLinkageRow { account_id: Some("a".to_owned()), ..OwnerLinkageRow::default() }); owner
+    }
+    #[test]
+    fn task6_retained_genesis_input_typed_extent_presence_and_drift() {
+        // These real in-memory SQL mutations test only the fixed data callee;
+        // they do not build a retained frame, fake proof or verified genesis.
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut source = original.into_additive_target_source().unwrap();
+            for case in ["plain", "head_later", "type", "head_type", "utf8", "missing", "sequence", "duplicate", "orphan"] {
+                let c = fixed_gate_connection();
+                c.execute_batch(match case {
+                    "head_later" => "UPDATE paper_book_v2_head SET version=3;",
+                    "type" => "UPDATE paper_book_v2_event SET payload='text';",
+                    "head_type" => "UPDATE paper_book_v2_head SET projection_bytes='text';",
+                    "utf8" => "UPDATE paper_book_v2_event SET command_id=CAST(X'ff' AS TEXT);",
+                    "missing" => "DELETE FROM paper_book_v2_event;",
+                    "sequence" => "UPDATE paper_book_v2_event SET seq=2;",
+                    "duplicate" => "INSERT INTO paper_book_v2_event SELECT * FROM paper_book_v2_event;",
+                    "orphan" => "UPDATE paper_book_v2_head SET account_id='orphan';", _ => "",
+                }).unwrap();
+                let mut fields = GenesisInputFields::default();
+                let mut facts: [GenesisInputReadFacts; 2] = std::array::from_fn(|_| GenesisInputReadFacts::default());
+                let work = source.storage_parts().unwrap().2;
+                let actual = (|| {
+                    for query in GenesisInputQuery::ALL {
+                        GenesisInputReadLoan { connection: &c, work: &mut *work,
+                            rows: &mut fields.rows[query.slot()], facts: &mut facts[query.slot()] }.read(query)?;
+                    }
+                    work.metadata(1024)?; genesis_input_rosters(&gate_roster(), &fields)
+                })();
+                if matches!(case, "plain" | "head_later") {
+                    actual.unwrap(); assert!(facts.iter().all(|r| r.eof && r.scopes_ended && r.returned == Some(true)));
+                    assert_eq!(fields.rows[0][0].sequence, Some(1));
+                    if case == "head_later" { assert_eq!(fields.rows[1][0].version, Some(3)); }
+                } else {
+                    let expected = match case {
+                        "type" | "head_type" => "additive genesis row types differ",
+                        "utf8" => "additive owner text is not UTF8",
+                        "duplicate" => "additive genesis duplicate or unordered account", _ => "additive genesis input roster differs",
+                    };
+                    assert!(matches!(actual.unwrap_err(), GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == expected));
+                    if case == "type" { assert!(fields.rows[0].is_empty() && !facts[0].charged); }
+                    if case == "head_type" { assert!(!fields.rows[0].is_empty() && fields.rows[1].is_empty() && !facts[1].charged); }
+                    if case == "utf8" { assert!(facts[0].charged && fields.rows[0][0].account_id.is_some() && fields.rows[0][0].command_id.is_none()); }
+                }
+                c.close().unwrap();
+            }
+            for growth in [false, true] {
+                let c = fixed_gate_connection(); let mut rows = Vec::new(); let mut facts = GenesisInputReadFacts::default();
+                let mut loan = GenesisInputReadLoan { connection: &c, work: source.storage_parts().unwrap().2, rows: &mut rows, facts: &mut facts };
+                loan.preflight(GenesisInputQuery::Event).unwrap();
+                c.execute_batch(if growth { "UPDATE paper_book_v2_event SET payload=X'0102030405';" }
+                    else { "UPDATE paper_book_v2_event SET payload=X'01';" }).unwrap();
+                let first = loan.acquire(GenesisInputQuery::Event).unwrap_err();
+                let expected = if growth { "additive owner field extent changed" } else { "additive genesis count/extent changed" };
+                assert!(matches!(first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == expected));
+                assert!(facts.scopes_ended && facts.returned == Some(false)); assert_eq!(facts.eof, !growth);
+                assert!(rows[0].account_id.is_some() && rows[0].kind.is_some());
+                assert_eq!(rows[0].payload.is_some(), !growth); c.close().unwrap();
+            }
+            drop(source);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = GenesisFieldsFrame::new(transformed(original).frame); assert!(f.start(false)); assert!(f.advance_reads());
+            f.validate_fields().unwrap();
+            let file = f.owner.fee.local.readonly.transform.base.target().unwrap(); let mut byte = [0]; file.read_exact_at(&mut byte, 100).unwrap();
+            file.write_all_at(&[byte[0] ^ 1], 100).unwrap(); file.sync_all().unwrap();
+            let actual = f.close_and_tail();
+            f.owner.fee.local.readonly.transform.base.target().unwrap().write_all_at(&byte, 100).unwrap();
+            f.owner.fee.local.readonly.transform.base.target().unwrap().sync_all().unwrap(); // Fixture cleanup only.
+            let first = actual.unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail }
+                if detail == "additive readonly retained target bytes changed"));
+            assert!(f.owner.fee.local.readonly.reader.is_none() && f.owner.fee.local.readonly.active.is_none());
+            assert!(f.owner.fee.local.readonly.facts[1].closed && f.owner.fee.local.readonly.facts[1].original_tail_validated);
+            assert!(f.owner.fee.local.phase == LocalCompletionPhase::ReaderClosed && f.phase == GenesisInputPhase::InputsChecked);
+            let used = f.owner.fee.local.readonly.loan().unwrap().2.metadata_used();
+            f.fail(first); assert!(f.fields.rows[0][0].payload.is_some() && f.fields.rows[1][0].projection_bytes.is_some());
+            let primary = f.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error;
+            for _ in 0..2 {
+                assert!(!f.finish() && f.phase == GenesisInputPhase::Refused);
+                assert_eq!(f.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error, primary);
+                assert_eq!(f.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+                assert!(f.owner.fee.local.readonly.facts[1].closed && f.owner.fee.local.readonly.facts[1].original_tail_validated);
+                assert!(f.owner.fee.local.readonly.reader.is_none() && f.owner.fee.local.readonly.active.is_none());
+                assert!(f.owner.fee.local.phase != LocalCompletionPhase::Complete);
+            }
+            drop(f);
+        });
+    }
+    #[test]
+    fn task6_retained_genesis_input_same_work_unknown_late_and_busy() {
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = GenesisFieldsFrame::new(transformed(original).frame); assert!(f.start(false));
+            let work = f.owner.fee.local.readonly.loan().unwrap().2;
+            let remaining = 16 * MIB - work.metadata_used(); work.metadata(remaining).unwrap();
+            assert!(!f.finish() && f.fields.rows.iter().all(Vec::is_empty) && f.reads.iter().all(|r| !r.started));
+            let first = f.owner.fee.local.readonly.transform.first.as_ref().unwrap().to_string();
+            let used = f.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert_eq!(f.owner.fee.local.readonly.transform.first.as_ref().unwrap().to_string(), first); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = GenesisFieldsFrame::new(transformed(original).frame); assert!(f.start(false));
+            let actual = f.read_fixed(GenesisInputQuery::Event); actual.as_ref().unwrap();
+            let pointer = f.fields.rows[0][0].payload.as_ref().unwrap().as_ptr();
+            assert!(f.reads[0].eof && f.reads[0].scopes_ended && f.returns[0].is_none());
+            let first = f.close_and_tail().unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail }
+                if detail == "additive genesis close before inputs returned"));
+            f.fail(first); f.returns[0] = Some(actual); // A real late return is retained after the barrier.
+            assert_eq!(f.fields.rows[0][0].payload.as_ref().unwrap().as_ptr(), pointer);
+            assert!(matches!(f.returns[0], Some(Ok(()))) && !f.reads[1].started && f.relations_returned.is_none());
+            let used = f.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(!f.owner.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = GenesisFieldsFrame::new(transformed(original).frame); assert!(f.start(false)); assert!(f.advance_reads());
+            f.validate_fields().unwrap(); f.owner.fee.local.readonly.prepare_busy_vm();
+            let first = f.close_and_tail().unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSqlite { operation: "close additive readonly", source }
+                if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)));
+            f.fail(first); assert!(f.owner.fee.local.readonly.reader.is_some() && f.fields.rows[0][0].payload.is_some());
+            let used = f.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(!f.owner.fee.local.readonly.facts[1].original_tail_validated);
+            assert!(f.owner.fee.local.readonly.finalize_busy_once()); f.owner.fee.local.readonly.cleanup_reader_once();
+            assert!(matches!(f.owner.fee.local.readonly.cleanup_close, Some(Ok(()))));
+            assert!(f.fields.rows[1][0].projection_bytes.is_some() && !f.owner.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = GenesisFieldsFrame::new(transformed(original).frame); assert!(f.start(false));
+            let first = f.close_and_tail().unwrap_err(); f.fail(first);
+            assert!(f.reads.iter().all(|r| !r.started && r.returned.is_none()) && f.returns.iter().all(Option::is_none));
+            assert!(!f.finish() && f.fields.rows.iter().all(Vec::is_empty) && !f.owner.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+    }
+}
