@@ -600,3 +600,14 @@ Root86213 限定 lib 编译 4m52，新增三项运行 78.47 秒、相关账户�
 真实 Genesis 表约束为 seq=1/kind=Genesis，head version=1，原账户唯一性门正确并保留；合法后续多事件属于独立 execution_event 域。内存 head_later=3 只覆盖低权限 typed 采集，不证明真实 schema、多事件执行或完整账本。下一片为同 reader 的 V1 账本、审计与审计链原件读取，其计划已独立复核，完整重放、operational schema8、决策/资金接线及真实 native/provider/layout/payment 仍待完成。
 
 并行 native 组合的历史正向两项与负向两项通过，但首 ownership whole 的 copy_source_current 在原 360 秒预算内超时；其余 ownership 与 related7 未运行，组合未应用。随后有界 OS 诊断在外层 380 秒终止，只有等待与 SHA/lstat/open/JSON C 帧观察，无 whole 结果或完整根因证明。正在评审单次 seal 内成功 Zstd 组复用方案，保留所有实时输入/FD/控制/负隔离/尾检查，不提高超时或跳过用例。实际 APP 控制仍需另行刷新。生产部署保持新闻组合 d9b4aabb/49518b30 已核验启动与首轮采集的有限结论，实际新新闻送达仍待自然推送窗口证据；本平台批次未部署、未远端 push 或合并。
+
+
+### 2026-10-06 V1 账本与审计原始字段读取完成
+
+在 Genesis 字段读取之后、原第二个仍存活的只读连接中，新增固定五组读取：V1 账户、事件、账本头、订单审计及审计链。严格字段类型、COUNT、UTF8 长度和容量先检查，同一 TargetWork 预付后逐项持有；显式区分 NULL、未取得字段及 REAL 原始 bits。V1 多事件以 (account_id, seq) 检查唯一性，允许合法多行与 seq gap；账户、head、audit/chain 原件做有限结构关联。成功仍须原 consuming close 与完整来源/目标 tail，未知返回、late、Busy 和漂移保首错及部分字段。未增加 reader/pair、预算或绕过规则/provider。
+
+候选 Source ea03939a、独立 Source a272ad6e、Root 自核 e0dade5a、实际单文件应用 4e344811、执行计划 b9356445 精确绑定。旧 280997 字节父前缀完全保持，新增生产与 cfg 共483行。这里只完成普通 owning inputs；完整 audit-chain/hash 校验、金融重放与 Genesis/execution/Adjudication 语义仍待接入。
+
+Root57015 限定 lib 实际编译 5m28，新增三项运行53.80秒，相关 Genesis 三项复用同一产物运行78.64秒，fresh6 全部退出0。闭合回执294a2a7e，非作者 DATA 3c59629f 核对通过；24 件相关源码、8 公共控制、环境6字段与同一 binary SHA9f1fcdea 在新增三项结束后及相关三项前后保持，未补造新增三项之前 binary 身份。文档检查及 git diff --check 通过，复用已通过测试，不追加 check/build/clippy/全量/release；本批只本地提交，未部署平台或远端 push/合并。
+
+并行 Zstd 单次 seal 成功组复用 Source e1ba48f5 已通过独立源码审查 c8b3b8a4；完整 fresh14 尚未运行，实际 tools/policy 未应用。历史360秒超时与有界诊断原件保留，不提高超时或跳过原校验。生产新闻组合 d9b4aabb/49518b30 已部署并核验启动及四源首轮采集；定时聚合新新闻送达仍待窗口证据，即时重大新闻仍因缺少权威强度来源禁用。Operational schema8、monitor 决策与资金持久化、真实 native/provider/layout/payment、远端长期留存及自然运行验收仍未完成。

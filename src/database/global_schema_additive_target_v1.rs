@@ -4306,3 +4306,486 @@ mod retained_genesis_input_tests {
         });
     }
 }
+
+// Ordinary fixed V1/audit material; no replay/hash/audit validity is inferred.
+// Null is an observed cell, None an unacquired cell. REAL stores returned bits.
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
+enum V1AuditInputCell { Text(String), Integer(i64), RealBits(u64), Null }
+#[cfg_attr(test, derive(Clone, Debug, PartialEq, Eq))]
+struct V1AuditInputRow { cells: [Option<V1AuditInputCell>; 13] }
+impl Default for V1AuditInputRow {
+    fn default() -> Self { Self { cells: std::array::from_fn(|_| None) } }
+}
+impl V1AuditInputRow {
+    fn text(&self, index: usize) -> StorageResult<&str> {
+        match &self.cells[index] { Some(V1AuditInputCell::Text(v)) => Ok(v),
+            _ => Err(storage_fail("additive V1/audit owned text absent")) }
+    }
+    fn integer(&self, index: usize) -> StorageResult<i64> {
+        match &self.cells[index] { Some(V1AuditInputCell::Integer(v)) => Ok(*v),
+            _ => Err(storage_fail("additive V1/audit owned integer absent")) }
+    }
+}
+#[derive(Default)]
+struct V1AuditInputReadFacts {
+    started: bool, count: Option<i64>, types_checked: bool, extent: Option<u64>,
+    charged: bool, acquired: usize, eof: bool, scopes_ended: bool, returned: Option<bool>,
+}
+struct V1AuditInputFields { rows: [Vec<V1AuditInputRow>; 5] }
+impl Default for V1AuditInputFields {
+    fn default() -> Self { Self { rows: std::array::from_fn(|_| Vec::new()) } }
+}
+#[derive(Clone, Copy)]
+enum V1AuditInputColumn { Text, NullableText, Integer, NullableInteger, Real, NullableReal }
+#[derive(Clone, Copy)]
+enum V1AuditInputQuery { Accounts, Events, Heads, Audits, Chain }
+impl V1AuditInputQuery {
+    const ALL: [Self; 5] = [Self::Accounts, Self::Events, Self::Heads, Self::Audits, Self::Chain];
+    fn slot(self) -> usize { match self { Self::Accounts => 0, Self::Events => 1, Self::Heads => 2, Self::Audits => 3, Self::Chain => 4 } }
+    fn columns(self) -> &'static [V1AuditInputColumn] {
+        use V1AuditInputColumn::*;
+        match self {
+            Self::Accounts => &[Text, Text, Text, Text],
+            Self::Events => &[Text, Integer, Text, Text, Text, Text, NullableText, NullableText, Integer, NullableInteger, NullableInteger],
+            Self::Heads => &[Text, Integer, Text, Text, Text],
+            Self::Audits => &[Integer, Text, Text, Text, Text, Text, Real, NullableReal, Integer, NullableText, Text, NullableText, Text],
+            Self::Chain => &[Integer, Text, Text],
+        }
+    }
+    fn sql(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::Accounts => (
+                "SELECT COUNT(*) FROM main.paper_ledger_account",
+                "SELECT COUNT(*) FROM main.paper_ledger_account WHERE typeof(account_id)!='text' OR typeof(epoch_id)!='text' OR typeof(manifest_hash)!='text' OR typeof(manifest_bytes)!='text'",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(epoch_id AS BLOB))+length(CAST(manifest_hash AS BLOB))+length(CAST(manifest_bytes AS BLOB))),0) FROM main.paper_ledger_account",
+                "SELECT account_id,epoch_id,manifest_hash,manifest_bytes FROM main.paper_ledger_account ORDER BY account_id",
+            ),
+            Self::Events => (
+                "SELECT COUNT(*) FROM main.paper_ledger_event",
+                "SELECT COUNT(*) FROM main.paper_ledger_event WHERE typeof(account_id)!='text' OR typeof(seq)!='integer' OR typeof(command_id)!='text' OR typeof(previous_hash)!='text' OR typeof(event_hash)!='text' OR typeof(payload)!='text' OR typeof(business_plan_id) NOT IN ('null','text') OR typeof(intent_hash) NOT IN ('null','text') OR typeof(is_terminal)!='integer' OR typeof(paper_trade_id) NOT IN ('null','integer') OR typeof(order_audit_id) NOT IN ('null','integer')",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(command_id AS BLOB))+length(CAST(previous_hash AS BLOB))+length(CAST(event_hash AS BLOB))+length(CAST(payload AS BLOB))+coalesce(length(CAST(business_plan_id AS BLOB)),0)+coalesce(length(CAST(intent_hash AS BLOB)),0)),0) FROM main.paper_ledger_event",
+                "SELECT account_id,seq,command_id,previous_hash,event_hash,payload,business_plan_id,intent_hash,is_terminal,paper_trade_id,order_audit_id FROM main.paper_ledger_event ORDER BY account_id,seq",
+            ),
+            Self::Heads => (
+                "SELECT COUNT(*) FROM main.paper_ledger_head",
+                "SELECT COUNT(*) FROM main.paper_ledger_head WHERE typeof(account_id)!='text' OR typeof(version)!='integer' OR typeof(event_hash)!='text' OR typeof(projection_bytes)!='text' OR typeof(projection_hash)!='text'",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(event_hash AS BLOB))+length(CAST(projection_bytes AS BLOB))+length(CAST(projection_hash AS BLOB))),0) FROM main.paper_ledger_head",
+                "SELECT account_id,version,event_hash,projection_bytes,projection_hash FROM main.paper_ledger_head ORDER BY account_id",
+            ),
+            Self::Audits => (
+                "SELECT COUNT(*) FROM main.order_audit",
+                "SELECT COUNT(*) FROM main.order_audit WHERE typeof(id)!='integer' OR typeof(business_order_id)!='text' OR typeof(source)!='text' OR typeof(decision_basis)!='text' OR typeof(side)!='text' OR typeof(code)!='text' OR typeof(requested_price)!='real' OR typeof(execution_price) NOT IN ('null','real') OR typeof(quantity)!='integer' OR typeof(quote_observed_at) NOT IN ('null','text') OR typeof(outcome)!='text' OR typeof(failure_reason) NOT IN ('null','text') OR typeof(created_at)!='text'",
+                "SELECT coalesce(sum(length(CAST(business_order_id AS BLOB))+length(CAST(source AS BLOB))+length(CAST(decision_basis AS BLOB))+length(CAST(side AS BLOB))+length(CAST(code AS BLOB))+coalesce(length(CAST(quote_observed_at AS BLOB)),0)+length(CAST(outcome AS BLOB))+coalesce(length(CAST(failure_reason AS BLOB)),0)+length(CAST(created_at AS BLOB))),0) FROM main.order_audit",
+                "SELECT id,business_order_id,source,decision_basis,side,code,requested_price,execution_price,quantity,quote_observed_at,outcome,failure_reason,created_at FROM main.order_audit ORDER BY id",
+            ),
+            Self::Chain => (
+                "SELECT COUNT(*) FROM main.order_audit_chain",
+                "SELECT COUNT(*) FROM main.order_audit_chain WHERE typeof(order_audit_id)!='integer' OR typeof(previous_hash)!='text' OR typeof(record_hash)!='text'",
+                "SELECT coalesce(sum(length(CAST(previous_hash AS BLOB))+length(CAST(record_hash AS BLOB))),0) FROM main.order_audit_chain",
+                "SELECT order_audit_id,previous_hash,record_hash FROM main.order_audit_chain ORDER BY order_audit_id",
+            ),
+        }
+    }
+}
+#[derive(PartialEq, Eq)]
+enum V1AuditInputPhase { Fresh, ReaderChecked, RowsReturned, InputsChecked, Complete, Refused }
+struct V1AuditInputsFrame {
+    genesis: GenesisFieldsFrame, phase: V1AuditInputPhase, fields: V1AuditInputFields,
+    reads: [V1AuditInputReadFacts; 5], returns: [Option<StorageResult<()>>; 5],
+    rosters_returned: Option<bool>,
+}
+pub(super) struct AdditiveStorageRetainedV1AuditInputs { frame: V1AuditInputsFrame }
+pub(super) struct AdditiveStorageV1AuditInputsHeld { frame: V1AuditInputsFrame }
+impl AdditiveStorageV1AuditInputsHeld {
+    pub(super) fn first_error(&self) -> &GlobalSchemaV1Error {
+        self.frame.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap()
+    }
+}
+impl AdditiveStorageTransformed {
+    pub(super) fn into_retained_v1_audit_inputs(self)
+        -> std::result::Result<AdditiveStorageRetainedV1AuditInputs, AdditiveStorageV1AuditInputsHeld> {
+        V1AuditInputsFrame::new(self.frame).run(false)
+    }
+}
+impl AdditiveStorageRetainedV1AuditInputs {
+    pub(super) fn create_or_resume(source: rows::AdditiveRowsTargetSource)
+        -> std::result::Result<Self, AdditiveStorageV1AuditInputsHeld> {
+        let base = AdditiveStorageCopied { source, managed: None, directory: None, anchor: None, fresh: false,
+            original: None, rows: None, records: std::array::from_fn(|_| None), pending: None,
+            target: None, target_node: None, copied: None, census_files: std::array::from_fn(|_| None),
+            codec: AdditiveRecordCodecState::new(), copy_issued: false, rejected_copy_return: None,
+            copy_return_failed: false, copy_return_error: None, copy_origin_return_error: None };
+        V1AuditInputsFrame::new(TransformFrame::new(base)).run(true)
+    }
+}
+impl V1AuditInputsFrame {
+    fn new(transform: TransformFrame) -> Self {
+        Self { genesis: GenesisFieldsFrame::new(transform), phase: V1AuditInputPhase::Fresh,
+            fields: V1AuditInputFields::default(), reads: std::array::from_fn(|_| V1AuditInputReadFacts::default()),
+            returns: std::array::from_fn(|_| None), rosters_returned: None }
+    }
+    fn fail(&mut self, first: GlobalSchemaV1Error) {
+        self.genesis.fail(first); self.phase = V1AuditInputPhase::Refused;
+    }
+    fn run(mut self, cold: bool)
+        -> std::result::Result<AdditiveStorageRetainedV1AuditInputs, AdditiveStorageV1AuditInputsHeld> {
+        if !self.start(cold) || !self.finish() { return Err(AdditiveStorageV1AuditInputsHeld { frame: self }); }
+        Ok(AdditiveStorageRetainedV1AuditInputs { frame: self })
+    }
+    fn start(&mut self, cold: bool) -> bool {
+        if self.genesis.owner.fee.local.readonly.transform.first.is_some() { return false; }
+        if self.phase != V1AuditInputPhase::Fresh { self.fail(storage_fail("additive V1/audit start phase differs")); return false; }
+        if !self.genesis.start(cold) || !self.genesis.advance_reads() { self.phase = V1AuditInputPhase::Refused; return false; }
+        match self.genesis.validate_fields() {
+            Ok(()) => { self.phase = V1AuditInputPhase::ReaderChecked; true },
+            Err(first) => { self.fail(first); false },
+        }
+    }
+    fn read_fixed(&mut self, query: V1AuditInputQuery) -> StorageResult<()> {
+        if self.genesis.owner.fee.local.readonly.transform.first.is_some() { return Err(storage_fail("additive V1/audit read after first error")); }
+        if self.phase != V1AuditInputPhase::ReaderChecked || self.genesis.phase != GenesisInputPhase::InputsChecked
+            || self.genesis.relations_returned != Some(true) || !self.genesis.all_returns()
+            || self.genesis.owner.fee.local.readonly.active != Some(1) {
+            return Err(storage_fail("additive V1/audit lacks validated second reader"));
+        }
+        let Retained8Frame { transform, permit, reader, .. } = &mut self.genesis.owner.fee.local.readonly;
+        let (_, _, work, completed) = transform.base.source.retained8_parts(permit.as_ref().unwrap())?;
+        if completed != 2 { return Err(storage_fail("additive V1/audit pair count differs")); }
+        V1AuditInputReadLoan { connection: reader.as_ref().unwrap(), work,
+            rows: &mut self.fields.rows[query.slot()], facts: &mut self.reads[query.slot()] }.read(query)
+    }
+    fn advance_reads(&mut self) -> bool {
+        if self.genesis.owner.fee.local.readonly.transform.first.is_some() { return false; }
+        if self.phase != V1AuditInputPhase::ReaderChecked { self.fail(storage_fail("additive V1/audit read phase differs")); return false; }
+        for query in V1AuditInputQuery::ALL {
+            let i = query.slot();
+            if self.returns[i].is_some() || self.reads[i].started { self.fail(storage_fail("additive V1/audit query already reached")); return false; }
+            // Children already live in this owning frame; park the actual Result
+            // before inspecting it, and move only its first owned error onward.
+            self.returns[i] = Some(self.read_fixed(query));
+            if self.returns[i].as_ref().unwrap().is_err() {
+                let first = self.returns[i].take().unwrap().unwrap_err(); self.fail(first); return false;
+            }
+        }
+        self.phase = V1AuditInputPhase::RowsReturned; true
+    }
+    fn all_returns(&self) -> bool {
+        self.returns.iter().all(|r| matches!(r, Some(Ok(()))))
+            && self.reads.iter().all(|r| r.returned == Some(true) && r.eof && r.scopes_ended && r.types_checked && r.charged)
+    }
+    fn validate_fields(&mut self) -> StorageResult<()> {
+        if self.genesis.owner.fee.local.readonly.transform.first.is_some() { return Err(storage_fail("additive V1/audit validation after first error")); }
+        if self.phase != V1AuditInputPhase::RowsReturned || !self.all_returns() || self.rosters_returned.is_some() {
+            return Err(storage_fail("additive V1/audit inputs before whole returns"));
+        }
+        self.genesis.owner.fee.local.readonly.loan()?.2.metadata(1024)?;
+        let actual = v1_audit_input_rosters(&self.genesis.owner.fields.rows[0], &self.fields);
+        self.rosters_returned = Some(actual.is_ok()); actual?;
+        self.phase = V1AuditInputPhase::InputsChecked; Ok(())
+    }
+    fn close_and_tail(&mut self) -> StorageResult<()> {
+        if self.genesis.owner.fee.local.readonly.transform.first.is_some() { return Err(storage_fail("additive V1/audit close after first error")); }
+        if self.phase != V1AuditInputPhase::InputsChecked || self.rosters_returned != Some(true) || !self.all_returns() {
+            return Err(storage_fail("additive V1/audit close before inputs returned"));
+        }
+        self.genesis.close_and_tail()?; self.phase = V1AuditInputPhase::Complete; Ok(())
+    }
+    fn finish(&mut self) -> bool {
+        if self.genesis.owner.fee.local.readonly.transform.first.is_some() { return false; }
+        if !self.advance_reads() { return false; }
+        let actual = self.validate_fields().and_then(|()| self.close_and_tail());
+        match actual { Ok(()) => true, Err(first) => { self.fail(first); false } }
+    }
+}
+struct V1AuditInputReadLoan<'a> {
+    connection: &'a Connection, work: &'a mut target::TargetWork,
+    rows: &'a mut Vec<V1AuditInputRow>, facts: &'a mut V1AuditInputReadFacts,
+}
+impl V1AuditInputReadLoan<'_> {
+    fn read(mut self, query: V1AuditInputQuery) -> StorageResult<()> {
+        if let Err(first) = self.preflight(query) {
+            self.facts.scopes_ended = true; self.facts.returned = Some(false); return Err(first);
+        }
+        self.acquire(query)
+    }
+    fn preflight(&mut self, query: V1AuditInputQuery) -> StorageResult<()> {
+        if self.facts.started || !self.rows.is_empty() { return Err(storage_fail("additive V1/audit query already started")); }
+        let (count_sql, type_sql, extent_sql, fields_sql) = query.sql();
+        self.work.metadata(4096 + (count_sql.len() + type_sql.len() + extent_sql.len() + fields_sql.len()) as u64)?;
+        self.facts.started = true;
+        let count: i64 = self.connection.query_row(count_sql, [], |r| r.get(0))
+            .map_err(|e| transform_sql_error("count additive V1/audit rows", e))?;
+        self.facts.count = Some(count);
+        let count = u64::try_from(count).map_err(|_| storage_fail("additive V1/audit count overflow"))?;
+        let invalid: i64 = self.connection.query_row(type_sql, [], |r| r.get(0))
+            .map_err(|e| transform_sql_error("type additive V1/audit rows", e))?;
+        if invalid != 0 { return Err(storage_fail("additive V1/audit row types differ")); }
+        self.facts.types_checked = true;
+        let extent: i64 = self.connection.query_row(extent_sql, [], |r| r.get(0))
+            .map_err(|e| transform_sql_error("extent additive V1/audit rows", e))?;
+        let extent = u64::try_from(extent).map_err(|_| storage_fail("additive V1/audit extent overflow"))?;
+        self.facts.extent = Some(extent);
+        let slots = count.checked_mul(std::mem::size_of::<V1AuditInputRow>() as u64)
+            .ok_or_else(|| storage_fail("additive V1/audit capacity overflow"))?;
+        self.work.metadata(slots.checked_add(extent).ok_or_else(|| storage_fail("additive V1/audit capacity overflow"))?)?;
+        self.facts.charged = true; Ok(())
+    }
+    fn acquire(self, query: V1AuditInputQuery) -> StorageResult<()> {
+        let actual = (|| {
+            if !self.facts.started || !self.facts.charged || self.facts.returned.is_some() || !self.rows.is_empty() {
+                return Err(storage_fail("additive V1/audit acquire lacks fixed preflight"));
+            }
+            let count = usize::try_from(self.facts.count.unwrap()).map_err(|_| storage_fail("additive V1/audit count overflow"))?;
+            let mut remaining = self.facts.extent.unwrap();
+            self.rows.try_reserve_exact(count).map_err(|_| storage_fail("additive V1/audit row allocation failed"))?;
+            let mut statement = self.connection.prepare(query.sql().3).map_err(|e| transform_sql_error("prepare additive V1/audit rows", e))?;
+            let mut rows = statement.query([]).map_err(|e| transform_sql_error("query additive V1/audit rows", e))?;
+            while let Some(row) = rows.next().map_err(|e| transform_sql_error("step additive V1/audit rows", e))? {
+                if self.rows.len() == count { return Err(storage_fail("additive V1/audit extra row")); }
+                self.rows.push(V1AuditInputRow::default()); self.facts.acquired = self.rows.len();
+                let slot = self.rows.last_mut().unwrap();
+                for (index, column) in query.columns().iter().enumerate() {
+                    // A successful actual field return enters its slot immediately.
+                    slot.cells[index] = Some(v1_audit_input_cell(row, index, *column, &mut remaining)?);
+                }
+            }
+            self.facts.eof = true;
+            if self.rows.len() != count || remaining != 0 { return Err(storage_fail("additive V1/audit count/extent changed")); }
+            Ok(())
+        })();
+        // Both lexical driver scopes ended, even on Err; ignored Drop results
+        // remain ignored, independently of the actual owning whole return.
+        self.facts.scopes_ended = true; self.facts.returned = Some(actual.is_ok()); actual
+    }
+}
+fn v1_audit_input_cell(row: &rusqlite::Row<'_>, index: usize, column: V1AuditInputColumn, remaining: &mut u64)
+    -> StorageResult<V1AuditInputCell> {
+    use rusqlite::types::ValueRef;
+    use V1AuditInputColumn::*;
+    let raw = row.get_ref(index).map_err(|e| transform_sql_error("read additive V1/audit field", e))?;
+    match (column, raw) {
+        (NullableText | NullableInteger | NullableReal, ValueRef::Null) => Ok(V1AuditInputCell::Null),
+        (Text | NullableText, ValueRef::Text(_)) => owner_linkage_text(row, index, remaining).map(V1AuditInputCell::Text),
+        (Integer | NullableInteger, ValueRef::Integer(v)) => Ok(V1AuditInputCell::Integer(v)),
+        (Real | NullableReal, ValueRef::Real(v)) => Ok(V1AuditInputCell::RealBits(v.to_bits())),
+        _ => Err(storage_fail("additive V1/audit field type changed")),
+    }
+}
+fn v1_audit_input_rosters(old: &[OwnerLinkageRow], fields: &V1AuditInputFields) -> StorageResult<()> {
+    let [accounts, events, heads, audits, chain] = &fields.rows;
+    for (slot, query) in V1AuditInputQuery::ALL.iter().enumerate() {
+        if fields.rows[slot].iter().any(|r| r.cells[..query.columns().len()].iter().any(Option::is_none)) {
+            return Err(storage_fail("additive V1/audit unacquired field"));
+        }
+    }
+    if accounts.windows(2).any(|w| w[0].text(0).unwrap() >= w[1].text(0).unwrap())
+        || accounts.len() != old.len() || accounts.iter().zip(old).any(|(a, b)|
+            a.text(0).unwrap() != b.account_id.as_deref().unwrap()
+            || a.text(1).unwrap() != b.epoch_id.as_deref().unwrap()
+            || a.text(2).unwrap() != b.manifest_hash.as_deref().unwrap()) {
+        return Err(storage_fail("additive V1/audit account roster differs"));
+    }
+    if events.windows(2).any(|w| (w[0].text(0).unwrap(), w[0].integer(1).unwrap())
+        >= (w[1].text(0).unwrap(), w[1].integer(1).unwrap())) {
+        return Err(storage_fail("additive V1/audit duplicate or unordered event key"));
+    }
+    if heads.windows(2).any(|w| w[0].text(0).unwrap() >= w[1].text(0).unwrap())
+        || heads.len() != accounts.len() || heads.iter().zip(accounts).any(|(h, a)| h.text(0).unwrap() != a.text(0).unwrap())
+        || events.iter().any(|e| accounts.binary_search_by(|a| a.text(0).unwrap().cmp(e.text(0).unwrap())).is_err())
+        || accounts.iter().any(|a| !events.iter().any(|e| e.text(0).unwrap() == a.text(0).unwrap())) {
+        return Err(storage_fail("additive V1/audit event/head roster differs"));
+    }
+    if audits.windows(2).any(|w| w[0].integer(0).unwrap() >= w[1].integer(0).unwrap())
+        || chain.windows(2).any(|w| w[0].integer(0).unwrap() >= w[1].integer(0).unwrap())
+        || audits.len() != chain.len() || audits.iter().zip(chain).any(|(a, c)| a.integer(0).unwrap() != c.integer(0).unwrap()) {
+        return Err(storage_fail("additive V1/audit id roster differs"));
+    }
+    // These are raw field associations only: no JSON/hash, economic replay,
+    // audit-chain validation, verified snapshot or layout/provider is issued.
+    Ok(())
+}
+
+#[cfg(test)]
+mod retained_v1_audit_input_tests {
+    use super::*;
+    fn transformed(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> AdditiveStorageTransformed {
+        let copied = match AdditiveStorageCopied::create(original.into_additive_target_source().unwrap()) {
+            Ok(owner) => owner, Err(held) => panic!("V1/audit real Copied: {}", held.first_error()),
+        };
+        match copied.into_transformed() { Ok(owner) => owner, Err(held) => panic!("V1/audit real WAL: {}", held.first_error()) }
+    }
+    fn complete(f: &mut V1AuditInputsFrame) {
+        assert!(f.phase == V1AuditInputPhase::Complete && f.genesis.phase == GenesisInputPhase::Complete);
+        assert!(f.all_returns() && f.rosters_returned == Some(true));
+        assert!(f.reads.iter().all(|r| r.started && r.charged && r.eof && r.scopes_ended && r.returned == Some(true)));
+        assert!(f.fields.rows.iter().all(|r| !r.is_empty()));
+        assert!(f.fields.rows[1].len() > f.fields.rows[0].len()); // Actual V1 multi-event rows, separate from Genesis.
+        assert!(f.fields.rows[1].iter().any(|r| matches!(&r.cells[6], Some(V1AuditInputCell::Null))));
+        assert!(f.fields.rows[1].iter().any(|r| matches!(&r.cells[6], Some(V1AuditInputCell::Text(_)))));
+        assert!(matches!(&f.fields.rows[3][0].cells[6], Some(V1AuditInputCell::RealBits(v)) if *v == 10.0_f64.to_bits()));
+        assert!(matches!(&f.fields.rows[3][0].cells[7], Some(V1AuditInputCell::RealBits(v)) if *v == 10.0_f64.to_bits()));
+        assert!(f.genesis.owner.fee.local.readonly.reader.is_none() && f.genesis.owner.fee.local.readonly.active.is_none());
+        assert!(f.genesis.owner.fee.local.readonly.facts.iter().all(|r| r.closed && r.original_tail_validated));
+        assert_eq!(f.genesis.owner.fee.local.readonly.loan().unwrap().3, 2);
+    }
+    #[test]
+    fn task6_retained_v1_audit_input_nonempty_same_reader_and_cold() {
+        super::super::tests::task6_with_cold_rows_backup_fixture_for_test(|original| {
+            let owner = transformed(original); let fd = owner.frame.base.target().unwrap().as_raw_fd();
+            let mut retained = match owner.into_retained_v1_audit_inputs() {
+                Ok(owner) => owner, Err(held) => panic!("V1/audit warm: {}", held.first_error()),
+            };
+            complete(&mut retained.frame);
+            let base = &retained.frame.genesis.owner.fee.local.readonly.transform.base;
+            assert_eq!(base.target().unwrap().as_raw_fd(), fd);
+            let saved = (base.target_node.unwrap(), base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>(),
+                retained.frame.fields.rows.clone()); // Owned test snapshot only, never a cap/payment.
+            drop(retained); saved
+        }, |(node, records, fields), original| {
+            let mut retained = match AdditiveStorageRetainedV1AuditInputs::create_or_resume(original.into_additive_target_source().unwrap()) {
+                Ok(owner) => owner, Err(held) => panic!("V1/audit cold6: {}", held.first_error()),
+            };
+            complete(&mut retained.frame); assert_eq!(retained.frame.fields.rows, fields);
+            assert!(retained.frame.genesis.owner.fee.local.readonly.transform.begin_return.is_none());
+            let base = &retained.frame.genesis.owner.fee.local.readonly.transform.base;
+            assert_eq!(base.target_node, Some(node));
+            assert_eq!(base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>(), records); drop(retained);
+        });
+    }
+    fn gate_connection() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes);
+            CREATE TABLE paper_ledger_event(account_id,seq,command_id,previous_hash,event_hash,payload,business_plan_id,intent_hash,is_terminal,paper_trade_id,order_audit_id);
+            CREATE TABLE paper_ledger_head(account_id,version,event_hash,projection_bytes,projection_hash);
+            CREATE TABLE order_audit(id,business_order_id,source,decision_basis,side,code,requested_price,execution_price,quantity,quote_observed_at,outcome,failure_reason,created_at);
+            CREATE TABLE order_audit_chain(order_audit_id,previous_hash,record_hash);
+            INSERT INTO paper_ledger_account VALUES('a','epoch','manifest','{}');
+            INSERT INTO paper_ledger_event VALUES('a',1,'seed','previous','event1','{}',NULL,NULL,0,NULL,NULL),
+                ('a',2,'order','event1','event2','{}','plan','intent',1,1,1);
+            INSERT INTO paper_ledger_head VALUES('a',2,'event2','{}','projection');
+            INSERT INTO order_audit VALUES(1,'order','source','basis','buy','code',10.0,10.0,100,NULL,'Filled',NULL,'time');
+            INSERT INTO order_audit_chain VALUES(1,'previous','record');").unwrap(); c
+    }
+    fn gate_roster() -> Vec<OwnerLinkageRow> {
+        vec![OwnerLinkageRow { account_id: Some("a".into()), epoch_id: Some("epoch".into()), manifest_hash: Some("manifest".into()), ..OwnerLinkageRow::default() }]
+    }
+    fn read_gate(c: &Connection, work: &mut target::TargetWork, fields: &mut V1AuditInputFields, facts: &mut [V1AuditInputReadFacts; 5]) -> StorageResult<()> {
+        for query in V1AuditInputQuery::ALL {
+            V1AuditInputReadLoan { connection: c, work: &mut *work, rows: &mut fields.rows[query.slot()], facts: &mut facts[query.slot()] }.read(query)?;
+        }
+        work.metadata(1024)?; v1_audit_input_rosters(&gate_roster(), fields)
+    }
+    #[test]
+    fn task6_retained_v1_audit_input_typed_nullable_extent_and_drift() {
+        // These memory databases test fixed SQL cells only, not retained issuer/replay.
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut source = original.into_additive_target_source().unwrap();
+            for case in ["plain", "null_real", "raw_gap", "type", "nullable_type", "real_type", "utf8", "missing", "foreign", "duplicate", "chain"] {
+                let c = gate_connection(); c.execute_batch(match case {
+                    "null_real" => "UPDATE order_audit SET execution_price=NULL;",
+                    "raw_gap" => "UPDATE paper_ledger_event SET seq=5 WHERE seq=2;",
+                    "type" => "UPDATE paper_ledger_account SET manifest_bytes=X'0102';",
+                    "nullable_type" => "UPDATE paper_ledger_event SET business_plan_id=7 WHERE seq=2;",
+                    "real_type" => "UPDATE order_audit SET requested_price=X'01';",
+                    "utf8" => "UPDATE paper_ledger_event SET command_id=CAST(X'ff' AS TEXT) WHERE seq=1;",
+                    "missing" => "DELETE FROM paper_ledger_head;",
+                    "foreign" => "UPDATE paper_ledger_event SET account_id='foreign';",
+                    "duplicate" => "INSERT INTO paper_ledger_event SELECT * FROM paper_ledger_event WHERE seq=1;",
+                    "chain" => "UPDATE order_audit_chain SET order_audit_id=2;", _ => "",
+                }).unwrap();
+                let mut fields = V1AuditInputFields::default();
+                let mut facts: [V1AuditInputReadFacts; 5] = std::array::from_fn(|_| V1AuditInputReadFacts::default());
+                let actual = read_gate(&c, source.storage_parts().unwrap().2, &mut fields, &mut facts);
+                if matches!(case, "plain" | "null_real" | "raw_gap") {
+                    actual.unwrap(); assert!(facts.iter().all(|r| r.eof && r.scopes_ended && r.returned == Some(true)));
+                    assert_eq!(fields.rows[1].len(), 2); // Does not validate the economic/event chain.
+                    if case == "null_real" { assert!(matches!(&fields.rows[3][0].cells[7], Some(V1AuditInputCell::Null))); }
+                    else { assert!(matches!(&fields.rows[3][0].cells[7], Some(V1AuditInputCell::RealBits(v)) if *v == 10.0_f64.to_bits())); }
+                    if case == "raw_gap" { assert_eq!(fields.rows[1][1].integer(1).unwrap(), 5); }
+                } else {
+                    let expected = match case {
+                        "type" | "nullable_type" | "real_type" => "additive V1/audit row types differ",
+                        "utf8" => "additive owner text is not UTF8",
+                        "duplicate" => "additive V1/audit duplicate or unordered event key",
+                        "chain" => "additive V1/audit id roster differs", _ => "additive V1/audit event/head roster differs",
+                    };
+                    assert!(matches!(actual.unwrap_err(), GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == expected));
+                    if case == "type" { assert!(fields.rows[0].is_empty() && !facts[0].charged); }
+                    if case == "nullable_type" { assert!(!fields.rows[0].is_empty() && fields.rows[1].is_empty() && !facts[1].charged); }
+                    if case == "real_type" { assert!(!fields.rows[2].is_empty() && fields.rows[3].is_empty() && !facts[3].charged); }
+                    if case == "utf8" { assert!(facts[1].charged && fields.rows[1][0].cells[0].is_some() && fields.rows[1][0].cells[1].is_some() && fields.rows[1][0].cells[2].is_none()); }
+                }
+                c.close().unwrap();
+            }
+            for change in ["grow", "shrink", "extra"] {
+                let c = gate_connection(); let mut rows = Vec::new(); let mut facts = V1AuditInputReadFacts::default();
+                let mut loan = V1AuditInputReadLoan { connection: &c, work: source.storage_parts().unwrap().2, rows: &mut rows, facts: &mut facts };
+                loan.preflight(V1AuditInputQuery::Events).unwrap();
+                c.execute_batch(match change {
+                    "grow" => "UPDATE paper_ledger_event SET payload='longer' WHERE seq=2;",
+                    "shrink" => "UPDATE paper_ledger_event SET payload='' WHERE seq=2;",
+                    _ => "INSERT INTO paper_ledger_event VALUES('a',3,'extra','event2','event3','{}',NULL,NULL,0,NULL,NULL);",
+                }).unwrap();
+                let first = loan.acquire(V1AuditInputQuery::Events).unwrap_err();
+                let expected = match change { "grow" => "additive owner field extent changed", "shrink" => "additive V1/audit count/extent changed", _ => "additive V1/audit extra row" };
+                assert!(matches!(first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == expected));
+                assert!(facts.scopes_ended && facts.returned == Some(false)); assert_eq!(facts.eof, change == "shrink");
+                assert!(rows[0].cells[..11].iter().all(Option::is_some)); c.close().unwrap();
+            }
+            drop(source);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = V1AuditInputsFrame::new(transformed(original).frame); assert!(f.start(false)); assert!(f.advance_reads()); f.validate_fields().unwrap();
+            let file = f.genesis.owner.fee.local.readonly.transform.base.target().unwrap(); let mut byte = [0]; file.read_exact_at(&mut byte, 100).unwrap();
+            file.write_all_at(&[byte[0] ^ 1], 100).unwrap(); file.sync_all().unwrap();
+            let actual = f.close_and_tail();
+            let file = f.genesis.owner.fee.local.readonly.transform.base.target().unwrap(); file.write_all_at(&byte, 100).unwrap(); file.sync_all().unwrap(); // Cleanup only.
+            let first = actual.unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == "additive readonly retained target bytes changed"));
+            assert!(f.genesis.owner.fee.local.readonly.reader.is_none() && f.genesis.owner.fee.local.readonly.facts[1].closed && f.genesis.owner.fee.local.readonly.facts[1].original_tail_validated);
+            f.fail(first); let primary = f.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error;
+            let used = f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used();
+            assert!(!f.finish() && f.phase == V1AuditInputPhase::Refused);
+            assert_eq!(f.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error, primary);
+            assert_eq!(f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(f.fields.rows.iter().all(|r| !r.is_empty()) && f.genesis.owner.fee.local.phase != LocalCompletionPhase::Complete); drop(f);
+        });
+    }
+    #[test]
+    fn task6_retained_v1_audit_input_same_work_unknown_late_and_busy() {
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = V1AuditInputsFrame::new(transformed(original).frame); assert!(f.start(false));
+            let work = f.genesis.owner.fee.local.readonly.loan().unwrap().2;
+            let remaining = 16 * MIB - work.metadata_used(); work.metadata(remaining).unwrap();
+            assert!(!f.finish() && f.fields.rows.iter().all(Vec::is_empty) && f.reads.iter().all(|r| !r.started));
+            let primary = f.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error;
+            let used = f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error, primary);
+            assert_eq!(f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = V1AuditInputsFrame::new(transformed(original).frame); assert!(f.start(false));
+            let actual = f.read_fixed(V1AuditInputQuery::Accounts); actual.as_ref().unwrap(); let pointer = f.fields.rows[0][0].text(3).unwrap().as_ptr();
+            assert!(f.reads[0].eof && f.reads[0].scopes_ended && f.returns[0].is_none());
+            let first = f.close_and_tail().unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == "additive V1/audit close before inputs returned"));
+            f.fail(first); f.returns[0] = Some(actual); // Retain this exact already reached owning return.
+            assert_eq!(f.fields.rows[0][0].text(3).unwrap().as_ptr(), pointer);
+            assert!(matches!(f.returns[0], Some(Ok(()))) && f.reads[1..].iter().all(|r| !r.started));
+            let used = f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(!f.genesis.owner.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = V1AuditInputsFrame::new(transformed(original).frame); assert!(f.start(false)); assert!(f.advance_reads()); f.validate_fields().unwrap();
+            f.genesis.owner.fee.local.readonly.prepare_busy_vm();
+            let first = f.close_and_tail().unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSqlite { operation: "close additive readonly", source }
+                if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)));
+            f.fail(first); assert!(f.genesis.owner.fee.local.readonly.reader.is_some() && f.fields.rows.iter().all(|r| !r.is_empty()));
+            let used = f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(!f.genesis.owner.fee.local.readonly.facts[1].original_tail_validated);
+            assert!(f.genesis.owner.fee.local.readonly.finalize_busy_once()); f.genesis.owner.fee.local.readonly.cleanup_reader_once();
+            assert!(matches!(f.genesis.owner.fee.local.readonly.cleanup_close, Some(Ok(()))));
+            assert!(f.fields.rows.iter().all(|r| !r.is_empty()) && !f.genesis.owner.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+    }
+}
