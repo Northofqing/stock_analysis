@@ -3276,6 +3276,16 @@ for fd in opened:os.close(fd)
 emit({'reason':'build-finished','success':True})
 '''
 
+
+
+E8_AUX_CARGO = "\n    if name=='ring':\n        e8=[];main=out/'libring_core_0_17_14_.a';aux=out/'libring_core_0_17_14__test.a';object_path=out/'a4019cc0736b0423-constant_time_test.o'\n        main_hash=hashlib.sha256(main.read_bytes()).hexdigest();main_prefix=controls[-1]['operation_id']\n        def auxiliary_call(stage,raw):\n            directory=session/('archive-entry' if role=='AR' else 'foreign-entry');directory.mkdir(exist_ok=True)\n            entries=set(directory.iterdir());before=set((session/'foreign-native-invocations').iterdir());result=execute(raw)\n            added=set((session/'foreign-native-invocations').iterdir())-before;assert len(added)==1\n            call=added.pop();row={'stage':stage,'operation_id':call.name,'argv':raw,'status':result.returncode,\n                'child_before':len(entries),'child_after':len(set(directory.iterdir())), 'receipt_sha256':hashlib.sha256((call/'receipt.json').read_bytes()).hexdigest()}\n            e8.append(row);return row\n        env.pop('LC_ALL',None);env.pop('ZERO_AR_DATE',None);env['LC_CTYPE']='C.UTF-8';role='CC'\n        if CASE!='aux_missing_family':\n            second=out/'12detect_compiler_family.c';second.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes())\n            e=auxiliary_call('AuxE',['-E',str(second)]);h=auxiliary_call('AuxH',['-?']);v=auxiliary_call('AuxV',['--version']);second.unlink()\n            if CASE=='aux_extra_family':\n                third=out/'13detect_compiler_family.c';third.write_bytes((session/'vendor/cc/src/detect_compiler_family.c').read_bytes())\n                auxiliary_call('ThirdE',['-E',str(third)]);auxiliary_call('ThirdH',['-?']);auxiliary_call('ThirdV',['--version']);third.unlink()\n            if CASE=='aux_missing_receipt':(session/'foreign-native-invocations'/h['operation_id']/'receipt.json').unlink()\n            if CASE=='aux_stream_drift':(session/'foreign-native-invocations'/e['operation_id']/'stdout.raw').write_bytes(b'TEST_CODE Aux stream drift')\n        prefix=session/'foreign-native-invocations'/main_prefix/'receipt.json'\n        if CASE=='aux_main_index_missing':prefix.unlink()\n        if CASE=='aux_main_raw_out':\n            qp=prefix.with_name('request.json');q=json.loads(qp.read_text());q['environment_hex'][os.fsencode('OUT_DIR').hex()]=os.fsencode(str(out.parent/'TEST_CODE_wrong_main_out')).hex();qp.write_text(json.dumps(q))\n        if CASE=='aux_main_family':\n            choices=[p for p in (session/'foreign-native-invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('operation',{}).get('class')=='CompilerObjectCompile' and json.loads(p.read_text()).get('context',{}).get('manifest')==str(root)]\n            assert len(choices)==29\n            for p in choices:\n                r=json.loads(p.read_text());r['family_pre']={};p.write_text(json.dumps(r))\n        raw=[x.replace('$ROOT',str(root)) for x in E2_PREFIX_DATA['ring']]+['-o',str(object_path),'-c',str(root/'crypto/constant_time_test.c')]\n        if CASE=='aux_wrong_object':raw[-3]=str(out/'0000000000000000-constant_time_test.o')\n        if CASE=='aux_wrong_flags':raw[0]='-O3'\n        if CASE=='aux_source_pre':\n            source_aux=root/'crypto/constant_time_test.c';source_aux.chmod(0o644);source_aux.write_bytes(b'TEST_CODE Aux pre drift')\n        env['LC_ALL']='C';env.pop('LC_CTYPE',None)\n        c=auxiliary_call('C1',raw)\n        if CASE=='aux_duplicate_c1':c=auxiliary_call('DuplicateC1',raw)\n        cp=session/'foreign-native-invocations'/c['operation_id']/'receipt.json';cr=json.loads(cp.read_text())\n        env.pop('LC_ALL',None);env['LC_CTYPE']='C.UTF-8';env['ZERO_AR_DATE']='1';role='AR'\n        if cr['protocol_state']!='Completed' or cr.get('tool_result')!=0:\n            auxiliary_call('AfterC1Cut',['cqD',str(aux),str(object_path)])\n        else:\n            if CASE=='aux_existing_archive':aux.write_bytes(b'TEST_CODE unowned initial Aux archive')\n            d=auxiliary_call('AuxFirstD',['cqD',str(aux),str(object_path)])\n            if CASE in ('aux_prior_raw_out','aux_prior_receiptless'):\n                poison=auxiliary_call('RefusedPrior',['r',str(aux),str(object_path)])\n                rp=session/'foreign-native-invocations'/poison['operation_id']/'receipt.json';qp=rp.with_name('request.json')\n                if CASE=='aux_prior_receiptless':rp.unlink()\n                else:\n                    q=json.loads(qp.read_text());q['environment_hex'][os.fsencode('OUT_DIR').hex()]=os.fsencode(str(out.parent/'TEST_CODE_wrong_aux_out')).hex();qp.write_text(json.dumps(q))\n            if CASE=='aux_early_index':auxiliary_call('EarlyIndex',['s',str(aux)])\n            if CASE=='aux_early_sd':\n                env.pop('ZERO_AR_DATE',None);auxiliary_call('EarlyIndexSD',['sD',str(aux)]);env['ZERO_AR_DATE']='1'\n            if d['status']!=0:\n                fallback=['cq',str(aux),str(object_path)]\n                if CASE=='aux_duplicate_member':fallback.append(str(object_path))\n                if CASE=='aux_archive_drift':aux.write_bytes(b'TEST_CODE Aux archive drift')\n                cq=auxiliary_call('AuxFallbackCQ',fallback)\n                if cq['status']==0:auxiliary_call('AuxIndexS',['s',str(aux)])\n            else:\n                env.pop('ZERO_AR_DATE',None)\n                if CASE=='aux_deterministic_wrong_zero':env['ZERO_AR_DATE']='1'\n                auxiliary_call('AuxIndexSD',['sD',str(aux)])\n        closed=[row for row in e8 if (session/'foreign-native-invocations'/row['operation_id']/'receipt.json').exists()]\n        if any(json.loads((session/'foreign-native-invocations'/row['operation_id']/'receipt.json').read_text())['protocol_state']=='ProtocolRefused' for row in closed):\n            auxiliary_call('StickyAfterCut',['cq',str(aux),str(object_path)])\n        assert hashlib.sha256(main.read_bytes()).hexdigest()==main_hash\n        e8_control={'case':CASE,'rows':e8,'main_archive':str(main),'main_sha256':main_hash,'main_index_id':main_prefix,\n                    'main_index_sha256':hashlib.sha256(prefix.read_bytes()).hexdigest() if prefix.exists() else None,\n                    'aux_archive':str(aux),'c1_object':str(object_path)}\n        (session/'e8-control.json').write_text(json.dumps(e8_control))\n"
+
+E8_AUX_CC = "\nif '-c' in args and pathlib.Path(args[-1]).name=='constant_time_test.c':\n    source=pathlib.Path(args[-1]);output=pathlib.Path(args[args.index('-o')+1])\n    os.write(1,b'TEST_CODE Aux C stdout\\n');os.write(2,b'TEST_CODE Aux C stderr\\n');output.write_bytes(b'TEST_CODE Aux object:'+source.name.encode())\n    if case=='aux_source_post':source.chmod(0o644);source.write_bytes(b'TEST_CODE Aux post drift')\n    sys.exit(7 if case=='aux_object_nonzero' else 0)\n"
+
+E8_AUX_AR = "\nif len(args)>=2 and pathlib.Path(args[1]).name=='libring_core_0_17_14__test.a':\n    pair=tuple(map(int,env['CARGO_MAKEFLAGS'].split('--jobserver-fds=')[1].split()[0].split(',')))\n    hits=session/'archive-entry';hits.mkdir(exist_ok=True)\n    (hits/uuid.uuid4().hex).write_text(json.dumps({'argv':args,'cwd':str(pathlib.Path.cwd()),'environment':env,\n        'fds':list(pair),'inodes':[os.fstat(fd).st_ino for fd in pair],'stdin_eof':sys.stdin.buffer.read()==b''}))\n    archive=pathlib.Path(args[1]);code=0 if args[0]!='cqD' or case in ('aux_deterministic','aux_deterministic_wrong_zero') else 7 if case=='aux_partial_fallback' else 1\n    if code==0 or case=='aux_partial_fallback':archive.write_bytes((archive.read_bytes() if archive.exists() else b'')+b'TEST_CODE Aux archive:'+args[0].encode()+b'\\n')\n    os.write(1,b'TEST_CODE Aux AR stdout\\n');os.write(2,b'TEST_CODE Aux AR stderr\\n');sys.exit(code)\n"
+
+E8_AUX_COPY = "\nif CASE.startswith('aux_copy_'):\n    kind,cut,owned=CASE[len('aux_copy_'):].split('_')\n    receipts=[p for p in paths if isinstance(json.loads(p.read_text()).get('operation'),dict)]\n    selected=[p for p in receipts if json.loads(p.read_text())['operation'].get('ring_build')=='AuxiliaryConstantTimeTest'\n        and json.loads(p.read_text())['operation']['class']==('CompilerObjectCompile' if owned=='object' else 'ArchiverIndex')]\n    assert len(selected)==1;p=selected[0];r=json.loads(p.read_text());state=r['output_post' if owned=='object' else 'archive_post']\n    body=(p.parent/state['snapshot']).read_bytes();retained=hashlib.sha256(body).hexdigest();assert state['sha256']==retained\n    copy=target/'copied-Aux.bin';copy.write_bytes(body)\n    cc_path=next(p for p in (session/'invocations').glob('*/receipt.json') if json.loads(p.read_text()).get('source')==str(session/'vendor/cc/src/lib.rs'))\n    rust=json.loads(cc_path.read_text())\n    if kind=='source':next(o for o in rust['outputs'] if o['kind']=='dep-info')['dep_info']['paths'].append(str(copy))\n    elif kind=='extern':rust['externs'].append({'name':'AuxNativeCopy','path':str(copy)})\n    else:rust['declared_outputs'].append({'path':str(copy),'kind':'link'})\n    cc_path.write_text(json.dumps(rust))\n    if cut=='retained':\n        for q in (session/'foreign-native-invocations').glob('*/*.raw'):\n            if hashlib.sha256(q.read_bytes()).hexdigest()==retained:q.unlink()\n        pathlib.Path(state['path']).unlink(missing_ok=True);(p.parent/'request.json').write_bytes(b'{TEST_CODE invalid Aux request')\n    if cut=='requestonly':p.unlink()\n    (session/'e8-copy.json').write_text(json.dumps({'copy':str(copy),'sha256':retained,'operation_id':p.parent.name,\n        'cc_id':cc_path.parent.name,'cc_receipt_sha256':hashlib.sha256(cc_path.read_bytes()).hexdigest(),'kind':kind,'cut':cut,'owned':owned}))\n"
+
 class RecordingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="TEST_CODE_replay_owner_")
@@ -7628,6 +7638,340 @@ class RecordingProtocolTests(unittest.TestCase):
                 self.assertTrue(any("ForeignEOnlySourcePin" in reason or "ForeignCompileSourcePin" in reason for reason in receipt["failures"]), receipt["failures"])
                 self.assertEqual(cut["next_child_before"], cut["next_child_after"])
                 _, following = calls[cut["next_operation_id"]]; self.assertEqual((following["protocol_state"], following["tool_result"]), ("ProtocolRefused", None))
+
+    def prepare_native_e8_ring_test(self, case):
+        inventory = self.prepare_native_e6_ring_index("ring_index_normal")
+        vendor = self.root / "vendor-origin"
+        fixture = TOOL.parent.parent / "fixture-source/ring/crypto/constant_time_test.c"
+        self.assertEqual(sha(fixture), owner.RING_AUX_SOURCE_SHA256)
+        write(vendor / "ring/crypto/constant_time_test.c", fixture.read_text())
+        inventory["vendor"] = snapshot(vendor, ["dep", "libsqlite3-sys", "cc", "diesel", "rusqlite", "ring", "psm"])
+        cargo = self.root / "fake-cargo"; body = cargo.read_text()
+        old = "CASE='ring_index_normal';argv="; self.assertEqual(body.count(old), 1)
+        body = body.replace(old, "CASE=" + repr(case) + ";argv=")
+        old = E6_RING_INDEX_CARGO + "    role='CC'\n"; self.assertEqual(body.count(old), 1)
+        body = body.replace(old, E6_RING_INDEX_CARGO + E8_AUX_CARGO + "    role='CC'\n")
+        old = "emit({'reason':'build-finished','success':True})"; self.assertEqual(body.count(old), 1)
+        body = body.replace(old, E8_AUX_COPY + "\n" + old); cargo.write_text(body)
+        native = self.root / "fake-native-cc"; body = native.read_text()
+        old = "if '-c' in args:"; self.assertEqual(body.count(old), 1)
+        native.write_text(body.replace(old, E8_AUX_CC + "\n" + old))
+        ar = self.root / "fake-native-ar"; body = ar.read_text()
+        old = "name=env['CARGO_PKG_NAME']\n"; self.assertEqual(body.count(old), 1)
+        ar.write_text(body.replace(old, old + E8_AUX_AR))
+        body = self.tool.read_text()
+        if case == "aux_capture":
+            old = 'try:dest=open(call/(name+".raw"),"xb")'; self.assertEqual(body.count(old), 1)
+            body = body.replace(old, 'try:\n                if env.get("E1_CASE")=="aux_capture" and "-c" in argv and Path(argv[-1]).name=="constant_time_test.c" and name=="stderr":raise OSError("TEST_CODE Aux capture")\n                dest=open(call/(name+".raw"),"xb")')
+        if case == "aux_return_fd":
+            old = 'receipt["tool_result"] = code; receipt["failures"].extend(faults)'; self.assertEqual(body.count(old), 1)
+            body = body.replace(old, old + '\n        if env.get("E1_CASE")=="aux_return_fd" and compiling and auxiliary:os.close(fds[0])')
+        self.tool.write_text(body)
+        inventory["cargo"]["sha256"] = sha(cargo); inventory["owner_sha256"] = sha(self.tool)
+        inventory["generators"]["CC"]["sha256"] = sha(native); inventory["generators"]["AR"]["sha256"] = sha(ar)
+        self.policy.write_text(json.dumps({"schema": owner.SCHEMA, "mode": "RecordingOnly", "profile": owner.BUNDLED_PROFILE, "inventory": inventory}))
+        return inventory
+
+    def native_e8_ring_test_result(self, case):
+        inventory = self.prepare_native_e8_ring_test(case)
+        run = subprocess.run([PYTHON, "-I", str(self.tool), "record"], env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
+        self.assertEqual(run.returncode, 2, run.stdout.decode(errors="replace") + run.stderr.decode(errors="replace"))
+        record = self.record_result(run); session = Path(json.loads(run.stdout)["record_path"]).parent
+        self.assertEqual(record["cargo_exit_code"], 0, (session / "cargo.stderr.raw").read_text(errors="replace"))
+        foreign = json.loads((session / "foreign-native-record.json").read_bytes())
+        self.assertEqual(record["foreign_native_record_sha256"], sha(session / "foreign-native-record.json"))
+        self.assertEqual((foreign["stage"], foreign["native_producer_qualification"], foreign["artifact_selection"], record["selected_library"]), ("StageCIncomplete", "not_issued", "not_observed", []))
+        calls = {p.parent.name: (p.parent, json.loads(p.read_bytes())) for p in (session / "foreign-native-invocations").glob("*/receipt.json")}
+        control = json.loads((session / "e8-control.json").read_bytes())
+        return inventory, session, record, foreign, calls, control
+
+    def native_e8_ring_test_private_result(self, case):
+        from unittest import mock
+        self.assertIn(case, ("aux_source_pre", "aux_source_post"))
+        inventory = self.prepare_native_e8_ring_test(case); root = self.root / ".replay-build-records"; before = set(root.glob("pending-*"))
+        run = subprocess.run([PYTHON, "-I", str(self.tool), "record"], env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
+        self.assertEqual(run.returncode, 2, run.stderr.decode(errors="replace")); self.assertEqual(run.stdout, b"")
+        self.assertEqual(json.loads(run.stderr), {"schema": owner.SCHEMA, "state": "RecordingOnly", "reason": "Refused", "detail": "InventoryMismatch"})
+        pending = set(root.glob("pending-*")) - before; self.assertEqual(len(pending), 1); session = pending.pop()
+        self.assertFalse((session / "record.json").exists()); self.assertFalse((session / "foreign-native-record.json").exists())
+        self.assertTrue((session / "e8-control.json").is_file(), (session / "cargo.stderr.raw").read_text(errors="replace"))
+        calls = {p.parent.name: (p.parent, json.loads(p.read_bytes())) for p in (session / "foreign-native-invocations").glob("*/receipt.json")}
+        with mock.patch.object(owner, "POLICY", self.policy): negative = owner.foreign_evidence_namespace(session)
+        return session, calls, json.loads((session / "e8-control.json").read_bytes()), negative
+
+    def test_native_e8_two_ring_builds_c1_and_independent_test_archive_branches(self):
+        for case in ("aux_fallback", "aux_partial_fallback", "aux_deterministic"):
+            with self.subTest(case=case):
+                _, session, record, foreign, calls, control = self.native_e8_ring_test_result(case)
+                self.assertFalse(any(b.startswith("ForeignOperation:") for b in foreign["blockers"]), foreign["blockers"])
+                main = [r for _, r in calls.values() if r.get("operation", {}).get("class") == "CompilerObjectCompile" and r["context"]["manifest"].endswith("/ring") and "ring_build" not in r["operation"]]
+                self.assertEqual(len(main), 29); f0 = main[0]["family_pre"]
+                self.assertTrue(all(r["family_pre"] == r["family_return"] == f0 for r in main))
+                rows = control["rows"]; self.assertEqual([r["status"] for r in rows[:3]], [0, 1, 0])
+                c = next(r for r in rows if r["stage"] == "C1"); _, cr = calls[c["operation_id"]]
+                self.assertEqual((cr["protocol_state"], cr["tool_result"]), ("Completed", 0)); f1 = cr["family_pre"]
+                self.assertEqual(f1, cr["family_return"]); self.assertNotEqual(f0, f1)
+                self.assertTrue({x["operation_id"] for v in f0["evidence"].values() for x in v}.isdisjoint({x["operation_id"] for v in f1["evidence"].values() for x in v}))
+                self.assertEqual(cr["output_post"]["path"], control["c1_object"]); self.assertEqual(cr["output_return"], cr["output_post"])
+                self.assertEqual(cr["input_return"], cr["input_post"]); self.assertEqual(cr["main_archive_checkpoint_pre"], cr["main_archive_checkpoint_return"])
+                self.assertEqual(cr["main_archive_checkpoint_pre"]["operation_id"], control["main_index_id"])
+                self.assertEqual(len(cr["main_archive_checkpoint_pre"]["ledger"]["producers"]), 29)
+                ar = [r for r in rows if r["stage"].startswith("Aux") and r["stage"] not in ("AuxE", "AuxH", "AuxV")]
+                self.assertEqual([r["stage"] for r in ar], ["AuxFirstD", "AuxIndexSD"] if case == "aux_deterministic" else ["AuxFirstD", "AuxFallbackCQ", "AuxIndexS"])
+                self.assertEqual([r["status"] for r in ar], [0, 0] if case == "aux_deterministic" else [7 if case == "aux_partial_fallback" else 1, 0, 0])
+                for row in ar:
+                    call, receipt = calls[row["operation_id"]]
+                    self.assertEqual((receipt["protocol_state"], receipt["family_pre"], receipt["family_return"]), ("Completed", f1, f1))
+                    self.assertEqual(receipt["operation"]["archive"], control["aux_archive"])
+                    self.assertEqual(receipt["operation"]["members"], [control["c1_object"]])
+                    self.assertEqual(receipt["archive_member_producers_pre"][0]["operation_id"], c["operation_id"])
+                    self.assertEqual(receipt["archive_member_producers_pre"], receipt["archive_member_producers_return"])
+                    self.assertEqual(receipt["main_archive_checkpoint_pre"], cr["main_archive_checkpoint_pre"])
+                    self.assertEqual(receipt["controls_pre"], receipt["controls_post"]); self.assertEqual(receipt["controls_pre"], receipt["controls_return"])
+                    self.assertEqual(receipt["jobserver_identity"], receipt["jobserver_return"])
+                    phase_env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in receipt["environment_hex"].items()}
+                    if row["stage"] == "AuxIndexSD": self.assertNotIn("ZERO_AR_DATE", phase_env)
+                    else: self.assertEqual(phase_env["ZERO_AR_DATE"], "1")
+                    for stream in ("stdout", "stderr"): self.assertEqual(sha(call / (stream + ".raw")), receipt[stream + "_sha256"])
+                self.assertEqual(len(calls[ar[-1]["operation_id"]][1]["archive_operand_ledger_return"]["producers"]), 1)
+                if case == "aux_partial_fallback":
+                    d = calls[ar[0]["operation_id"]][1]; fallback = calls[ar[1]["operation_id"]][1]
+                    self.assertTrue(d["archive_post"]["exists"]); self.assertEqual(d["archive_post"]["sha256"], fallback["archive_pre"]["sha256"])
+                self.assertEqual(sha(Path(control["main_archive"])), control["main_sha256"])
+                psm = [r for _, r in calls.values() if r.get("role") == "ar" and r.get("context", {}).get("manifest", "").endswith("/psm")]
+                self.assertEqual(sorted(r["tool_result"] for r in psm), [0, 0, 1])
+
+    def test_native_e8_ring_c1_and_aux_history_faults_block_next_native_child(self):
+        cases = {"aux_deterministic_wrong_zero": "ForeignArchiveEnvironment", "aux_early_sd": "ForeignArchivePredecessor",
+                 "aux_missing_family": "ForeignRingFamilyReference", "aux_extra_family": "ForeignFamilyUnique",
+                 "aux_missing_receipt": "ForeignFamilyPending", "aux_stream_drift": "ForeignFamilyStream",
+                 "aux_main_family": "ForeignRingMainFamily", "aux_main_index_missing": "ForeignArchiveReceiptBinding",
+                 "aux_main_raw_out": "ForeignFamilyReceiptBinding", "aux_wrong_object": "ForeignCompileArgv",
+                 "aux_wrong_flags": "ForeignCompileArgv", "aux_duplicate_c1": "ForeignCompileOwnership",
+                 "aux_capture": "ForeignCaptureSticky", "aux_return_fd": "InvalidJobserverDescriptors",
+                 "aux_early_index": "ForeignArchivePredecessor", "aux_duplicate_member": "ForeignArchiveTemplate",
+                 "aux_archive_drift": "NativeVersionChanged", "aux_prior_raw_out": "ForeignFamilyReceiptBinding",
+                 "aux_prior_receiptless": "ForeignArchiveReceiptBinding", "aux_existing_archive": "ForeignArchiveInitial"}
+        for case, marker in cases.items():
+            with self.subTest(case=case):
+                _, session, _, foreign, calls, control = self.native_e8_ring_test_result(case)
+                refused = [(r, calls[r["operation_id"]][1]) for r in control["rows"] if r["operation_id"] in calls and calls[r["operation_id"]][1]["protocol_state"] == "ProtocolRefused"]
+                self.assertTrue(refused, control); self.assertTrue(any(marker in reason for _, r in refused for reason in r["failures"]), refused)
+                row, receipt = refused[-1]; self.assertEqual(receipt["tool_result"], None)
+                self.assertEqual(row["child_after"], row["child_before"])
+                self.assertTrue(any("ForeignOperation:" + row["operation_id"] + ":ForeignProtocolSticky" == b for b in foreign["blockers"]), foreign["blockers"])
+                self.assertEqual(sha(Path(control["main_archive"])), control["main_sha256"])
+                if case in ("aux_deterministic_wrong_zero", "aux_early_sd"):
+                    first = next(r for r in control["rows"] if r["stage"] == "AuxFirstD"); call, prior = calls[first["operation_id"]]
+                    self.assertEqual((prior["protocol_state"], prior["tool_result"]), ("Completed", 0 if case == "aux_deterministic_wrong_zero" else 1))
+                    self.assertEqual(first["child_after"], first["child_before"] + 1); self.assertEqual(sha(call / "receipt.json"), first["receipt_sha256"])
+                    denied = next(r for r in control["rows"] if r["stage"] == ("AuxIndexSD" if case == "aux_deterministic_wrong_zero" else "EarlyIndexSD"))
+                    _, refused_sd = calls[denied["operation_id"]]
+                    self.assertEqual((refused_sd["protocol_state"], refused_sd["tool_result"]), ("ProtocolRefused", None))
+                    self.assertIn(marker, refused_sd["failures"]); self.assertEqual(denied["child_before"], denied["child_after"])
+                    if case == "aux_deterministic_wrong_zero":
+                        self.assertEqual(sha(Path(control["aux_archive"])), prior["archive_post"]["sha256"])
+                        self.assertEqual(len(prior["archive_operand_ledger_return"]["producers"]), 1)
+                if case in ("aux_capture", "aux_return_fd"):
+                    c = next(r for r in control["rows"] if r["stage"] == "C1"); r = calls[c["operation_id"]][1]
+                    self.assertEqual(c["child_after"], c["child_before"] + 1); self.assertEqual(r["tool_result"], 0)
+        _, _, _, foreign, calls, control = self.native_e8_ring_test_result("aux_object_nonzero")
+        c = next(r for r in control["rows"] if r["stage"] == "C1"); receipt = calls[c["operation_id"]][1]
+        self.assertEqual((receipt["protocol_state"], receipt["tool_result"], receipt["source_semantics"]["compiler_success"]), ("Completed", 7, False))
+        following = control["rows"][-1]; self.assertEqual(following["child_before"], following["child_after"])
+        self.assertEqual((calls[following["operation_id"]][1]["protocol_state"], calls[following["operation_id"]][1]["tool_result"]), ("ProtocolRefused", None))
+        cuts = [row for row in control["rows"] if row["stage"] == "AfterC1Cut"]
+        self.assertEqual(len(cuts), 1, control)
+        cut = cuts[0]; cut_call, cut_receipt = calls[cut["operation_id"]]
+        self.assertEqual((cut_call.name, cut_receipt["operation_id"]), (cut["operation_id"], cut["operation_id"]))
+        self.assertEqual(sha(cut_call / "receipt.json"), cut["receipt_sha256"])
+        cut_request = json.loads((cut_call / "request.json").read_bytes())
+        self.assertEqual([os.fsdecode(bytes.fromhex(v)) for v in cut_request["args_hex"]], cut["argv"])
+        self.assertTrue(all(cut_receipt[k] == v for k, v in cut_request.items()), cut_receipt)
+        self.assertEqual((cut_request["role"], cut_receipt["role"], cut_receipt["protocol_state"], cut_receipt["tool_result"]),
+                         ("ar", "ar", "ProtocolRefused", None))
+        self.assertEqual(cut["child_before"], cut["child_after"])
+        self.assertIn("ForeignFamilySticky", cut_receipt["failures"])
+        self.assertIn("ForeignOperation:" + following["operation_id"] + ":ForeignProtocolSticky", foreign["blockers"])
+
+    def test_native_e8_ring_aux_owned_bytes_survive_retained_and_request_only_cuts(self):
+        for owned in ("object", "archive"):
+            for kind, cut in (("source", "current"), ("extern", "retained"), ("output", "requestonly")):
+                with self.subTest(owned=owned, kind=kind, cut=cut):
+                    _, session, record, foreign, _, _ = self.native_e8_ring_test_result("aux_copy_" + kind + "_" + cut + "_" + owned)
+                    control = json.loads((session / "e8-copy.json").read_bytes()); copy = Path(control["copy"])
+                    self.assertEqual(sha(copy), control["sha256"]); self.assertIn(control["sha256"], foreign["quarantine"]["sha256"])
+                    self.assertIn("NativeOutputRole:" + (control["cc_id"] if kind == "output" else str(copy)), record["blockers"])
+                    self.assertFalse(any(r["path"] == str(copy) for r in record["consumed_sources"]))
+                    self.assertFalse(any(control["cc_id"] in r["producers"] for r in record["extern_edges"]))
+                    self.assertFalse(any(r["producer_invocation"] == control["cc_id"] for r in record["build_script_associations"]))
+                    self.assertEqual(sha(session / "invocations" / control["cc_id"] / "receipt.json"), control["cc_receipt_sha256"])
+                    if cut == "retained": self.assertNotIn(control["sha256"], {sha(p) for p in (session / "foreign-native-invocations").glob("*/*.raw")})
+                    if cut == "requestonly": self.assertFalse((session / "foreign-native-invocations" / control["operation_id"] / "receipt.json").exists())
+        for case in ("aux_source_pre", "aux_source_post"):
+            with self.subTest(case=case):
+                session, calls, control, negative = self.native_e8_ring_test_private_result(case)
+                path = session / "vendor/ring/crypto/constant_time_test.c"; paths, _, hashes, _ = negative
+                self.assertIn(str(path), paths); self.assertIn(sha(path), hashes); self.assertIn(owner.RING_AUX_SOURCE_SHA256, hashes)
+                c = next(r for r in control["rows"] if r["stage"] == "C1"); r = calls[c["operation_id"]][1]
+                self.assertEqual(c["child_after"], c["child_before"] + (1 if case.endswith("post") else 0))
+                self.assertEqual((r["protocol_state"], r["tool_result"]), ("ProtocolRefused", 0 if case.endswith("post") else None))
+                self.assertTrue(any("ForeignInputChanged" in x or "ForeignCompileSourcePin" in x for x in r["failures"]))
+                following = control["rows"][-1]; self.assertEqual(following["child_before"], following["child_after"])
+                self.assertEqual((calls[following["operation_id"]][1]["protocol_state"], calls[following["operation_id"]][1]["tool_result"]), ("ProtocolRefused", None))
+
+
+    def test_native_compile_pin_stable_fd_read_rejects_real_changes_and_releases_fd(self):
+        """Real borrowed file reads only; no native child, receipt or qualification."""
+        import errno
+        from unittest import mock
+
+        data = b"a" * (65536 + 17)
+        expected = hashlib.sha256(data).hexdigest()
+        real_read = os.read
+        cases = ("normal", "wrong_sha", "same_bytes_new_inode", "in_place_write", "extent_grow", "symlink", "hardlink", "io_failure")
+        for case in cases:
+            with self.subTest(case=case):
+                directory = self.root / ("stable_pin_" + case); directory.mkdir()
+                path = directory / "leaf"; path.write_bytes(data)
+                replacement = directory / "replacement"
+                before = path.stat(); original = directory / "original"
+                if case == "same_bytes_new_inode": replacement.write_bytes(data)
+                if case == "symlink": path.rename(original); path.symlink_to(original)
+                if case == "hardlink": os.link(path, original)
+                descriptors = set(); blocks = []; changed = False
+
+                def read_once(fd, size):
+                    nonlocal changed
+                    descriptors.add(fd)
+                    self.assertFalse(os.get_inheritable(fd))
+                    if case == "io_failure": raise OSError(errno.EIO, "real pin read injected failure")
+                    block = real_read(fd, size); blocks.append(len(block))
+                    if block and not changed:
+                        changed = True
+                        if case == "same_bytes_new_inode":
+                            os.replace(replacement, path)
+                            self.assertNotEqual(path.stat().st_ino, before.st_ino)
+                            self.assertEqual(path.read_bytes(), data)
+                        elif case == "in_place_write":
+                            # Change already-read bytes: a digest-only read would retain the old SHA.
+                            with path.open("r+b") as writer:
+                                writer.write(b"X"); writer.flush(); os.fsync(writer.fileno())
+                            self.assertEqual(path.stat().st_ino, before.st_ino)
+                        elif case == "extent_grow":
+                            with path.open("ab") as writer:
+                                writer.write(b"X"); writer.flush(); os.fsync(writer.fileno())
+                    return block
+
+                with mock.patch.object(owner.os, "read", read_once):
+                    if case == "normal":
+                        self.assertEqual(owner.foreign_compile_leaf_hash(path, expected), expected)
+                    elif case == "io_failure":
+                        with self.assertRaises(OSError) as raised:
+                            owner.foreign_compile_leaf_hash(path, expected)
+                        self.assertEqual(raised.exception.errno, errno.EIO)
+                    else:
+                        reason = "NotRegularFile" if case == "symlink" else "ForeignCompileSourcePin"
+                        with self.assertRaisesRegex(owner.Refusal, "^" + reason + "$"):
+                            owner.foreign_compile_leaf_hash(path, "0" * 64 if case == "wrong_sha" else expected)
+                if case in ("symlink", "hardlink"):
+                    self.assertEqual(descriptors, set())
+                else:
+                    self.assertEqual(len(descriptors), 1)
+                    for fd in descriptors:
+                        with self.assertRaises(OSError) as closed:
+                            os.fstat(fd)
+                        self.assertEqual(closed.exception.errno, errno.EBADF)
+                if case == "normal": self.assertEqual(blocks, [65536, 17, 0])
+                if case == "in_place_write":
+                    self.assertEqual(blocks, [65536, 17, 0])
+                    self.assertNotEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected)
+
+
+    def test_native_e8_closed_seal_group_revalidation_and_first_fault(self):
+        from unittest import mock
+        _, session, record, foreign, calls, control = self.native_e8_ring_test_result("aux_fallback")
+        self.assertFalse(any(b.startswith("ForeignOperation:") for b in foreign["blockers"]), foreign["blockers"])
+        self.assertEqual(record["selected_library"], [])
+        spec = importlib.util.spec_from_file_location("closed_ring_fixture_owner", self.tool)
+        subject = importlib.util.module_from_spec(spec); spec.loader.exec_module(subject)
+        policy = subject.strict_json(self.policy.read_bytes())
+        build = subject.foreign_closed_ring_seal_scope
+        main = sorted((ident, call, receipt) for ident, (call, receipt) in calls.items()
+            if receipt.get("operation", {}).get("class") == "CompilerObjectCompile"
+            and receipt["context"]["manifest"].endswith("/ring") and "ring_build" not in receipt["operation"])
+        ident, call, receipt = main[0]; context = receipt["context"]
+        source = Path(receipt["operation"]["source"]); tail = Path(control["aux_archive"])
+        namespace = session / "foreign-native-invocations"
+        self.assertEqual(len(main), 29)
+        self.assertTrue(any(r.get("context", {}).get("manifest", "").endswith("/psm") for _, r in calls.values()))
+
+        def replace(path, data):
+            saved, before = path.read_bytes(), path.stat()
+            path.chmod(before.st_mode | 0o200); path.write_bytes(data)
+            def restore():
+                path.write_bytes(saved); path.chmod(before.st_mode)
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return restore
+
+        for _ in range(2):
+            with mock.patch.object(subject, "foreign_ring_families", wraps=subject.foreign_ring_families) as families:
+                resealed = subject.foreign_seal(session, policy)
+            self.assertEqual(resealed, foreign)
+            self.assertEqual(families.call_count, 1)  # Supplementary: each independent seal is still fresh.
+            self.assertEqual((resealed["stage"], resealed["native_producer_qualification"]), ("StageCIncomplete", "not_issued"))
+
+        for cut in ("source", "receipt", "stream", "tail", "alias", "new_call"):
+            with self.subTest(cut=cut):
+                restores, constructed = [], []
+                def mutate(*args, **kwargs):
+                    scope = build(*args, **kwargs); self.assertIsNotNone(scope)
+                    constructed.append(scope)
+                    if cut == "source": restores.append(replace(source, source.read_bytes() + b"\nTEST_CODE drift\n"))
+                    elif cut == "receipt":
+                        value = json.loads((call / "receipt.json").read_bytes()); value["tool_sha256"] = "0" * 64
+                        restores.append(replace(call / "receipt.json", json.dumps(value).encode()))
+                    elif cut == "stream": restores.append(replace(call / "stdout.raw", (call / "stdout.raw").read_bytes() + b"TEST_CODE drift"))
+                    elif cut == "tail": restores.append(replace(tail, tail.read_bytes() + b"TEST_CODE drift"))
+                    elif cut == "alias":
+                        path = call / "stdout.raw"; backup = self.root / "TEST_CODE_closed_seal_stream_backup"
+                        path.rename(backup); path.symlink_to(backup)
+                        def restore_alias(): path.unlink(); backup.rename(path)
+                        restores.append(restore_alias)
+                    else:
+                        pending = namespace / ("f" * 32); self.assertFalse(pending.exists()); pending.mkdir()
+                        restores.append(pending.rmdir)
+                    return scope
+                try:
+                    with mock.patch.object(subject, "foreign_closed_ring_seal_scope", side_effect=mutate):
+                        rejected = subject.foreign_seal(session, policy)
+                    self.assertEqual(len(constructed), 1)
+                    marker = "NativeVersionChanged" if cut == "tail" else "ForeignClosedSealAlias" if cut == "alias" else "ForeignClosedSealPending" if cut == "new_call" else "ForeignClosedSealGenerationChanged"
+                    self.assertIn("ForeignSeal:" + context["out_dir"] + ":" + marker, rejected["blockers"])
+                    self.assertEqual((rejected["stage"], rejected["native_producer_qualification"], rejected["artifact_selection"]),
+                                     ("StageCIncomplete", "not_issued", "not_observed"))
+                    if cut == "source": self.assertIn("ForeignOperation:" + ident + ":ForeignCompileSourcePin", rejected["blockers"])
+                    if cut == "tail": self.assertIn(str(tail), rejected["quarantine"]["paths"])
+                    if cut == "stream": self.assertIn(sha(call / "stdout.raw"), rejected["quarantine"]["sha256"])
+                    if cut == "new_call": self.assertTrue(any(b.startswith("ForeignNamespace:" + "f" * 32 + ":") for b in rejected["blockers"]))
+                finally:
+                    for restore in reversed(restores): restore()
+
+        changed = dict(receipt); changed["family_return"] = {}
+        restore = replace(call / "receipt.json", json.dumps(changed).encode())
+        try:
+            with mock.patch.object(subject, "foreign_closed_ring_seal_scope", return_value=None):
+                original_order = subject.foreign_seal(session, policy)
+            with mock.patch.object(subject, "foreign_closed_ring_seal_scope", wraps=build) as failed:
+                fallback = subject.foreign_seal(session, policy)
+            self.assertEqual(failed.call_count, 1)
+            self.assertEqual(fallback, original_order)
+            self.assertIn("ForeignOperation:" + ident + ":ForeignRingMainFamily", fallback["blockers"])
+            self.assertFalse(any("ForeignClosedSeal" in b for b in fallback["blockers"]), fallback["blockers"])
+        finally: restore()
+        self.assertEqual(subject.foreign_seal(session, policy), foreign)
+        self.assertEqual(sha(Path(control["main_archive"])), control["main_sha256"])
+        self.assertEqual(record["selected_library"], [])
 
 
 if __name__ == "__main__":
