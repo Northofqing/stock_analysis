@@ -455,3 +455,16 @@ Ring保留诊断仍在原240秒限制内超时。v5完整性复核通过，仅�
 财务目标转换首片计划发现现有exact Catalog6 reader不能直接接纳Catalog8。已收窄为真实六表捕获的目标选择器与独立六槽记录codec；真实八表target入口、typed rows/rowid/sequence比较、SQL提交、持久恢复及完整财务reader继续欠缺。计划正在修订，尚未新增目标转换源码。平台整体未完成。
 
 本检查点无远端推送、合并、生产新版本切换或历史消息重发。
+
+
+### 2026-10-05 14:10 财务首段提交与Ring失败边界
+
+财务目标选择器与借用六槽记录codec已在独立工作树完成，本地提交 `959a4c77`。首轮Root37221编译通过但三项均在共享夹具失败；新夹具首次捕获前未初始化TEMP，后续空TEMP检查使第二次PRAGMA database_list多TEMP。修补仅新增cfg(test)夹具的一行空TEMP检查，生产完整目录一致性条件保留，修补独审通过。Root12196同一lib过滤命令实际退出0，3通过、0失败（编译6m36，运行5.89s）。原失败及Source包保留，详情见独立树TASK6_SELECTOR_CODEC_HANDOFF_20261005.md与本地closed receipt。未为已通过目标例行追加check/build/full tests。
+
+新闻阶段诊断本地提交 `5e024056`，monitor目标编译通过，未执行或部署；冻结新闻重连提交365及其制品不变。14:00候选activation时间已到但未收到精确候选批准，未上线、未重发、未重启新版本；后续切换仍须符合未来生效activation和精确人工作用范围。
+
+Ring稳定FD单次读取primitive实际1完整方法通过；Root解析器漏识别Python3.14换行description的原记录保留并独立核raw纠正，未重跑。完整所有权Root59879仍失败：240.549秒，首个source/current/object子场景超时，零完整方法通过，1071有限Source/922实际应用/Tools与工具链控制前后保持。新优化没有证明解决整体超时，相关五项不运行、实际工具不应用。此轮fixture未保留，不能从旧v6栈补写本轮编译/归档阶段；并行Rust编译也不能被当作已证实的CPU原因。
+
+后续将原生记录超时限制为独立有界诊断，不阻挡可独立的新闻和财务开发。Catalog8数据投影/typed rowid、sqlite_sequence、REAL bits及双EOF比较的下一段计划已封、独审准备中；SQL持久发行/COMMIT/fsync/冷恢复与完整财务验收仍待完成。平台整体七类余项继续开放。
+
+本检查点仅本地分支提交及隔离验证；平台实际922源码、生产运行根和数据库未修改，没有远端push/合并。
