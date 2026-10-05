@@ -137,7 +137,7 @@ pub(crate) fn validate_chain_rows_with_work(audits: &[CanonicalOrderAuditRow], c
     }
     let mut previous = work.history_text(HistoryText::Audit(AuditText::Genesis))?;
     for (audit, evidence) in audits.iter().zip(chain.iter()) {
-        if evidence.order_audit_id != audit.id || evidence.previous_hash != previous {
+        if !raw_order_audit_link_matches(audit.id, evidence.order_audit_id, &evidence.previous_hash, &previous) {
             return Err(work.history_error(HistoryText::Audit(AuditText::Link(audit.id)))?);
         }
         let expected = audit_record_hash_with_work(&previous, audit, work)?;
@@ -931,4 +931,12 @@ pub(crate) fn history_audit_fixture(work: &mut FinancialWork<'_, '_>) {
         let expected_outer = crate::trading::paper_ledger::LedgerError::IntegrityFailure(expected_source.to_string());
         assert_eq!(work.source_error_to_ledger(actual_source).unwrap().to_string(), expected_outer.to_string());
     }
+}
+
+// Borrowed linkage only. Content hashing, paid diagnostics and chain validity
+// stay in the existing caller; this predicate neither allocates nor issues a guard.
+pub(crate) fn raw_order_audit_link_matches(
+    audit_id: i64, evidence_id: i64, evidence_previous: &str, expected_previous: &str,
+) -> bool {
+    evidence_id == audit_id && evidence_previous == expected_previous
 }

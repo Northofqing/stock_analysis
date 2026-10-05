@@ -4789,3 +4789,444 @@ mod retained_v1_audit_input_tests {
         });
     }
 }
+
+// Ordinary borrowed links only. The complete same owner remains retained;
+// canonical content hashes, Fact/economic replay and audit validity are not checked.
+#[derive(PartialEq, Eq)]
+enum RawV1AuditLinksPhase { Fresh, InputsChecked, AuditStarted, AuditChecked, V1Started, LinksChecked, Complete, Refused }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawV1AuditGate { Audit, V1 }
+impl RawV1AuditGate {
+    const ALL: [Self; 2] = [Self::Audit, Self::V1];
+    fn slot(self) -> usize { match self { Self::Audit => 0, Self::V1 => 1 } }
+    fn predecessor(self) -> RawV1AuditLinksPhase {
+        match self { Self::Audit => RawV1AuditLinksPhase::InputsChecked, Self::V1 => RawV1AuditLinksPhase::AuditChecked }
+    }
+    fn started(self) -> RawV1AuditLinksPhase {
+        match self { Self::Audit => RawV1AuditLinksPhase::AuditStarted, Self::V1 => RawV1AuditLinksPhase::V1Started }
+    }
+    fn checked(self) -> RawV1AuditLinksPhase {
+        match self { Self::Audit => RawV1AuditLinksPhase::AuditChecked, Self::V1 => RawV1AuditLinksPhase::LinksChecked }
+    }
+}
+#[derive(Default)]
+struct RawV1AuditGateFacts {
+    started: bool, charged: bool, callee_reached: bool, callee_returned: Option<bool>,
+    checked_rows: usize, checked_heads: usize, tail_row: Option<usize>, returned: Option<bool>,
+}
+#[derive(PartialEq, Eq)]
+enum RawV1AuditContentHashes { NotChecked }
+struct RawV1AuditLinksFrame {
+    input: V1AuditInputsFrame, phase: RawV1AuditLinksPhase,
+    gates: [RawV1AuditGateFacts; 2], returns: [Option<StorageResult<()>>; 2],
+    unaccepted_return: Option<StorageResult<()>>, content_hashes: RawV1AuditContentHashes,
+}
+pub(super) struct AdditiveStorageLocalRawV1AuditLinksChecked { frame: RawV1AuditLinksFrame }
+pub(super) struct AdditiveStorageRawV1AuditLinksHeld { frame: RawV1AuditLinksFrame }
+impl AdditiveStorageRawV1AuditLinksHeld {
+    pub(super) fn first_error(&self) -> &GlobalSchemaV1Error {
+        self.frame.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap()
+    }
+}
+impl AdditiveStorageTransformed {
+    pub(super) fn into_raw_v1_audit_links(self)
+        -> std::result::Result<AdditiveStorageLocalRawV1AuditLinksChecked, AdditiveStorageRawV1AuditLinksHeld> {
+        RawV1AuditLinksFrame::new(self.frame).run(false)
+    }
+}
+impl AdditiveStorageLocalRawV1AuditLinksChecked {
+    pub(super) fn create_or_resume(source: rows::AdditiveRowsTargetSource)
+        -> std::result::Result<Self, AdditiveStorageRawV1AuditLinksHeld> {
+        let base = AdditiveStorageCopied { source, managed: None, directory: None, anchor: None, fresh: false,
+            original: None, rows: None, records: std::array::from_fn(|_| None), pending: None,
+            target: None, target_node: None, copied: None, census_files: std::array::from_fn(|_| None),
+            codec: AdditiveRecordCodecState::new(), copy_issued: false, rejected_copy_return: None,
+            copy_return_failed: false, copy_return_error: None, copy_origin_return_error: None };
+        RawV1AuditLinksFrame::new(TransformFrame::new(base)).run(true)
+    }
+}
+impl RawV1AuditLinksFrame {
+    fn new(transform: TransformFrame) -> Self {
+        Self { input: V1AuditInputsFrame::new(transform), phase: RawV1AuditLinksPhase::Fresh,
+            gates: std::array::from_fn(|_| RawV1AuditGateFacts::default()),
+            returns: std::array::from_fn(|_| None), unaccepted_return: None,
+            content_hashes: RawV1AuditContentHashes::NotChecked }
+    }
+    fn first(&self) -> bool { self.input.genesis.owner.fee.local.readonly.transform.first.is_some() }
+    fn fail(&mut self, first: GlobalSchemaV1Error) { self.input.fail(first); self.phase = RawV1AuditLinksPhase::Refused; }
+    fn prepare(&mut self, cold: bool) -> bool {
+        if self.first() { return false; }
+        if self.phase != RawV1AuditLinksPhase::Fresh {
+            self.fail(storage_fail("additive raw links start phase differs")); return false;
+        }
+        if !self.input.start(cold) || !self.input.advance_reads() { self.phase = RawV1AuditLinksPhase::Refused; return false; }
+        match self.input.validate_fields() {
+            Ok(()) => { self.phase = RawV1AuditLinksPhase::InputsChecked; true },
+            Err(first) => { self.fail(first); false },
+        }
+    }
+    fn run(mut self, cold: bool)
+        -> std::result::Result<AdditiveStorageLocalRawV1AuditLinksChecked, AdditiveStorageRawV1AuditLinksHeld> {
+        if !self.prepare(cold) || !self.finish() { return Err(AdditiveStorageRawV1AuditLinksHeld { frame: self }); }
+        Ok(AdditiveStorageLocalRawV1AuditLinksChecked { frame: self })
+    }
+    fn begin_gate(&mut self, gate: RawV1AuditGate) -> bool {
+        if self.first() { return false; }
+        let i = gate.slot();
+        if self.phase != gate.predecessor() || self.gates[i].started || self.returns[i].is_some()
+            || self.input.phase != V1AuditInputPhase::InputsChecked || !self.input.all_returns()
+            || self.input.rosters_returned != Some(true) || self.input.genesis.owner.fee.local.readonly.active != Some(1) {
+            self.fail(storage_fail("additive raw links gate lacks actual input returns")); return false;
+        }
+        let amount = match raw_v1_audit_scan_reservation(&self.input.fields, gate) {
+            Ok(amount) => amount, Err(first) => { self.fail(first); return false; },
+        };
+        let charged = self.input.genesis.owner.fee.local.readonly.loan().and_then(|(_, _, work, _)| work.metadata(amount));
+        if let Err(first) = charged { self.fail(first); return false; }
+        self.gates[i].charged = true; self.gates[i].started = true; self.phase = gate.started(); true
+    }
+    fn evaluate_gate(&mut self, gate: RawV1AuditGate) -> Option<StorageResult<()>> {
+        let i = gate.slot();
+        if self.first() || self.phase != gate.started() || !self.gates[i].started || !self.gates[i].charged
+            || self.gates[i].callee_reached || self.gates[i].returned.is_some() || self.returns[i].is_some() { return None; }
+        self.gates[i].callee_reached = true;
+        let clear = self.input.genesis.owner.fee.local.readonly.loan().and_then(|(_, _, work, _)|
+            work.require_replay_clear().map_err(GlobalSchemaV1Error::ReplayTerminal));
+        let actual = clear.and_then(|()| match gate {
+            RawV1AuditGate::Audit => raw_audit_predecessor_links(&self.input.fields, &mut self.gates[i]),
+            RawV1AuditGate::V1 => raw_v1_event_head_links(&self.input.fields, &mut self.gates[i]),
+        });
+        self.gates[i].callee_returned = Some(actual.is_ok()); Some(actual)
+    }
+    // The actual owned callee return moves into this frame before any first-error
+    // inspection. Rejected duplicates return the SAME payload to their caller.
+    fn retain_return(&mut self, gate: RawV1AuditGate, actual: StorageResult<()>)
+        -> std::result::Result<(), StorageResult<()>> {
+        let i = gate.slot();
+        if !self.gates[i].started || !self.gates[i].charged || !self.gates[i].callee_reached
+            || self.gates[i].callee_returned != Some(actual.is_ok()) || self.gates[i].returned.is_some()
+            || self.returns[i].is_some() || !(self.phase == gate.started() || self.phase == RawV1AuditLinksPhase::Refused) {
+            return Err(actual);
+        }
+        self.returns[i] = Some(actual);
+        self.gates[i].returned = Some(self.returns[i].as_ref().unwrap().is_ok());
+        if self.first() { return Ok(()); } // Late Err stays owned; no successor or replaced first.
+        if self.gates[i].returned == Some(false) {
+            let first = self.returns[i].take().unwrap().unwrap_err(); self.fail(first);
+        } else { self.phase = gate.checked(); }
+        Ok(())
+    }
+    fn advance_links(&mut self) -> bool {
+        if self.first() { return false; }
+        for gate in RawV1AuditGate::ALL {
+            if !self.begin_gate(gate) { return false; }
+            let Some(actual) = self.evaluate_gate(gate) else {
+                self.fail(storage_fail("additive raw links result not observed")); return false;
+            };
+            if let Err(actual) = self.retain_return(gate, actual) {
+                self.unaccepted_return = Some(actual); // Whole owns even an internally inconsistent return.
+                self.fail(storage_fail("additive raw links return already retained")); return false;
+            }
+            if self.first() { return false; }
+        }
+        true
+    }
+    fn all_returns(&self) -> bool {
+        self.gates.iter().all(|f| f.started && f.charged && f.callee_reached && f.callee_returned == Some(true) && f.returned == Some(true))
+            && self.returns.iter().all(|r| matches!(r, Some(Ok(())))) && self.unaccepted_return.is_none()
+    }
+    fn close_and_tail(&mut self) -> StorageResult<()> {
+        if self.first() { return Err(storage_fail("additive raw links close after first error")); }
+        if self.phase != RawV1AuditLinksPhase::LinksChecked || !self.all_returns()
+            || self.content_hashes != RawV1AuditContentHashes::NotChecked {
+            return Err(storage_fail("additive raw links close before actual results"));
+        }
+        self.input.close_and_tail()?; self.phase = RawV1AuditLinksPhase::Complete; Ok(())
+    }
+    fn finish(&mut self) -> bool {
+        if self.first() { return false; }
+        if !self.advance_links() { return false; }
+        match self.close_and_tail() { Ok(()) => true, Err(first) => { self.fail(first); false } }
+    }
+}
+// Fixed ordinary borrowed scan work, not a serializer/SDK/payment witness.
+fn raw_v1_audit_scan_reservation(fields: &V1AuditInputFields, gate: RawV1AuditGate) -> StorageResult<u64> {
+    let slots: &[usize] = match gate { RawV1AuditGate::Audit => &[3, 4], RawV1AuditGate::V1 => &[0, 1, 2] };
+    let mut count = 0u64;
+    for &slot in slots {
+        count = count.checked_add(u64::try_from(fields.rows[slot].len()).map_err(|_| storage_fail("additive raw links count overflow"))?)
+            .ok_or_else(|| storage_fail("additive raw links count overflow"))?;
+    }
+    count.checked_mul(64).and_then(|n| n.checked_add(256)).ok_or_else(|| storage_fail("additive raw links scan overflow"))
+}
+fn raw_audit_predecessor_links(fields: &V1AuditInputFields, facts: &mut RawV1AuditGateFacts) -> StorageResult<()> {
+    let audits = &fields.rows[3]; let chain = &fields.rows[4];
+    if audits.len() != chain.len() { return Err(storage_fail("additive raw audit length differs")); }
+    let mut previous = super::super::order_audit::AUDIT_CHAIN_GENESIS;
+    for (index, (audit, evidence)) in audits.iter().zip(chain).enumerate() {
+        if !super::super::order_audit::raw_order_audit_link_matches(audit.integer(0)?, evidence.integer(0)?, evidence.text(1)?, previous) {
+            return Err(storage_fail("additive raw audit predecessor differs"));
+        }
+        previous = evidence.text(2)?; facts.checked_rows += 1; facts.tail_row = Some(index);
+    }
+    Ok(())
+}
+fn raw_v1_event_head_links(fields: &V1AuditInputFields, facts: &mut RawV1AuditGateFacts) -> StorageResult<()> {
+    let events = &fields.rows[1]; let heads = &fields.rows[2]; let mut index = 0;
+    for head in heads {
+        let account = head.text(0)?; let mut version = 0i64; let mut previous = None;
+        while index < events.len() && events[index].text(0)? == account {
+            let event = &events[index];
+            let expected = version.checked_add(1).ok_or_else(|| storage_fail("additive raw V1 sequence overflow"))?;
+            if !crate::trading::paper_ledger::raw_v1_event_link_matches(event.integer(1)?, expected, event.text(3)?, previous) {
+                return Err(storage_fail("additive raw V1 event link differs"));
+            }
+            version = expected; previous = Some(event.text(4)?);
+            facts.checked_rows += 1; facts.tail_row = Some(index); index += 1;
+        }
+        let last_hash = previous.ok_or_else(|| storage_fail("additive raw V1 head lacks events"))?;
+        if !crate::trading::paper_ledger::raw_v1_head_link_matches(head.integer(1)?, head.text(2)?, version, last_hash) {
+            return Err(storage_fail("additive raw V1 head link differs"));
+        }
+        facts.checked_heads += 1;
+    }
+    if index != events.len() { return Err(storage_fail("additive raw V1 trailing event differs")); }
+    Ok(())
+}
+
+#[cfg(test)]
+mod retained_semantic_validation_tests {
+    use super::*;
+    fn transformed(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> AdditiveStorageTransformed {
+        let copied = match AdditiveStorageCopied::create(original.into_additive_target_source().unwrap()) {
+            Ok(owner) => owner, Err(held) => panic!("raw links real Copied: {}", held.first_error()),
+        };
+        match copied.into_transformed() { Ok(owner) => owner, Err(held) => panic!("raw links real WAL: {}", held.first_error()) }
+    }
+    fn checked(f: &mut RawV1AuditLinksFrame) {
+        assert!(f.phase == RawV1AuditLinksPhase::Complete && f.all_returns());
+        assert!(f.content_hashes == RawV1AuditContentHashes::NotChecked);
+        assert!(f.input.phase == V1AuditInputPhase::Complete && f.input.genesis.phase == GenesisInputPhase::Complete);
+        assert!(f.input.all_returns() && f.input.fields.rows.iter().all(|r| !r.is_empty()));
+        assert_eq!(f.input.fields.rows[3].len(), 1); // Genuine current fixture has one audit, not two.
+        assert_eq!(f.gates[0].checked_rows, 1); assert_eq!(f.gates[0].tail_row, Some(0));
+        assert!(f.gates[1].checked_rows > f.gates[1].checked_heads && f.gates[1].checked_heads == f.input.fields.rows[2].len());
+        assert!(f.input.genesis.owner.fee.local.readonly.reader.is_none() && f.input.genesis.owner.fee.local.readonly.active.is_none());
+        assert!(f.input.genesis.owner.fee.local.readonly.facts.iter().all(|r| r.closed && r.original_tail_validated));
+        assert_eq!(f.input.genesis.owner.fee.local.readonly.loan().unwrap().3, 2);
+    }
+    #[test]
+    fn task6_retained_semantic_links_nonempty_same_owner_and_cold() {
+        super::super::tests::task6_with_cold_rows_backup_fixture_for_test(|original| {
+            let owner = transformed(original); let fd = owner.frame.base.target().unwrap().as_raw_fd();
+            let mut local = match owner.into_raw_v1_audit_links() {
+                Ok(owner) => owner, Err(held) => panic!("raw links warm: {}", held.first_error()),
+            };
+            checked(&mut local.frame);
+            let base = &local.frame.input.genesis.owner.fee.local.readonly.transform.base;
+            assert_eq!(base.target().unwrap().as_raw_fd(), fd);
+            let saved = (base.target_node.unwrap(), base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>(), local.frame.input.fields.rows.clone());
+            drop(local); saved // All old leases/owners end before a fresh genuine source is acquired.
+        }, |(node, records, fields), original| {
+            let mut local = match AdditiveStorageLocalRawV1AuditLinksChecked::create_or_resume(original.into_additive_target_source().unwrap()) {
+                Ok(owner) => owner, Err(held) => panic!("raw links cold6: {}", held.first_error()),
+            };
+            checked(&mut local.frame); assert_eq!(local.frame.input.fields.rows, fields);
+            assert!(local.frame.input.genesis.owner.fee.local.readonly.transform.begin_return.is_none());
+            let base = &local.frame.input.genesis.owner.fee.local.readonly.transform.base;
+            assert_eq!(base.target_node, Some(node));
+            assert_eq!(base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>(), records); drop(local);
+        });
+        super::super::tests::task6_with_cold_rows_backup_fixture_for_test(|original| {
+            let owner = transformed(original); let base = &owner.frame.base;
+            assert_eq!(base.records.iter().flatten().count(), 5);
+            let node = base.target_node.unwrap(); drop(owner); node
+        }, |node, original| {
+            let mut local = match AdditiveStorageLocalRawV1AuditLinksChecked::create_or_resume(original.into_additive_target_source().unwrap()) {
+                Ok(owner) => owner, Err(held) => panic!("raw links cold5: {}", held.first_error()),
+            };
+            checked(&mut local.frame); assert_eq!(local.frame.input.genesis.owner.fee.local.readonly.transform.base.target_node, Some(node));
+            assert!(local.frame.input.genesis.owner.fee.local.readonly.transform.begin_return.is_none()); drop(local);
+        });
+    }
+    fn gate_connection() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes);
+            CREATE TABLE paper_ledger_event(account_id,seq,command_id,previous_hash,event_hash,payload,business_plan_id,intent_hash,is_terminal,paper_trade_id,order_audit_id);
+            CREATE TABLE paper_ledger_head(account_id,version,event_hash,projection_bytes,projection_hash);
+            CREATE TABLE order_audit(id,business_order_id,source,decision_basis,side,code,requested_price,execution_price,quantity,quote_observed_at,outcome,failure_reason,created_at);
+            CREATE TABLE order_audit_chain(order_audit_id,previous_hash,record_hash);
+            INSERT INTO paper_ledger_account VALUES('a','epoch','manifest','{}');
+            INSERT INTO paper_ledger_event VALUES('a',1,'seed','PAPER_LEDGER_GENESIS_V1','event1','{}',NULL,NULL,0,NULL,NULL),
+                ('a',2,'order','event1','event2','{}','plan','intent',1,1,1);
+            INSERT INTO paper_ledger_head VALUES('a',2,'event2','{}','projection');
+            INSERT INTO order_audit VALUES(1,'order1','source','basis','buy','code',10.0,10.0,100,NULL,'Filled',NULL,'time'),
+                (2,'order2','source','basis','buy','code',20.0,NULL,200,NULL,'Rejected','reason','time');
+            INSERT INTO order_audit_chain VALUES(1,'BR086_ORDER_AUDIT_GENESIS_V1','record1'),(2,'record1','record2');").unwrap(); c
+    }
+    fn read_gate(c: &Connection, work: &mut target::TargetWork) -> V1AuditInputFields {
+        let mut fields = V1AuditInputFields::default();
+        let mut facts: [V1AuditInputReadFacts; 5] = std::array::from_fn(|_| V1AuditInputReadFacts::default());
+        for query in V1AuditInputQuery::ALL {
+            V1AuditInputReadLoan { connection: c, work: &mut *work, rows: &mut fields.rows[query.slot()], facts: &mut facts[query.slot()] }.read(query).unwrap();
+        }
+        let old = [OwnerLinkageRow { account_id: Some("a".into()), epoch_id: Some("epoch".into()), manifest_hash: Some("manifest".into()), ..OwnerLinkageRow::default() }];
+        work.metadata(1024).unwrap(); v1_audit_input_rosters(&old, &fields).unwrap();
+        assert!(facts.iter().all(|r| r.eof && r.scopes_ended && r.returned == Some(true))); fields
+    }
+    #[test]
+    fn task6_retained_semantic_links_exact_rejections_and_hash_not_checked() {
+        // Fixed real SQL material feeds the SAME production borrowed gates.
+        // This two-audit/empty-chain control is low permission, not an owner issuer.
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut source = original.into_additive_target_source().unwrap();
+            for case in ["plain", "first_audit", "next_audit", "seq_gap", "first_event", "next_event", "head_version", "head_hash", "changed_payload", "empty_audit"] {
+                let c = gate_connection(); c.execute_batch(match case {
+                    "first_audit" => "UPDATE order_audit_chain SET previous_hash='bad' WHERE order_audit_id=1;",
+                    "next_audit" => "UPDATE order_audit_chain SET previous_hash='bad' WHERE order_audit_id=2;",
+                    "seq_gap" => "UPDATE paper_ledger_event SET seq=5 WHERE seq=2;",
+                    "first_event" => "UPDATE paper_ledger_event SET previous_hash='bad' WHERE seq=1;",
+                    "next_event" => "UPDATE paper_ledger_event SET previous_hash='bad' WHERE seq=2;",
+                    "head_version" => "UPDATE paper_ledger_head SET version=3;",
+                    "head_hash" => "UPDATE paper_ledger_head SET event_hash='bad';",
+                    "changed_payload" => "UPDATE paper_ledger_event SET payload='not canonical JSON'; UPDATE order_audit SET decision_basis='different'; UPDATE paper_ledger_head SET projection_bytes='unchecked';",
+                    "empty_audit" => "DELETE FROM order_audit_chain; DELETE FROM order_audit;", _ => "",
+                }).unwrap();
+                let work = source.storage_parts().unwrap().2; let fields = read_gate(&c, work);
+                let mut audit = RawV1AuditGateFacts::default(); let mut v1 = RawV1AuditGateFacts::default();
+                work.metadata(raw_v1_audit_scan_reservation(&fields, RawV1AuditGate::Audit).unwrap()).unwrap();
+                let audit_return = raw_audit_predecessor_links(&fields, &mut audit);
+                let actual = match audit_return {
+                    Err(first) => Err(first), Ok(()) => {
+                        work.metadata(raw_v1_audit_scan_reservation(&fields, RawV1AuditGate::V1).unwrap()).unwrap();
+                        raw_v1_event_head_links(&fields, &mut v1)
+                    },
+                };
+                if matches!(case, "plain" | "changed_payload" | "empty_audit") {
+                    actual.unwrap(); assert_eq!(v1.checked_rows, 2); assert_eq!(v1.checked_heads, 1);
+                    if case == "empty_audit" { assert_eq!(audit.checked_rows, 0); assert!(audit.tail_row.is_none()); }
+                    else { assert_eq!(audit.checked_rows, 2); assert_eq!(audit.tail_row, Some(1)); }
+                    if case == "changed_payload" {
+                        assert_eq!(fields.rows[1][0].text(5).unwrap(), "not canonical JSON");
+                        assert_eq!(fields.rows[3][0].text(3).unwrap(), "different");
+                        assert_eq!(fields.rows[2][0].text(3).unwrap(), "unchecked");
+                    } // A real malformed payload passes LINKS only; no content-hash validation ran.
+                } else {
+                    let expected = match case {
+                        "first_audit" | "next_audit" => "additive raw audit predecessor differs",
+                        "head_version" | "head_hash" => "additive raw V1 head link differs", _ => "additive raw V1 event link differs",
+                    };
+                    assert!(matches!(actual.unwrap_err(), GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == expected));
+                    if case == "next_audit" { assert_eq!(audit.checked_rows, 1); assert_eq!(audit.tail_row, Some(0)); assert_eq!(v1.checked_rows, 0); }
+                    if case == "next_event" || case == "seq_gap" { assert_eq!(v1.checked_rows, 1); }
+                }
+                c.close().unwrap();
+            }
+            drop(source);
+        });
+        for original_drift in [false, true] {
+            super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+                let mut f = RawV1AuditLinksFrame::new(transformed(original).frame);
+                assert!(f.prepare(false) && f.advance_links());
+                let target_node = f.input.genesis.owner.fee.local.readonly.transform.base.target_node;
+                let original_path = f.input.genesis.owner.fee.local.readonly.loan().unwrap().0.with_namespace(|ns|
+                    Ok(ns.database_parent.path.join(&ns.database_leaf))).unwrap();
+                let original_file = if original_drift { Some(std::fs::OpenOptions::new().read(true).write(true).open(original_path).unwrap()) } else { None };
+                let mut byte = [0];
+                {
+                    let file = original_file.as_ref().unwrap_or_else(|| f.input.genesis.owner.fee.local.readonly.transform.base.target().unwrap());
+                    file.read_exact_at(&mut byte, 100).unwrap(); file.write_all_at(&[byte[0] ^ 1], 100).unwrap(); file.sync_all().unwrap();
+                }
+                let actual = f.close_and_tail();
+                {
+                    let file = original_file.as_ref().unwrap_or_else(|| f.input.genesis.owner.fee.local.readonly.transform.base.target().unwrap());
+                    file.write_all_at(&byte, 100).unwrap(); file.sync_all().unwrap();
+                }
+                drop(original_file); // Fixture cleanup only; no production or cfg target File clone.
+                let expected = if original_drift { "rows original main bytes changed" } else { "additive readonly retained target bytes changed" };
+                let first = actual.unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == expected));
+                f.fail(first); assert!(f.input.genesis.owner.fee.local.readonly.reader.is_none());
+                assert_eq!(f.input.genesis.owner.fee.local.readonly.transform.base.target_node, target_node);
+                assert_eq!(f.input.genesis.owner.fee.local.readonly.facts[1].original_tail_validated, !original_drift);
+                let primary = f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error;
+                let used = f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+                assert_eq!(f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+                assert_eq!(f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error, primary);
+                assert!(f.input.fields.rows.iter().all(|r| !r.is_empty()) && f.content_hashes == RawV1AuditContentHashes::NotChecked); drop(f);
+            });
+        }
+    }
+    #[test]
+    fn task6_retained_semantic_links_same_work_unknown_late_and_busy() {
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = RawV1AuditLinksFrame::new(transformed(original).frame);
+            let used = f.input.genesis.owner.fee.local.readonly.transform.base.source.storage_parts().unwrap().2.metadata_used();
+            f.fail(storage_fail("TEST_CODE first before raw links admission"));
+            let primary = f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error;
+            assert!(!f.prepare(false) && !f.finish() && !f.begin_gate(RawV1AuditGate::Audit));
+            assert!(f.input.reads.iter().all(|r| !r.started) && f.input.returns.iter().all(Option::is_none));
+            assert!(f.gates.iter().all(|g| !g.started && !g.callee_reached) && f.returns.iter().all(Option::is_none));
+            assert_eq!(f.input.genesis.owner.fee.local.readonly.transform.base.source.storage_parts().unwrap().2.metadata_used(), used);
+            assert_eq!(f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error, primary); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = RawV1AuditLinksFrame::new(transformed(original).frame); assert!(f.prepare(false));
+            let work = f.input.genesis.owner.fee.local.readonly.loan().unwrap().2;
+            let remaining = 16 * MIB - work.metadata_used(); work.metadata(remaining).unwrap();
+            assert!(!f.finish() && f.gates.iter().all(|g| !g.started && !g.charged) && f.returns.iter().all(Option::is_none));
+            assert!(matches!(f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap(),
+                GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == "target metadata work exceeded before allocation"));
+            let primary = f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error;
+            let used = f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert_eq!(f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error, primary); drop(f);
+        });
+        for late_error in [false, true] {
+            super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+                let mut f = RawV1AuditLinksFrame::new(transformed(original).frame); assert!(f.prepare(false));
+                if late_error {
+                    // Held-byte mutation exercises callee Err custody only, not a SQL/issuer witness.
+                    f.input.fields.rows[4][0].cells[1] = Some(V1AuditInputCell::Text("TEST_CODE_bad_previous".into()));
+                }
+                let pointer = f.input.fields.rows[4][0].text(2).unwrap().as_ptr();
+                assert!(f.begin_gate(RawV1AuditGate::Audit));
+                assert!(f.retain_return(RawV1AuditGate::Audit, Ok(())).is_err()); // No callee return yet.
+                let actual = f.evaluate_gate(RawV1AuditGate::Audit).unwrap();
+                assert!(f.evaluate_gate(RawV1AuditGate::Audit).is_none()); // Once reached, no second scan/debit.
+                let contradiction = if late_error { Ok(()) } else { Err(storage_fail("TEST_CODE contradictory return")) };
+                assert!(f.retain_return(RawV1AuditGate::Audit, contradiction).is_err());
+                assert_eq!(actual.is_err(), late_error); assert!(f.gates[0].returned.is_none() && f.returns[0].is_none());
+                let first = f.close_and_tail().unwrap_err();
+                assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == "additive raw links close before actual results"));
+                f.fail(first); let primary = f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error;
+                f.retain_return(RawV1AuditGate::Audit, actual).unwrap();
+                assert_eq!(f.gates[0].returned, Some(!late_error)); assert_eq!(f.returns[0].as_ref().unwrap().is_err(), late_error);
+                assert_eq!(f.input.fields.rows[4][0].text(2).unwrap().as_ptr(), pointer);
+                let duplicate = storage_fail("TEST_CODE duplicate owned return");
+                let detail_ptr = match &duplicate { GlobalSchemaV1Error::SelectionSnapshotChanged { detail } => detail.as_ptr(), _ => unreachable!() };
+                let same = f.retain_return(RawV1AuditGate::Audit, Err(duplicate)).unwrap_err();
+                assert!(matches!(&same, Err(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) if detail.as_ptr() == detail_ptr));
+                f.unaccepted_return = Some(same); // Exact refused payload remains inside the same whole.
+                let used = f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used();
+                assert!(!f.begin_gate(RawV1AuditGate::V1) && f.evaluate_gate(RawV1AuditGate::Audit).is_none() && !f.finish());
+                assert_eq!(f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+                assert_eq!(f.input.genesis.owner.fee.local.readonly.transform.first.as_ref().unwrap() as *const GlobalSchemaV1Error, primary);
+                assert!(!f.gates[1].started && !f.input.genesis.owner.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+            });
+        }
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = RawV1AuditLinksFrame::new(transformed(original).frame); assert!(f.prepare(false) && f.advance_links());
+            f.input.genesis.owner.fee.local.readonly.prepare_busy_vm();
+            let first = f.close_and_tail().unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSqlite { operation: "close additive readonly", source }
+                if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)));
+            f.fail(first); assert!(f.input.genesis.owner.fee.local.readonly.reader.is_some());
+            let used = f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.input.genesis.owner.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(!f.input.genesis.owner.fee.local.readonly.facts[1].original_tail_validated);
+            assert!(f.input.genesis.owner.fee.local.readonly.finalize_busy_once()); f.input.genesis.owner.fee.local.readonly.cleanup_reader_once();
+            assert!(matches!(f.input.genesis.owner.fee.local.readonly.cleanup_close, Some(Ok(()))));
+            assert!(f.input.fields.rows.iter().all(|r| !r.is_empty()) && f.all_returns());
+            assert!(f.phase == RawV1AuditLinksPhase::Refused && !f.input.genesis.owner.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+    }
+}

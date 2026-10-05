@@ -1046,7 +1046,7 @@ fn start_original_replay(binding: &AccountBinding, account: &AccountRow, work: &
 }
 fn validate_next_original_event(binding: &AccountBinding, cursor: &mut OriginalReplayCursor, mut row: EventRow, work: &mut FinancialWork<'_, '_>) -> fw::Result<OriginalPending> {
     cursor.version += 1;
-    if row.seq != cursor.version || row.previous_hash != cursor.previous || row.event_hash != work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Event {
+    if !raw_v1_event_link_matches(row.seq, cursor.version, &row.previous_hash, Some(&cursor.previous)) || row.event_hash != work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Event {
         account: &binding.account_id, seq: row.seq, command: &row.command_id, previous: &cursor.previous, payload: &row.payload,
     })? {
         return Err(ledger_history_error(work, LedgerHistoryText::EventChain)?);
@@ -1157,7 +1157,7 @@ fn load_inner_with_audit_guard(
 }
 
 fn compare_original_head(view: &PaperView, head: &HeadRow, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
-    if head.version != view.version || head.event_hash != view.event_hash || head.projection_hash != work.raw_hash(head.projection_bytes.as_bytes())? || !work.canonical_equal(&view.projection, head.projection_bytes.as_bytes())? {
+    if !raw_v1_head_link_matches(head.version, &head.event_hash, view.version, &view.event_hash) || head.projection_hash != work.raw_hash(head.projection_bytes.as_bytes())? || !work.canonical_equal(&view.projection, head.projection_bytes.as_bytes())? {
         return Err(ledger_history_error(work, LedgerHistoryText::HeadMismatch)?);
     }
     Ok(())
@@ -3605,4 +3605,18 @@ pub(crate) fn history_legacy_fixture<'loan, 'pool>(
     work: FinancialWork<'loan, 'pool>,
 ) -> FinancialWork<'loan, 'pool> {
     effective::history_legacy_fixture(work)
+}
+
+// No owned fields, replay, hashes or qualification are constructed here.
+// None is the actual first-event domain constant; old replay supplies its
+// existing paid cursor.previous, preserving its exact short-circuit position.
+pub(crate) fn raw_v1_event_link_matches(
+    sequence: i64, expected_sequence: i64, previous: &str, previous_event_hash: Option<&str>,
+) -> bool {
+    sequence == expected_sequence && previous == previous_event_hash.unwrap_or(GENESIS)
+}
+pub(crate) fn raw_v1_head_link_matches(
+    head_version: i64, head_hash: &str, last_version: i64, last_event_hash: &str,
+) -> bool {
+    head_version == last_version && head_hash == last_event_hash
 }

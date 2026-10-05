@@ -611,3 +611,14 @@ Root86213 限定 lib 编译 4m52，新增三项运行 78.47 秒、相关账户�
 Root57015 限定 lib 实际编译 5m28，新增三项运行53.80秒，相关 Genesis 三项复用同一产物运行78.64秒，fresh6 全部退出0。闭合回执294a2a7e，非作者 DATA 3c59629f 核对通过；24 件相关源码、8 公共控制、环境6字段与同一 binary SHA9f1fcdea 在新增三项结束后及相关三项前后保持，未补造新增三项之前 binary 身份。文档检查及 git diff --check 通过，复用已通过测试，不追加 check/build/clippy/全量/release；本批只本地提交，未部署平台或远端 push/合并。
 
 并行 Zstd 单次 seal 成功组复用 Source e1ba48f5 已通过独立源码审查 c8b3b8a4；完整 fresh14 尚未运行，实际 tools/policy 未应用。历史360秒超时与有界诊断原件保留，不提高超时或跳过原校验。生产新闻组合 d9b4aabb/49518b30 已部署并核验启动及四源首轮采集；定时聚合新新闻送达仍待窗口证据，即时重大新闻仍因缺少权威强度来源禁用。Operational schema8、monitor 决策与资金持久化、真实 native/provider/layout/payment、远端长期留存及自然运行验收仍未完成。
+
+
+### 2026-10-06 审计与 V1 账本链接局部校验完成
+
+新增同一第二只读窗口内的普通链接校验：审计首前驱/逐行前驱、每账户 V1 从 1 开始的连续序号及前驱、实际末 head.version/event_hash。原字段、唯一 Work、持有资源、实际 close 和原始库/目标库尾复验沿用原 owner。原 audit 一处、ledger 两处条件仅机械共享纯借用谓词，原付费哈希、解码、经济回放和错误短路顺序保持。
+
+Source manifest `7e552270`、独立 Source `f50bbc06`、Root own `552aae9e`；实际三文件应用 `85955512`。Root 新增 3 项定向 lib 测试通过（编译 7m13s、运行 99.21s），同一成功 harness 再跑 V1 输入相关 3 项通过（60.25s）；6 项实际闭合凭据 `078b8440`、独立 DATA `f26fb317`。验证后未追加 check/build/clippy/full/release。完整两审计行/空链控制只验证低权限固定 SQL→借用 gate，真实 warm/cold fixture 是 1 审计行和多个 V1 事件。
+
+结果仍明确 ContentHashesNotChecked：没有重算 audit/event/manifest/projection 内容哈希、完整经济/Genesis/Financial、VerifiedCatalog8 或 operational/native/provider/layout/rules/payment/funding 资格；本批没有部署平台或开启 paper。
+
+Native FIX1 Source `029799ab` 的新漂移 whole 和原 Zstd ownership whole 已闭合 PASS，后者完整执行 16 个隔离控制场景；正向协议 2 项正在运行，完整 fresh14/DATA/current APP+policy 应用仍未完成，实际 tools 尚未改。新闻已部署的 d9b 采集修复保持；新的 N01 实际评分与完整发送链正在隔离 Source 收尾，尚未实际应用或部署，不能称真实即时推送已恢复。资金只读梳理 `d31a09c3` 确认 V1 seed writer 已存在，但资金审核材料无持久 writer、V2 开账入口与正文仅 cfg(test)；普通 NotIssued 材料持久和真正批准资金 writer 是不同后继。
