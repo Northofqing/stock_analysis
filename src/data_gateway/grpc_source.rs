@@ -1112,6 +1112,7 @@ fn reason_code_static(s: &str) -> &'static str {
         "external_source_field_conflict",
         "external_response_wire_invalid",
         "external_acquisition_authority_missing",
+        "external_connection_unqualified",
         "provider_authentication_rejected",
         "provider_rate_limited",
         "provider_unavailable",
@@ -1907,26 +1908,6 @@ fn required_opening_bridge(op_name: &'static str) -> Result<Arc<GrpcSource>, Gat
     bridge_for(op_name)
 }
 
-async fn current_external_opening_capabilities(
-    source: &GrpcSource,
-) -> Result<Vec<ExternalCapability>, GatewayError> {
-    let mut guard = source.external_client.lock().await;
-    let state = guard
-        .as_mut()
-        .expect("ensure_external_connected 后必有 external client");
-    let health = state
-        .client
-        .get_external_health()
-        .await
-        .map_err(map_external_connection_error)?;
-    require_external_health_qualified(&health)?;
-    state
-        .client
-        .get_external_capabilities()
-        .await
-        .map_err(map_external_connection_error)
-}
-
 fn opening_route<T>(
     route: &'static str,
     profile: &'static str,
@@ -2212,10 +2193,9 @@ pub async fn external_static_opening_diagnostics() -> Result<OpeningDiagnosticRe
 {
     const CANARY_CODE: &str = "600396";
     let source = required_opening_bridge("SecurityMetadata")?;
-    source
+    let (_, capabilities) = source
         .ensure_external_connected(known_external_method(ExternalOperation::SecurityMetadata))
         .await?;
-    let capabilities = current_external_opening_capabilities(&source).await?;
     require_external_static_capabilities(&capabilities)?;
 
     let code = CANARY_CODE.to_owned();
@@ -2289,10 +2269,9 @@ pub async fn external_static_opening_diagnostics() -> Result<OpeningDiagnosticRe
 pub async fn external_static_opening_readiness() -> Result<OpeningReadinessReport, GatewayError> {
     const CANARY_CODE: &str = "600396";
     let source = required_opening_bridge("SecurityMetadata")?;
-    source
+    let (_, capabilities) = source
         .ensure_external_connected(known_external_method(ExternalOperation::SecurityMetadata))
         .await?;
-    let capabilities = current_external_opening_capabilities(&source).await?;
     require_external_static_capabilities(&capabilities)?;
 
     let code = CANARY_CODE.to_string();
@@ -2393,10 +2372,9 @@ pub async fn external_static_opening_readiness() -> Result<OpeningReadinessRepor
 pub async fn external_live_opening_readiness() -> Result<OpeningReadinessReport, GatewayError> {
     const CANARY_CODE: &str = "600396";
     let source = required_opening_bridge("RealtimeQuotes")?;
-    source
+    let (_, capabilities) = source
         .ensure_external_connected(known_external_method(ExternalOperation::RealtimeQuotes))
         .await?;
-    let capabilities = current_external_opening_capabilities(&source).await?;
     require_external_live_capabilities(&capabilities)?;
 
     let code = CANARY_CODE.to_string();
@@ -3143,7 +3121,10 @@ impl GrpcSource {
         parse_benchmark_query_response(&request_id, response)
     }
 
-    async fn ensure_external_connected(&self, method: ExternalMethod) -> Result<(), GatewayError> {
+    async fn ensure_external_connected(
+        &self,
+        method: ExternalMethod,
+    ) -> Result<(GrpcMarketClient, Vec<ExternalCapability>), GatewayError> {
         let _qualification = Arc::clone(&self.external_initialization)
             .acquire_owned()
             .await
@@ -3155,32 +3136,26 @@ impl GrpcSource {
                     "External initialization qualification closed",
                 )
             })?;
-        let cached = self
-            .external_client
-            .lock()
-            .await
-            .as_ref()
-            .map(|state| state.client.clone());
-        if let Some(mut client) = cached {
-            // Tonic may transparently reconnect a cached Channel. A previous
-            // capability result must not authorize a different service build.
-            let health = client
+        // Remove the cached generation before awaiting. Failure or cancellation
+        // spends this cache entry; the next acquisition makes one fresh dial
+        // and repeats every gate. Never retry this acquisition transparently.
+        let cached = self.external_client.lock().await.take();
+        if let Some(mut state) = cached {
+            let health = state
+                .client
                 .get_external_health()
                 .await
                 .map_err(map_external_connection_error)?;
             require_external_health_qualified(&health)?;
-            let capabilities = client
+            let capabilities = state
+                .client
                 .get_external_capabilities()
                 .await
                 .map_err(map_external_connection_error)?;
             require_external_capability(&capabilities, method)?;
-            self.external_client
-                .lock()
-                .await
-                .as_mut()
-                .expect("cached ExternalV1 client exists during qualification")
-                .client = client;
-            return Ok(());
+            let client = state.client.clone();
+            *self.external_client.lock().await = Some(state);
+            return Ok((client, capabilities));
         }
         let bundle = self.external_bundle.as_ref().ok_or_else(|| {
             GatewayError::classified(
@@ -3223,8 +3198,11 @@ impl GrpcSource {
             "[data_gateway] ExternalV1 已通过 health/capability gate: method={}",
             method.as_str_name()
         );
-        *self.external_client.lock().await = Some(ExternalClientState { client, prepared });
-        Ok(())
+        *self.external_client.lock().await = Some(ExternalClientState {
+            client: client.clone(),
+            prepared,
+        });
+        Ok((client, capabilities))
     }
 
     async fn query_external_op(
@@ -3248,15 +3226,7 @@ impl GrpcSource {
                     "ExternalV1 operation 或参数未在交付合同中冻结",
                 )
             })?;
-        self.ensure_external_connected(method).await?;
-        let mut client = self
-            .external_client
-            .lock()
-            .await
-            .as_ref()
-            .expect("ensure_external_connected 后必有 external client")
-            .client
-            .clone();
+        let (mut client, _) = self.ensure_external_connected(method).await?;
         client
             .query(operation, params)
             .await
@@ -3288,16 +3258,9 @@ impl GrpcSource {
                 "ExternalV1 operation 或参数未在交付合同中冻结",
             )
         })?;
-        self.ensure_external_connected(known_external_method(operation))
+        let (mut client, _) = self
+            .ensure_external_connected(known_external_method(operation))
             .await?;
-        let mut client = self
-            .external_client
-            .lock()
-            .await
-            .as_ref()
-            .expect("ensure_external_connected 后必有 external client")
-            .client
-            .clone();
         client
             .query_external_native(operation, params)
             .await
@@ -4412,6 +4375,233 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn external_cached_transport_restart_recovers_on_next_acquisition() {
+        let mut fixture = ExternalQueryWireFixture::bind_generated_routes()
+            .await
+            .unwrap();
+        let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                let source = GrpcSource::from_external_macro_bundle_for_test(
+                    fixture.bundle_path().to_path_buf(),
+                );
+                fixture.release_capabilities();
+                fixture.release();
+                source
+                    .query_external_op(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .unwrap();
+                let original = source
+                    .external_client
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .client
+                    .external_connection_identity()
+                    .unwrap();
+                fixture.restart_transport().await.unwrap();
+                let before = fixture.snapshot();
+                // The failed acquisition neither sends data nor secretly redials.
+                source
+                    .query_external_op(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(source.external_client.lock().await.is_none());
+                assert_eq!(fixture.snapshot().calls, before.calls);
+                assert_eq!(fixture.snapshot().tcp_accepts, before.tcp_accepts);
+                fixture.release_capabilities();
+                fixture.release();
+                source
+                    .query_external_op(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .unwrap();
+                let recovered = source
+                    .external_client
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .client
+                    .external_connection_identity()
+                    .unwrap();
+                assert_ne!(original.epoch, recovered.epoch);
+                let observed = fixture.snapshot();
+                assert_eq!(observed.tcp_accepts, 2);
+                assert_eq!(observed.health_calls, 2);
+                assert_eq!(observed.capabilities_calls, 2);
+                assert_eq!(observed.calls, 2);
+                assert!(observed.authorized.iter().all(|authorized| *authorized));
+            },
+        ))
+        .catch_unwind()
+        .await;
+        fixture.finish().await.unwrap();
+        match body {
+            Ok(result) => result.expect("TEST_CODE restart recovery deadline"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_cached_identity_failure_never_authorizes_a_query() {
+        let fixture = ExternalQueryWireFixture::bind_generated_routes()
+            .await
+            .unwrap();
+        let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                let source = GrpcSource::from_external_macro_bundle_for_test(
+                    fixture.bundle_path().to_path_buf(),
+                );
+                let method = known_external_method(ExternalOperation::GlobalNews);
+                fixture.release_capabilities();
+                source.ensure_external_connected(method).await.unwrap();
+                fixture.set_invalid_health_identity(true);
+                for _ in 0..2 {
+                    let error = source
+                        .query_external_op(
+                            Operation::GlobalNews,
+                            serde_json::json!({"provider":"Eastmoney","limit":20}),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.reason_code(), "external_connection_unqualified");
+                    assert!(!error.retryable());
+                    assert!(source.external_client.lock().await.is_none());
+                    assert_eq!(fixture.snapshot().calls, 0);
+                    assert_eq!(fixture.snapshot().capabilities_calls, 1);
+                }
+                fixture.set_invalid_health_identity(false);
+                fixture.release_capabilities();
+                fixture.release();
+                source
+                    .query_external_op(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(fixture.snapshot().health_calls, 4);
+                assert_eq!(fixture.snapshot().calls, 1);
+                assert_eq!(fixture.snapshot().tcp_accepts, 3);
+            },
+        ))
+        .catch_unwind()
+        .await;
+        fixture.finish().await.unwrap();
+        match body {
+            Ok(result) => result.expect("TEST_CODE identity refusal deadline"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_cached_cancelled_qualification_releases_cache_and_owner() {
+        let fixture = ExternalQueryWireFixture::bind_generated_routes()
+            .await
+            .unwrap();
+        let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                let source = GrpcSource::from_external_macro_bundle_for_test(
+                    fixture.bundle_path().to_path_buf(),
+                );
+                let method = known_external_method(ExternalOperation::GlobalNews);
+                fixture.release_capabilities();
+                source.ensure_external_connected(method).await.unwrap();
+                let cancelled = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    source.ensure_external_connected(method),
+                )
+                .await;
+                assert!(cancelled.is_err());
+                assert_eq!(fixture.snapshot().capabilities_calls, 2);
+                assert!(source.external_client.lock().await.is_none());
+                // Release both the abandoned server handler and the fresh one.
+                fixture.release_capabilities();
+                fixture.release_capabilities();
+                fixture.release();
+                source
+                    .query_external_op(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(fixture.snapshot().tcp_accepts, 2);
+                assert_eq!(fixture.snapshot().calls, 1);
+            },
+        ))
+        .catch_unwind()
+        .await;
+        fixture.finish().await.unwrap();
+        match body {
+            Ok(result) => result.expect("TEST_CODE cancellation recovery deadline"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_cached_missing_capability_does_not_reuse_previous_permission() {
+        let fixture = ExternalQueryWireFixture::bind_generated_routes()
+            .await
+            .unwrap();
+        let body = std::panic::AssertUnwindSafe(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                let source = GrpcSource::from_external_macro_bundle_for_test(
+                    fixture.bundle_path().to_path_buf(),
+                );
+                fixture.release_capabilities();
+                source
+                    .ensure_external_connected(known_external_method(ExternalOperation::GlobalNews))
+                    .await
+                    .unwrap();
+                fixture.release_capabilities();
+                let error = source
+                    .ensure_external_connected(known_external_method(
+                        ExternalOperation::SecurityMetadata,
+                    ))
+                    .await
+                    .map(|_| ())
+                    .unwrap_err();
+                assert!(!error.retryable());
+                assert!(source.external_client.lock().await.is_none());
+                assert_eq!(fixture.snapshot().calls, 0);
+                fixture.release_capabilities();
+                fixture.release();
+                source
+                    .query_external_op(
+                        Operation::GlobalNews,
+                        serde_json::json!({"provider":"Eastmoney","limit":20}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(fixture.snapshot().tcp_accepts, 2);
+                assert_eq!(fixture.snapshot().capabilities_calls, 3);
+                assert_eq!(fixture.snapshot().calls, 1);
+            },
+        ))
+        .catch_unwind()
+        .await;
+        fixture.finish().await.unwrap();
+        match body {
+            Ok(result) => result.expect("TEST_CODE missing capability deadline"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn external_cached_capabilities_refresh_updates_status_catalog() {
         let mut fixture = Some(
             ExternalQueryWireFixture::bind_catalog_lifecycle_requested_provider()
@@ -4431,6 +4621,7 @@ mod tests {
                 source
                     .ensure_external_connected(method)
                     .await
+                    .map(|_| ())
                     .expect_err("TEST_CODE first Capabilities request ID is wrong");
                 fixture.release_capabilities();
                 source.ensure_external_connected(method).await.unwrap();
@@ -4456,11 +4647,13 @@ mod tests {
                 source
                     .ensure_external_connected(method)
                     .await
+                    .map(|_| ())
                     .expect_err("TEST_CODE Capabilities refresh unavailable");
                 fixture.release_capabilities();
                 source
                     .ensure_external_connected(method)
                     .await
+                    .map(|_| ())
                     .expect_err("TEST_CODE replacement Capabilities request ID is wrong");
                 fixture.release_capabilities();
                 source.ensure_external_connected(method).await.unwrap();
@@ -6343,6 +6536,7 @@ mod tests {
             block_on(bridge.ensure_external_connected(known_external_method(
                 ExternalOperation::SecurityMetadata,
             )))
+            .map(|_| ())
             .expect_err("identity must not fall back to the local bridge contract");
         assert_eq!(error.capability(), "GrpcExternalV1");
         assert_eq!(error.reason_code(), "external_bundle_unconfigured");

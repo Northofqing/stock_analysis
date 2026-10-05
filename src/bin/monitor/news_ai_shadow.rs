@@ -334,11 +334,10 @@ async fn run_durable_recovery(status: NewsAiRuntimeStatus, limit: usize) -> usiz
                         stats.deferred += 1;
                         let result = tokio::task::spawn_blocking(move || {
                             publish_manual_review(
-                                || {
-                                    let identity = format!("news-ai-recovery:{assessment_id}:{claim_id}");
+                                &assessment_id, claim_id, reason.len(),
+                                |kind, identity, outcome, channel, rendered_len, latency_ms| {
                                     stock_analysis::event::publish_delivery(
-                                        "NewsAiRecoveryManualReview", Some(&identity),
-                                        "manual_review_required", "internal_audit", reason.len(), 0,
+                                        kind, identity, outcome, channel, rendered_len, latency_ms,
                                     )?;
                                     log::warn!("[NewsAI][BR-172] pending assessment requires manual review assessment_id={assessment_id} claim={claim_id} reason={reason}");
                                     Ok(())
@@ -375,12 +374,28 @@ async fn run_durable_recovery(status: NewsAiRuntimeStatus, limit: usize) -> usiz
     recovered_work
 }
 
-fn publish_manual_review<P, C>(publish: P, confirm: C) -> Result<(), String>
+fn publish_manual_review<P, C>(
+    assessment_id: &str,
+    claim_id: i64,
+    reason_len: usize,
+    publish: P,
+    confirm: C,
+) -> Result<(), String>
 where
-    P: FnOnce() -> Result<(), String>,
+    P: FnOnce(&str, Option<&str>, &str, &str, usize, u64) -> Result<(), String>,
     C: FnOnce() -> Result<(), String>,
 {
-    publish()?;
+    let identity = format!("news-ai-recovery:{assessment_id}:{claim_id}");
+    // This acknowledges an internal notice of blocked delivery, never a sink
+    // receipt or resolution of the assessment. Use the closed audit vocabulary.
+    publish(
+        "NewsAiRecoveryManualReview",
+        Some(&identity),
+        "Denied",
+        "internal_audit",
+        reason_len,
+        0,
+    )?;
     confirm()
 }
 
@@ -1032,7 +1047,31 @@ mod tests {
     fn br172_manual_notice_is_confirmed_only_after_publication() {
         let events = std::cell::RefCell::new(Vec::new());
         publish_manual_review(
-            || {
+            "TEST_CODE_ASSESSMENT",
+            42,
+            17,
+            |kind, identity, outcome, channel, rendered_len, latency_ms| {
+                let event = stock_analysis::event::PushDeliveryEvent::new(
+                    kind.to_owned(),
+                    identity.map(str::to_owned),
+                    outcome.to_owned(),
+                    channel.to_owned(),
+                    rendered_len,
+                    latency_ms,
+                );
+                let envelope = stock_analysis::event::EventEnvelope::from_event(
+                    &event,
+                    "TEST_CODE_NOTICE".to_owned(),
+                    "TEST_CODE_TRACE".to_owned(),
+                    chrono::Local::now(),
+                )
+                .map_err(|error| error.to_string())?;
+                assert_eq!(identity, Some("news-ai-recovery:TEST_CODE_ASSESSMENT:42"));
+                assert_eq!(envelope.payload["kind"], "NewsAiRecoveryManualReview");
+                assert_eq!(envelope.payload["outcome"], "Denied");
+                assert_eq!(envelope.payload["channel"], "internal_audit");
+                assert_eq!(envelope.payload["retryable"], false);
+                assert_eq!(envelope.payload["rendered_len"], 17);
                 events.borrow_mut().push("publish");
                 Ok(())
             },
@@ -1045,13 +1084,19 @@ mod tests {
         assert_eq!(*events.borrow(), vec!["publish", "confirm"]);
 
         assert!(publish_manual_review(
-            || Err("TEST_CODE_AUDIT_UNAVAILABLE".to_owned()),
+            "TEST_CODE_ASSESSMENT",
+            42,
+            17,
+            |_, _, _, _, _, _| Err("TEST_CODE_AUDIT_UNAVAILABLE".to_owned()),
             || panic!("failed publication must not be acknowledged"),
         )
         .is_err());
         let publications = std::cell::Cell::new(0);
         assert!(publish_manual_review(
-            || {
+            "TEST_CODE_ASSESSMENT",
+            42,
+            17,
+            |_, _, _, _, _, _| {
                 publications.set(publications.get() + 1);
                 Ok(())
             },
@@ -1059,7 +1104,10 @@ mod tests {
         )
         .is_err());
         publish_manual_review(
-            || {
+            "TEST_CODE_ASSESSMENT",
+            42,
+            17,
+            |_, _, _, _, _, _| {
                 publications.set(publications.get() + 1);
                 Ok(())
             },
