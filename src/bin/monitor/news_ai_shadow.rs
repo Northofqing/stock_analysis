@@ -206,6 +206,7 @@ impl NewsAiRuntimeStatus {
 pub(super) struct NewsAiProducer {
     analyzer: Option<NewsAIAnalyzer>,
     test_process_isolation: bool,
+    critical_sender: Option<stock_analysis::monitor::news_ai::CriticalCompletionSender>,
 }
 
 impl NewsAiProducer {
@@ -221,7 +222,14 @@ impl NewsAiProducer {
         Self {
             analyzer,
             test_process_isolation,
+            critical_sender: None,
         }
+    }
+
+    pub(super) fn with_critical_completion(mut self,
+        sender: stock_analysis::monitor::news_ai::CriticalCompletionSender) -> Self {
+        self.critical_sender = Some(sender);
+        self
     }
 
     fn runtime_status(&self) -> NewsAiRuntimeStatus {
@@ -286,13 +294,14 @@ impl NewsAiProducer {
             .map(<[AdmittedGlobalNewsBatch]>::to_vec);
         let analyzer = self.analyzer.clone();
         let recovery_status = status.clone();
+        let critical_sender = self.critical_sender.clone();
         if schedule_news_ai_tick(
             &NEWS_AI_BATCH_PERMIT,
             selection_enabled,
             session,
             batches,
             move |limit| run_durable_recovery(recovery_status, limit),
-            move |batches, used| run_same_tick_batches(batches, analyzer, status, used),
+            move |batches, used| run_same_tick_batches(batches, analyzer, status, used, critical_sender),
         )
         .is_none()
         {
@@ -404,6 +413,7 @@ async fn run_same_tick_batches(
     analyzer: Option<NewsAIAnalyzer>,
     status: NewsAiRuntimeStatus,
     recovered_work: usize,
+    critical_sender: Option<stock_analysis::monitor::news_ai::CriticalCompletionSender>,
 ) {
     let mut stats = NewsAiRunStats::default();
     let Some(profile) = analyzer
@@ -424,7 +434,15 @@ async fn run_same_tick_batches(
     );
     while let Some(index) = budget.next_index() {
         let candidate = &candidates[index];
-        let did_work = match assess_candidate(analyzer.as_ref(), &status, candidate).await {
+        let designated = AdmittedNewsFact::from_admitted_global(&candidate.batch, candidate.record_index, &candidate.target_code)
+            .ok().and_then(|fact| stock_analysis::monitor::news_ai::canonical_critical_target(&fact))
+            .as_deref() == Some(candidate.target_code.as_str());
+        let outcome = if designated && critical_sender.is_some() {
+            assess_critical_candidate(analyzer.as_ref(), &status, candidate, critical_sender.as_ref().expect("checked sender")).await
+        } else {
+            assess_candidate(analyzer.as_ref(), &status, candidate).await
+        };
+        let did_work = match outcome {
             Ok(CandidateOutcome::Governed { existing, delivery }) => {
                 stats.record_governed(&candidate.key, existing, delivery)
             }
@@ -1608,5 +1626,80 @@ mod tests {
             status.candidate_execution(false),
             CandidateExecution::RejectNewAnalysisUnavailable
         );
+    }
+    #[test]
+    fn news_n01_canonical_target_does_not_follow_result_or_budget_order() {
+        let batch = v3_revision_batch();
+        let profile = NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider","TEST_CODE_model").unwrap();
+        let mut records=batch.records().to_vec();
+        for record in &mut records { record.instruments=vec!["600600".into(),"600519".into(),"600600".into()]; }
+        let ordered=AdmittedGlobalNewsBatch::from_parts(records.clone(),batch.evidence().clone());
+        let first=exact_candidates(&[ordered],&profile);
+        assert_eq!(first.len(),4); // two real revisions, two distinct source-bound targets each
+        for candidate in &first {
+            let fact=AdmittedNewsFact::from_admitted_global(&candidate.batch,candidate.record_index,&candidate.target_code).unwrap();
+            assert_eq!(stock_analysis::monitor::news_ai::canonical_critical_target(&fact).as_deref(),Some("600519"));
+        }
+        for record in &mut records { record.instruments.reverse(); }
+        let reversed=AdmittedGlobalNewsBatch::from_parts(records,batch.evidence().clone());
+        let second=exact_candidates(&[reversed],&profile);
+        assert_eq!(first.iter().map(|c|&c.key).collect::<Vec<_>>(),second.iter().map(|c|&c.key).collect::<Vec<_>>());
+        let mut no_capacity=CandidateVisitBudget::with_worked(first.len(),0,MAX_ASSESSMENTS_PER_TICK);
+        assert!(no_capacity.next_index().is_none());
+        // Quota never creates a fallback designation for an unvisited target.
+        assert!(first.iter().all(|c| c.target_code=="600519" || c.target_code=="600600"));
+    }
+
+}
+
+async fn assess_critical_candidate(
+    analyzer: Option<&NewsAIAnalyzer>, status: &NewsAiRuntimeStatus, candidate: &NewsAiCandidate,
+    sender: &stock_analysis::monitor::news_ai::CriticalCompletionSender,
+) -> Result<CandidateOutcome,String> {
+    let execution = status.candidate_execution(false);
+    if execution == CandidateExecution::RejectNewAnalysisUnavailable {
+        return Err("receipt-bearing news_ai unavailable".into());
+    }
+    let analyzer = analyzer.ok_or_else(||"receipt-bearing news_ai unavailable".to_owned())?;
+    let fact = AdmittedNewsFact::from_admitted_global(&candidate.batch,candidate.record_index,&candidate.target_code)
+        .map_err(|e|e.to_string())?;
+    if stock_analysis::monitor::news_ai::canonical_critical_target(&fact).as_deref() != Some(candidate.target_code.as_str()) {
+        return Err("critical designation changed".into());
+    }
+    let profile = analyzer.critical_identity_profile().map_err(|e|e.to_string())?;
+    let identity = NewsAiIdentityV3::from_fact(&fact,&profile).map_err(|e|e.to_string())?;
+    let barrier_fact = fact.clone();
+    let mut completion_slot = None;
+    let slot_owner = &mut completion_slot;
+    let result = analyzer.assess_critical_if_absent(identity,
+        move |_| async move {
+            tokio::task::spawn_blocking(move || stock_analysis::database::get_db().has_audited_news_base(&barrier_fact))
+                .await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())
+        },
+        |identity| async move {
+            let request = prepare_candidate_request(fact,&candidate.target_code,identity).await?;
+            // Only a genuinely absent, prepared candidate reserves capacity;
+            // a historical hit never waits for a slot or calls the model.
+            *slot_owner = Some(sender.reserve().await.map_err(|_|"critical completion receiver closed before call".to_owned())?);
+            Ok(request)
+        }
+    ).await?;
+    let Some(result) = result else { return Ok(CandidateOutcome::AwaitingDeliveryRecovery{existing:true}); };
+    let completion_slot = completion_slot.take().ok_or_else(||"critical completion slot missing".to_owned())?;
+    // The real audit/mint and handoff share the same blocking owner. Dropping
+    // an awaiting join handle cannot strand a freshly committed score outside it.
+    let (audited, completion_outcome) = tokio::task::spawn_blocking(move || {
+        let (audited, critical) = stock_analysis::database::get_db().append_audited_critical_news(result)
+            .map_err(|e|e.to_string())?;
+        Ok::<_,String>((audited,completion_slot.submit(critical)))
+    }).await.map_err(|e|e.to_string())??;
+    if completion_outcome == stock_analysis::monitor::news_ai::CriticalCompletionSubmitted::RetainedReceiverClosed {
+        log::warn!("[NewsAI][BR244] audited score retained by completion owner after receiver closed; no historical remint");
+    }
+    match execution {
+        CandidateExecution::CreateAssessmentAndDeliver => Ok(CandidateOutcome::Governed{existing:false,
+            delivery:deliver_governed_news_ai(&audited,&ProductionNewsAiDeliveryPort).await}),
+        CandidateExecution::CreateAssessmentOnly => Ok(CandidateOutcome::AwaitingDeliveryRecovery{existing:false}),
+        _ => unreachable!("typed availability checked before acquisition"),
     }
 }

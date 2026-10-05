@@ -1905,3 +1905,13 @@ mod tests {
         let _ = RawNewsAggregationBatch::test_fixture("production", Vec::new(), Utc::now());
     }
 }
+
+impl NewsFlashSourceIdentity {
+    /// Only a fresh immutable scored capability can supply this source identity.
+    pub fn from_audited_critical(score: &crate::monitor::news_ai::AuditedCriticalNews) -> Result<Self,String> {
+        let value = score.evidence().source().map_err(|e|e.to_string())?;
+        Ok(Self { event_id:value.event_id, provider:value.provider, source:value.source,
+            published_at:value.published_at.with_timezone(&Utc), observed_at:value.observed_at.with_timezone(&Utc),
+            batch_id:value.batch_id })
+    }
+}

@@ -2894,8 +2894,7 @@ pub(super) async fn push_news_flash_v3(
         return NewsFlashNotifyOutcome::RejectedBeforeSink(reason_code);
     }
     let attempt_observed_at = chrono::Utc::now().fixed_offset();
-    let attempt = match stock_analysis::event::publish_news_flash_attempt(
-        stock_analysis::event::NewsFlashAttemptAuditInput {
+    let attempt_input = stock_analysis::event::NewsFlashAttemptAuditInput {
             push_kind: reservation.push_kind().to_owned(),
             business_date: reservation.business_date(),
             decision_key: reservation.decision_key().to_owned(),
@@ -2907,8 +2906,12 @@ pub(super) async fn push_news_flash_v3(
             render_sha256: reservation.render_sha256().to_owned(),
             attempt_ordinal: reservation.attempt_ordinal(),
             observed_at: attempt_observed_at,
-        },
-    ) {
+        };
+    let attempt_result = match reservation.critical_score() {
+        Some(score) => stock_analysis::event::publish_critical_news_flash_attempt(attempt_input,score),
+        None => stock_analysis::event::publish_news_flash_attempt(attempt_input),
+    };
+    let attempt = match attempt_result {
         Ok(attempt) => attempt,
         Err(stock_analysis::event::NewsFlashDeliveryAuditError::DuplicateAuthority {
             envelope_id,

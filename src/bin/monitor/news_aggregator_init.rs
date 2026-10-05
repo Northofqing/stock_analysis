@@ -186,9 +186,12 @@ pub struct FlashReservation {
     render_sha256: String,
     sources: Vec<stock_analysis::news::aggregator::raw_v2::NewsFlashSourceIdentity>,
     decision: Option<FlashDecision>,
+    critical_score: Option<stock_analysis::monitor::news_ai::AuditedCriticalNews>,
 }
 
 impl FlashReservation {
+    pub fn critical_score(&self) -> Option<&stock_analysis::monitor::news_ai::AuditedCriticalNews> { self.critical_score.as_ref() }
+
     pub const fn token_id(&self) -> u64 {
         self.token_id
     }
@@ -274,7 +277,8 @@ impl FlashReservation {
                 &input.observed_at,
                 &expected_attempt_identity,
             );
-        input.push_kind == self.push_kind
+        self.critical_score.as_ref().map(|score|score.evidence()) == attempt.critical_evidence()
+            && input.push_kind == self.push_kind
             && input.business_date == self.business_date
             && input.decision_key == self.decision_key
             && input.rendered_len == self.rendered_len
@@ -373,6 +377,7 @@ pub struct NewsFlashGate {
     pending: std::collections::HashMap<u64, PendingFlash>,
     recovered_attempt_ordinals: std::collections::HashMap<String, u32>,
     next_token_id: u64,
+    critical_blocked_events: std::collections::HashSet<String>,
 }
 
 impl NewsFlashGate {
@@ -388,6 +393,7 @@ impl NewsFlashGate {
             pending: std::collections::HashMap::new(),
             recovered_attempt_ordinals: std::collections::HashMap::new(),
             next_token_id: 1,
+            critical_blocked_events: std::collections::HashSet::new(),
         }
     }
 
@@ -397,6 +403,7 @@ impl NewsFlashGate {
             self.day = today;
             self.buffered_ids.clear();
             self.critical_committed.clear();
+            self.critical_blocked_events.clear();
             self.critical_pending.clear();
             self.unresolved_reservations.clear();
             self.window_state = [WindowState::Eligible; 4];
@@ -434,6 +441,7 @@ impl NewsFlashGate {
         self.rollover(snapshot.business_date());
 
         self.critical_committed = snapshot.accepted_event_ids().iter().cloned().collect();
+        self.critical_blocked_events = snapshot.blocked_critical_event_ids().iter().cloned().collect();
         self.critical_pending.clear();
         self.window_state = recovered_window_state;
         self.unresolved_reservations = snapshot.unresolved_reservations().iter().cloned().collect();
@@ -682,9 +690,11 @@ impl NewsFlashGate {
                 self.critical_pending.remove(&reservation_identity_sha256);
                 match action {
                     FlashSettlementAction::Committed => {
+                        self.critical_blocked_events.insert(event_id.clone());
                         self.critical_committed.insert(event_id);
                     }
                     FlashSettlementAction::Uncertain => {
+                        self.critical_blocked_events.insert(event_id);
                         self.unresolved_reservations
                             .insert(reservation_identity_sha256);
                     }
@@ -833,6 +843,7 @@ fn make_reservation(
         render_sha256,
         sources,
         decision: Some(decision),
+        critical_score: None,
     }
 }
 
@@ -1881,5 +1892,60 @@ mod tests {
             .await
             .expect_err("TEST_CODE zero limit must fail before provider work");
         assert!(matches!(error, RawNewsAcquisitionError::InvalidLimit(0)));
+    }
+}
+
+impl NewsFlashGate {
+    /// This sole owner receives fresh score capabilities, never a scalar score/declared JSON.
+    pub fn reserve_critical_from_authority(&mut self,
+        snapshot: &stock_analysis::event::NewsFlashAuthoritySnapshot,
+        score: stock_analysis::monitor::news_ai::AuditedCriticalNews,
+        now: chrono::DateTime<chrono::Local>, threshold: u8, max_per_day: u32,
+    ) -> Result<Vec<FlashReservation>,String> {
+        if snapshot.business_date() != now.date_naive() { return Err("critical authority day mismatch".into()); }
+        if !snapshot.critical_source_identity_complete() { return Err("legacy critical source identity Unknown".into()); }
+        self.recover(snapshot).map_err(|e|format!("critical authority recovery: {e:?}"))?;
+        let evidence = score.evidence();
+        if evidence.digest().map_err(|e|e.to_string())? != score.evidence_sha256() {
+            return Err("critical score readback differs".into());
+        }
+        let fact = score.fact().map_err(|e|e.to_string())?;
+        let event_id = evidence.event_id().map_err(|e|e.to_string())?;
+        let published = fact.published_at().with_timezone(&chrono::Local);
+        let observed = fact.observed_at().with_timezone(&chrono::Local);
+        let unresolved_count = self.critical_blocked_events.difference(&self.critical_committed).count();
+        if published.date_naive() != now.date_naive() || observed.date_naive() != now.date_naive()
+            || published > observed || observed > now + chrono::Duration::seconds(2)
+            || score.completed_at().with_timezone(&chrono::Local) > now
+            || evidence.strength() < threshold || threshold > 100
+            || self.critical_blocked_events.contains(&event_id)
+            || self.critical_concurrency_capacity(max_per_day).saturating_sub(unresolved_count) == 0 {
+            return Ok(Vec::new());
+        }
+        // Source certainty is the independent admitted BR166 source contract (100), not model confidence.
+        let certainty = 100;
+        let ordinal = self.critical_committed.len() as u32 + 1;
+        let text = assemble_news_flash_critical(&now.format("%H:%M").to_string(),"指定证券新闻评分",fact.title(),
+            evidence.strength(),certainty,ordinal,max_per_day);
+        let decision = FlashDecision::Critical { event_id:event_id.clone(), headline:fact.title().into(), source:fact.source().into(),
+            observed_at:observed, source_published_on:published.date_naive(), stale:false, strength:evidence.strength(), certainty, text:text.clone() };
+        let push_kind = crate::notify::PushKind::NewsFlashCritical.stable_template_id();
+        let render_sha256 = sha256_domain("stock_analysis.news_flash_render.v1",text.as_bytes());
+        let day = self.day.to_string();
+        let mut hash = Sha256::new(); hash.update(b"stock_analysis.news_flash_reservation.v2");
+        for value in [push_kind.as_str(),day.as_str(),event_id.as_str(),event_id.as_str(),"<absent>",score.evidence_sha256(),render_sha256.as_str()] {
+            hash.update((value.len() as u64).to_be_bytes()); hash.update(value.as_bytes());
+        }
+        let reservation_sha = format!("{:x}",hash.finalize());
+        let token_id = self.next_token_id;
+        self.next_token_id = token_id.checked_add(1).ok_or_else(||"critical token ordinal overflow".to_owned())?;
+        let source = stock_analysis::news::aggregator::raw_v2::NewsFlashSourceIdentity::from_audited_critical(&score)?;
+        let reservation = FlashReservation { token_id,push_kind,business_date:self.day,decision_key:event_id.clone(),event_id:Some(event_id.clone()),
+            window:None,attempt_ordinal:snapshot.next_attempt_ordinal(&reservation_sha),rendered_len:text.len(),
+            reservation_identity_sha256:reservation_sha.clone(),evidence_sha256:score.evidence_sha256().into(),render_sha256,
+            sources:vec![source],decision:Some(decision),critical_score:Some(score) };
+        self.critical_pending.insert(reservation_sha.clone());
+        self.pending.insert(token_id,PendingFlash::Critical{event_id,reservation_identity_sha256:reservation_sha});
+        Ok(vec![reservation])
     }
 }

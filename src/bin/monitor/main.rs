@@ -8179,8 +8179,10 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
     nm.restore_dedup();
 
-    let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
+    let (critical_completion_tx,mut critical_completion_rx) = stock_analysis::monitor::news_ai::critical_news_completion_channel();
+    let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime().with_critical_completion(critical_completion_tx);
     news_ai_producer.log_startup_banner();
+    log::info!("[NewsAI][BR244] designated N01 purpose shares existing call budget; new audited score and full authority required");
     news_ai_producer.schedule_tick(
         selection_v2_enabled,
         stock_analysis::calendar::current_session(),
@@ -8214,16 +8216,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
     // news ticks. It carries no selection-ingress capability.
     let mut news_flash_gate =
         crate::news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
-    log::warn!(
-        "{}",
-        crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
-    );
-    push_templates::log_dispatcher_attempt(
-        "N-01",
-        false,
-        0,
-        "disabled=no_authoritative_strength_provider",
-    );
+    log::info!("[NewsFlash][BR244] raw SourceOnly path cannot mint scored N01; completion receiver registered, awaiting fresh model receipt, immutable score readback and delivery authority; configured model availability is reported by NewsAI new_analysis");
     let news_flash_startup_date = chrono::Local::now().date_naive();
     match stock_analysis::event::reconcile_news_flash_business_date(news_flash_startup_date) {
         Ok(snapshot) => {
@@ -8241,13 +8234,16 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
     }
 
     loop {
+        let monitor_config = stock_analysis::config::get_monitor_config();
         if !NewsMonitor::should_run() {
             news_ai_producer.schedule_tick(
                 selection_v2_enabled,
                 stock_analysis::calendar::current_session(),
                 None,
             );
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            wait_for_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,
+                tokio::time::Instant::now()+tokio::time::Duration::from_secs(60),
+                monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
             continue;
         }
 
@@ -8325,7 +8321,6 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 }
             }
 
-            let monitor_config = stock_analysis::config::get_monitor_config();
             // BR-244: projection and every immutable failure audit complete
             // before the snapshot that may authorize reservation. The earlier
             // read is provider preflight only and is never reused for reserve.
@@ -8445,6 +8440,11 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 }
             }
         }
+
+        // Preserve the original N02 CriticalFlash phase before handling queued
+        // N01 scores. Never await an unfinished model or drain to exhaustion.
+        drain_ready_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,
+            monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
 
         // One owner always recovers durable work, with optional same-tick live
         // analysis. Missing batches/activation/market windows never hide recovery.
@@ -8809,8 +8809,47 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             if let Err(error) = outer_tick.finish() {
                 log::error!("[NewsMonitor][BR-138] outer tick contract failed: {error}");
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
+            let sleep_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(poll_secs);
+            wait_for_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,sleep_deadline,
+                monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
         }
+    }
+}
+
+async fn drain_ready_critical_completions(receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
+    gate: &mut crate::news_aggregator_init::NewsFlashGate,threshold:u8,max_per_day:u32) {
+    for _ in 0..5 {
+        let Some(score) = receiver.try_receive() else { break; };
+        reserve_completed_critical_news(gate,score,threshold,max_per_day).await;
+    }
+}
+async fn wait_for_critical_completions(receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
+    gate: &mut crate::news_aggregator_init::NewsFlashGate,deadline:tokio::time::Instant,threshold:u8,max_per_day:u32) {
+    loop {
+        match receiver.receive_until(deadline).await {
+            stock_analysis::monitor::news_ai::CriticalCompletionWait::Score(score) => {
+                reserve_completed_critical_news(gate,score,threshold,max_per_day).await;
+            }
+            stock_analysis::monitor::news_ai::CriticalCompletionWait::Deadline => break,
+            stock_analysis::monitor::news_ai::CriticalCompletionWait::Closed => {
+                tokio::time::sleep_until(deadline).await; break;
+            }
+        }
+    }
+}
+
+async fn reserve_completed_critical_news(gate: &mut crate::news_aggregator_init::NewsFlashGate,
+    score: stock_analysis::monitor::news_ai::AuditedCriticalNews,threshold:u8,max_per_day:u32) {
+    let now = chrono::Local::now();
+    if matches!(stock_analysis::event::runtime_delivery_audit_health(),stock_analysis::event::AuditHealth::Degraded{..}) {
+        log::error!("[NewsFlash][BR244] score completion refused: delivery audit degraded"); return;
+    }
+    let authority = match stock_analysis::event::reconcile_news_flash_business_date(now.date_naive()) {
+        Ok(value)=>value, Err(error)=>{log::error!("[NewsFlash][BR244] critical authority unavailable: {error}");return;}
+    };
+    match gate.reserve_critical_from_authority(&authority,score,chrono::Local::now(),threshold,max_per_day) {
+        Ok(reservations)=>{crate::news_aggregator_init::push_flash_reservations(gate,reservations).await;}
+        Err(error)=>log::error!("[NewsFlash][BR244] critical completion refused: {error}"),
     }
 }
 
@@ -13067,11 +13106,11 @@ mod tests_post_session_review_scheduler {
             production
                 .matches("reconcile_news_flash_business_date(")
                 .count(),
-            3,
-            "startup, tick preflight, and fresh pre-reserve reads must use immutable authority"
+            4,
+            "startup, tick preflight, N02 reserve and scored N01 completion use immutable authority"
         );
-        assert!(production.contains("NEWS_FLASH_CRITICAL_DISABLED_BANNER"));
-        assert!(production.contains("disabled=no_authoritative_strength_provider"));
+        assert!(production.contains("raw SourceOnly path cannot mint scored N01"));
+        assert!(production.contains("awaiting fresh model receipt, immutable score readback and delivery authority"));
         assert_eq!(
             production.matches("project_news_flash_events(").count(),
             1,
@@ -13079,8 +13118,8 @@ mod tests_post_session_review_scheduler {
         );
         assert_eq!(
             production.matches("push_flash_reservations(").count(),
-            1,
-            "NewsFlash decisions must have one governed production delivery caller"
+            2,
+            "N02 tick and N01 completion use the same governed reservation dispatcher and sole Gate"
         );
         let projection = production
             .find("project_news_flash_events(")

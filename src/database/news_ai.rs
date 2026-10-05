@@ -5,6 +5,9 @@
 //! state chain owns exact delivery reservation, sink evidence and prediction
 //! linkage; this module performs no physical sink or trading side effect.
 
+#[path = "news_ai/critical_strength.rs"]
+mod critical_strength;
+
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -1923,6 +1926,8 @@ pub(crate) fn rollback_news_ai_delivery_on_conn(
 pub(super) fn create_schema(conn: &mut SqliteConnection) -> Result<(), String> {
     conn.batch_execute(SCHEMA)
         .map_err(|error| format!("BR-172 create NewsAI assessment schema: {error}"))?;
+    conn.batch_execute(critical_strength::SCHEMA)
+        .map_err(|error| format!("BR244 score schema: {error}"))?;
     validate_news_ai_assessment_chain(conn).map_err(|error| error.to_string())?;
     validate_news_ai_delivery_audit(conn)
         .map(|_| ())
@@ -2788,7 +2793,7 @@ impl DatabaseManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::market_domain::ProviderId;
     use crate::market_domain::SourceEvidence;
@@ -2802,7 +2807,7 @@ mod tests {
         count: i64,
     }
 
-    fn connection() -> SqliteConnection {
+    pub(crate) fn connection() -> SqliteConnection {
         let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
         conn.batch_execute("PRAGMA foreign_keys = ON;")
             .expect("foreign keys");
@@ -2877,7 +2882,7 @@ mod tests {
     /// with the source item and target ticket selectable so a test can build a
     /// second, distinct NewsAI identity for the same ticket (F5b cooldown
     /// evidence) or for another ticket.
-    fn core_assessment_for(
+    pub(crate) fn core_assessment_for(
         item_id: &str,
         target_code: &str,
     ) -> (
@@ -4642,4 +4647,106 @@ mod tests {
         .count;
         assert_eq!(installed, 2);
     }
+    const N01_RESPONSE: &str = r#"{"impact":"positive","confidence":73,"uncertainty":"TEST_CODE execution risk","core_logic":"TEST_CODE contract evidence","strength":91}"#;
+
+    pub(crate) fn critical_fixture(conn: &mut SqliteConnection, item: &str) -> crate::monitor::news_ai::AuditedCriticalNews {
+        let (request,_) = core_assessment_for(item,"TEST_CODE_600519");
+        let result = crate::monitor::news_ai::critical_test_result(request,N01_RESPONSE).unwrap();
+        critical_strength::append(conn,result).unwrap().1
+    }
+
+    #[test]
+    fn news_n01_strict_receipt_audit_and_closed_delivery_evidence() {
+        use crate::event::envelope::{DomainEvent,PushDeliveryEvent,NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION};
+        let mut conn = connection();
+        let score = critical_fixture(&mut conn,"TEST_CODE_N01_STRICT");
+        assert_eq!(score.evidence().strength(),91);
+        assert_eq!(score.evidence().digest().unwrap(),score.evidence_sha256());
+        let source = score.evidence().source().unwrap();
+        let day = source.published_at.date_naive();
+        let mut event = PushDeliveryEvent::new_news_flash_attempt("news_flash_critical_v1".into(),source.event_id.clone(),"TEST_CODE_channel".into(),42,
+            day,"a".repeat(64),vec![source.clone()],score.evidence_sha256().into(),"b".repeat(64),1,source.observed_at+chrono::Duration::seconds(2));
+        event.audit_schema_version = NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION;
+        event.news_critical_evidence = Some(score.evidence().clone());
+        event.validate().unwrap();
+        let envelope = crate::event::EventEnvelope::from_event(&event,event.news_flash_join_sha256.clone().unwrap(),"TEST_CODE_trace".into(),chrono::Local::now()).unwrap();
+        crate::event::PushRecord::try_from_authoritative(&envelope).unwrap();
+        let namespace = crate::event::dispatcher::TestAuditNamespace::new("TEST_CODE_N01_GENERIC_REFUSED");
+        let dispatcher = namespace.dispatcher();
+        assert!(matches!(crate::event::Dispatcher::dispatch(&dispatcher,envelope),
+            crate::event::DispatchResult::Failed(_)));
+        // Mutations preserve old six source slots while changing the bound full score material.
+        for field in ["fact_snapshot","normalized_prompt","response","assessment_audit_sha256","strength"] {
+            let mut value = serde_json::to_value(score.evidence()).unwrap();
+            if field == "strength" { value[field] = serde_json::json!(92); }
+            else { value[field] = serde_json::json!("TEST_CODE_changed"); }
+            let bad: crate::monitor::news_ai::CriticalNewsEvidence = serde_json::from_value(value).unwrap();
+            event.news_critical_evidence = Some(bad);
+            assert!(event.validate().is_err(),"{field}");
+        }
+        for raw in [r#"{"impact":"positive","confidence":73,"uncertainty":"x","core_logic":"y"}"#,
+            r#"{"impact":"positive","confidence":73,"uncertainty":"x","core_logic":"y","strength":101}"#,
+            r#"{"impact":"positive","confidence":73,"uncertainty":"x","core_logic":"y","strength":91,"extra":1}"#] {
+            let (request,_) = core_assessment_for("TEST_CODE_invalid","TEST_CODE_600519");
+            assert!(crate::monitor::news_ai::critical_test_result(request,raw).is_err());
+        }
+        assert!(conn.batch_execute("UPDATE news_ai_n01_score SET evidence_sha256='x'").is_err());
+        assert!(conn.batch_execute("DELETE FROM news_ai_n01_score").is_err());
+    }
+
+    #[test]
+    fn news_n01_cross_profile_base_and_unknown_never_absent() {
+        let mut conn = connection();
+        let (request,assessment) = core_assessment_for("TEST_CODE_N01_OLD","TEST_CODE_600519");
+        let fact = request.fact().clone();
+        append_audited_news_ai_assessment_on_conn(&mut conn,request,assessment).unwrap();
+        assert!(critical_strength::has_base(&mut conn,&fact).unwrap());
+        // Target/profile/batch cannot reopen the same immutable text revision.
+        let (other,_) = core_assessment_for("TEST_CODE_N01_OLD","TEST_CODE_600600");
+        assert_eq!(crate::monitor::news_ai::NewsBaseIdentity::from_fact(&fact).unwrap(),
+            crate::monitor::news_ai::NewsBaseIdentity::from_fact(other.fact()).unwrap());
+        assert!(critical_strength::has_base(&mut conn,other.fact()).unwrap());
+        let result = crate::monitor::news_ai::critical_test_result(core_assessment_for("TEST_CODE_N01_OLD","TEST_CODE_600519").0,N01_RESPONSE).unwrap();
+        assert!(critical_strength::append(&mut conn,result).is_err());
+        // Missing legacy snapshot is Unknown, never a successful cache miss.
+        conn.batch_execute("DROP TRIGGER trg_news_ai_delivery_recovery_snapshot_no_delete; DELETE FROM news_ai_delivery_recovery_snapshot").unwrap();
+        assert!(critical_strength::has_base(&mut conn,&fact).is_err());
+        let (absent,_) = core_assessment_for("TEST_CODE_N01_NEW","TEST_CODE_600519");
+        // Corrupt full chain is checked even for an otherwise absent item.
+        conn.batch_execute("DROP TRIGGER trg_news_ai_assessment_chain_no_update; UPDATE news_ai_assessment_chain SET record_hash='0000000000000000000000000000000000000000000000000000000000000000'").unwrap();
+        assert!(critical_strength::has_base(&mut conn,absent.fact()).is_err());
+    }
+
+    #[test]
+    fn news_n01_revision_persistence_readback_and_no_recovery_mint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("TEST_CODE_N01.sqlite");
+        let mut conn = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        conn.batch_execute("PRAGMA foreign_keys=ON").unwrap();
+        create_schema(&mut conn).unwrap();
+        let score = critical_fixture(&mut conn,"TEST_CODE_N01_COLD");
+        let fact = score.fact().unwrap();
+        drop(conn);
+        let mut conn = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        conn.batch_execute("PRAGMA foreign_keys=ON").unwrap();
+        create_schema(&mut conn).unwrap();
+        assert!(critical_strength::has_base(&mut conn,&fact).unwrap());
+        let id = score.evidence().assessment_id();
+        let row = load_by_assessment_id(&mut conn,&id).unwrap().unwrap();
+        let identity = load_recovery_identity(&mut conn,&row).unwrap().unwrap();
+        let restored = load_audited_news_ai_assessment_for_identity_on_conn(&mut conn,&identity).unwrap().unwrap();
+        assert_eq!(restored.delivery().assessment().assessment_id(),id);
+        // Original delivery is recoverable; no loader exposes a scored-capability return.
+        let result = crate::monitor::news_ai::critical_test_result(core_assessment_for("TEST_CODE_N01_COLD","TEST_CODE_600519").0,N01_RESPONSE).unwrap();
+        assert!(critical_strength::append(&mut conn,result).is_err());
+        let count: CountRow = diesel::sql_query("SELECT COUNT(*) AS count FROM news_ai_n01_score").get_result(&mut conn).unwrap();
+        assert_eq!(count.count,1);
+        // A failed score association rolls the original assessment back with it.
+        conn.batch_execute("CREATE TRIGGER TEST_CODE_score_abort BEFORE INSERT ON news_ai_n01_score BEGIN SELECT RAISE(ABORT,'TEST_CODE fault'); END").unwrap();
+        let result = crate::monitor::news_ai::critical_test_result(core_assessment_for("TEST_CODE_N01_ROLLBACK","TEST_CODE_600519").0,N01_RESPONSE).unwrap();
+        let failed_id = result.assessment.assessment_id().to_owned();
+        assert!(critical_strength::append(&mut conn,result).is_err());
+        assert!(load_by_assessment_id(&mut conn,&failed_id).unwrap().is_none());
+    }
+
 }
