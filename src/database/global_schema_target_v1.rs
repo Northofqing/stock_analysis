@@ -201,6 +201,14 @@ pub(super) struct TargetWork {
     journal: u64,
 }
 impl TargetWork {
+    // The R-private token can be created only by its consuming owned6 path.
+    // It pays for the one target meter and issues no target/reader capability.
+    pub(super) fn for_additive_projection(
+        source: &rows::OriginalRowsTargetSource,
+        _once: rows::AdditiveWorkInitToken,
+    ) -> Self {
+        Self::new(Limits::production(), source)
+    }
     fn new(limits: Limits, source: &rows::OriginalRowsTargetSource) -> Self {
         let metadata = source.new_target_metadata_meter(limits.metadata);
         Self {
@@ -1434,5 +1442,89 @@ mod tests {
         let mut options = Options::production();
         options.comparator_test = true;
         assert!(options.validate(false).is_err());
+    }
+}
+
+// Additive-only fixed physical operations. The old four-slot emitter and its
+// domain, options, lifecycle and function bodies remain unchanged.
+impl TargetWork {
+    pub(super) fn additive_encode(&mut self, value: &impl Serialize, max: u64) -> Result<Vec<u8>> {
+        if self.limits != Limits::production() { return Err(fail("additive fixed limits changed")); }
+        let padded = add(max, 1)?;
+        let n = encoded_len(value, padded)?;
+        self.journal(n)?;
+        self.metadata(n)?;
+        let mut bytes = prospective::bounded_json(value, padded as usize)?;
+        if bytes.pop() != Some(b'\n') { return Err(fail("additive canonical encoder terminator")); }
+        // The actual allocation included the newline; removing it never refunds.
+        Ok(bytes)
+    }
+    pub(super) fn additive_record_read(&mut self, file: &File, slot: usize) -> Result<usize> {
+        let n = io(file.metadata())?.len();
+        if slot >= 6 || n == 0 || n > self.limits.record(slot) {
+            return Err(fail("additive record extent"));
+        }
+        self.journal(add(n, 1)?)?;
+        self.physical(add(n, 1)?)?;
+        self.metadata(n)?;
+        usize::try_from(n).map_err(|_| fail("additive record size overflow"))
+    }
+    pub(super) fn additive_record_write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.journal(bytes.len() as u64)?;
+        self.physical(bytes.len() as u64)
+    }
+    pub(super) fn additive_hash_read(&mut self, file: &File) -> Result<u64> {
+        let n = io(file.metadata())?.len();
+        if n > self.limits.extent { return Err(fail("additive target extent")); }
+        self.physical(add(n, 1)?)?;
+        self.metadata(64)?;
+        Ok(n)
+    }
+    pub(super) fn additive_census_entry(&mut self, name: &[u8]) -> Result<()> {
+        self.physical(add(name.len() as u64, 1)?)
+    }
+}
+// Only A's fixed WAL writer uses these loans. They pay the actual fixed
+// header read / extent stat; they do not attest SQLite's internal heap or IO.
+impl TargetWork {
+    pub(super) fn additive_header_read(&mut self) -> Result<()> {
+        self.metadata(100)?;
+        self.physical(100)
+    }
+    pub(super) fn additive_sidecar_extent(&mut self, file: &File) -> Result<u64> {
+        self.metadata(64)?;
+        self.physical(1)?;
+        let n = io(file.metadata())?.len();
+        if n > self.limits.extent { return Err(fail("additive sidecar extent exceeded")); }
+        Ok(n)
+    }
+}
+// The permit is non-Clone and minted only by A after actual durable Created,
+// exact empty File/named/record/census checks. Its File always returns to A
+// before either result is propagated; no caller File/path/limits constructor.
+pub(super) fn copy_additive_created(
+    source: &mut rows::OriginalRowsTargetSource,
+    work: &mut TargetWork,
+    mut permit: super::additive_target::DurableAdditiveCreatedPermit<'_>,
+) -> Result<()> {
+    let file = permit.take_file()?;
+    let options = Options::production();
+    let mut created = CreatedTarget { file, options: &options };
+    let mut copy_primary = None;
+    let result = source.with_copy_origin(work, |loan, work| {
+        if let Err(error) = loan.copy_to(&mut created, work) { copy_primary = Some(error); }
+        // This transports ownership through B's unconditional tail checks; it
+        // does not report copy success. The actual copy error below wins.
+        Ok(())
+    });
+    let result = if let Some(primary) = copy_primary {
+        if let Err(error) = result { permit.retain_post_copy_failure(error); }
+        Err(primary)
+    } else { result };
+    let returned = permit.return_file(created.file);
+    if returned { result } else {
+        // A retains the actual wrong-return diagnostic and File. Preserve an
+        // already-owned copy primary instead of replacing it with this failure.
+        match result { Err(primary) => Err(primary), Ok(()) => Err(fail("additive copy File return failed")) }
     }
 }

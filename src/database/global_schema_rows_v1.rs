@@ -899,6 +899,211 @@ impl VerifiedUnapprovedOriginalRowsBackup {
     }
 }
 
+
+// Only this module can mint the one-use target-meter init token, and only
+// after consuming the actual owned six-stream source. No caller factory.
+pub(super) struct AdditiveWorkInitToken { _private: () }
+pub(super) struct AdditiveRowsTargetSource {
+    core: OriginalRowsTargetSource,
+    recipe: super::super::global_schema_catalog_v1::ClosedAdditiveCatalog8Recipe,
+    target_work: target::TargetWork,
+    pairs: AdditivePairProgress,
+}
+impl VerifiedUnapprovedOriginalRowsBackup {
+    pub(super) fn into_additive_target_source(
+        self,
+    ) -> Result<AdditiveRowsTargetSource, GlobalSchemaV1Error> {
+        let references = self.pending.references.as_ref()
+            .ok_or_else(|| fail("additive original references missing"))?;
+        let recipe = self.pending.spec.select_additive_catalog6_to8(references)
+            .map_err(catalog_error)?;
+        let core = self.into_target_source()?;
+        let once = AdditiveWorkInitToken { _private: () };
+        let target_work = target::TargetWork::for_additive_projection(&core, once);
+        Ok(AdditiveRowsTargetSource { core, recipe, target_work, pairs: AdditivePairProgress::new() })
+    }
+}
+// A fixed storage loan, never a new source, target meter or reader issuer.
+impl AdditiveRowsTargetSource {
+    pub(super) fn storage_parts(
+        &mut self,
+    ) -> Result<(&mut OriginalRowsTargetSource,
+        &super::super::global_schema_catalog_v1::ClosedAdditiveCatalog8Recipe,
+        &mut target::TargetWork), GlobalSchemaV1Error> {
+        if self.core.original.pending.work.streams != 6
+            || self.pairs.completed != 0 || self.pairs.phase != AdditivePairPhase::Ready {
+            return Err(fail("additive storage requires an unused six-stream source"));
+        }
+        self.target_work.require_replay_clear().map_err(GlobalSchemaV1Error::ReplayTerminal)?;
+        Ok((&mut self.core, &self.recipe, &mut self.target_work))
+    }
+}
+// Fixed writer validation under A's retained writer loan. This does not
+// consume a retained-reader pair or mint a Connection/file capability.
+impl AdditiveRowsTargetSource {
+    pub(super) fn validate_additive_write_projection(
+        &mut self, connection: &Connection,
+    ) -> Result<(), GlobalSchemaV1Error> {
+        self.storage_parts()?;
+        let pending = &mut self.core.original.pending;
+        let references = pending.references.as_ref().ok_or_else(|| fail("additive references missing"))?;
+        let metadata = self.target_work.catalog_metadata();
+        let projection = self.recipe.validate_projection(&pending.spec, references,
+            &pending.authority, connection, metadata).map_err(catalog_error)?;
+        for (_, sql) in projection.eof_queries() {
+            metadata.charge(32).map_err(catalog_error)?;
+            let mut statement = connection.prepare(sql).map_err(sql_error)?;
+            if statement.column_count() != 1 { return Err(fail("additive new EOF column count")); }
+            let mut rows = statement.query([]).map_err(sql_error)?;
+            if let Some(row) = rows.next().map_err(sql_error)? {
+                pending.work.row()?;
+                pending.work.value(row.get_ref(0).map_err(sql_error)?, &mut 0)?;
+                return Err(fail("additive new table is not empty"));
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(PartialEq, Eq)]
+enum AdditivePairPhase { Ready, Reading, Refused }
+struct AdditivePairProgress {
+    phase: AdditivePairPhase,
+    completed: u64,
+}
+impl AdditivePairProgress {
+    fn new() -> Self { Self { phase: AdditivePairPhase::Ready, completed: 0 } }
+    fn begin(&mut self) -> Result<(), GlobalSchemaV1Error> {
+        if self.phase != AdditivePairPhase::Ready || self.completed >= 2 {
+            return Err(fail("additive pair is refused/incomplete or exhausted"));
+        }
+        self.phase = AdditivePairPhase::Reading;
+        Ok(())
+    }
+}
+// This is deliberately a low-authority SQL data comparison, not a reader
+// issuer. Production and cfg tests call the same fixed core. No SQL is supplied.
+fn read_additive_pair_core(
+    original: &Connection,
+    target: &Connection,
+    spec: &WholeRowsReadSpec,
+    recipe: &super::super::global_schema_catalog_v1::ClosedAdditiveCatalog8Recipe,
+    references: &SameRuntimeCatalogReferences,
+    authority: &SelectionCatalogCaptureAuthority,
+    expected: &Transcript,
+    work: &mut RowsWork,
+    metadata: &mut RowsSpecWork,
+    progress: &mut AdditivePairProgress,
+) -> Result<Transcript, GlobalSchemaV1Error> {
+    progress.begin()?;
+    read_additive_pair_entered(original, target, spec, recipe, references, authority,
+        expected, work, metadata, progress)
+}
+fn read_additive_pair_entered(
+    original: &Connection,
+    target: &Connection,
+    spec: &WholeRowsReadSpec,
+    recipe: &super::super::global_schema_catalog_v1::ClosedAdditiveCatalog8Recipe,
+    references: &SameRuntimeCatalogReferences,
+    authority: &SelectionCatalogCaptureAuthority,
+    expected: &Transcript,
+    work: &mut RowsWork,
+    metadata: &mut RowsSpecWork,
+    progress: &mut AdditivePairProgress,
+) -> Result<Transcript, GlobalSchemaV1Error> {
+    if progress.phase != AdditivePairPhase::Reading {
+        return Err(fail("additive core was not entered"));
+    }
+    let result = (|| {
+        let projection = recipe.validate_projection(spec, references, authority, target, metadata)
+            .map_err(catalog_error)?;
+        let rows = expected.tables.iter().try_fold(0, |n, t| add(n, t.rows))?;
+        let bytes = expected.tables.iter().try_fold(0, |n, t| add(n, t.typed_bytes))?;
+        if add(work.rows, multiply(rows, 2)?)? > work.limits.row_observations
+            || add(work.bytes, multiply(bytes, 2)?)? > work.limits.observation_bytes
+        {
+            return Err(fail("additive pair exceeds remaining original Rows allowance"));
+        }
+        work.reserve_transcript(spec.tables().len())?;
+        let mut tables = Vec::with_capacity(spec.tables().len());
+        for table in spec.tables() {
+            tables.push(read_table_pair(original, target, table.sql(), table.name(),
+                table.column_count(), work)?);
+        }
+        let actual = Transcript { tables };
+        if &actual != expected {
+            return Err(fail("additive pair differs from original proof transcript"));
+        }
+        for (_, sql) in projection.eof_queries() {
+            metadata.charge(32).map_err(catalog_error)?;
+            let mut statement = target.prepare(sql).map_err(sql_error)?;
+            if statement.column_count() != 1 {
+                return Err(fail("additive new table projection changed"));
+            }
+            let mut rows = statement.query([]).map_err(sql_error)?;
+            if let Some(row) = rows.next().map_err(sql_error)? {
+                work.row()?;
+                work.value(row.get_ref(0).map_err(sql_error)?, &mut 0)?;
+                return Err(fail("additive new table is not empty"));
+            }
+        }
+        Ok(actual)
+    })();
+    match result {
+        Ok(actual) => {
+            progress.completed += 1; // bounded to two by begin()
+            progress.phase = AdditivePairPhase::Ready;
+            Ok(actual)
+        }
+        Err(error) => {
+            progress.phase = AdditivePairPhase::Refused;
+            Err(error)
+        }
+    }
+}
+impl AdditiveRowsTargetSource {
+    // No physical target qualification is returned. A future retained issuer
+    // must supply its already-opened Connection under the fixed file loan.
+    pub(super) fn compare_projection_core(
+        &mut self,
+        connection: &Connection,
+    ) -> Result<(), GlobalSchemaV1Error> {
+        if self.core.original.pending.work.streams != 6 {
+            return Err(fail("additive source requires six original streams"));
+        }
+        self.target_work.require_replay_clear().map_err(|_| fail("additive target terminal"))?;
+        // Latch before the original journal/FD loan, so a refusal anywhere in
+        // that outer owner operation cannot be retried with fresh allowances.
+        self.pairs.begin()?;
+        let result = (|| {
+            let reservation = self.core.original.backup.target_metadata_reservation()?;
+            self.core.original.pending.work.metadata.charge(reservation).map_err(catalog_error)?;
+            let p = &mut self.core.original.pending;
+            let references = p.references.as_ref().ok_or_else(|| fail("additive references missing"))?;
+            let expected = p.initial.as_ref().ok_or_else(|| fail("additive transcript missing"))?;
+            let spec = &p.spec;
+            let authority = &p.authority;
+            let recipe = &self.recipe;
+            let metadata = self.target_work.catalog_metadata();
+            let pairs = &mut self.pairs;
+            self.core.original.backup.with_copied_rows(&mut p.work, |copy, work| {
+                read_additive_pair_entered(copy.connection(), connection, spec, recipe,
+                    references, authority, expected, work, metadata, pairs)
+            })
+        })();
+        match result {
+            Ok(actual) => {
+                self.core.target_comparisons.push(actual);
+                self.core.target_streams = multiply(self.pairs.completed, 2)?;
+                Ok(())
+            }
+            Err(error) => {
+                self.pairs.phase = AdditivePairPhase::Refused;
+                Err(error)
+            }
+        }
+    }
+}
+
 /// One-way move out of the original Rows renderer. The original counters,
 /// transcript, actual backup and exclusive lease remain the same objects.
 pub(super) struct OriginalRowsTargetSource {
@@ -1386,6 +1591,136 @@ mod tests {
         work.value(ValueRef::Integer(1), &mut row).unwrap();
         assert!(work.value(ValueRef::Null, &mut row).is_err());
     }
+
+    fn additive_core_expected(source: &Connection, spec: &WholeRowsReadSpec, work: &mut RowsWork) -> Transcript {
+        work.reserve_transcript(spec.tables().len()).unwrap();
+        Transcript { tables: spec.tables().iter().map(|t|
+            read_table(source, t.sql(), t.name(), t.column_count(), work).unwrap()).collect() }
+    }
+    #[test]
+    fn task6_additive_projection_preserves_real_rows_and_new_table_eof() {
+        let (source, target, spec, references, authority) =
+            super::super::super::global_schema_catalog_v1::additive_projection_fixture_for_test();
+        let recipe = spec.select_additive_catalog6_to8(&references).unwrap();
+        let mut work = RowsWork::new(Limits::production());
+        let expected = additive_core_expected(&source, &spec, &mut work);
+        assert!(expected.tables.iter().any(|t| t.name == "ledger" && t.rows == 2));
+        assert!(expected.tables.iter().any(|t| t.name == "sqlite_sequence" && t.rows >= 3));
+        let mut metadata = RowsSpecWork::new(16 * MIB, 4096, 1024);
+        let mut pairs = AdditivePairProgress::new();
+        let rows_before = work.rows;
+        let result = read_additive_pair_core(&source, &target, &spec, &recipe,
+            &references, &authority, &expected, &mut work, &mut metadata, &mut pairs).unwrap();
+        assert!(result == expected);
+        assert_eq!(pairs.completed, 1);
+        assert!(work.rows > rows_before);
+        assert_eq!(work.streams, 0, "core fixture issues no six-stream source or retained reader");
+        let debit = metadata.used();
+        read_additive_pair_core(&source, &target, &spec, &recipe, &references, &authority,
+            &expected, &mut work, &mut metadata, &mut pairs).unwrap();
+        assert_eq!(pairs.completed, 2);
+        assert_eq!(metadata.used(), debit * 2);
+        let before = (work.rows, work.bytes, work.metadata.used(), metadata.used());
+        assert!(read_additive_pair_core(&source, &target, &spec, &recipe, &references, &authority,
+            &expected, &mut work, &mut metadata, &mut pairs).is_err());
+        assert_eq!((work.rows, work.bytes, work.metadata.used(), metadata.used()), before);
+    }
+    #[test]
+    fn task6_additive_projection_rejects_catalog_and_typed_row_changes() {
+        for mutation in [
+            "PRAGMA user_version=7",
+            "PRAGMA user_version=9",
+            "CREATE TEMP TABLE unexpected(v)",
+            "CREATE TABLE unexpected(v)",
+            "DROP TRIGGER investment_decisions_v1_no_update",
+            "UPDATE ledger SET total_value=123.25000000000003 WHERE id=-10",
+            "UPDATE ledger SET created_at=X'FF0041' WHERE id=-10",
+            "UPDATE ledger SET id=-11 WHERE id=-10",
+            "UPDATE sqlite_sequence SET seq=CAST(seq AS TEXT) WHERE name='TEST_CODE_UNKNOWN_COUNTER'",
+            "DELETE FROM ledger WHERE id=50",
+            "INSERT INTO candidate_scope_observations_v1(policy_id,slot_start_unix_ms,evaluation_revision,cutoff_unix_seconds,cutoff_subsec_nanos,scope_sha256,scope_canonical) VALUES('intraday-unconsumed-pushed-row-top50-v1',0,1,0,0,zeroblob(32),X'31')",
+            "PRAGMA foreign_keys=OFF; INSERT INTO investment_decisions_v1(strategy_id,scope_policy_id,slot_start_unix_ms,evaluation_revision,observation_row_id,cutoff_unix_seconds,cutoff_subsec_nanos,decision_id,record_sha256,record_canonical) VALUES('intraday-pushed-research-v1','intraday-unconsumed-pushed-row-top50-v1',0,1,1,0,0,'investment-decision-v1:'||printf('%064d',0),zeroblob(32),X'31')",
+        ] {
+            let (source, target, spec, references, authority) =
+                super::super::super::global_schema_catalog_v1::additive_projection_fixture_for_test();
+            let recipe = spec.select_additive_catalog6_to8(&references).unwrap();
+            let mut work = RowsWork::new(Limits::production());
+            let expected = additive_core_expected(&source, &spec, &mut work);
+            target.execute_batch(mutation).unwrap();
+            let mut metadata = RowsSpecWork::new(16 * MIB, 4096, 1024);
+            let mut pairs = AdditivePairProgress::new();
+            assert!(read_additive_pair_core(&source, &target, &spec, &recipe, &references,
+                &authority, &expected, &mut work, &mut metadata, &mut pairs).is_err(), "{mutation}");
+            assert!(pairs.phase == AdditivePairPhase::Refused);
+            let before = (work.rows, work.bytes, work.metadata.used(), metadata.used());
+            assert!(read_additive_pair_core(&source, &target, &spec, &recipe, &references,
+                &authority, &expected, &mut work, &mut metadata, &mut pairs).is_err());
+            assert_eq!((work.rows, work.bytes, work.metadata.used(), metadata.used()), before);
+        }
+    }
+    #[test]
+    fn task6_additive_projection_keeps_one_owner_and_cumulative_work() {
+        let (source, target, spec, references, authority) =
+            super::super::super::global_schema_catalog_v1::additive_projection_fixture_for_test();
+        let recipe = spec.select_additive_catalog6_to8(&references).unwrap();
+        let mut measure = RowsWork::new(Limits::production());
+        let expected = additive_core_expected(&source, &spec, &mut measure);
+        let mut measured_metadata = RowsSpecWork::new(16 * MIB, 4096, 1024);
+        read_additive_pair_core(&source, &target, &spec, &recipe, &references, &authority,
+            &expected, &mut measure, &mut measured_metadata, &mut AdditivePairProgress::new()).unwrap();
+        let twice = measured_metadata.used() * 2;
+        for short in [0, 1] {
+            let mut work = RowsWork::new(Limits::production());
+            let expected = additive_core_expected(&source, &spec, &mut work);
+            let mut metadata = RowsSpecWork::new(twice - short, 4096, 1024);
+            let mut pairs = AdditivePairProgress::new();
+            read_additive_pair_core(&source, &target, &spec, &recipe, &references, &authority,
+                &expected, &mut work, &mut metadata, &mut pairs).unwrap();
+            // Move the owning state and meters, preserving all spent work.
+            let before = (work.rows, work.bytes, work.metadata.used(), metadata.used());
+            let mut moved = (work, metadata, pairs);
+            assert_eq!((moved.0.rows, moved.0.bytes, moved.0.metadata.used(), moved.1.used()), before);
+            let result = read_additive_pair_core(&source, &target, &spec, &recipe, &references,
+                &authority, &expected, &mut moved.0, &mut moved.1, &mut moved.2);
+            assert_eq!(result.is_ok(), short == 0);
+            assert_eq!(moved.1.used(), twice);
+            if short == 1 { assert!(moved.2.phase == AdditivePairPhase::Refused); }
+            let spent = (moved.0.rows, moved.0.bytes, moved.1.used());
+            assert!(read_additive_pair_core(&source, &target, &spec, &recipe, &references,
+                &authority, &expected, &mut moved.0, &mut moved.1, &mut moved.2).is_err());
+            assert_eq!((moved.0.rows, moved.0.bytes, moved.1.used()), spent);
+        }
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let table_allocation = original.pending.spec.tables().as_ptr();
+            let transcript_allocation = original.pending.initial.as_ref().unwrap().tables.as_ptr();
+            let before = (original.pending.work.rows, original.pending.work.bytes,
+                original.pending.work.metadata.used(), original.pending.work.streams);
+            assert_eq!(before.3, 5);
+            let mut moved = original.into_additive_target_source().unwrap();
+            assert_eq!(moved.core.original.pending.spec.tables().as_ptr(), table_allocation);
+            assert_eq!(moved.core.original.pending.initial.as_ref().unwrap().tables.as_ptr(), transcript_allocation);
+            assert_eq!(moved.core.original.pending.work.streams, 6);
+            assert!(moved.core.original.pending.work.rows > before.0);
+            assert!(moved.core.original.pending.work.bytes > before.1);
+            assert!(moved.core.original.pending.work.metadata.used() > before.2);
+            assert_eq!(moved.target_work.metadata_used(), 0);
+            moved.target_work.catalog_metadata().charge(17).unwrap();
+            { let borrowed = moved.target_work.catalog_metadata(); assert_eq!(borrowed.used(), 17); }
+            assert_eq!(moved.target_work.metadata_used(), 17);
+            assert_eq!(moved.core.original.pending.work.streams, 6);
+            // This real eight target has different old rows from this genuine
+            // offline backup. Refusal must retain both meters and the owner.
+            assert!(moved.compare_projection_core(&target).is_err());
+            assert!(moved.pairs.phase == AdditivePairPhase::Refused);
+            let spent = (moved.core.original.pending.work.metadata.used(),
+                moved.core.original.pending.work.rows, moved.target_work.metadata_used());
+            assert!(spent.0 > before.2 && spent.2 > 17);
+            assert!(moved.compare_projection_core(&target).is_err());
+            assert_eq!((moved.core.original.pending.work.metadata.used(),
+                moved.core.original.pending.work.rows, moved.target_work.metadata_used()), spent);
+            assert_eq!(moved.core.original.pending.work.streams, 6);
+        });
+    }
 }
 
 
@@ -1828,5 +2163,24 @@ pub(in crate::database) mod original_source {
             assert_eq!(construction.work.source_terminal, None);
             assert_eq!(construction.source_loan().require_clear(), Ok(()));
         }
+    }
+}
+
+// Only the same A owning reader frame can carry this opaque post-WAL loan gate.
+// It is not a Connection factory, a replacement source or a new TargetWork.
+impl AdditiveRowsTargetSource {
+    pub(super) fn retained8_parts(
+        &mut self,
+        _permit: &super::additive_target::Retained8FramePermit,
+    ) -> Result<(&mut OriginalRowsTargetSource,
+        &super::super::global_schema_catalog_v1::ClosedAdditiveCatalog8Recipe,
+        &mut target::TargetWork, u64), GlobalSchemaV1Error> {
+        if self.core.original.pending.work.streams != 6
+            || self.pairs.phase != AdditivePairPhase::Ready || self.pairs.completed > 2
+            || self.core.target_streams != self.pairs.completed * 2 {
+            return Err(fail("additive retained8 loan requires completed fixed pair state"));
+        }
+        self.target_work.require_replay_clear().map_err(GlobalSchemaV1Error::ReplayTerminal)?;
+        Ok((&mut self.core, &self.recipe, &mut self.target_work, self.pairs.completed))
     }
 }

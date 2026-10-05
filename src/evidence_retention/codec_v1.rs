@@ -959,6 +959,31 @@ pub(super) fn canonical<T: Serialize>(v: &T, b: &[u8], w: &mut Work) -> Result<(
     }
     Ok(())
 }
+// Only the fixed shared parser calls this after decoding and validating this
+// exact input into DraftWire. Every mandatory field (including both Time
+// objects) is present, with no skipped/flattened/custom Serialize field. Compact
+// JSON punctuation, decimal integers and necessary string escapes cannot be
+// longer than their representations in that same preflighted JSON input. Thus
+// the entire serializer pass is covered by b.len(), not a caller credit. Keep
+// the generic canonical() and its schema-wide reservation unchanged.
+pub(super) fn canonical_preflighted_draft(
+    d: &super::DraftWire,
+    b: &[u8],
+    w: &mut Work,
+) -> Result<(), ValueError> {
+    if b.is_empty() || b.len() > DRAFT_LIMIT {
+        return Err(ValueError::InputLimit);
+    }
+    // Failure stops before the serializer or any canonical comparison starts.
+    // Work remains cumulative, including an attempted over-limit reservation.
+    w.scan(b.len())?;
+    let mut c = Compare { b, p: 0, failed: false };
+    serde_json::to_writer(&mut c, d).map_err(|_| ValueError::InvalidScalar)?;
+    if c.failed || c.p != b.len() {
+        return Err(ValueError::NonCanonical);
+    }
+    Ok(())
+}
 pub(super) fn copy(b: &[u8], w: &mut Work) -> Result<Vec<u8>, ValueError> {
     w.own(b.len())?;
     w.scan(b.len())?;

@@ -563,3 +563,16 @@ Task7仅G/Q/W新增真实Vec消费迭代与pending String同frame保留；未知
 fresh新增3+Sort3+exactCompileOptions2共8项通过，Root13341/79798及两次exact调用均退出0，闭合回执f8a24050含绝对DEV执行坐标和五源码/四raw日志。编译5m17，新组运行0.03秒，相关5复用产物；打印同lib harness1c34，binary SHA未测。diff检查通过，未追加check/build/fullsuite/release，未把局部机制测试当完整SHA/native/provider/付款/Financial资格。
 
 完整实际domain/count/hash/finalize/lower_hex/validator后继计划4266经独立PLAN5594批准，正隔离Source实现；C只计划最小三个helper可见性。Task8本地Unverified持久材料队列计划41e1/独立PLAN2fa3批准后并行实现，真实commit/close未知、冷恢复和两个coordinator是验收重点。尚未应用或运行这两个新实现，远端WORM与业务Financial仍未完成。本段8项结果经独立DATA `be4997d2` 核对通过，按G/Q/W与交接文档四个路径本地提交；未远端push或合并。
+
+
+### 2026-10-06 迁移校验、真实摘要与本地材料队列完成
+
+DEV已组合接入Task6选择器、六槽记录、真实复制/WAL转换、冷阶段分派、两次只读比较及完整性/FK检查；新增真实SHA domain/count/字段/hash/finalize/lower_hex/validator所有权后继，以及独立本地Unverified材料持久队列。队列覆盖精确内容复用、冲突双份保留、命名空间/32条配额、真实COMMIT及close的未知返回、冷恢复与两个coordinator；不发行远端留存或已核验材料资格。
+
+初轮摘要测试2PASS/1锁等待后退出101、队列2PASS/1InputLimit失败原件保留。摘要修补仅在新cfg方法断言结束后释放前一夹具owner，再创建下一独立夹具；队列对固定同源DraftWire完整compact序列化按实际输入长度预付扫描，原generic canonical与8MiB/32MiB/8192预算保持。mkdirat改用已声明的直接libc接口；旧32条、cold、冲突、quota和原断言保持。
+
+费用清单读取已接到第二个仍活着的只读连接：真实字段类型/数量/长度先检查，同一TargetWork预付复制，立即保实际字段及read/validator结果，复用原schema/domain/SHA/policy规则；实际close成功及完整来源/目标tail才完成。坏字段、预算不足、Unknown返回、目标漂移和Busy均保首次错误及整体资源。仅普通费用数据校验，不是完整Financial。
+
+Root完成限定lib编译（5m19），fresh摘要3、队列3与相关retention3、费用3、原integrity3、RO3及旧普通staging1，共19项全部退出0；主回执69dd483a。针对旧staging未动态经过抽取wrapper的具体覆盖缺口，另用相同制品运行一条existing exact Catalog7实际升级用例，经verify_v7_manifest_on→verify_manifest_row_on→shared fee helper，退出0/1PASS/3.71s（追加回执2abee8ee）。合计fresh20不同整方法，原19回执保持不改。旧base30闭合结果a4f7复用，Task6其中23项独立DATA496281通过。fresh同harness SHA509f096c在摘要运行后、其余16项前及结束后精确测量，21件源码与公共控制保持；不补造摘要运行前二进制SHA。旧staging用例验证原费用staging不可变与不同policy拒绝，其覆盖不等于抽取wrapper的动态覆盖。git diff检查通过，不追加例行check/build/clippy、全量或release。
+
+平台开发仅本地，生产仍是已部署的新闻四文件组合d9b4aabb/49518b30；启动和71条首轮采集已核验，实际推送窗口的新闻送达仍待验证。完整财务重放、operational schema8发行及monitor决策/资金接线、真实native/provider/layout/payment、远端长期留存和自然运行验收仍未完成。下一片是同第二live reader的真实typed owner/account关系校验，尚未应用；不能从已关闭费用owner新增reader或铸完整Financial资格。未远端push或合并。

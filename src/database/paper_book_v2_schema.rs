@@ -261,16 +261,33 @@ fn verify_manifest_row_on(
          FROM paper_book_v2_fee_manifest ORDER BY singleton",
     )
     .load(conn)?;
-    if rows.len() != 1 || rows[0].schema_id != STAGED_SCHEMA {
+    if rows.len() != 1 {
         return Err(StagedPaperBookV2Error::ManifestMismatch);
     }
     let row = &rows[0];
+    verify_fee_manifest_fields(&row.schema_id, &row.policy_instance_id,
+        &row.descriptor_sha256, &row.descriptor_bytes)
+}
+
+// The original ordinary predicate is shared by the retained fixed read. This
+// accepts data only and never creates an execution, policy or catalog owner.
+// The retained caller precharges its actual copies and these two output lengths.
+pub(super) fn fee_manifest_validation_owned_bytes() -> usize {
+    64 + A_SHARE_FEE_SCHEDULE_V2.len() + ":sha256:".len() + 64
+}
+pub(super) fn verify_fee_manifest_fields(
+    schema_id: &str, policy_instance_id: &str, descriptor_sha256: &str,
+    descriptor_bytes: &[u8],
+) -> Result<(), StagedPaperBookV2Error> {
+    if schema_id != STAGED_SCHEMA {
+        return Err(StagedPaperBookV2Error::ManifestMismatch);
+    }
     let mut hasher = Sha256::new();
     hasher.update(b"a-share-fee-policy-descriptor/v1\n");
-    hasher.update(&row.descriptor_bytes);
+    hasher.update(descriptor_bytes);
     let digest = hex::encode(hasher.finalize());
-    if row.descriptor_sha256 != digest
-        || row.policy_instance_id != format!("{A_SHARE_FEE_SCHEDULE_V2}:sha256:{digest}")
+    if descriptor_sha256 != digest
+        || policy_instance_id != format!("{A_SHARE_FEE_SCHEDULE_V2}:sha256:{digest}")
     {
         return Err(StagedPaperBookV2Error::ManifestMismatch);
     }

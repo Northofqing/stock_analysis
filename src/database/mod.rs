@@ -6901,3 +6901,67 @@ mod tests {
 }
 
 pub(crate) mod investment_decision_schema_v1;
+
+
+// Only the Unverified material owner can construct this loan. This adapter
+// does not grant DatabaseManager, amended-schema, SQL-owner or retention authority.
+static RETENTION_MATERIAL_OPEN_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) struct RetentionMaterialConnection {
+    connection: rusqlite::Connection,
+    main: RetentionMaterialMainProof,
+}
+pub(crate) struct RetentionMaterialMainProof(sqlite_descriptor_attestation::AttestedRetentionMain);
+pub(crate) struct RetentionMaterialMainFailure(DescriptorAttestationError);
+pub(crate) struct RetentionMaterialOpenFailure {
+    connection: Option<rusqlite::Connection>,
+    detail: RetentionMaterialOpenDetail,
+}
+enum RetentionMaterialOpenDetail {
+    Poisoned,
+    Route(ConnectionManagerError),
+    Snapshot(DescriptorAttestationError),
+    Native(rusqlite::Error),
+}
+impl RetentionMaterialConnection {
+    pub(crate) fn into_owned_parts(self) -> (rusqlite::Connection, RetentionMaterialMainProof) {
+        (self.connection, self.main)
+    }
+}
+impl RetentionMaterialOpenFailure {
+    pub(crate) fn into_held_owned_parts(mut self) -> (Option<rusqlite::Connection>, Self) {
+        let connection = self.connection.take();
+        (connection, self) // Preserve the real error capsule beside the restored connection.
+    }
+}
+impl RetentionMaterialMainProof {
+    pub(crate) fn validate(
+        &self,
+        loan: crate::evidence_retention::outbox_v1::OutboxOpenLoan<'_>,
+    ) -> Result<(), RetentionMaterialMainFailure> {
+        self.0.validate(loan.retained_pair().1).map_err(RetentionMaterialMainFailure)
+    }
+}
+pub(crate) fn open_retention_material(
+    loan: crate::evidence_retention::outbox_v1::OutboxOpenLoan<'_>,
+) -> Result<RetentionMaterialConnection, RetentionMaterialOpenFailure> {
+    let _open_lock = RETENTION_MATERIAL_OPEN_LOCK.lock().map_err(|_| RetentionMaterialOpenFailure {
+        connection: None, detail: RetentionMaterialOpenDetail::Poisoned,
+    })?;
+    let (parent, main) = loan.retained_pair();
+    let route = sqlite_open_route_from_retained_parent(parent, OsStr::new("materials-v1.sqlite"))
+        .map_err(|error| RetentionMaterialOpenFailure { connection: None, detail: RetentionMaterialOpenDetail::Route(error) })?;
+    let before = ProcessDescriptorSnapshot::capture().map_err(|error| RetentionMaterialOpenFailure {
+        connection: None, detail: RetentionMaterialOpenDetail::Snapshot(error),
+    })?;
+    let connection = rusqlite::Connection::open_with_flags(route,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .map_err(|error| RetentionMaterialOpenFailure { connection: None, detail: RetentionMaterialOpenDetail::Native(error) })?;
+    // Nothing opens an auxiliary pin between these snapshots. Every failure
+    // after the real open returns the actual Connection to the owning frame.
+    let main = match ProcessDescriptorSnapshot::capture().and_then(|after|
+        sqlite_descriptor_attestation::AttestedRetentionMain::from_delta(&before, &after, main)) {
+        Ok(main) => main,
+        Err(error) => return Err(RetentionMaterialOpenFailure { connection: Some(connection), detail: RetentionMaterialOpenDetail::Snapshot(error) }),
+    };
+    Ok(RetentionMaterialConnection { connection, main: RetentionMaterialMainProof(main) })
+}

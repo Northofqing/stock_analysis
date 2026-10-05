@@ -52,6 +52,8 @@ mod rows;
 pub(crate) mod replay_work;
 #[path = "global_schema_target_v1.rs"]
 mod target;
+#[path = "global_schema_additive_target_v1.rs"]
+mod additive_target;
 
 pub(crate) const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 pub(crate) const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
@@ -1218,6 +1220,41 @@ impl FinancialCompileIteratorFrame<'_, '_> {
     fn iteration_loan(&mut self) -> replay_work::OriginalCompileIteratorLoan<'_> {
         self.sort.compile.prefix.integrity.prefix.source.fields().compile_iterator(
             &mut self.sort.compile.options, &mut self.sort.compile.prefix.capture.source_id, &mut self.iteration)
+    }
+}
+// Fixed data continuation: every value remains with the original whole frame.
+// These ordinary library returns issue neither payment nor native SQL rules.
+struct FinancialCompileDigestState {
+    hasher: Option<sha2::Sha256>,
+    output: Option<sha2::digest::Output<sha2::Sha256>>,
+    version: Option<i32>,
+    source_part: Option<String>,
+    encoded: Option<String>,
+    identity: Option<super::global_schema_catalog_v1::SqliteRuntimeIdentity>,
+    validation: Option<Result<(), GlobalSchemaCatalogError>>,
+    pending_runtime: Option<Result<super::global_schema_catalog_v1::SqliteRuntimeIdentity, GlobalSchemaCatalogError>>,
+}
+impl FinancialCompileDigestState {
+    fn empty() -> Self { Self { hasher: None, output: None, version: None, source_part: None,
+        encoded: None, identity: None, validation: None, pending_runtime: None } }
+}
+struct FinancialCompileDigestFrame<'purpose, 'writer> {
+    sort: FinancialCompileSortFrame<'purpose, 'writer>,
+    iteration: FinancialCompileIteratorState,
+    digest: FinancialCompileDigestState,
+}
+impl<'purpose, 'writer> FinancialCompileSortFrame<'purpose, 'writer> {
+    fn begin_digest(mut self) -> Result<FinancialCompileDigestFrame<'purpose, 'writer>, Self> {
+        if self.compile.options.rows.is_none() || self.compile.prefix.capture.source_id.is_none()
+            || !self.compile.prefix.integrity.prefix.source.fields().begin_compile_digest() { return Err(self); }
+        Ok(FinancialCompileDigestFrame { sort: self, iteration: FinancialCompileIteratorState { iterator: None, pending: None },
+            digest: FinancialCompileDigestState::empty() })
+    }
+}
+impl FinancialCompileDigestFrame<'_, '_> {
+    fn digest_loan(&mut self) -> replay_work::OriginalCompileDigestLoan<'_> {
+        self.sort.compile.prefix.integrity.prefix.source.fields().compile_digest(
+            &mut self.sort.compile.options, &mut self.sort.compile.prefix.capture.source_id, &mut self.iteration, &mut self.digest)
     }
 }
 fn retain_capture_catalog_error(error: GlobalSchemaCatalogError) -> rows::original_source::SourceOperationError {
@@ -3114,6 +3151,199 @@ mod financial_original_audit_acquisition_tests {
                 else { assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
                 assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
             } }
+        }
+
+        // Fixed ordinary library execution through the production protocol
+        // cores. These fixtures retain existing native/SQL debts; they issue no
+        // rules, allocation payment, layout or Financial completion witness.
+        fn fixed_compile_digest_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter, trace: &Trace, values: Vec<String>) -> FinancialCompileDigestFrame<'purpose, 'writer> {
+            let mut frame = fixed_compile_sort_frame(purpose, writer, trace, values);
+            frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
+            frame.sort_duplicate_loan().test_code_check_unique();
+            frame.begin_digest().unwrap_or_else(|_| panic!("actual sorted unique returned Vec enters fixed digest"))
+        }
+        fn advance_compile_digest_to_call(frame: &mut FinancialCompileDigestFrame<'_, '_>, step: u8) {
+            if step == 0 { return; }
+            frame.digest_loan().test_code_call(0, 3); frame.digest_loan().test_code_move_iterator();
+            loop {
+                frame.digest_loan().test_code_next();
+                if frame.iteration.pending.is_none() { break; }
+                if step == 1 { return; }
+                frame.digest_loan().test_code_call(1, 3); frame.digest_loan().test_code_consume_field();
+            }
+            frame.digest_loan().test_code_finish_iterator(); if step == 2 { return; }
+            frame.digest_loan().test_code_call(2, 3); frame.digest_loan().test_code_move_source(); if step == 3 { return; }
+            frame.digest_loan().test_code_call(3, 3); if step == 4 { return; }
+            frame.digest_loan().test_code_call(4, 3); frame.digest_loan().test_code_build_identity();
+            assert_eq!(step, 5);
+        }
+        #[test]
+        fn history_original_real_digest_known_answers_and_once_ownership() {
+            // Root's independently frozen known answers, not recomputation of
+            // the candidate's domain/length encoding or formatter.
+            for (values, expected) in [
+                (Vec::new(), "145c4a8741a57b51d094fc06ccf9736ac86a5fa0a780060c99dc4c57de465552"),
+                (vec![String::from("AB"), String::from("C")], "ea00837041ee515aee37d5696f8f342c8b384913a59a51366314a67c5fcb1253"),
+                (vec![String::from("A"), String::from("BC")], "705aceba8dfbcdd880e0a55ae2b15d6d75c20f576840327b864e7986c6ab26be"),
+                (vec![String::from("A"), String::from("é"), String::from("λ")], "471e2f0ed6c07de21406a8a3c8ad5fa78b8856eaf8d29b7dc630ef963ad9f307"),
+            ] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let vector = values.as_ptr(); let children: Vec<_> = values.iter().map(|s| s.as_ptr()).collect();
+                let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, values);
+                let source_id = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
+                let integrity = frame.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                assert_eq!(frame.sort.compile.options.rows.as_ref().unwrap().as_ptr(), vector);
+                assert!(frame.iteration.iterator.is_none());
+                frame.digest_loan().test_code_call(0, 2);
+                // Initialization has really returned, but the Vec is still in
+                // its old owning slot until independent return observation.
+                assert!(frame.digest.hasher.is_some()); assert!(frame.iteration.iterator.is_none());
+                assert_eq!(frame.sort.compile.options.rows.as_ref().unwrap().as_ptr(), vector);
+                { let _short = frame.digest_loan(); } let mut moved = frame;
+                moved.digest_loan().test_code_return(); moved.digest_loan().test_code_move_iterator();
+                assert!(moved.sort.compile.options.rows.is_none());
+                assert_eq!(moved.iteration.iterator.as_ref().unwrap().as_slice().as_ptr(), vector);
+                for child in children {
+                    moved.digest_loan().test_code_next();
+                    assert_eq!(moved.iteration.pending.as_ref().unwrap().as_ptr(), child);
+                    moved.digest_loan().test_code_call(1, 2);
+                    assert_eq!(moved.iteration.pending.as_ref().unwrap().as_ptr(), child);
+                    moved.digest_loan().test_code_return(); moved.digest_loan().test_code_consume_field();
+                    assert!(moved.iteration.pending.is_none());
+                }
+                moved.digest_loan().test_code_next(); assert!(moved.iteration.pending.is_none());
+                assert!(moved.iteration.iterator.as_ref().unwrap().as_slice().is_empty());
+                moved.digest_loan().test_code_finish_iterator(); assert!(moved.iteration.iterator.is_none());
+                moved.digest_loan().test_code_call(2, 3);
+                let actual_version = moved.digest.version.unwrap();
+                moved.digest_loan().test_code_move_source();
+                assert_eq!(moved.digest.source_part.as_ref().unwrap().as_ptr(), source_id);
+                assert!(moved.sort.compile.prefix.capture.source_id.is_none());
+                moved.digest_loan().test_code_call(3, 2);
+                assert!(moved.digest.hasher.is_none()); assert!(moved.digest.output.is_some());
+                moved.digest_loan().test_code_return(); moved.digest_loan().test_code_call(4, 2);
+                assert_eq!(moved.digest.encoded.as_deref(), Some(expected));
+                assert!(moved.digest.output.is_some()); let encoded = moved.digest.encoded.as_ref().unwrap().as_ptr();
+                moved.digest_loan().test_code_return(); assert!(moved.digest.output.is_none());
+                moved.digest_loan().test_code_build_identity();
+                let identity = moved.digest.identity.as_ref().unwrap();
+                assert_eq!(identity.source_id.as_ptr(), source_id); assert_eq!(identity.compile_options_sha256.as_ptr(), encoded);
+                assert_eq!(identity.libversion_number, actual_version);
+                moved.digest_loan().test_code_call(5, 3); moved.digest_loan().test_code_retain_runtime();
+                let runtime = moved.digest.pending_runtime.as_ref().unwrap().as_ref().unwrap();
+                assert_eq!(runtime.compile_options_sha256, expected); assert_eq!(runtime.source_id.as_ptr(), source_id);
+                assert_eq!(runtime.compile_options_sha256.as_ptr(), encoded); assert_eq!(runtime.libversion_number, actual_version);
+                assert!(moved.digest.identity.is_none() && moved.digest.validation.is_none());
+                assert_eq!(moved.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
+                assert!(std::ptr::eq(moved.sort.compile.prefix.integrity.prefix.initial.purpose, &purpose));
+                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            }
+        }
+        #[test]
+        fn history_original_real_digest_validator_keeps_actual_error_and_return_debts() {
+            let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, vec![String::from("A")]);
+            // Change only the test-owned captured input. The existing real
+            // validator allocates and returns its own original diagnostic.
+            frame.sort.compile.prefix.capture.source_id = Some(String::from("   "));
+            advance_compile_digest_to_call(&mut frame, 5);
+            frame.digest_loan().test_code_call(5, 2);
+            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.validation
+                else { panic!("actual fixed validator must return the empty-source-id error"); };
+            assert_eq!(detail, "source_id is empty"); let diagnostic = detail.as_ptr();
+            assert!(frame.digest.identity.is_some()); frame.digest_loan().test_code_return();
+            frame.digest_loan().test_code_retain_runtime(); assert!(frame.digest.identity.is_none());
+            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.pending_runtime
+                else { panic!("same owned error expression retained before Statement drop"); };
+            assert_eq!(detail.as_ptr(), diagnostic);
+            assert!(frame.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+            let (primary, allocation) = fixed_primary();
+            // Adverse existing-primary fixture only, not a paid-return issuer.
+            frame.sort.compile.prefix.integrity.prefix.source.physical.primary = Some(primary);
+            frame.sort.compile.prefix.integrity.prefix.source.physical.audit_phase = FinancialAuditPhase::Failed;
+            let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+            { let _short = frame.digest_loan(); } let mut moved = frame;
+            moved.digest_loan().test_code_no_new_work();
+            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &moved.digest.pending_runtime
+                else { panic!("late first primary cannot discard or overwrite unissued error payment"); };
+            assert_eq!(detail.as_ptr(), diagnostic); assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation);
+            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            drop(moved); // Release this actual audit pin before admitting the next independent fixture.
+            for terminal in [false, true] {
+                let trace = Trace::new();
+                let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, Vec::new());
+                frame.sort.compile.prefix.capture.source_id = Some(String::from("   "));
+                advance_compile_digest_to_call(&mut frame, 5); frame.digest_loan().test_code_call(5, 2);
+                let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.validation
+                    else { panic!("actual independently returned validation error"); };
+                let actual_error = detail.as_ptr();
+                let (primary, allocation) = fixed_primary();
+                let first = if terminal { drop(primary);
+                    Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err())
+                } else {
+                    frame.sort.compile.prefix.integrity.prefix.source.physical.primary = Some(primary);
+                    frame.sort.compile.prefix.integrity.prefix.source.physical.audit_phase = FinancialAuditPhase::Failed; None
+                };
+                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                frame.digest_loan().test_code_return(); frame.digest_loan().test_code_no_new_work();
+                let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.validation
+                    else { panic!("late failure retains the same unpaid diagnostic owner"); };
+                assert_eq!(detail.as_ptr(), actual_error);
+                assert!(frame.digest.identity.is_some()); assert!(frame.digest.pending_runtime.is_none());
+                assert_eq!(frame.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.sort.compile.prefix.integrity.prefix.source.audit);
+                if let Some(first) = first {
+                    assert_eq!(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                } else { assert_primary(&frame.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
+                assert_eq!(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            }
+        }
+        #[test]
+        fn history_original_real_digest_unknown_and_late_first_failure_hold_whole() {
+            for step in 0..6 { for cut in 0..3 { for terminal in [false, true] {
+                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, vec![String::from("A")]);
+                advance_compile_digest_to_call(&mut frame, step);
+                frame.digest_loan().test_code_call(step, cut);
+                let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
+                let source_part = frame.digest.source_part.as_ref().map(|s| s.as_ptr());
+                let encoded = frame.digest.encoded.as_ref().map(|s| s.as_ptr());
+                let identity = frame.digest.identity.as_ref().map(|i| (i.source_id.as_ptr(), i.compile_options_sha256.as_ptr()));
+                let (primary, allocation) = fixed_primary();
+                let first = if terminal {
+                    drop(primary); Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err())
+                } else {
+                    // This deliberately injected first-owner control carries no
+                    // payment observation and never mints production authority.
+                    frame.sort.compile.prefix.integrity.prefix.source.physical.primary = Some(primary);
+                    frame.sort.compile.prefix.integrity.prefix.source.physical.audit_phase = FinancialAuditPhase::Failed; None
+                };
+                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                { let _short = frame.digest_loan(); } let mut moved = frame;
+                moved.digest_loan().test_code_barrier();
+                assert_eq!(moved.iteration.pending.as_ref().map(|s| s.as_ptr()), pending);
+                assert_eq!(moved.digest.source_part.as_ref().map(|s| s.as_ptr()), source_part);
+                assert_eq!(moved.digest.encoded.as_ref().map(|s| s.as_ptr()), encoded);
+                assert_eq!(moved.digest.identity.as_ref().map(|i| (i.source_id.as_ptr(), i.compile_options_sha256.as_ptr())), identity);
+                if cut < 2 { moved.digest_loan().test_code_unobserved(cut == 1); }
+                else { moved.digest_loan().test_code_late_return(step); }
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                if let Some(first) = first {
+                    assert!(moved.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+                    assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                } else { assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
+                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            } } }
         }
 
         fn integrity_raw_allocation(raw: &rusqlite::Error) -> usize {
@@ -6885,6 +7115,71 @@ mod tests {
             c.execute("INSERT INTO sqlite_sequence(name,seq) VALUES('ledger',91),('TEST_CODE_UNKNOWN_COUNTER',X'3100FF')",[]).unwrap();
         });
     }
+    // cfg-only bridge: the callback receives the actual owned backup while
+    // its real fixture/lease remains live. No cap or File is fabricated.
+    pub(super) fn task6_with_actual_rows_backup_for_test(
+        operation: impl FnOnce(rows::VerifiedUnapprovedOriginalRowsBackup),
+    ) {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        rows_test_seed(&fixture);
+        let before = fs::read(fixture.database()).unwrap();
+        let read_audit = || match fs::read(writer.path()) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("TEST_CODE additive audit read: {error}"),
+        };
+        let audit = read_audit();
+        let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+        operation(original);
+        assert_eq!(fs::read(fixture.database()).unwrap(), before);
+        assert_eq!(read_audit(), audit);
+        prospective_assert_fixture_offline(&fixture);
+        drop(fixture.acquire_exclusive().unwrap());
+    }
+
+    // cfg-only, process-equivalent cold recovery in the same real directory.
+    // The first callback must end all old owners; the exclusive probe rejects
+    // any retained old lease before the second genuine cap is constructed.
+    pub(super) fn task6_with_cold_rows_backup_fixture_for_test<T>(
+        first: impl FnOnce(rows::VerifiedUnapprovedOriginalRowsBackup) -> T,
+        second: impl FnOnce(T, rows::VerifiedUnapprovedOriginalRowsBackup),
+    ) {
+        let _serial = PROSPECTIVE_TEST_SERIAL.lock().unwrap();
+        let (fixture, writer) = actual_offline_catalog6_fixture();
+        rows_test_seed(&fixture);
+        let before = fs::read(fixture.database()).unwrap();
+        let original_node = FileIdentity::from_metadata(&fs::metadata(fixture.database()).unwrap());
+        let audit = match fs::read(writer.path()) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => panic!("unexpected audit read: {e}"),
+        };
+        let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+        let saved = first(original);
+        drop(fixture.acquire_exclusive().unwrap());
+        assert_eq!(fs::read(fixture.database()).unwrap(), before);
+        assert_eq!(FileIdentity::from_metadata(&fs::metadata(fixture.database()).unwrap()), original_node);
+        let mid_audit = match fs::read(writer.path()) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => panic!("unexpected audit read: {e}"),
+        };
+        assert_eq!(mid_audit, audit);
+        let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
+        second(saved, original);
+        assert_eq!(fs::read(fixture.database()).unwrap(), before);
+        assert_eq!(FileIdentity::from_metadata(&fs::metadata(fixture.database()).unwrap()), original_node);
+        let after_audit = match fs::read(writer.path()) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => panic!("unexpected audit read: {e}"),
+        };
+        assert_eq!(after_audit, audit);
+        prospective_assert_fixture_offline(&fixture);
+        drop(fixture.acquire_exclusive().unwrap());
+    }
+
     fn rows_test_report(rendered: &str) -> serde_json::Value {
         serde_json::from_str(rendered).unwrap()
     }

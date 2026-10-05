@@ -806,3 +806,40 @@ mod tests {
         assert!(fixture.main.as_raw_fd() >= 0);
     }
 }
+
+
+/// DELETE-mode local retention material only. No WAL/SHM or reusable parked
+/// descriptor is admitted by this entry; the already owned Main pin precedes
+/// the before snapshot. The actual connection continues to own this handle.
+#[derive(Debug)]
+pub(super) struct AttestedRetentionMain(RetainedSqliteHandle);
+impl AttestedRetentionMain {
+    pub(super) fn from_delta(
+        before: &ProcessDescriptorSnapshot,
+        after: &ProcessDescriptorSnapshot,
+        main: &File,
+    ) -> Result<Self, DescriptorAttestationError> {
+        let expected = FileObjectIdentity::from_file(main)?;
+        expected.require_regular(SqliteObjectRole::Main)?;
+        let mut candidates = before.delta(after).into_iter()
+            .filter(|candidate| candidate.identity == expected);
+        let first = candidates.next().ok_or_else(||
+            DescriptorAttestationError::unavailable("retention Main has no fresh native descriptor"))?;
+        if candidates.next().is_some() {
+            return Err(DescriptorAttestationError::ambiguous("retention Main has multiple fresh native descriptors"));
+        }
+        let result = Self(RetainedSqliteHandle { descriptor: first.descriptor, identity: expected });
+        result.validate(main)?;
+        Ok(result)
+    }
+    pub(super) fn validate(&self, main: &File) -> Result<(), DescriptorAttestationError> {
+        self.0.validate(SqliteObjectRole::Main, FileObjectIdentity::from_file(main)?)?;
+        unsafe extern "C" { fn fcntl(fd: i32, command: i32, ...) -> i32; }
+        // F_GETFD/FD_CLOEXEC are the fixed Unix descriptor flags; no handle escapes.
+        let flags = unsafe { fcntl(self.0.descriptor(), 1) };
+        if flags < 0 || flags & 1 == 0 {
+            return Err(DescriptorAttestationError::identity_changed("retention Main descriptor is inheritable or unavailable"));
+        }
+        Ok(())
+    }
+}

@@ -224,10 +224,16 @@ fn finish_draft(
     })
 }
 pub(crate) fn parse_draft(b: &[u8]) -> Result<UnverifiedEvidencePackageDraft, ValueError> {
-    let w = &mut Work::new();
+    parse_draft_with_work(b, &mut Work::new())
+}
+
+fn parse_draft_with_work(
+    b: &[u8],
+    w: &mut Work,
+) -> Result<UnverifiedEvidencePackageDraft, ValueError> {
     let d: DraftWire = codec_v1::decode(b, Shape::Draft, DRAFT_LIMIT, w)?;
     validate_draft(&d, w)?;
-    codec_v1::canonical(&d, b, w)?;
+    codec_v1::canonical_preflighted_draft(&d, b, w)?;
     let b = codec_v1::copy(b, w)?;
     finish_draft(d, b, w)
 }
@@ -923,3 +929,8 @@ pub(crate) fn build_daily_root(
 }
 #[cfg(test)]
 mod tests;
+
+// Persistent local material remains Unverified; no remote dispatcher or seal issuer.
+pub(crate) mod outbox_v1;
+#[cfg(test)]
+mod outbox_v1_tests;

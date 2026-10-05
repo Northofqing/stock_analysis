@@ -81,6 +81,7 @@ tonic-prost-build = "0.14"
 toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
+libc = "=0.2.184" # fixed libc DIR/dirent ABI for descriptor-relative additive census
 pam = "0.7"           # PAM 跨平台认证 (Linux/macOS, 用 0.7 因 0.8 与 rustc 1.97+ 编译失败)
 
 # v20.2: race condition 彻底解决 (test_design_contradiction 跨 test binary 文件 race)

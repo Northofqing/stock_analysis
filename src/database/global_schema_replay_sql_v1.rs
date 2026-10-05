@@ -855,6 +855,7 @@ pub(super) mod original_native {
         compile_options: CompileOptionsRecord,
         compile_sort: CompileSortRecord,
         compile_iterator: CompileIteratorRecord,
+        compile_digest: CompileDigestRecord,
         secondary: Option<FixedAdverse>,
         _thread: PhantomData<Rc<()>>,
     }
@@ -889,6 +890,7 @@ pub(super) mod original_native {
                 compile_options: CompileOptionsRecord::empty(),
                 compile_sort: CompileSortRecord::empty(),
                 compile_iterator: CompileIteratorRecord::empty(),
+                compile_digest: CompileDigestRecord::empty(),
                 secondary: None,
                 _thread: PhantomData,
             }
@@ -972,6 +974,11 @@ pub(super) mod original_native {
         AcquireCompileDuplicateError, AwaitCompileDuplicateOwner, AwaitCompileDuplicateReturn, AwaitCompileDigestSuccessor,
         NextCompileOption, AwaitCompileOptionNextReturn, BorrowCompileOptionHash, AwaitCompileOptionHashScope,
         AwaitCompileOptionHashReturn, DiscardCompileOption, DiscardCompileIterator, StopCompileIterator,
+        InitializeCompileDigest, AwaitCompileDigestCall, AwaitCompileDigestLoan, MoveCompileDigestIterator,
+        HashCompileDigestField, ConsumeCompileDigestField, ReadCompileDigestVersion, MoveCompileDigestSource,
+        FinalizeCompileDigest, EncodeCompileDigest, BuildCompileDigestIdentity, ValidateCompileDigestIdentity,
+        RetainCompileDigestRuntime, AwaitCompileDigestPayment, DrainCompileDigest,
+
     }
     enum ConstructorObservation { Open(i32), Extended(i32), BusyTimeout(i32), Close(i32) }
     enum A00Observation { Prepare(i32), QueryStarted, Step(i32), Integer(i64), Reset(i32), Finalize(i32) }
@@ -1829,7 +1836,7 @@ pub(super) mod original_native {
                 && self.statements.iter().all(|slot| slot.live().is_none())
                 && self.initial_read.driver_error.is_none() && self.initial_read.ignored.is_none()
                 && self.integrity_read.stopped_clear() && self.capture_prefix.stopped_clear() && self.compile_options.stopped_clear()
-                && self.compile_sort.stopped_clear() && self.compile_iterator.stopped_clear()
+                && self.compile_sort.stopped_clear() && self.compile_iterator.stopped_clear() && self.compile_digest.stopped_clear()
         }
     }
     impl<'a> OriginalOwnerFields<'a> {
@@ -2004,7 +2011,8 @@ pub(super) mod original_native {
                 || self.fields.native.capture_prefix.blocks_early_primary()
                 || self.fields.native.compile_options.blocks_early_primary()
                 || self.fields.native.compile_sort.blocks_early_primary()
-                || self.fields.native.compile_iterator.blocks_early_primary() { return Err(error); }
+                || self.fields.native.compile_iterator.blocks_early_primary()
+                || self.fields.native.compile_digest.blocks_early_primary() { return Err(error); }
             self.fields.physical.primary = Some(error);
             self.fields.physical.audit_phase = super::super::super::FinancialAuditPhase::Failed;
             Ok(())
@@ -4673,6 +4681,7 @@ pub(super) mod original_native {
     }
     impl NativeOriginalOwner {
         fn compile_options_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            if let Some(action) = self.compile_digest_action(work, physical) { return Some(action); }
             if let Some(action) = self.compile_iterator_action(work, physical) { return Some(action); }
             if let Some(action) = self.compile_sort_action(work, physical) { return Some(action); }
             let r = &self.compile_options;
@@ -5675,4 +5684,368 @@ pub(super) mod original_native {
             assert!(self.fields.native.compile_options.stopped_clear());
         }
     }
+    // This ledger is a fixed callee grammar, not a native/payment issuer. A
+    // dropped call port leaves Calling; a returned body still owes its loan end.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DigestCall { Initialize, Field, Version, Finalize, Hex, Validate }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DigestPhase { Dormant, Initialize, Calling(DigestCall), Returned(DigestCall), MoveIterator,
+        Iterating, ConsumeField, Version, MoveSource, Finalize, Hex, Build, Validate, RetainRuntime,
+        Statement, Draining, Stopped }
+    struct CompileDigestRecord { phase: DigestPhase, loan_ended: bool, formatter_unissued: bool, diagnostic_unissued: bool }
+    impl CompileDigestRecord {
+        fn empty() -> Self { Self { phase: DigestPhase::Dormant, loan_ended: false, formatter_unissued: false, diagnostic_unissued: false } }
+        fn has_unissued_allocation(&self) -> bool { self.formatter_unissued || self.diagnostic_unissued }
+        fn stopped_clear(&self) -> bool { matches!(self.phase, DigestPhase::Dormant | DigestPhase::Stopped) && !self.has_unissued_allocation() }
+        fn blocks_early_primary(&self) -> bool { !self.stopped_clear() }
+    }
+    impl NativeOriginalOwner {
+        fn compile_digest_action(&self, work: &OriginalSourceWork<'_>, physical: &super::super::super::FinancialPhysical) -> Option<LifecycleAction> {
+            use DigestPhase as Phase;
+            let r = &self.compile_digest;
+            let stopped = work.terminal().is_some() || physical.primary.is_some();
+            Some(match r.phase {
+                Phase::Dormant | Phase::Stopped | Phase::Draining => return None,
+                Phase::Calling(_) => LifecycleAction::AwaitCompileDigestCall,
+                Phase::Returned(_) => if r.loan_ended { LifecycleAction::AwaitCompileDigestCall } else { LifecycleAction::AwaitCompileDigestLoan },
+                Phase::Statement => {
+                    // Pending Result is installed before the old Statement
+                    // cleanup. Cleanup does not pay or emit that Result.
+                    if self.compile_options.statement_drop_owed { LifecycleAction::AwaitCompileStatementDrop }
+                    else if self.statements[0].live().is_some() { LifecycleAction::FinalizeCompileStatement }
+                    else { LifecycleAction::AwaitCompileDigestPayment }
+                },
+                // Acquired library allocations retain their actual owner. No
+                // scalar setter, resource drain or late T invents their payment.
+                _ if stopped && r.has_unissued_allocation() => LifecycleAction::AwaitCompileDigestPayment,
+                Phase::ConsumeField => LifecycleAction::ConsumeCompileDigestField,
+                Phase::Iterating => return self.compile_iterator_action(work, physical).map(|action| {
+                    if action == LifecycleAction::BorrowCompileOptionHash { LifecycleAction::HashCompileDigestField } else { action }
+                }),
+                _ if stopped => LifecycleAction::DrainCompileDigest,
+                Phase::Initialize => LifecycleAction::InitializeCompileDigest,
+                Phase::MoveIterator => LifecycleAction::MoveCompileDigestIterator,
+                Phase::Version => LifecycleAction::ReadCompileDigestVersion,
+                Phase::MoveSource => LifecycleAction::MoveCompileDigestSource,
+                Phase::Finalize => LifecycleAction::FinalizeCompileDigest,
+                Phase::Hex => LifecycleAction::EncodeCompileDigest,
+                Phase::Build => LifecycleAction::BuildCompileDigestIdentity,
+                Phase::Validate => LifecycleAction::ValidateCompileDigestIdentity,
+                Phase::RetainRuntime => LifecycleAction::RetainCompileDigestRuntime,
+            })
+        }
+    }
+    impl OriginalOwnerFields<'_> {
+        pub(in crate::database::global_schema_v1) fn begin_compile_digest(&mut self) -> bool {
+            let n = &mut self.native; let r = &n.compile_options;
+            if self.work.terminal().is_some() || self.physical.primary.is_some() || !matches!(n.tx.phase, TxPhase::Active)
+                || n.compile_digest.phase != DigestPhase::Dormant || n.compile_iterator.phase != CompileIteratorPhase::Dormant
+                || n.compile_sort.phase != CompileSortPhase::DigestHeld || r.stage != CompileStage::Ready
+                || r.collect_return != CompileReturn::Ok || !r.vector_live || r.blocks_early_primary()
+                || r.runtime_return != CompileReturn::Unknown || r.catalog_return != CompileReturn::Unknown
+                || !n.statements[0].live().is_some_and(|s| s.action == FixedAction::CompileOptions && s.cursor == CursorPhase::NoCursor)
+                || !n.capture_prefix.value_live { return false; }
+            n.compile_digest.phase = DigestPhase::Initialize; true
+        }
+    }
+    pub(in crate::database::global_schema_v1) struct OriginalCompileDigestLoan<'a> {
+        fields: OriginalOwnerFields<'a>, options: &'a mut super::super::super::FinancialCompileOptionsState,
+        source_id: &'a mut Option<String>, iteration: &'a mut super::super::super::FinancialCompileIteratorState,
+        digest: &'a mut super::super::super::FinancialCompileDigestState,
+    }
+    struct OriginalCompileDigestPort<'short, 'a, 'rules> {
+        loan: &'short mut OriginalCompileDigestLoan<'a>, _rules: &'rules SelectedOriginalNativeRules,
+    }
+    struct OriginalDigestBodyPort<'short, 'a> {
+        loan: &'short mut OriginalCompileDigestLoan<'a>, call: DigestCall,
+    }
+    impl<'a> OriginalOwnerFields<'a> {
+        pub(in crate::database::global_schema_v1) fn compile_digest(self,
+            options: &'a mut super::super::super::FinancialCompileOptionsState, source_id: &'a mut Option<String>,
+            iteration: &'a mut super::super::super::FinancialCompileIteratorState,
+            digest: &'a mut super::super::super::FinancialCompileDigestState) -> OriginalCompileDigestLoan<'a> {
+            OriginalCompileDigestLoan { fields: self, options, source_id, iteration, digest }
+        }
+    }
+    impl<'a> OriginalCompileDigestLoan<'a> {
+        fn fixed_port<'short, 'rules>(&'short mut self, rules: &'rules SelectedOriginalNativeRules) -> OriginalCompileDigestPort<'short, 'a, 'rules> {
+            OriginalCompileDigestPort { loan: self, _rules: rules }
+        }
+        fn next(&self) -> Option<LifecycleAction> { self.fields.native.compile_options_action(&self.fields.work, self.fields.physical) }
+        fn parent_loan(&mut self) -> OriginalCompileOptionsLoan<'_> {
+            OriginalCompileOptionsLoan { fields: self.fields.reborrow(), options: &mut *self.options, source_id: &mut *self.source_id }
+        }
+        fn iterator_loan(&mut self) -> OriginalCompileIteratorLoan<'_> {
+            OriginalCompileIteratorLoan { fields: self.fields.reborrow(), options: &mut *self.options,
+                source_id: &mut *self.source_id, iteration: &mut *self.iteration }
+        }
+        fn body_port(&mut self, call: DigestCall) -> Result<OriginalDigestBodyPort<'_, 'a>, ProtocolFault> {
+            let expected = match call { DigestCall::Initialize => LifecycleAction::InitializeCompileDigest,
+                DigestCall::Field => LifecycleAction::HashCompileDigestField, DigestCall::Version => LifecycleAction::ReadCompileDigestVersion,
+                DigestCall::Finalize => LifecycleAction::FinalizeCompileDigest, DigestCall::Hex => LifecycleAction::EncodeCompileDigest,
+                DigestCall::Validate => LifecycleAction::ValidateCompileDigestIdentity };
+            if self.next() != Some(expected) { return Err(ProtocolFault::UnexpectedObservation); }
+            let installed = match call {
+                DigestCall::Initialize => self.options.rows.is_some() && self.digest.hasher.is_none() && self.iteration.iterator.is_none(),
+                DigestCall::Field => self.digest.hasher.is_some() && self.iteration.pending.is_some(),
+                DigestCall::Version => self.digest.version.is_none() && self.iteration.iterator.is_none(),
+                DigestCall::Finalize => self.digest.hasher.is_some() && self.digest.output.is_none() && self.digest.source_part.is_some(),
+                DigestCall::Hex => self.digest.output.is_some() && self.digest.encoded.is_none(),
+                DigestCall::Validate => self.digest.identity.is_some() && self.digest.validation.is_none(),
+            };
+            if !installed { return Err(ProtocolFault::ResourceNotInstalled); }
+            let r = &mut self.fields.native.compile_digest; r.phase = DigestPhase::Calling(call); r.loan_ended = false;
+            Ok(OriginalDigestBodyPort { loan: self, call })
+        }
+        fn body_return(&mut self) -> Result<(), ProtocolFault> {
+            let r = &mut self.fields.native.compile_digest;
+            let DigestPhase::Returned(call) = r.phase else { return Err(ProtocolFault::UnexpectedObservation); };
+            if !r.loan_ended { return Err(ProtocolFault::UnexpectedObservation); }
+            r.phase = match call { DigestCall::Initialize => DigestPhase::MoveIterator, DigestCall::Field => DigestPhase::ConsumeField,
+                DigestCall::Version => DigestPhase::MoveSource, DigestCall::Finalize => DigestPhase::Hex,
+                DigestCall::Hex => { drop(self.digest.output.take().ok_or(ProtocolFault::ResourceNotInstalled)?); DigestPhase::Build },
+                DigestCall::Validate => DigestPhase::RetainRuntime };
+            Ok(())
+        }
+        fn move_iterator(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::MoveCompileDigestIterator) || self.digest.hasher.is_none()
+                || self.iteration.iterator.is_some() || !self.fields.begin_compile_iterator() { return Err(ProtocolFault::UnexpectedObservation); }
+            let rows = self.options.rows.take().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            self.iteration.iterator = Some(rows.into_iter());
+            self.fields.native.compile_digest.phase = DigestPhase::Iterating; Ok(())
+        }
+        fn next_body_port(&mut self) -> Result<OriginalCompileNextBodyPort<'_>, ProtocolFault> {
+            if self.next() != Some(LifecycleAction::NextCompileOption) || self.iteration.pending.is_some() {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            let iterator = self.iteration.iterator.as_mut().ok_or(ProtocolFault::ResourceNotInstalled)?;
+            let record = &mut self.fields.native.compile_iterator;
+            record.phase = CompileIteratorPhase::NextReturn; record.next_returned = false;
+            Ok(OriginalCompileNextBodyPort { iterator, pending: &mut self.iteration.pending, record })
+        }
+        fn consume_field(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::ConsumeCompileDigestField) { return Err(ProtocolFault::UnexpectedObservation); }
+            drop(self.iteration.pending.take().ok_or(ProtocolFault::ResourceNotInstalled)?);
+            let n = &mut self.fields.native; n.compile_iterator.pending_live = false;
+            n.compile_iterator.phase = CompileIteratorPhase::Next; n.compile_digest.phase = DigestPhase::Iterating; Ok(())
+        }
+        fn finish_iterator(&mut self) -> Result<(), ProtocolFault> {
+            if self.fields.native.compile_digest.phase != DigestPhase::Iterating
+                || self.fields.native.compile_iterator.phase != CompileIteratorPhase::Eof || self.iteration.pending.is_some() {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            self.iterator_loan().discard_iterator()?;
+            self.fields.native.compile_digest.phase = DigestPhase::Version; Ok(())
+        }
+        fn move_source(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::MoveCompileDigestSource) || self.digest.version.is_none()
+                || self.digest.source_part.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            self.digest.source_part = Some(self.source_id.take().ok_or(ProtocolFault::ResourceNotInstalled)?);
+            self.fields.native.capture_prefix.value_live = false;
+            self.fields.native.compile_digest.phase = DigestPhase::Finalize; Ok(())
+        }
+        fn build_identity(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::BuildCompileDigestIdentity) || self.digest.identity.is_some()
+                || self.digest.version.is_none() || self.digest.source_part.is_none() || self.digest.encoded.is_none() {
+                return Err(ProtocolFault::UnexpectedObservation);
+            }
+            self.digest.identity = Some(super::super::super::super::global_schema_catalog_v1::SqliteRuntimeIdentity {
+                libversion_number: self.digest.version.take().unwrap(), source_id: self.digest.source_part.take().unwrap(),
+                compile_options_sha256: self.digest.encoded.take().unwrap(),
+            });
+            self.fields.native.compile_digest.phase = DigestPhase::Validate; Ok(())
+        }
+        fn retain_runtime(&mut self) -> Result<(), ProtocolFault> {
+            if self.next() != Some(LifecycleAction::RetainCompileDigestRuntime) || self.digest.pending_runtime.is_some()
+                || self.digest.validation.is_none() || self.digest.identity.is_none() { return Err(ProtocolFault::UnexpectedObservation); }
+            let result = match self.digest.validation.take().unwrap() {
+                Ok(()) => Ok(self.digest.identity.take().unwrap()),
+                Err(error) => { drop(self.digest.identity.take().unwrap()); Err(error) },
+            };
+            self.digest.pending_runtime = Some(result);
+            // This is the pending return expression. Actual Statement::Drop,
+            // independent C/catalog/G returns and payments are still owed.
+            self.fields.native.compile_digest.phase = DigestPhase::Statement; Ok(())
+        }
+        fn drain_before_allocation(&mut self) -> Result<(), ProtocolFault> {
+            let phase = self.fields.native.compile_digest.phase;
+            if self.fields.work.terminal().is_none() && self.fields.physical.primary.is_none() { return Err(ProtocolFault::UnexpectedObservation); }
+            if self.fields.native.compile_digest.has_unissued_allocation() || matches!(phase, DigestPhase::Calling(_) | DigestPhase::Returned(_) | DigestPhase::Draining | DigestPhase::Stopped)
+                || self.fields.native.compile_iterator.phase == CompileIteratorPhase::NextReturn { return Err(ProtocolFault::UnexpectedObservation); }
+            if self.fields.native.compile_iterator.pending_live {
+                drop(self.iteration.pending.take().ok_or(ProtocolFault::ResourceNotInstalled)?);
+                self.fields.native.compile_iterator.pending_live = false;
+            }
+            if self.fields.native.compile_iterator.iterator_live {
+                drop(self.iteration.iterator.take().ok_or(ProtocolFault::ResourceNotInstalled)?);
+                self.fields.native.compile_iterator.iterator_live = false;
+            }
+            if self.fields.native.compile_options.vector_live {
+                drop(self.options.rows.take().ok_or(ProtocolFault::ResourceNotInstalled)?);
+                self.fields.native.compile_options.vector_live = false;
+            }
+            drop(self.digest.hasher.take()); drop(self.digest.output.take()); drop(self.digest.source_part.take());
+            self.digest.version = None;
+            self.fields.native.compile_iterator.phase = CompileIteratorPhase::Draining;
+            self.fields.native.compile_sort.phase = CompileSortPhase::Draining;
+            self.fields.native.compile_digest.phase = DigestPhase::Draining; Ok(())
+        }
+        fn stop_after_drain(&mut self) -> Result<(), ProtocolFault> {
+            if self.fields.native.compile_digest.phase != DigestPhase::Draining || self.fields.native.compile_digest.has_unissued_allocation()
+                || self.iteration.iterator.is_some() || self.iteration.pending.is_some() || self.digest.hasher.is_some()
+                || self.digest.output.is_some() || self.digest.version.is_some() || self.digest.source_part.is_some()
+                || self.digest.encoded.is_some() || self.digest.identity.is_some() || self.digest.validation.is_some()
+                || self.digest.pending_runtime.is_some() { return Err(ProtocolFault::UnexpectedObservation); }
+            // The old parent still requires its independently observed
+            // Statement/ignored Result/runtime/catalog return obligations.
+            self.parent_loan().stop()?;
+            self.fields.native.compile_iterator.phase = CompileIteratorPhase::Stopped;
+            self.fields.native.compile_digest.phase = DigestPhase::Stopped; Ok(())
+        }
+    }
+    impl OriginalDigestBodyPort<'_, '_> {
+        fn run(&mut self) -> Result<(), ProtocolFault> {
+            use sha2::Digest;
+            if self.loan.fields.native.compile_digest.phase != DigestPhase::Calling(self.call) { return Err(ProtocolFault::UnexpectedObservation); }
+            let d = &mut self.loan.digest;
+            match self.call {
+                DigestCall::Initialize => {
+                    let mut hasher = sha2::Sha256::new();
+                    super::super::super::super::global_schema_catalog_v1::hash_field(&mut hasher, b"stock_analysis.br180.sqlite_compile_options.v1");
+                    hasher.update((self.loan.options.rows.as_ref().unwrap().len() as u64).to_be_bytes());
+                    d.hasher = Some(hasher);
+                },
+                DigestCall::Field => super::super::super::super::global_schema_catalog_v1::hash_field(
+                    d.hasher.as_mut().unwrap(), self.loan.iteration.pending.as_ref().unwrap().as_bytes()),
+                DigestCall::Version => d.version = Some(rusqlite::version_number()),
+                DigestCall::Finalize => d.output = Some(d.hasher.take().unwrap().finalize()),
+                DigestCall::Hex => {
+                    d.encoded = Some(super::super::super::super::global_schema_catalog_v1::lower_hex(d.output.as_ref().unwrap()));
+                    self.loan.fields.native.compile_digest.formatter_unissued = true;
+                },
+                DigestCall::Validate => {
+                    d.validation = Some(super::super::super::super::global_schema_catalog_v1::validate_runtime_identity(d.identity.as_ref().unwrap()));
+                    self.loan.fields.native.compile_digest.diagnostic_unissued = d.validation.as_ref().unwrap().is_err();
+                },
+            }
+            // Installation happens first, including an actual owned Err. A
+            // late primary/T cannot overwrite it or turn an unrun body into Ok.
+            self.loan.fields.native.compile_digest.phase = DigestPhase::Returned(self.call); Ok(())
+        }
+        fn end_scope(self) -> Result<(), ProtocolFault> {
+            if self.loan.fields.native.compile_digest.phase != DigestPhase::Returned(self.call) { return Err(ProtocolFault::UnexpectedObservation); }
+            self.loan.fields.native.compile_digest.loan_ended = true; Ok(())
+        }
+    }
+    impl<'a> OriginalCompileDigestPort<'_, 'a, '_> {
+        fn body(&mut self, call: DigestCall) -> Result<OriginalDigestBodyPort<'_, 'a>, ProtocolFault> { self.loan.body_port(call) }
+        fn body_return(&mut self) -> Result<(), ProtocolFault> { self.loan.body_return() }
+        fn move_iterator(&mut self) -> Result<(), ProtocolFault> { self.loan.move_iterator() }
+        fn next_body(&mut self) -> Result<OriginalCompileNextBodyPort<'_>, ProtocolFault> { self.loan.next_body_port() }
+        fn next_return(&mut self) -> Result<(), ProtocolFault> { self.loan.iterator_loan().next_return() }
+        fn consume_field(&mut self) -> Result<(), ProtocolFault> { self.loan.consume_field() }
+        fn finish_iterator(&mut self) -> Result<(), ProtocolFault> { self.loan.finish_iterator() }
+        fn move_source(&mut self) -> Result<(), ProtocolFault> { self.loan.move_source() }
+        fn build_identity(&mut self) -> Result<(), ProtocolFault> { self.loan.build_identity() }
+        fn retain_runtime(&mut self) -> Result<(), ProtocolFault> { self.loan.retain_runtime() }
+        fn drain_before_allocation(&mut self) -> Result<(), ProtocolFault> { self.loan.drain_before_allocation() }
+        fn finalize(&mut self, code: i32) -> Result<(), ProtocolFault> { self.loan.parent_loan().observe_finalize(code) }
+        fn statement_drop_return(&mut self) -> Result<(), ProtocolFault> { self.loan.parent_loan().statement_drop_return() }
+        fn discard_owned(&mut self) -> Result<(), ProtocolFault> { self.loan.parent_loan().discard_owned() }
+        fn runtime_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.loan.fields.native.compile_digest.phase != DigestPhase::Draining { return Err(ProtocolFault::UnexpectedObservation); }
+            self.loan.parent_loan().runtime_return(fact)
+        }
+        fn catalog_return(&mut self, fact: CompileReturn) -> Result<(), ProtocolFault> {
+            if self.loan.fields.native.compile_digest.phase != DigestPhase::Draining { return Err(ProtocolFault::UnexpectedObservation); }
+            self.loan.parent_loan().catalog_return(fact)
+        }
+        fn stop_after_drain(&mut self) -> Result<(), ProtocolFault> { self.loan.stop_after_drain() }
+    }
+
+    #[cfg(test)]
+    impl OriginalCompileDigestLoan<'_> {
+        pub(in crate::database::global_schema_v1) fn test_code_barrier(&mut self) {
+            self.parent_loan().test_code_barrier();
+            assert!(!self.fields.native.compile_digest.stopped_clear());
+            assert!(self.fields.native.compile_digest.blocks_early_primary());
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_call(&mut self, step: u8, cut: u8) {
+            // cut selects admission/actual execution/loan-end boundaries. It
+            // never supplies a returned value, hash, version or error owner.
+            let call = match step { 0 => DigestCall::Initialize, 1 => DigestCall::Field, 2 => DigestCall::Version,
+                3 => DigestCall::Finalize, 4 => DigestCall::Hex, 5 => DigestCall::Validate, _ => panic!("fixed six callees") };
+            assert!(self.body_return().is_err());
+            let mut port = self.body_port(call).unwrap();
+            if cut == 0 { drop(port); }
+            else {
+                port.run().unwrap(); assert!(port.run().is_err());
+                if cut == 1 { drop(port); } else { port.end_scope().unwrap(); }
+            }
+            assert!(self.body_port(call).is_err());
+            if cut == 3 { self.body_return().unwrap(); assert!(self.body_return().is_err()); }
+            self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_return(&mut self) {
+            self.body_return().unwrap(); assert!(self.body_return().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_move_iterator(&mut self) {
+            self.move_iterator().unwrap(); assert!(self.move_iterator().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_next(&mut self) {
+            assert!(self.iterator_loan().next_return().is_err()); self.next_body_port().unwrap().run();
+            assert!(self.next_body_port().is_err()); self.iterator_loan().next_return().unwrap();
+            assert!(self.iterator_loan().next_return().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_consume_field(&mut self) {
+            self.consume_field().unwrap(); assert!(self.consume_field().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_finish_iterator(&mut self) {
+            self.finish_iterator().unwrap(); assert!(self.finish_iterator().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_move_source(&mut self) {
+            self.move_source().unwrap(); assert!(self.move_source().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_build_identity(&mut self) {
+            self.build_identity().unwrap(); assert!(self.build_identity().is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_retain_runtime(&mut self) {
+            self.retain_runtime().unwrap(); assert!(self.retain_runtime().is_err());
+            assert_eq!(self.next(), Some(LifecycleAction::FinalizeCompileStatement));
+            assert!(self.fields.native.compile_digest.formatter_unissued);
+            assert!(self.fields.native.statements[0].live().is_some());
+            assert!(self.fields.native.compile_options.runtime_return == CompileReturn::Unknown);
+            assert!(self.fields.native.compile_options.catalog_return == CompileReturn::Unknown);
+            assert!(self.parent_loan().runtime_return(CompileReturn::Ok).is_err());
+            assert!(self.parent_loan().catalog_return(CompileReturn::Ok).is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_no_new_work(&mut self) {
+            for call in [DigestCall::Initialize, DigestCall::Field, DigestCall::Version, DigestCall::Finalize, DigestCall::Hex, DigestCall::Validate] {
+                assert!(self.body_port(call).is_err());
+            }
+            assert!(self.move_iterator().is_err()); assert!(self.next_body_port().is_err());
+            assert!(self.consume_field().is_err()); assert!(self.move_source().is_err());
+            assert!(self.build_identity().is_err()); assert!(self.retain_runtime().is_err());
+            assert!(self.parent_loan().runtime_return(CompileReturn::Ok).is_err()); self.test_code_barrier();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_unobserved(&mut self, body_returned: bool) {
+            assert_eq!(self.next(), Some(if body_returned { LifecycleAction::AwaitCompileDigestLoan } else { LifecycleAction::AwaitCompileDigestCall }));
+            assert!(self.body_return().is_err()); assert!(self.drain_before_allocation().is_err()); self.test_code_no_new_work();
+        }
+        pub(in crate::database::global_schema_v1) fn test_code_late_return(&mut self, step: u8) {
+            self.test_code_return();
+            if step < 4 {
+                if step == 1 { self.consume_field().unwrap(); assert!(self.consume_field().is_err()); }
+                self.drain_before_allocation().unwrap(); assert!(self.drain_before_allocation().is_err());
+                assert!(self.options.rows.is_none()); assert!(self.iteration.pending.is_none() && self.iteration.iterator.is_none());
+                assert!(self.digest.hasher.is_none() && self.digest.output.is_none() && self.digest.source_part.is_none());
+                assert_eq!(self.next(), Some(LifecycleAction::FinalizeCompileStatement));
+            } else {
+                assert_eq!(self.next(), Some(LifecycleAction::AwaitCompileDigestPayment));
+                assert!(self.drain_before_allocation().is_err());
+            }
+            self.test_code_no_new_work();
+        }
+    }
+
 }
