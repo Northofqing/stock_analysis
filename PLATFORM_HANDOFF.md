@@ -533,3 +533,13 @@ Task6隔离树本地提交 `309a08fd`，工作树干净。在真实Transformed�
 Root最终fresh新RO3+相关WAL3+exact projection1共7项通过，三个会话43994/70391/89786均退出0；新组编译5m19、运行128.73s，相关组复用产物运行51.97s与1.60s。闭合回执93993196、独立DATA2d241da4全文核对通过。仅确认相同打印harness路径947c，未测二进制SHA；git diff --check通过，未追加check/build/clippy/全量/release。详情见Task6隔离树 `TASK6_READONLY8_HANDOFF_20261005.md`。
 
 结果止于普通ReadonlyCompared owner；最终target/schema8发行、完整Financial prepare/render、真实native/provider及完整16MiB链路等仍待完成。Ring优化7项已通过并本地提交45ad075e，该已通过组不重跑。新闻63ae676d仅本地，冻结365精确审批及生产状态保持；本片未上线、重启、重发、push或合并。平台整体未完成。
+
+### 2026-10-05 新闻组合修复已部署
+
+用户明确授权“部署 继续开发”后，在独立新闻热修树上把63ae676d的Main刷新差量迁入365ca5ba，形成源码提交 `d9b4aabb`；相对旧生产735项输入只变化四件，DEV平台和诊断源码未迁入。相关monitor2项通过、release退出0（2m42），同制品INFO dry-run61家族/失败0/外部尝试0/回执追加0；父件未变的63项定向验证复用。当前生产monitor SHA49518b30，正确activation expected hash eab56ef2、SHA96db29bf，20:56:48 CST生效。
+
+更正后唯一monitor PID81292、原bridge PID56417；20:57:28注册4feed，20:59:31主库初始化，20:59:33桥连接，20:59:40四源接纳19+20+20+12共71条。当前735项输入、5公共编译输入、二进制和activation核对；有限启动采集主回执403fa9b6及非作者DATA8ea64d24通过。CLI健康检查退出1，Frozen/Unsafe/数据不完整仍存在，晚间无新合格推送窗口，不能宣称新新闻已送达或全面Financial健康。未强制测试推送、重放历史、裁定Uncertain或替换数据库。
+
+首轮完整stat检查在停服务前退出；首次activation错取准备工具编译绑定的旧生产哈希17a3，启动门拒绝。原检查、错误候选、拒绝日志与后续eab56更正及重启全部保留；正确735输入安装后实际重算、未来激活并在生效后重启，未绕门。回退保留同根数据库，仅恢复六件备份。详细交接在新闻隔离树 `NEWS_ROLLOUT_HANDOFF_20261005.md`，文档本地提交 `53c54201`；完整部署证据目录 `/Users/zhangzhen/.local/share/stock-analysis-news-rollout-20261005/`。原冻结365包保持不变，没有远端push或合并。
+
+继续开发：Task6最终integrity/FK的A-only新Source已封包、Root全文与18payload/16named14ranges/3whole字节pin核对，非作者Source审查中，尚未应用/运行；使用第二个已真实打开的只读reader，在typed pair后固定完整性/FK检查，再实际close和来源/目标tail，不新增pair或预算。Task7真实迭代器所有权Source并行开发中，平台整体未完成。
