@@ -7877,6 +7877,27 @@ async fn poll_announcement_watch_load(
         .map_err(|error| format!("BR-138 explicit watch background task failed: {error}"))?
 }
 
+type ConceptIndexRefreshBatch = (
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, Vec<String>>,
+);
+type ConceptIndexRefreshTask = tokio::task::JoinHandle<Result<ConceptIndexRefreshBatch, String>>;
+
+async fn poll_concept_index_refresh(
+    task: &mut Option<ConceptIndexRefreshTask>,
+) -> Option<Result<ConceptIndexRefreshBatch, String>> {
+    if !task.as_ref()?.is_finished() {
+        return None;
+    }
+    let handle = task.take()?;
+    Some(
+        handle
+            .await
+            .map_err(|error| format!("BR-188 concept index background task failed: {error}"))
+            .and_then(|result| result),
+    )
+}
+
 fn merge_news_monitor_codes(
     holding_codes: Result<std::collections::HashSet<String>, String>,
     watch_codes: Option<&std::collections::HashSet<String>>,
@@ -8187,6 +8208,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let mut announcement_watch_load: Option<AnnouncementWatchLoadTask> = None;
+    let mut concept_index_refresh: Option<ConceptIndexRefreshTask> = None;
 
     // BR-244: one process-local owner preserves event/window dedup across all
     // news ticks. It carries no selection-ingress capability.
@@ -8513,49 +8535,44 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             }
         }
 
-        // L2 概念索引刷新（每5分钟一次）
-
-        if outer_tick.enter(NewsOuterTickPhase::L2)
-            && last_concept_refresh.elapsed().as_secs() >= 300
-        {
-            last_concept_refresh = std::time::Instant::now();
-
-            if let Some(our_codes) = &our_codes {
-                let codes = our_codes.clone();
-
-                match tokio::task::spawn_blocking(move || {
-                    // 同步HTTP在独立线程执行，不触发 runtime 冲突
-
-                    stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
-                })
-                .await
-                {
-                    Ok(Ok(index)) => {
-                        nm.linker_mut().replace_concept_index(index);
-
-                        log::info!(
-                            "[NewsMonitor][BR-188] L2 概念索引已更新（{}个板块关联）",
-                            nm.linker_ref().concept_count()
-                        );
-                    }
-
-                    Ok(Err(error)) => log::error!(
-                        "[NewsMonitor][BR-188] L2 概念索引完整批次拒绝，本轮保留上一份索引: {}",
-                        error
-                    ),
-
-                    Err(error) => log::error!(
-                        "[NewsMonitor][BR-188] L2 概念索引 blocking worker 失败，本轮保留上一份索引: {}",
-                        error
-                    ),
+        // A slow complete-batch refresh stays owned across ticks, so the next
+        // NewsFlash reservation can still run inside its five-minute window.
+        if outer_tick.enter(NewsOuterTickPhase::L2) {
+            match poll_concept_index_refresh(&mut concept_index_refresh).await {
+                Some(Ok((codes, index))) if our_codes.as_ref() == Some(&codes) => {
+                    nm.linker_mut().replace_concept_index(index);
+                    log::info!(
+                        "[NewsMonitor][BR-188] L2 概念索引已更新（{}个板块关联）",
+                        nm.linker_ref().concept_count()
+                    );
                 }
-            } else {
-                log::warn!("[NewsMonitor] L2 概念索引刷新跳过（标的来源不可用）");
+                Some(Ok(_)) => log::warn!(
+                    "[NewsMonitor][BR-188] L2 概念索引受众已变化，本轮保留上一份索引"
+                ),
+                Some(Err(error)) => log::error!(
+                    "[NewsMonitor][BR-188] L2 概念索引完整批次拒绝，本轮保留上一份索引: {}",
+                    error
+                ),
+                None => {}
             }
 
-            // v41: 周期刷新 banner (让 news_monitor_loop 的 D-01/I-02 用真 AccountMode)
+            if concept_index_refresh.is_none()
+                && last_concept_refresh.elapsed().as_secs() >= 300
+            {
+                last_concept_refresh = std::time::Instant::now();
+                if let Some(our_codes) = &our_codes {
+                    let codes = our_codes.clone();
+                    concept_index_refresh = Some(tokio::task::spawn_blocking(move || {
+                        stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
+                            .map(|index| (codes, index))
+                    }));
+                } else {
+                    log::warn!("[NewsMonitor] L2 概念索引刷新跳过（标的来源不可用）");
+                }
 
-            evaluate_account_mode_hook(false).await;
+                // Keep the account banner on the existing refresh cadence.
+                evaluate_account_mode_hook(false).await;
+            }
         }
 
         let mut pushed: Vec<AlertEvent> = Vec::new();
@@ -13494,6 +13511,56 @@ mod tests_v17_7_announcement_wiring {
             .take()
             .expect("unfinished task remains owned by the next tick")
             .await;
+    }
+
+    #[tokio::test]
+    async fn news_concept_refresh_pending_keeps_worker_without_waiting() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut task = Some(tokio::task::spawn_blocking(move || {
+            release_rx.recv().expect("test releases the retained worker");
+            Err("TEST_CODE complete membership batch rejected".to_string())
+        }));
+        let worker_id = task.as_ref().unwrap().id();
+
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                poll_concept_index_refresh(&mut task),
+            )
+            .await
+            .expect("pending concept refresh must not delay the next news tick");
+            assert!(result.is_none());
+            assert_eq!(task.as_ref().unwrap().id(), worker_id);
+        }
+        release_tx.send(()).expect("release the background worker");
+        let result = task.take().unwrap().await.unwrap();
+        assert!(result.unwrap_err().contains("complete membership batch rejected"));
+    }
+
+    #[tokio::test]
+    async fn news_concept_refresh_completion_is_consumed_once_with_batch_identity() {
+        let codes = std::collections::HashSet::from(["TEST_CODE".to_string()]);
+        let index = std::collections::HashMap::from([(
+            "TEST_CONCEPT".to_string(),
+            vec!["TEST_CODE".to_string()],
+        )]);
+        for expected in [Ok((codes, index)), Err("TEST_CODE provider failure".to_string())] {
+            let completed = expected.clone();
+            let mut task = Some(tokio::spawn(async move { completed }));
+            let actual = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(result) = poll_concept_index_refresh(&mut task).await {
+                        break result;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the completed worker is collected by a later tick");
+            assert_eq!(actual, expected);
+            assert!(task.is_none());
+            assert!(poll_concept_index_refresh(&mut task).await.is_none());
+        }
     }
 
     #[test]
