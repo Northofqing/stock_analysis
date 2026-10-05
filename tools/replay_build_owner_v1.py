@@ -3354,9 +3354,156 @@ RING_AUX_OBJECT = "a4019cc0736b0423-constant_time_test.o"
 RING_AUX_SOURCE_SHA256 = "bf5812781fb3fdd1e46ddc92124a74d821e77130af2593b22b196762e78607b9"
 
 
+FOREIGN_ZSTD_ORDINARY_SOURCES = (
+    'zstd/lib/common/debug.c',
+    'zstd/lib/common/entropy_common.c',
+    'zstd/lib/common/error_private.c',
+    'zstd/lib/common/fse_decompress.c',
+    'zstd/lib/common/pool.c',
+    'zstd/lib/common/threading.c',
+    'zstd/lib/common/zstd_common.c',
+    'zstd/lib/compress/fse_compress.c',
+    'zstd/lib/compress/hist.c',
+    'zstd/lib/compress/huf_compress.c',
+    'zstd/lib/compress/zstd_compress.c',
+    'zstd/lib/compress/zstd_compress_literals.c',
+    'zstd/lib/compress/zstd_compress_sequences.c',
+    'zstd/lib/compress/zstd_compress_superblock.c',
+    'zstd/lib/compress/zstd_double_fast.c',
+    'zstd/lib/compress/zstd_fast.c',
+    'zstd/lib/compress/zstd_lazy.c',
+    'zstd/lib/compress/zstd_ldm.c',
+    'zstd/lib/compress/zstd_opt.c',
+    'zstd/lib/compress/zstd_preSplit.c',
+    'zstd/lib/compress/zstdmt_compress.c',
+    'zstd/lib/decompress/huf_decompress.c',
+    'zstd/lib/decompress/zstd_ddict.c',
+    'zstd/lib/decompress/zstd_decompress.c',
+    'zstd/lib/decompress/zstd_decompress_block.c',
+    'zstd/lib/dictBuilder/cover.c',
+    'zstd/lib/dictBuilder/divsufsort.c',
+    'zstd/lib/dictBuilder/fastcover.c',
+    'zstd/lib/dictBuilder/zdict.c',
+    'zstd/lib/legacy/zstd_v01.c',
+    'zstd/lib/legacy/zstd_v02.c',
+    'zstd/lib/legacy/zstd_v03.c',
+    'zstd/lib/legacy/zstd_v04.c',
+    'zstd/lib/legacy/zstd_v05.c',
+    'zstd/lib/legacy/zstd_v06.c',
+    'zstd/lib/legacy/zstd_v07.c',
+    'zstd/lib/decompress/huf_decompress_amd64.S',
+)
+
+FOREIGN_ZSTD_ORDINARY_FLAGS = (
+    '-O0',
+    '-ffunction-sections',
+    '-fdata-sections',
+    '-fPIC',
+    '-g',
+    '-gdwarf-2',
+    '-fno-omit-frame-pointer',
+    '-m64',
+    '--target=x86_64-apple-macosx',
+    '-mmacosx-version-min=26.5',
+    '-I',
+    'zstd/lib/',
+    '-I',
+    'zstd/lib/common',
+    '-I',
+    'zstd/lib/legacy',
+    '-w',
+    '-fvisibility=hidden',
+    '-ffunction-sections',
+    '-fdata-sections',
+    '-fmerge-all-constants',
+    '-DZSTD_LIB_DEPRECATED=0',
+    '-DXXH_PRIVATE_API=',
+    '-DZSTDLIB_VISIBILITY=',
+    '-DZDICTLIB_VISIBILITY=',
+    '-DZSTDERRORLIB_VISIBILITY=',
+    '-DZSTD_LEGACY_SUPPORT=1',
+)
+
+
+def foreign_zstd_classify(role, args, context, session, *, current_call=None):
+    """Fixed 36 C/one .S inputs; RecordingOnly CompileOnly objects."""
+    root = Path(context["manifest"])
+    require(role == "cc" and root == session / "vendor/zstd-sys", "ForeignRole")
+    require(len(args) == len(FOREIGN_ZSTD_ORDINARY_FLAGS) + 4 and args[-4] == "-o"
+            and args[-2] == "-c", "ForeignCompileArgv")
+    source = args[-1]; require(source in FOREIGN_ZSTD_ORDINARY_SOURCES, "ForeignCompileSource")
+    dirname = str(Path(source).parent); extension = Path(source).suffix[1:]
+    mapping = {("zstd/lib/common", "c"): "44ff4c55aa9e5133", ("zstd/lib/compress", "c"): "fb80479a5fb81f6a",
+               ("zstd/lib/decompress", "c"): "88f362f13b0528ed", ("zstd/lib/dictBuilder", "c"): "a6c81c75fc82913a",
+               ("zstd/lib/legacy", "c"): "3f451b2306bc13c8", ("zstd/lib/decompress", "S"): "7faed3f8272f2313"}
+    require((dirname, extension) in mapping, "ForeignObjectMap")
+    prefix = mapping[(dirname, extension)]
+    output = Path(context["out_dir"]) / (prefix + "-" + Path(source).with_suffix(".o").name)
+    require(args == [*FOREIGN_ZSTD_ORDINARY_FLAGS, "-o", str(output), "-c", source], "ForeignCompileArgv")
+    require(output.is_absolute() and output.resolve() == output, "ForeignCompileOutputAlias")
+    for call in (session / "foreign-native-invocations").iterdir():
+        if call == current_call: continue
+        if not (call / "request.json").exists() and not (call / "receipt.json").exists(): continue
+        request = strict_json((call / "request.json").read_bytes())
+        cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        values = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
+        for index, value in enumerate(values[:-1]):
+            if value == "-o": require((cwd / values[index + 1]).resolve() != output, "ForeignCompileOwnership")
+    return {"class": "CompilerObjectCompile", "scope": "CompileOnly", "source": str(root / source),
+            "raw_source": source, "output": str(output), "context_group": context["out_dir"],
+            "object_derivation": {"dirname": dirname, "extension": extension, "prefix": prefix}}
+
+def foreign_zstd_receipt(call, receipt, args, context, session, inv):
+    states = [receipt.get(key) for key in ("serialization_pre", "serialization_post", "serialization_return")]
+    require(all(isinstance(state, dict) for state in states) and states[0] == states[1] == states[2]
+            and set(states[0]) == {"scope", "path", "sha256", "identity", "held_fd"}
+            and isinstance(states[0].get("held_fd"), int) and not isinstance(states[0].get("held_fd"), bool)
+            and states[0]["held_fd"] >= 0, "ForeignCompileSerialization")
+    fd = os.open(session / "owner.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        observed = foreign_lz4_lock_state(session, fd)
+        require({k:v for k,v in observed.items() if k != "held_fd"}
+                == {k:v for k,v in states[0].items() if k != "held_fd"}, "ForeignCompileSerializationChanged")
+    finally: os.close(fd)
+    operation = foreign_zstd_classify(receipt["role"], args, context, session, current_call=call)
+    require(receipt["operation"] == operation, "ForeignFamilyClassification")
+    pins = foreign_compile_pins(session, inv, context)
+    require(all(receipt.get(key) == pins for key in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
+    for key in ("input_pre", "input_post", "input_return", "output_pre", "output_post", "output_return"):
+        require(isinstance(receipt.get(key), dict), "ForeignSnapshotFields")
+        native_state_check(call, receipt[key])
+    pre, post, returned = (receipt[key] for key in ("input_pre", "input_post", "input_return"))
+    require(native_state_key(pre) == native_state_key(post) == native_state_key(returned)
+            and pre["exists"] is True and pre["path"] == operation["source"]
+            and pre["sha256"] == pins["source_sha256"]["zstd-sys/" + operation["raw_source"]], "ForeignCompileSnapshot")
+    native_state_check(call, returned, live=True)
+    output = receipt["output_post"]
+    require(receipt["output_pre"] == {"exists": False, "path": operation["output"]}
+            and output["exists"] is True and output["path"] == operation["output"] and output["length"] > 0
+            and native_state_key(output) == native_state_key(receipt["output_return"]), "ForeignCompileSnapshot")
+    native_state_check(call, receipt["output_return"], live=True)
+    require(receipt["tool_result"] == 0 and receipt["source_semantics"]
+            == {"compiler_success": True, "object_observed": True}, "ForeignFamilySticky")
+
+def foreign_zstd_family_evidence(rows, effective, helps, ordered, flags, context):
+    require(len(effective) == len(helps) == len(ordered) == 4 and len(flags) == 3, "ForeignFamilyUnique")
+    require(all(receipt["tool_result"] == 0 and receipt["source_semantics"] ==
+                {"supported": True, "source_branch": "StatusSuccessAndEmptyStderr", "execution_edge": "not_observed"}
+                for _, receipt, _ in flags), "ForeignFlagSupport")
+    family = foreign_e_family_evidence(ordered[0], ordered[-1], rows, context)
+    family["cycles"] = [foreign_e_family_evidence(version, version, rows, context)["base"] for version in ordered]
+    family["typed_flags"] = [foreign_e_reference(call, receipt) for call, receipt, _ in flags]
+    return family
+
+def foreign_zstd_family(session, policy, owner, context, *, current_call=None):
+    require(native_control(session, policy, owner) == policy["inventory"], "ForeignFamilyControl")
+    rows, effective, helps, ordered, flags = foreign_e_history(session, policy["inventory"], context, current_call=current_call)
+    return foreign_zstd_family_evidence(rows, effective, helps, ordered, flags, context)
+
+
 def foreign_compile_inputs(inv, name, *, auxiliary=False):
     """Negative-only declaration for the closed ring/psm input set; no observation."""
-    if name == "lz4-sys":
+    if name in ("lz4-sys", "zstd-sys"):
         members = FOREIGN_E_ONLY_INPUTS[name]
         return {"state": "DeclaredOnly", "source_sha256": {m: FOREIGN_E_ONLY_SOURCE_PINS[m] for m in members}}
     require(name in FOREIGN_COMPILE_SOURCES, "ForeignCompileSource")
@@ -3411,7 +3558,7 @@ def foreign_compile_pins(session, inv, context, *, auxiliary=False):
     sources = foreign_compile_inputs(inv, name, auxiliary=auxiliary)["source_sha256"]
     if auxiliary: require(inv["vendor"]["files"].get("ring/" + RING_AUX_SOURCE) == RING_AUX_SOURCE_SHA256, "ForeignCompileSourcePin")
     helpers = ({m for m in FOREIGN_E_ONLY_SOURCE_PINS if m.startswith("cc/")}
-               if name == "lz4-sys" else set(FOREIGN_COMPILE_CC_MEMBERS))
+               if name in ("lz4-sys", "zstd-sys") else set(FOREIGN_COMPILE_CC_MEMBERS))
     source_pins, helper_pins = {}, {}
     for members, pins in ((sources, source_pins), (helpers, helper_pins)):
         for member in sorted(members):
@@ -3428,6 +3575,7 @@ def foreign_compile_classify(role, args, context, session, *, current_call=None)
     require(role == "cc", "ForeignRole")
     root = Path(context["manifest"]); name = root.name
     if name == "lz4-sys": return foreign_lz4_classify(role, args, context, session, current_call=current_call)
+    if name == "zstd-sys": return foreign_zstd_classify(role, args, context, session, current_call=current_call)
     require(len(args) >= 5 and args[-4] == "-o" and args[-2] == "-c", "ForeignCompileArgv")
     raw_source = args[-1]
     roster = (*FOREIGN_COMPILE_SOURCES[name], RING_AUX_SOURCE) if name == "ring" else FOREIGN_COMPILE_SOURCES[name]
@@ -3464,6 +3612,8 @@ def foreign_compile_classify(role, args, context, session, *, current_call=None)
 
 def foreign_compile_family(session, policy, owner, context, *, current_call=None, allow_archive=False,
                            auxiliary=False, probe_ids=None, compile_outputs=None, ring_split=False):
+    if Path(context["manifest"]).name == "zstd-sys":
+        return foreign_zstd_family(session, policy, owner, context, current_call=current_call)
     if not ring_split and Path(context["manifest"]).name == "ring" and foreign_ring_aux_present(session, context):
         families = foreign_ring_families(session, policy, owner, context, current_call=current_call)
         if auxiliary:
@@ -3712,12 +3862,53 @@ def foreign_ring_main_checkpoint(chain):
             "archive_post": receipt["archive_post"], "ledger": foreign_archive_ledger(chain)}
 
 
+def foreign_lz4_archive_members(context):
+    out = Path(context["out_dir"])
+    require(Path(context["manifest"]).name == "lz4-sys" and out.is_absolute()
+            and out.resolve() == out and not out.is_symlink(), "ForeignArchiveAlias")
+    members = [str(out / ("efce31824dbf3730-" + Path(source).with_suffix(".o").name))
+               for source in FOREIGN_LZ4_ORDINARY_SOURCES]
+    batches = []; batch = []; remaining = 4000
+    for member in members:
+        length = len(os.fsencode(member))
+        if batch and length > remaining:
+            batches.append(batch); batch = []; remaining = 4000
+        batch.append(member); remaining = max(0, remaining - length)
+    if batch: batches.append(batch)
+    require(batches == [members], "ForeignArchiveBatchGeometry")
+    return members
+
+
+def foreign_lz4_archive_relevant(request, receipt, context):
+    # Fixed paths and retained views select negative relevance, never success.
+    out = Path(context["out_dir"])
+    paths = {str(out / "liblz4.a"), *foreign_lz4_archive_members(context)}
+    for row in (request, receipt):
+        if not isinstance(row, dict): continue
+        saved = row.get("context")
+        if isinstance(saved, dict) and saved.get("out_dir") == str(out): return True
+        values = row.get("args_hex")
+        if isinstance(values, list) and any(os.fsdecode(bytes.fromhex(value)) in paths for value in values): return True
+        operation = row.get("operation")
+        if isinstance(operation, dict) and (operation.get("archive") in paths or operation.get("output") in paths): return True
+    return False
+
+
 def foreign_archive_environment(env, session, inv, *, operation=None, chain=None):
     native_environment(env, session, inv)
     require("LC_ALL" not in env and env.get("LC_CTYPE") == "C.UTF-8", "ForeignArchiveEnvironment")
+    lz4_sd = (isinstance(operation, dict) and Path(operation.get("archive", "")).name == "liblz4.a"
+              and operation.get("class") == "ArchiverIndex" and operation.get("mode") == "sD")
     auxiliary_sd = (isinstance(operation, dict) and operation.get("ring_build") == "AuxiliaryConstantTimeTest"
                     and operation.get("class") == "ArchiverIndex" and operation.get("mode") == "sD")
-    if auxiliary_sd:
+    if lz4_sd:
+        require(isinstance(chain, list), "ForeignArchivePredecessor")
+        foreign_archive_predecessor(operation, chain)
+        require(len(chain) == 1 and chain[0][1]["protocol_state"] == "Completed"
+                and chain[0][1]["failures"] == [] and type(chain[0][1]["tool_result"]) is int
+                and chain[0][1]["tool_result"] == 0, "ForeignArchivePredecessor")
+        require("ZERO_AR_DATE" not in env, "ForeignArchiveEnvironment")
+    elif auxiliary_sd:
         require(isinstance(chain, list), "ForeignArchivePredecessor")
         foreign_archive_predecessor(operation, chain)
         prior = chain[0][1]
@@ -3738,6 +3929,13 @@ def foreign_archive_environment(env, session, inv, *, operation=None, chain=None
 def foreign_archive_classify(role, args, context, *, auxiliary=False):
     require(role == "ar", "ForeignArchiveRole")
     name = Path(context["manifest"]).name; out = Path(context["out_dir"])
+    if name == "lz4-sys":
+        archive = out / "liblz4.a"; members = foreign_lz4_archive_members(context)
+        require(args in (["cqD", str(archive), *members], ["cq", str(archive), *members],
+                         ["s", str(archive)], ["sD", str(archive)]), "ForeignArchiveTemplate")
+        require(archive.resolve() == archive and all(Path(v).resolve() == Path(v) for v in members), "ForeignArchiveAlias")
+        return {"class": "ArchiverIndex" if args[0] in ("s", "sD") else "ArchiverFirstAppend",
+                "mode": args[0], "archive": str(archive), "members": members, "context_group": context["out_dir"]}
     archive = out / (RING_ARCHIVES[0] if name == "ring" else PSM_ARCHIVE)
     members = [str(out / n) for n in FOREIGN_ARCHIVE_FIRST_MEMBERS[name]]
     if auxiliary:
@@ -3789,6 +3987,10 @@ def foreign_archive_partition(context):
 
 
 def foreign_archive_stage(operation):
+    if Path(operation["archive"]).name == "liblz4.a":
+        stage = {("ArchiverFirstAppend", "cqD"): "Lz4FirstD", ("ArchiverFirstAppend", "cq"): "Lz4FallbackCQ",
+                 ("ArchiverIndex", "s"): "Lz4IndexS", ("ArchiverIndex", "sD"): "Lz4IndexSD"}.get((operation["class"], operation["mode"]))
+        require(stage is not None, "ForeignArchiveTemplate"); return stage
     if operation.get("ring_build") == "AuxiliaryConstantTimeTest":
         stage = {("ArchiverFirstAppend", "cqD"): "AuxFirstD", ("ArchiverFirstAppend", "cq"): "AuxFallbackCQ",
                  ("ArchiverIndex", "s"): "AuxIndexS", ("ArchiverIndex", "sD"): "AuxIndexSD"}.get((operation["class"], operation["mode"]))
@@ -3835,6 +4037,23 @@ def foreign_archive_producers(session, context, operation, *, current_call=None)
 
 def foreign_archive_predecessor(operation, chain):
     stage = foreign_archive_stage(operation)
+    if stage.startswith("Lz4"):
+        if stage == "Lz4FirstD": require(not chain, "ForeignArchivePredecessor")
+        elif stage == "Lz4FallbackCQ":
+            require(len(chain) == 1 and foreign_archive_stage(chain[0][1]["operation"]) == "Lz4FirstD"
+                    and chain[0][1]["tool_result"] != 0, "ForeignArchivePredecessor")
+        elif stage == "Lz4IndexS":
+            require(len(chain) == 2 and foreign_archive_stage(chain[0][1]["operation"]) == "Lz4FirstD"
+                    and chain[0][1]["tool_result"] != 0
+                    and foreign_archive_stage(chain[1][1]["operation"]) == "Lz4FallbackCQ"
+                    and chain[1][1]["tool_result"] == 0, "ForeignArchivePredecessor")
+        else:
+            require(len(chain) == 1 and foreign_archive_stage(chain[0][1]["operation"]) == "Lz4FirstD"
+                    and chain[0][1]["tool_result"] == 0, "ForeignArchivePredecessor")
+        require(all(r["operation"]["archive"] == operation["archive"] for _, r in chain), "ForeignArchivePredecessor")
+        if stage in ("Lz4IndexS", "Lz4IndexSD"):
+            require([p["path"] for p in foreign_archive_ledger(chain)["producers"]] == operation["members"], "ForeignArchiveLedger")
+        return
     if stage.startswith("Aux"):
         if stage == "AuxFirstD": require(not chain, "ForeignArchivePredecessor")
         elif stage == "AuxFallbackCQ":
@@ -3960,7 +4179,9 @@ def foreign_archive_history(session, policy, owner, context, family, *, current_
                 # Any matching raw/context view still enters the strict gate below.
                 pass
         # Retained views supply negative relevance only, never predecessor success.
-        if not (raw_group or retained_group or retained_raw_group or (split and foreign_ring_relevant(request, receipt, context))): continue
+        lz4 = Path(context["manifest"]).name == "lz4-sys"
+        if not (raw_group or retained_group or retained_raw_group or (split and foreign_ring_relevant(request, receipt, context))
+                or (lz4 and foreign_lz4_archive_relevant(request, receipt, context))): continue
         operation_row = receipt.get("operation") if isinstance(receipt, dict) else None
         retained_ar = isinstance(receipt, dict) and (receipt.get("role") == "ar"
             or (isinstance(operation_row, dict) and operation_row.get("class") in
@@ -3982,7 +4203,8 @@ def foreign_archive_history(session, policy, owner, context, family, *, current_
         require(isinstance(receipt.get("operation"), dict), "ForeignArchiveOperationFields")
         args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
         auxiliary_sd = split and args == ["sD", str(Path(context["out_dir"]) / RING_ARCHIVES[1])]
-        if auxiliary_sd: native_environment(env, session, inv)
+        lz4_sd = lz4 and args == ["sD", str(Path(context["out_dir"]) / "liblz4.a")]
+        if auxiliary_sd or lz4_sd: native_environment(env, session, inv)
         else: foreign_archive_environment(env, session, inv)
         require(foreign_context(env, cwd, session, inv) == context and receipt["context"] == context
                 and all(receipt.get(k) == controls for k in ("controls_pre", "controls_post", "controls_return")), "ForeignArchiveControl")
@@ -4010,6 +4232,7 @@ def foreign_archive_history(session, policy, owner, context, family, *, current_
         stage = foreign_archive_stage(operation)
         require(stage not in rows, "ForeignArchiveOnce"); rows[stage] = (call, receipt)
     partitions = [("FirstD", "FirstFallbackCQ", "RingRemainingCQ", "RingIndexS")] if Path(context["manifest"]).name == "ring" else [("FirstD", "FirstFallbackCQ", "PSMIndexS")]
+    if Path(context["manifest"]).name == "lz4-sys": partitions = [("Lz4FirstD", "Lz4FallbackCQ", "Lz4IndexS", "Lz4IndexSD")]
     if split: partitions.append(("AuxFirstD", "AuxFallbackCQ", "AuxIndexS", "AuxIndexSD"))
     chains = []
     for stage_order in partitions:
@@ -4019,7 +4242,7 @@ def foreign_archive_history(session, policy, owner, context, family, *, current_
             if stage not in rows: continue
             call, receipt = rows[stage]; operation = receipt["operation"]
             foreign_archive_predecessor(operation, chain)
-            if stage == "AuxIndexSD":
+            if stage in ("AuxIndexSD", "Lz4IndexSD"):
                 env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v))
                        for k, v in receipt["environment_hex"].items()}
                 foreign_archive_environment(env, session, inv, operation=operation, chain=chain)
@@ -4068,12 +4291,15 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
     policy = strict_json(POLICY.read_bytes()); owner = strict_json((session / "owner.json").read_bytes())
     require(policy["inventory"] == inv, "ForeignFamilyControl")
     controls = foreign_controls(session, policy, owner, context)
-    rows = {}; ordinary = []; namespace = session / "foreign-native-invocations"
-    ordinary_current = False
-    if current_call is not None and Path(context["manifest"]).name == "lz4-sys":
+    rows = {}; ordinary = []; archives = []; namespace = session / "foreign-native-invocations"
+    ordinary_current = False; archive_current = False
+    if current_call is not None and Path(context["manifest"]).name in ("lz4-sys", "zstd-sys"):
         current = strict_json((current_call / "request.json").read_bytes())
         current_args = [os.fsdecode(bytes.fromhex(v)) for v in current["args_hex"]]
         ordinary_current = len(current_args) >= 4 and current_args[-2] == "-c"
+        archive_current = Path(context["manifest"]).name == "lz4-sys" and current.get("role") == "ar"
+        if Path(context["manifest"]).name == "zstd-sys":
+            ordinary_current = ordinary_current and foreign_flag_argv(current_args, Path(context["out_dir"])) is None
     for call in namespace.iterdir():
         if call == current_call: continue
         require(ID.fullmatch(call.name) and call.is_dir() and call.resolve() == call and not call.is_symlink(), "ForeignFamilyEvidenceAlias")
@@ -4086,19 +4312,22 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
                if isinstance(request, dict) else {})
         retained = receipt.get("context") if isinstance(receipt, dict) else None
         relevant = env.get("OUT_DIR") == context["out_dir"] or (isinstance(retained, dict) and retained.get("out_dir") == context["out_dir"])
-        if isinstance(request, dict) and Path(context["manifest"]).name == "lz4-sys":
+        if isinstance(request, dict) and Path(context["manifest"]).name in ("lz4-sys", "zstd-sys"):
             raw_args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
             # A request-only ordinary output still selects its negative group if
             # a malformed raw OUT_DIR tries to detach it from that same output.
             relevant = relevant or any(value == "-o" and Path(raw_args[index + 1]).parent == Path(context["out_dir"])
                                        for index, value in enumerate(raw_args[:-1]))
+        if Path(context["manifest"]).name == "lz4-sys":
+            relevant = relevant or foreign_lz4_archive_relevant(request, receipt, context)
         if not relevant: continue
         require(isinstance(request, dict) and isinstance(receipt, dict), "ForeignFamilyPending")
         for path in (request_path, receipt_path):
             regular(path); require(path.resolve() == path and path.stat().st_nlink == 1, "ForeignFamilyEvidenceAlias")
         keys(request, {"schema", "state", "lane", "role", "args_hex", "cwd_hex", "environment_hex", "owner_issued_inspector"})
         require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly" and request["lane"] == FOREIGN_LANE
-                and request["role"] == "cc" and request["owner_issued_inspector"] is False
+                and request["role"] in ({"cc", "ar"} if Path(context["manifest"]).name == "lz4-sys" else {"cc"})
+                and request["owner_issued_inspector"] is False
                 and receipt["operation_id"] == call.name and all(receipt.get(k) == v for k, v in request.items()), "ForeignFamilyReceiptBinding")
         require(receipt["protocol_state"] == "Completed" and receipt["failures"] == [], "ForeignFamilySticky")
         args = [os.fsdecode(bytes.fromhex(v)) for v in request["args_hex"]]
@@ -4106,8 +4335,11 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
         require(foreign_context(env, cwd, session, inv, args=args) == context and receipt["context"] == context
                 and all(receipt.get(k) == controls for k in ("controls_pre", "controls_post", "controls_return")), "ForeignFamilyControl")
         operation = receipt.get("operation"); require(isinstance(operation, dict), "ForeignFamilyClassification")
+        if request["role"] == "ar":
+            require(Path(context["manifest"]).name == "lz4-sys", "ForeignFamilyClass")
+            archives.append((call, receipt)); continue
         kind = operation.get("class"); flagging = kind == "CompilerFlagProbe"
-        compiling = kind == "CompilerObjectCompile" and Path(context["manifest"]).name == "lz4-sys"
+        compiling = kind == "CompilerObjectCompile" and Path(context["manifest"]).name in ("lz4-sys", "zstd-sys")
         (foreign_compile_environment if flagging or compiling else foreign_environment)(env, session, inv)
         if compiling: require(env.get("NUM_JOBS") == "12", "ForeignCompileConfiguration")
         require(receipt["tool_sha256"] == inv["generators"]["CC"]["sha256"]
@@ -4119,7 +4351,7 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
             require(path.resolve() == path and path.stat().st_nlink == 1 and file_hash(path) == receipt[stream + "_sha256"], "ForeignFamilyStream")
         require(foreign_semantics(call, receipt) == receipt["source_semantics"], "ForeignFamilySemantics")
         if compiling:
-            foreign_lz4_receipt(call, receipt, args, context, session, inv)
+            (foreign_lz4_receipt if Path(context["manifest"]).name == "lz4-sys" else foreign_zstd_receipt)(call, receipt, args, context, session, inv)
             ordinary.append(receipt); continue
         require(kind in {"CompilerFamilyFileProbe", "CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe", "CompilerFlagProbe"}, "ForeignFamilyClass")
         rows[call.name] = (call, receipt, args)
@@ -4196,11 +4428,21 @@ def foreign_e_history(session, inv, context, *, current_call=None, live_output=T
         native_state_check(call, receipt["input_return"], live=True)
         if live_output: native_state_check(call, receipt["output_return"], live=True)
     if ordinary:
-        require(current_call is None or ordinary_current, "ForeignFamilyOrder")
+        require(current_call is None or ordinary_current or archive_current, "ForeignFamilyOrder")
+        if Path(context["manifest"]).name == "lz4-sys":
+            require(len(effective) == len(helps) == len(ordered) == 1 and not ordered_flags, "ForeignFamilyUnique")
+            family = foreign_e_family_evidence(ordered[0], ordered[0], rows, context)
+        else:
+            family = foreign_zstd_family_evidence(rows, effective, helps, ordered, ordered_flags, context)
+        require(all(receipt.get("family_pre") == receipt.get("family_return") == family for receipt in ordinary), "ForeignFamilyChanged")
+    if archives or archive_current:
         require(Path(context["manifest"]).name == "lz4-sys" and len(effective) == len(helps) == len(ordered) == 1
                 and not ordered_flags, "ForeignFamilyUnique")
         family = foreign_e_family_evidence(ordered[0], ordered[0], rows, context)
-        require(all(receipt.get("family_pre") == receipt.get("family_return") == family for receipt in ordinary), "ForeignFamilyChanged")
+        # No callback: history reads raw AR/producers/states/ledger using this validated family.
+        history_current = current_call if current_call is not None and not ((current_call / "receipt.json").exists()
+            or (current_call / "receipt.json").is_symlink()) else None
+        foreign_archive_history(session, policy, owner, context, family, current_call=history_current)
     return rows, effective, helps, ordered, ordered_flags
 
 
@@ -4315,19 +4557,23 @@ def foreign_operation(session, policy, owner, role, args, cwd, env, *, lz4_lock=
         context = foreign_context(env, cwd, session, inv, args=args); receipt["context"] = context
         flagging = foreign_flag_argv(args, Path(context["out_dir"])) is not None and cwd == Path(context["out_dir"])
         if Path(context["manifest"]).name in FOREIGN_E_ONLY_PACKAGES:
-            require(role == "cc" and (flagging or args in (["-?"], ["--version"]) or (len(args) == 2 and args[:1] == ["-E"])
+            require((role == "cc" and (flagging or args in (["-?"], ["--version"]) or (len(args) == 2 and args[:1] == ["-E"])
                     or (len(args) == 3 and args[:2] == ["-E", "--"])
-                    or (Path(context["manifest"]).name == "lz4-sys" and len(args) >= 4 and args[-2] == "-c")), "ForeignEOnlyArgv")
+                    or (Path(context["manifest"]).name == "lz4-sys" and len(args) >= 4 and args[-2] == "-c")
+                    or (Path(context["manifest"]).name == "zstd-sys" and len(args) == 31
+                        and args[:-4] == list(FOREIGN_ZSTD_ORDINARY_FLAGS) and args[-4] == "-o" and args[-2] == "-c")))
+                    or (role == "ar" and Path(context["manifest"]).name == "lz4-sys"), "ForeignEOnlyArgv")
         archiving = role == "ar"; compiling = "-c" in args and not archiving and not flagging
         auxiliary = Path(context["manifest"]).name == "ring" and ((compiling and args[-1:] == [str(cwd / RING_AUX_SOURCE)])
             or (archiving and len(args) >= 2 and args[1] == str(Path(context["out_dir"]) / RING_ARCHIVES[1]) and foreign_ring_aux_present(session, context)))
         if archiving:
             # Declarations are negative-only, retained before environment/pin refusal.
             receipt["compile_input_declaration"] = foreign_compile_inputs(inv, Path(context["manifest"]).name, auxiliary=auxiliary)
-            names = RING_ARCHIVES if Path(context["manifest"]).name == "ring" else (PSM_ARCHIVE,)
+            names = ("liblz4.a", *["efce31824dbf3730-" + Path(v).with_suffix(".o").name for v in FOREIGN_LZ4_ORDINARY_SOURCES]) if Path(context["manifest"]).name == "lz4-sys" else RING_ARCHIVES if Path(context["manifest"]).name == "ring" else (PSM_ARCHIVE,)
             receipt["archive_output_declaration"] = [str(Path(context["out_dir"]) / n) for n in names]
         auxiliary_sd = archiving and auxiliary and args == ["sD", str(Path(context["out_dir"]) / RING_ARCHIVES[1])]
-        if auxiliary_sd: native_environment(env, session, inv)
+        lz4_sd = archiving and Path(context["manifest"]).name == "lz4-sys" and args == ["sD", str(Path(context["out_dir"]) / "liblz4.a")]
+        if auxiliary_sd or lz4_sd: native_environment(env, session, inv)
         else: (foreign_archive_environment if archiving else foreign_compile_environment if compiling or flagging else foreign_environment)(env, session, inv)
         controls = foreign_controls(session, policy, owner, context); receipt["controls_pre"] = controls
         if flagging:
@@ -4340,7 +4586,7 @@ def foreign_operation(session, policy, owner, role, args, cwd, env, *, lz4_lock=
                      else foreign_probe_classify(role, args, context, env, session, inv, current_call=call))
         receipt["operation"] = operation
         if compiling:
-            if Path(context["manifest"]).name == "lz4-sys":
+            if Path(context["manifest"]).name in ("lz4-sys", "zstd-sys"):
                 require(env.get("NUM_JOBS") == "12", "ForeignCompileConfiguration")
                 require(isinstance(lz4_lock, tuple) and len(lz4_lock) == 2, "ForeignCompileSerialization")
                 receipt["serialization_pre"] = foreign_lz4_lock_state(session, *lz4_lock)
@@ -4359,7 +4605,7 @@ def foreign_operation(session, policy, owner, role, args, cwd, env, *, lz4_lock=
             receipt["family_pre"] = family; receipt["archive_member_producers_pre"] = members
             chain = foreign_archive_history(session, policy, owner, context, family, current_call=call, live_archive=True)
             foreign_archive_predecessor(operation, chain)
-            if auxiliary_sd: foreign_archive_environment(env, session, inv, operation=operation, chain=chain)
+            if auxiliary_sd or lz4_sd: foreign_archive_environment(env, session, inv, operation=operation, chain=chain)
             receipt["archive_operand_ledger_pre"] = foreign_archive_ledger(chain)
             receipt["archive_predecessor"] = chain[-1][0].name if chain else None
             receipt["archive_history_pre"] = [{"operation_id": c.name, "request_sha256": file_hash(c / "request.json"),
@@ -4418,7 +4664,7 @@ def foreign_operation(session, policy, owner, role, args, cwd, env, *, lz4_lock=
         if compiling or archiving:
             receipt["compile_pins_post"] = foreign_compile_pins(session, inv, post_context, auxiliary=auxiliary)
             require(receipt["compile_pins_post"] == receipt["compile_pins_pre"], "ForeignCompilePinChanged")
-            if compiling and Path(context["manifest"]).name == "lz4-sys":
+            if compiling and Path(context["manifest"]).name in ("lz4-sys", "zstd-sys"):
                 receipt["serialization_post"] = foreign_lz4_lock_state(session, *lz4_lock)
         require(not receipt["failures"], "ForeignCaptureSticky")
         receipt["source_semantics"] = foreign_semantics(call, receipt)
@@ -4459,7 +4705,7 @@ def foreign_operation(session, policy, owner, role, args, cwd, env, *, lz4_lock=
                 require(returned == operation and family == receipt["family_pre"], "ForeignFamilyChanged")
             if compiling:
                 native_state_check(call, receipt["output_post"], live=True)
-                if auxiliary or Path(context["manifest"]).name == "lz4-sys":
+                if auxiliary or Path(context["manifest"]).name in ("lz4-sys", "zstd-sys"):
                     receipt["input_return"] = dict(receipt["input_post"])
                     receipt["output_return"] = dict(receipt["output_post"])
                     if not auxiliary: receipt["serialization_return"] = foreign_lz4_lock_state(session, *lz4_lock)
@@ -4608,20 +4854,21 @@ def foreign_evidence_namespace(session):
             # Source-first declaration also closes receiptless/refused AR inputs;
             # package cwd and finite canonical OUT shape grant only negative ownership.
             if request["role"] == "ar":
-                name = next((n for n in FOREIGN_PACKAGES if cwd == session / "vendor" / n
+                name = next((n for n in (*FOREIGN_PACKAGES, "lz4-sys") if cwd == session / "vendor" / n
                              and cwd.resolve() == cwd and not cwd.is_symlink()), None)
                 env = {os.fsdecode(bytes.fromhex(k)): os.fsdecode(bytes.fromhex(v)) for k, v in request["environment_hex"].items()}
                 out = Path(env.get("OUT_DIR", ""))
                 if name is not None and out.is_absolute() and out.resolve() == out and not out.is_symlink() and out.name == "out" and out.parent.parent == session / "target" / TARGET / "debug/build" and re.fullmatch(re.escape(name) + r"-[0-9a-f]{16}", out.parent.name):
                     inv = strict_json(POLICY.read_bytes())["inventory"]
-                    package = {"id": RING_PACKAGE if name == "ring" else PSM_PACKAGE, "tree": "vendor", "manifest": name + "/Cargo.toml"}
+                    package = {"id": ("registry+https://github.com/rust-lang/crates.io-index#lz4-sys@1.11.1+lz4-1.10.0" if name == "lz4-sys" else RING_PACKAGE if name == "ring" else PSM_PACKAGE), "tree": "vendor", "manifest": name + "/Cargo.toml"}
                     require(inv["packages"].count(package) == 1, "ForeignArchiveDeclarationPackage")
                     auxiliary = name == "ring" and len(args) >= 2 and args[1] == str(out / RING_ARCHIVES[1])
                     for member, sha in foreign_compile_inputs(inv, name, auxiliary=auxiliary)["source_sha256"].items():
                         paths.add(str((session / "vendor" / member).resolve()))
                         if isinstance(sha, str) and HEX.fullmatch(sha): hashes.add(sha)
-                    names = RING_ARCHIVES if name == "ring" else (PSM_ARCHIVE,)
-                    paths.update(str(out / n) for n in (*names, *FOREIGN_ARCHIVE_FIRST_MEMBERS[name],
+                    names = ("liblz4.a",) if name == "lz4-sys" else RING_ARCHIVES if name == "ring" else (PSM_ARCHIVE,)
+                    first = tuple("efce31824dbf3730-" + Path(v).with_suffix(".o").name for v in FOREIGN_LZ4_ORDINARY_SOURCES) if name == "lz4-sys" else FOREIGN_ARCHIVE_FIRST_MEMBERS[name]
+                    paths.update(str(out / n) for n in (*names, *first,
                                  *(FOREIGN_ARCHIVE_REMAINING_MEMBERS if name == "ring" else ()),
                                  *((RING_AUX_OBJECT,) if auxiliary else ())))
             if receipt is not None:
@@ -4837,6 +5084,187 @@ def foreign_closed_ring_seal_check(session, policy, owner, scope):
     require(foreign_closed_seal_generation(session, policy, owner) == scope["generation"], "ForeignClosedSealGenerationChanged")
 
 
+def foreign_closed_zstd_seal_generation(session, policy, owner):
+    """Bind the complete closed namespace, retaining unrelated refusals as negatives."""
+    inv = native_control(session, policy, owner)
+    namespace = session / "foreign-native-invocations"
+    fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    negative_paths, negative_probes, negative_hashes, negative_failures = foreign_evidence_namespace(session)
+    directories, membership, paths = {}, {}, {Path(value) for value in negative_paths | negative_probes}
+
+    def directory(path, *, allow_absent=False):
+        require(path.is_absolute() and path.resolve() == path and not path.is_symlink(), "ForeignClosedSealAlias")
+        if allow_absent and not path.exists():
+            require(str(path) not in directories or directories[str(path)] is None, "ForeignClosedSealGenerationChanged")
+            directories[str(path)] = None; return  # An absent negative-only ancestor grants no directory authority.
+        require(path.is_dir(), "ForeignClosedSealAlias")
+        identity = tuple(getattr(path.stat(), k) for k in fields)
+        require(str(path) not in directories or directories[str(path)] == identity, "ForeignClosedSealGenerationChanged")
+        directories[str(path)] = identity
+
+    def current(path):
+        require(path.is_absolute(), "ForeignClosedSealAlias")
+        paths.add(path)
+
+    directory(namespace)
+    calls = sorted(namespace.iterdir()); membership[str(namespace)] = tuple(p.name for p in calls)
+    for call in calls:
+        require(ID.fullmatch(call.name), "ForeignClosedSealCall")
+        directory(call)
+        leaves = sorted(call.iterdir()); membership[str(call)] = tuple(p.name for p in leaves)
+        require((call / "request.json") in leaves and (call / "receipt.json") in leaves, "ForeignClosedSealPending")
+        for path in leaves: current(path)
+        request = strict_json((call / "request.json").read_bytes())
+        receipt = strict_json((call / "receipt.json").read_bytes())
+        require(isinstance(request, dict) and isinstance(receipt, dict), "ForeignClosedSealPending")
+        keys(request, {"schema", "state", "lane", "role", "args_hex", "cwd_hex", "environment_hex", "owner_issued_inspector"})
+        require(request["schema"] == NATIVE_SCHEMA and request["state"] == "RecordingOnly"
+                and request["lane"] == FOREIGN_LANE and request["role"] in {"cc", "ar"}
+                and request["owner_issued_inspector"] is False and receipt.get("operation_id") == call.name
+                and all(receipt.get(k) == value for k, value in request.items()), "ForeignClosedSealBinding")
+        cwd = Path(os.fsdecode(bytes.fromhex(request["cwd_hex"])))
+        require(cwd.is_absolute(), "ForeignClosedSealAlias")
+        args = [os.fsdecode(bytes.fromhex(value)) for value in request["args_hex"]]
+        declared = [args[-1]] if args[:1] == ["-E"] and len(args) >= 2 else []
+        declared.extend(args[index + 1] for index, arg in enumerate(args[:-1]) if arg in {"-o", "-c"})
+        if request["role"] == "ar" and len(args) >= 2: declared.extend(args[1:])
+        for value in declared: current(cwd / value)
+        require((receipt.get("protocol_state") == "Completed" and receipt.get("failures") == []
+                 and type(receipt.get("tool_result")) is int)
+                or (receipt.get("protocol_state") == "ProtocolRefused" and isinstance(receipt.get("failures"), list)
+                    and bool(receipt["failures"]) and (receipt.get("tool_result") is None
+                        or type(receipt.get("tool_result")) is int)), "ForeignClosedSealPending")
+        context = receipt.get("context"); require(isinstance(context, dict), "ForeignClosedSealContext")
+        for key in ("manifest", "out_dir"): directory(Path(context[key]))
+        source_maps = [(context["source_sha256"], False)]
+        for key in ("compile_input_declaration", "compile_pins_pre", "compile_pins_post", "compile_pins_return", "e_only_input_declaration"):
+            if key not in receipt: continue
+            pins = receipt[key]; require(isinstance(pins, dict), "ForeignClosedSealPins")
+            source_maps.append((pins["source_sha256"], key == "e_only_input_declaration"))
+            if "helper_sha256" in pins: source_maps.append((pins["helper_sha256"], False))
+        for members, flag_declaration in source_maps:
+            require(isinstance(members, dict), "ForeignClosedSealPins")
+            for member, sha in members.items():
+                require(isinstance(member, str) and isinstance(sha, str) and HEX.fullmatch(sha), "ForeignClosedSealPins")
+                if Path(member).is_absolute():
+                    out = Path(context["out_dir"])
+                    require(flag_declaration and request["role"] == "cc"
+                            and context["manifest"] == str(session / "vendor" / "zstd-sys")
+                            and cwd == out and member == str(out / "flag_check.c")
+                            and args[-2:] == ["-c", member] and sha == FOREIGN_FLAG_LITERAL_DIGEST,
+                            "ForeignClosedSealPins")
+                    current(Path(member))  # Fixed OUT input; live literal remains checked by the strict flag family gate.
+                else:
+                    current(session / "vendor" / relative_name(member))
+        for key in ("input_pre", "input_post", "input_return", "output_pre", "output_post", "output_return", "archive_pre", "archive_post"):
+            if key not in receipt: continue
+            state = receipt[key]; require(isinstance(state, dict) and isinstance(state.get("path"), str), "ForeignSnapshotFields")
+            current(Path(state["path"]))
+            if "snapshot" in state: current(call / relative_name(state["snapshot"]))
+        for key in ("archive_members_pre", "archive_members_post", "archive_member_producers_pre", "archive_member_producers_return"):
+            if key not in receipt: continue
+            states = receipt[key]; require(isinstance(states, list), "ForeignSnapshotFields")
+            for state in states:
+                require(isinstance(state, dict) and isinstance(state.get("path"), str), "ForeignSnapshotFields")
+                current(Path(state["path"]))
+    for path in (POLICY, Path(__file__), session / "owner.json", session / "native-record.json", session / "cargo.stdout.raw", session / "cargo.stderr.raw"):
+        current(path)
+    for pin in (*owner["native_launchers"].values(), inv["generators"]["CC"], inv["generators"]["AR"], inv["rustc"]):
+        current(Path(pin["path"]))
+    parents = {path.parent for path in paths}
+    for path in paths:
+        parent = path.parent
+        while parent.is_relative_to(session):
+            parents.add(parent)
+            if parent == session: break
+            parent = parent.parent
+    for parent in sorted(parents): directory(parent, allow_absent=True)
+    cargo_lines = (session / "cargo.stdout.raw").read_bytes().splitlines()
+    require(cargo_lines, "ForeignClosedSealPhase")
+    terminal = strict_json(cargo_lines[-1])
+    native = strict_json((session / "native-record.json").read_bytes())
+    require(isinstance(terminal, dict) and terminal.get("reason") == "build-finished"
+            and type(terminal.get("success")) is bool and isinstance(native, dict)
+            and native.get("state") == "RecordingOnly", "ForeignClosedSealPhase")
+    files = {}
+    for path in sorted(paths):
+        require(path.resolve() == path and not path.is_symlink(), "ForeignClosedSealAlias")
+        if not path.exists() and not path.is_symlink():
+            files[str(path)] = None; continue  # Valid probe retirement remains checked by the family gate.
+        regular(path); before = path.lstat()
+        require(path.resolve() == path and before.st_nlink == 1, "ForeignClosedSealAlias")
+        sha = file_hash(path); after = path.lstat()
+        identity = tuple(getattr(before, k) for k in fields)
+        require(identity == tuple(getattr(after, k) for k in fields)
+                and path.resolve() == path and not path.is_symlink(), "ForeignClosedSealGenerationChanged")
+        files[str(path)] = (identity, sha)
+    for value, identity in directories.items():
+        path = Path(value)
+        require(path.resolve() == path and not path.is_symlink()
+                and (not path.exists() if identity is None else
+                    identity == tuple(getattr(path.stat(), k) for k in fields)), "ForeignClosedSealGenerationChanged")
+    for value, names in membership.items():
+        require(tuple(p.name for p in sorted(Path(value).iterdir())) == names, "ForeignClosedSealGenerationChanged")
+    native_control(session, policy, owner)
+    return {"files": files, "directories": directories, "membership": membership,
+            "negative": {"paths": tuple(sorted(negative_paths)), "probes": tuple(sorted(negative_probes)),
+                         "sha256": tuple(sorted(negative_hashes)), "blockers": tuple(sorted(negative_failures))}}
+
+
+def foreign_closed_zstd_seal_scope(session, policy, owner, context):
+    """Success-only, seal-local evidence; unrelated negative rows remain visible."""
+    try:
+        require(Path(context["manifest"]).name == "zstd-sys", "ForeignClosedZstdContext")
+        generation = foreign_closed_zstd_seal_generation(session, policy, owner)
+        inv = native_control(session, policy, owner)
+        rows, effective, helps, versions, flags = foreign_e_history(session, inv, context, current_call=None)
+        family = foreign_zstd_family_evidence(rows, effective, helps, versions, flags, context)
+        receipts = {ident: receipt for ident, (_, receipt, _) in rows.items()}
+        ordinary = []
+        for call in (session / "foreign-native-invocations").iterdir():
+            receipt = strict_json((call / "receipt.json").read_bytes())
+            require(isinstance(receipt, dict), "ForeignClosedZstdClassification")
+            if receipt.get("context") != context: continue
+            operation = receipt.get("operation")
+            require(isinstance(operation, dict), "ForeignClosedZstdClassification")
+            if operation["class"] == "CompilerObjectCompile":
+                require(receipt["operation_id"] not in receipts, "ForeignClosedZstdRepeated")
+                receipts[receipt["operation_id"]] = receipt; ordinary.append((call, receipt))
+            else:
+                require(receipt["operation_id"] in receipts and receipts[receipt["operation_id"]] == receipt,
+                        "ForeignClosedZstdClassification")
+        require(len(ordinary) == len(FOREIGN_ZSTD_ORDINARY_SOURCES)
+                and {receipt["operation"]["raw_source"] for _, receipt in ordinary}
+                    == set(FOREIGN_ZSTD_ORDINARY_SOURCES)
+                and len({receipt["operation"]["output"] for _, receipt in ordinary}) == len(ordinary),
+                "ForeignClosedZstdIncomplete")
+        controls = foreign_controls(session, policy, owner, context)
+        require(foreign_closed_zstd_seal_generation(session, policy, owner) == generation,
+                "ForeignClosedSealGenerationChanged")
+        return {"context": context, "rows": rows, "effective": effective, "helps": helps,
+                "versions": versions, "flags": flags, "family": family, "receipts": receipts,
+                "ordinary": ordinary, "controls": controls, "generation": generation}
+    except (Refusal, OSError, KeyError, TypeError, ValueError, IndexError):
+        # Optional success reuse never captures a failure or changes its original per-ID attribution.
+        return None
+
+
+def foreign_closed_zstd_seal_check(session, policy, owner, scope, *, final=False):
+    require(foreign_controls(session, policy, owner, scope["context"]) == scope["controls"], "ForeignFamilyControl")
+    for call, receipt, _ in scope["rows"].values():
+        if receipt["operation"]["class"] == "CompilerFamilyFileProbe":
+            native_state_check(call, receipt["input_post"], live=True, retire=True)
+    call, receipt, _ = scope["flags"][-1]
+    native_state_check(call, receipt["input_return"], live=True)
+    native_state_check(call, receipt["output_return"], live=True)
+    if final:
+        for call, receipt in scope["ordinary"]:
+            native_state_check(call, receipt["input_return"], live=True)
+            native_state_check(call, receipt["output_return"], live=True)
+        require(foreign_closed_zstd_seal_generation(session, policy, owner) == scope["generation"],
+                "ForeignClosedSealGenerationChanged")
+
+
 def foreign_seal(session, policy):
     namespace = session / "foreign-native-invocations"
     owner = strict_json((session / "owner.json").read_bytes()); inv = native_control(session, policy, owner)
@@ -4847,7 +5275,7 @@ def foreign_seal(session, policy):
               "unclosed": ["compiler-family-successors", "family-to-compile", "object", "archive", "builder-run", "consumer"]}
     paths, probes, hashes, failures = foreign_evidence_namespace(session)
     calls = {}; groups = {}; outdirs = {}; compile_requested = False; archive_requested = False
-    closed_scopes = {}
+    closed_scopes = {}; closed_zstd_scopes = {}
     if namespace.exists() and namespace.is_dir() and namespace.resolve() == namespace and not namespace.is_symlink():
         for call in sorted(namespace.iterdir()):
             item = {"operation_id": call.name}; result["operations"].append(item)
@@ -4862,8 +5290,10 @@ def foreign_seal(session, policy):
                 archive_requested = archive_requested or early_request.get("role") == "ar"
                 early_args = [os.fsdecode(bytes.fromhex(v)) for v in early_request["args_hex"]]
                 if (early_request.get("role") == "cc" and "-c" in early_args and early_args[-1:]
-                        and early_args[-1] in FOREIGN_LZ4_ORDINARY_SOURCES
-                        and Path(os.fsdecode(bytes.fromhex(early_request["cwd_hex"]))) == session / "vendor/lz4-sys"):
+                        and ((early_args[-1] in FOREIGN_LZ4_ORDINARY_SOURCES
+                              and Path(os.fsdecode(bytes.fromhex(early_request["cwd_hex"]))) == session / "vendor/lz4-sys")
+                             or (early_args[-1] in FOREIGN_ZSTD_ORDINARY_SOURCES
+                                 and Path(os.fsdecode(bytes.fromhex(early_request["cwd_hex"]))) == session / "vendor/zstd-sys"))):
                     foreign_lz4_lock_quiescent(session)
                 for leaf in ("request", "receipt"):
                     path = call / (leaf + ".json"); regular(path)
@@ -4888,7 +5318,9 @@ def foreign_seal(session, policy):
                 auxiliary_sd = (archiving and operation.get("ring_build") == "AuxiliaryConstantTimeTest"
                                 and operation.get("class") == "ArchiverIndex" and operation.get("mode") == "sD"
                                 and args == ["sD", str(Path(context["out_dir"]) / RING_ARCHIVES[1])])
-                if auxiliary_sd: native_environment(env, session, inv)
+                lz4_sd = (archiving and Path(context["manifest"]).name == "lz4-sys" and operation.get("class") == "ArchiverIndex"
+                          and operation.get("mode") == "sD" and args == ["sD", str(Path(context["out_dir"]) / "liblz4.a")])
+                if auxiliary_sd or lz4_sd: native_environment(env, session, inv)
                 else: (foreign_archive_environment if archiving else foreign_compile_environment if compiling or flagging else foreign_environment)(env, session, inv)
                 group = context["out_dir"]; package = context["package_id"]
                 require(group not in outdirs or outdirs[group] == package, "ForeignOutDirCollision"); outdirs[group] = package
@@ -4916,6 +5348,12 @@ def foreign_seal(session, policy):
             for group, context in ring_contexts.items():
                 scope = foreign_closed_ring_seal_scope(session, policy, owner, context)
                 if scope is not None: closed_scopes[group] = scope
+        zstd_contexts = {receipt["context"]["out_dir"]: receipt["context"] for _, receipt, _, _ in calls.values()
+            if Path(receipt["context"]["manifest"]).name == "zstd-sys"
+            and receipt["operation"].get("class") == "CompilerObjectCompile"}
+        for group, context in zstd_contexts.items():
+            scope = foreign_closed_zstd_seal_scope(session, policy, owner, context)
+            if scope is not None: closed_zstd_scopes[group] = scope
         for ident, (call, receipt, env, args) in calls.items():
             try:
                 operation = receipt["operation"]; predecessor = operation.get("predecessor")
@@ -4926,8 +5364,16 @@ def foreign_seal(session, policy):
                 compiling = operation["class"] == "CompilerObjectCompile"
                 archiving = operation["class"] in {"ArchiverFirstAppend", "ArchiverRemainingAppend", "ArchiverIndex"}
                 extended = Path(receipt["context"]["manifest"]).name in FOREIGN_E_ONLY_PACKAGES and operation["class"] in {"CompilerFamilyHelpProbe", "CompilerFamilyVersionProbe", "CompilerFlagProbe"}
+                zstd_scope = closed_zstd_scopes.get(receipt["context"]["out_dir"])
+                if zstd_scope is not None:
+                    require(zstd_scope["context"] == receipt["context"] and zstd_scope["receipts"].get(ident) == receipt,
+                            "ForeignClosedZstdBinding")
+                    foreign_closed_zstd_seal_check(session, policy, owner, zstd_scope)
                 if extended:
-                    _, effective, helps, versions, flags = foreign_e_history(session, inv, receipt["context"])
+                    if zstd_scope is None:
+                        _, effective, helps, versions, flags = foreign_e_history(session, inv, receipt["context"])
+                    else:
+                        effective, helps, versions, flags = (zstd_scope[k] for k in ("effective", "helps", "versions", "flags"))
                     if operation["class"] == "CompilerFlagProbe":
                         require(len(flags) == 3 and len(versions) == 4 and len(helps) == 4
                                 and len(effective) == 4, "ForeignFlagIncomplete")
@@ -4950,8 +5396,8 @@ def foreign_seal(session, policy):
                     # Full retained overwrite lineage was validated above.
                     pass
                 elif compiling:
-                    if Path(receipt["context"]["manifest"]).name == "lz4-sys":
-                        foreign_lz4_receipt(call, receipt, args, receipt["context"], session, inv)
+                    if Path(receipt["context"]["manifest"]).name in ("lz4-sys", "zstd-sys"):
+                        (foreign_lz4_receipt if Path(receipt["context"]["manifest"]).name == "lz4-sys" else foreign_zstd_receipt)(call, receipt, args, receipt["context"], session, inv)
                     auxiliary = operation.get("ring_build") == "AuxiliaryConstantTimeTest"
                     pins = foreign_compile_pins(session, inv, receipt["context"], auxiliary=auxiliary)
                     require(all(receipt.get(k) == pins for k in ("compile_pins_pre", "compile_pins_post", "compile_pins_return")), "ForeignCompilePinChanged")
@@ -4960,6 +5406,7 @@ def foreign_seal(session, policy):
                     scope = closed_scopes.get(receipt["context"]["out_dir"])
                     if scope is not None: require(scope["context"] == receipt["context"], "ForeignClosedSealContext")
                     family = (scope["families"][1 if auxiliary else 0] if scope is not None else
+                              zstd_scope["family"] if zstd_scope is not None else
                               foreign_compile_family(session, policy, owner, receipt["context"], current_call=call, allow_archive=True, auxiliary=auxiliary))
                     require(receipt["family_pre"] == receipt["family_return"] == family, "ForeignFamilyChanged")
                     if auxiliary:
@@ -5034,6 +5481,13 @@ def foreign_seal(session, policy):
             failures.append("ForeignSeal:" + group + ":" + str(error))
             extra_paths, extra_probes, extra_hashes, extra_failures = foreign_evidence_namespace(session)
             paths.update(extra_paths); probes.update(extra_probes); hashes.update(extra_hashes); failures.extend(extra_failures)
+    for group, scope in closed_zstd_scopes.items():
+        try:
+            foreign_closed_zstd_seal_check(session, policy, owner, scope, final=True)
+        except (Refusal, OSError, KeyError, TypeError, ValueError) as error:
+            failures.append("ForeignSeal:" + group + ":" + str(error))
+            extra_paths, extra_probes, extra_hashes, extra_failures = foreign_evidence_namespace(session)
+            paths.update(extra_paths); probes.update(extra_probes); hashes.update(extra_hashes); failures.extend(extra_failures)
     result["quarantine"] = {"paths": sorted(paths), "probe_paths": sorted(probes), "sha256": sorted(hashes)}
     result["blockers"] = sorted(set(failures)); native_control(session, policy, owner)
     atomic_json(session / "foreign-native-record.json", result)
@@ -5049,6 +5503,8 @@ def native_wrapper(session_id, role, args):
     # Only the actual canonical SQLite tree uses its unchanged native graph.
     operation = native_operation if cwd == session / "vendor/libsqlite3-sys" else foreign_operation
     if role == "cc" and cwd == session / "vendor/lz4-sys" and "-c" in args and args[-1:] and args[-1] in FOREIGN_LZ4_ORDINARY_SOURCES:
+        operation = foreign_lz4_serialized_operation
+    if role == "cc" and cwd == session / "vendor/zstd-sys" and "-c" in args:
         operation = foreign_lz4_serialized_operation
     call,r=operation(session,policy,owner,role,args,cwd,env)
     if r["protocol_state"]!="Completed":

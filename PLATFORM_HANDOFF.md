@@ -633,3 +633,13 @@ Native FIX1 Source `029799ab` 的新漂移 whole 和原 Zstd ownership whole 已
 验证：定向 `cargo test --lib funding_material_` 新3项，以及同一成功 harness 的相关3项，共6项 fresh whole 全通过；独立 Source 与 DATA 审查均 C0/I0/M0。没有追加全量测试、release 或生产部署。Source cf63d7df；Source peer104096db；fresh6 d61aaf52；DATA peer1c259f5d；Root现有原生构建14项另已通过，actual Tools/policy 仍待当前 APP 更新后应用。
 
 代码在 `src/trading/paper_funding_review_store_v1.rs` 与 review 的私有 owning seam；注册一处，既有 outbox/funding fixture 只调整必要 cfg(test) 可见性。生产数据库、批准接口与主分支均未修改。下一步：完成当前 APP 清单和构建策略更新、真实 record/issuer 接线；新闻 Source 独立修补并另行测试部署。
+
+## 构建工具与当前应用清单已落地（2026-10-06）
+
+Zstd 单次 seal 内成功组复用及 Lz4/相关控制已完成 fresh14：六组实际执行共14项，全通过，独立 Source 与 DATA 审查通过。历史360秒超时及诊断原件保留；没有提高超时或跳过旧检查，也没有把合成测试当作真实 native/provider/Financial 资格。
+
+当前应用清单重新扫描固定16个根，得到926个文件、79个目录；保留593个精确 package IDs。构建策略仅更新 owner_sha256 和 application.files，完整逆变换还原旧策略原文。独立 DATA 核对后，Root 精确应用两个工具文件和策略文件，应用回执 `9821bce2` 为 ROOT_EXACT3_APPLIED_RECORDING_ONLY；三个文件实测内容与候选一致，其他受控输入保持。
+
+验证复用已通过 fresh14 `d1e15b1f`，没有重复测试、Cargo编译或 release。清单 DATA `01fcd9f8`、controller Source `6916998c` 及应用闭合证据齐全。此批仍是 RecordingOnly；真实构建 record、native producer/consumer graph issuer、业务 Financial 和平台生产接线尚未完成。
+
+新闻部署继续在独立工作树推进。FIX2 的新库测试实际1通过/6失败，原因是新夹具使用真实标的而被测试隔离门拒绝；发布构建另发现三处 monitor_config 作用域错误。两份失败原件保留，正在分别修正测试命名空间和变量接线。生产保持原新闻版本，尚未安装失败构建或宣称即时新闻送达已恢复。
