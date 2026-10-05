@@ -3363,3 +3363,479 @@ mod retained_fee_manifest_tests {
         });
     }
 }
+
+// Ordinary fixed owner/account linkage. Genesis/event bodies and Financial
+// replay are deliberately not checked or qualified by this retained frame.
+#[derive(Default)]
+struct OwnerLinkageRow {
+    account_id: Option<String>, epoch_id: Option<String>, manifest_hash: Option<String>,
+    active_generation: Option<i64>, active_epoch_id: Option<String>, active_manifest_hash: Option<String>,
+    owner_revision: Option<i64>, cutover_id: Option<Option<String>>,
+    manifest_bytes: Option<Vec<u8>>, fee_policy_instance_id: Option<String>,
+    v1_epoch_id: Option<String>, v1_manifest_hash: Option<String>, v1_head_version: Option<i64>,
+    v1_head_hash: Option<String>, v1_projection_hash: Option<String>, account_cutover_id: Option<String>,
+}
+#[derive(Default)]
+struct OwnerLinkageReadFacts {
+    started: bool, count: Option<i64>, types_checked: bool, extent: Option<u64>,
+    charged: bool, acquired: usize, eof: bool, scopes_ended: bool, returned: Option<bool>,
+}
+struct OwnerLinkageFields { rows: [Vec<OwnerLinkageRow>; 5] }
+impl Default for OwnerLinkageFields {
+    fn default() -> Self { Self { rows: std::array::from_fn(|_| Vec::new()) } }
+}
+#[derive(Clone, Copy)]
+enum OwnerLinkageQuery { OldAccounts, Owners, Accounts, Events, Heads }
+impl OwnerLinkageQuery {
+    const ALL: [Self; 5] = [Self::OldAccounts, Self::Owners, Self::Accounts, Self::Events, Self::Heads];
+    fn slot(self) -> usize { match self { Self::OldAccounts => 0, Self::Owners => 1, Self::Accounts => 2, Self::Events => 3, Self::Heads => 4 } }
+    fn sql(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::OldAccounts => (
+                "SELECT COUNT(*) FROM main.paper_ledger_account",
+                "SELECT COUNT(*) FROM main.paper_ledger_account WHERE typeof(account_id)!='text' OR typeof(epoch_id)!='text' OR typeof(manifest_hash)!='text'",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(epoch_id AS BLOB))+length(CAST(manifest_hash AS BLOB))),0) FROM main.paper_ledger_account",
+                "SELECT account_id,epoch_id,manifest_hash FROM main.paper_ledger_account ORDER BY account_id",
+            ),
+            Self::Owners => (
+                "SELECT COUNT(*) FROM main.paper_book_owner_v2",
+                "SELECT COUNT(*) FROM main.paper_book_owner_v2 WHERE typeof(account_id)!='text' OR typeof(active_generation)!='integer' OR typeof(active_epoch_id)!='text' OR typeof(active_manifest_hash)!='text' OR typeof(owner_revision)!='integer' OR typeof(cutover_id) NOT IN ('null','text')",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(active_epoch_id AS BLOB))+length(CAST(active_manifest_hash AS BLOB))+coalesce(length(CAST(cutover_id AS BLOB)),0)),0) FROM main.paper_book_owner_v2",
+                "SELECT account_id,active_generation,active_epoch_id,active_manifest_hash,owner_revision,cutover_id FROM main.paper_book_owner_v2 ORDER BY account_id",
+            ),
+            Self::Accounts => (
+                "SELECT COUNT(*) FROM main.paper_book_v2_account",
+                "SELECT COUNT(*) FROM main.paper_book_v2_account WHERE typeof(account_id)!='text' OR typeof(epoch_id)!='text' OR typeof(manifest_hash)!='text' OR typeof(manifest_bytes)!='blob' OR typeof(fee_policy_instance_id)!='text' OR typeof(v1_epoch_id)!='text' OR typeof(v1_manifest_hash)!='text' OR typeof(v1_head_version)!='integer' OR typeof(v1_head_hash)!='text' OR typeof(v1_projection_hash)!='text' OR typeof(cutover_id)!='text'",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))+length(CAST(epoch_id AS BLOB))+length(CAST(manifest_hash AS BLOB))+length(manifest_bytes)+length(CAST(fee_policy_instance_id AS BLOB))+length(CAST(v1_epoch_id AS BLOB))+length(CAST(v1_manifest_hash AS BLOB))+length(CAST(v1_head_hash AS BLOB))+length(CAST(v1_projection_hash AS BLOB))+length(CAST(cutover_id AS BLOB))),0) FROM main.paper_book_v2_account",
+                "SELECT account_id,epoch_id,manifest_hash,manifest_bytes,fee_policy_instance_id,v1_epoch_id,v1_manifest_hash,v1_head_version,v1_head_hash,v1_projection_hash,cutover_id FROM main.paper_book_v2_account ORDER BY account_id",
+            ),
+            Self::Events => (
+                "SELECT COUNT(*) FROM main.paper_book_v2_event",
+                "SELECT COUNT(*) FROM main.paper_book_v2_event WHERE typeof(account_id)!='text'",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))),0) FROM main.paper_book_v2_event",
+                "SELECT account_id FROM main.paper_book_v2_event ORDER BY account_id",
+            ),
+            Self::Heads => (
+                "SELECT COUNT(*) FROM main.paper_book_v2_head",
+                "SELECT COUNT(*) FROM main.paper_book_v2_head WHERE typeof(account_id)!='text'",
+                "SELECT coalesce(sum(length(CAST(account_id AS BLOB))),0) FROM main.paper_book_v2_head",
+                "SELECT account_id FROM main.paper_book_v2_head ORDER BY account_id",
+            ),
+        }
+    }
+}
+#[derive(PartialEq, Eq)]
+enum OwnerLinkagePhase { Fresh, ReaderChecked, RowsReturned, RelationsChecked, Complete, Refused }
+struct OwnerLinkageFrame {
+    fee: FeeManifestFrame, phase: OwnerLinkagePhase, fields: OwnerLinkageFields,
+    reads: [OwnerLinkageReadFacts; 5], returns: [Option<StorageResult<()>>; 5], relations_returned: Option<bool>,
+}
+pub(super) struct AdditiveStorageRetainedOwnerLinkage { frame: OwnerLinkageFrame }
+pub(super) struct AdditiveStorageOwnerLinkageHeld { frame: OwnerLinkageFrame }
+impl AdditiveStorageOwnerLinkageHeld {
+    pub(super) fn first_error(&self) -> &GlobalSchemaV1Error { self.frame.fee.local.readonly.transform.first.as_ref().unwrap() }
+}
+impl AdditiveStorageRetainedOwnerLinkage {
+    // Ordinary borrowed data only, never a full owner/financial capability.
+    pub(super) fn active_accounts(&self) -> impl Iterator<Item = (&str, i64, &str, &str)> {
+        self.frame.fields.rows[1].iter().map(|r| (r.account_id.as_deref().unwrap(), r.active_generation.unwrap(),
+            r.active_epoch_id.as_deref().unwrap(), r.active_manifest_hash.as_deref().unwrap()))
+    }
+    pub(super) fn create_or_resume(source: rows::AdditiveRowsTargetSource)
+        -> std::result::Result<Self, AdditiveStorageOwnerLinkageHeld> {
+        let base = AdditiveStorageCopied { source, managed: None, directory: None, anchor: None, fresh: false,
+            original: None, rows: None, records: std::array::from_fn(|_| None), pending: None,
+            target: None, target_node: None, copied: None, census_files: std::array::from_fn(|_| None),
+            codec: AdditiveRecordCodecState::new(), copy_issued: false, rejected_copy_return: None,
+            copy_return_failed: false, copy_return_error: None, copy_origin_return_error: None };
+        OwnerLinkageFrame::new(TransformFrame::new(base)).run(true)
+    }
+}
+impl AdditiveStorageTransformed {
+    pub(super) fn into_retained_owner_linkage(self)
+        -> std::result::Result<AdditiveStorageRetainedOwnerLinkage, AdditiveStorageOwnerLinkageHeld> {
+        OwnerLinkageFrame::new(self.frame).run(false)
+    }
+}
+impl OwnerLinkageFrame {
+    fn new(transform: TransformFrame) -> Self {
+        Self { fee: FeeManifestFrame::new(transform), phase: OwnerLinkagePhase::Fresh,
+            fields: OwnerLinkageFields::default(), reads: std::array::from_fn(|_| OwnerLinkageReadFacts::default()),
+            returns: std::array::from_fn(|_| None), relations_returned: None }
+    }
+    fn fail(&mut self, first: GlobalSchemaV1Error) { self.fee.fail(first); self.phase = OwnerLinkagePhase::Refused; }
+    fn run(mut self, cold: bool) -> std::result::Result<AdditiveStorageRetainedOwnerLinkage, AdditiveStorageOwnerLinkageHeld> {
+        if !self.start(cold) || !self.finish() { return Err(AdditiveStorageOwnerLinkageHeld { frame: self }); }
+        Ok(AdditiveStorageRetainedOwnerLinkage { frame: self })
+    }
+    fn start(&mut self, cold: bool) -> bool {
+        if self.fee.local.readonly.transform.first.is_some() { return false; }
+        if self.phase != OwnerLinkagePhase::Fresh { self.fail(storage_fail("additive owner start phase differs")); return false; }
+        if !self.fee.start(cold) { self.phase = OwnerLinkagePhase::Refused; return false; }
+        let result = self.fee.acquire_fields().and_then(|()| self.fee.validate_fields());
+        match result { Ok(()) => { self.phase = OwnerLinkagePhase::ReaderChecked; true }, Err(first) => { self.fail(first); false } }
+    }
+    fn read_fixed(&mut self, query: OwnerLinkageQuery) -> StorageResult<()> {
+        if self.phase != OwnerLinkagePhase::ReaderChecked || self.fee.phase != FeeManifestPhase::Validated
+            || self.fee.local.readonly.active != Some(1) || !matches!(self.fee.validation, Some(Ok(()))) {
+            return Err(storage_fail("additive owner lacks validated second reader"));
+        }
+        let Retained8Frame { transform, permit, reader, .. } = &mut self.fee.local.readonly;
+        let (_, _, work, completed) = transform.base.source.retained8_parts(permit.as_ref().unwrap())?;
+        if completed != 2 { return Err(storage_fail("additive owner pair count differs")); }
+        OwnerLinkageReadLoan { connection: reader.as_ref().unwrap(), work,
+            rows: &mut self.fields.rows[query.slot()], facts: &mut self.reads[query.slot()] }.read(query)
+    }
+    fn advance_reads(&mut self) -> bool {
+        if self.fee.local.readonly.transform.first.is_some() { return false; }
+        if self.phase != OwnerLinkagePhase::ReaderChecked { self.fail(storage_fail("additive owner read phase differs")); return false; }
+        for query in OwnerLinkageQuery::ALL {
+            let i = query.slot();
+            if self.returns[i].is_some() || self.reads[i].started { self.fail(storage_fail("additive owner query already reached")); return false; }
+            // The actual owned result lands before first-error inspection. Every
+            // field acquired by the callee already resides in this same frame.
+            let actual = self.read_fixed(query); self.returns[i] = Some(actual);
+            if self.returns[i].as_ref().unwrap().is_err() {
+                let first = self.returns[i].take().unwrap().unwrap_err(); self.fail(first); return false;
+            }
+        }
+        self.phase = OwnerLinkagePhase::RowsReturned; true
+    }
+    fn all_returns(&self) -> bool {
+        self.returns.iter().all(|r| matches!(r, Some(Ok(()))))
+            && self.reads.iter().all(|r| r.returned == Some(true) && r.eof && r.scopes_ended)
+    }
+    fn validate_fields(&mut self) -> StorageResult<()> {
+        if self.phase != OwnerLinkagePhase::RowsReturned || !self.all_returns() || self.relations_returned.is_some() {
+            return Err(storage_fail("additive owner relations before whole returns"));
+        }
+        self.fee.local.readonly.loan()?.2.metadata(1024)?;
+        let actual = owner_linkage_relations(&self.fields);
+        self.relations_returned = Some(actual.is_ok()); actual?;
+        self.phase = OwnerLinkagePhase::RelationsChecked; Ok(())
+    }
+    fn close_and_tail(&mut self) -> StorageResult<()> {
+        if self.phase != OwnerLinkagePhase::RelationsChecked || self.relations_returned != Some(true) || !self.all_returns() {
+            return Err(storage_fail("additive owner close before relations returned"));
+        }
+        self.fee.close_and_tail()?; self.phase = OwnerLinkagePhase::Complete; Ok(())
+    }
+    fn finish(&mut self) -> bool {
+        if self.fee.local.readonly.transform.first.is_some() { return false; }
+        if !self.advance_reads() { return false; }
+        let actual = self.validate_fields().and_then(|()| self.close_and_tail());
+        match actual { Ok(()) => true, Err(first) => { self.fail(first); false } }
+    }
+}
+// Only the fixed frame lends its existing actual second Connection and work.
+struct OwnerLinkageReadLoan<'a> {
+    connection: &'a Connection, work: &'a mut target::TargetWork,
+    rows: &'a mut Vec<OwnerLinkageRow>, facts: &'a mut OwnerLinkageReadFacts,
+}
+impl OwnerLinkageReadLoan<'_> {
+    fn read(self, query: OwnerLinkageQuery) -> StorageResult<()> {
+        if self.facts.started || !self.rows.is_empty() { return Err(storage_fail("additive owner query already started")); }
+        let (count_sql, type_sql, extent_sql, fields_sql) = query.sql();
+        self.work.metadata(4096 + (count_sql.len() + type_sql.len() + extent_sql.len() + fields_sql.len()) as u64)?;
+        self.facts.started = true;
+        let actual = (|| {
+            let count: i64 = self.connection.query_row(count_sql, [], |r| r.get(0))
+                .map_err(|e| transform_sql_error("count additive owner rows", e))?;
+            self.facts.count = Some(count);
+            let count = usize::try_from(count).map_err(|_| storage_fail("additive owner count overflow"))?;
+            let invalid: i64 = self.connection.query_row(type_sql, [], |r| r.get(0))
+                .map_err(|e| transform_sql_error("type additive owner rows", e))?;
+            if invalid != 0 { return Err(storage_fail("additive owner row types differ")); }
+            self.facts.types_checked = true;
+            let extent: i64 = self.connection.query_row(extent_sql, [], |r| r.get(0))
+                .map_err(|e| transform_sql_error("extent additive owner rows", e))?;
+            let mut remaining = u64::try_from(extent).map_err(|_| storage_fail("additive owner extent overflow"))?;
+            self.facts.extent = Some(remaining);
+            let slots = (count as u64).checked_mul(std::mem::size_of::<OwnerLinkageRow>() as u64)
+                .ok_or_else(|| storage_fail("additive owner capacity overflow"))?;
+            self.work.metadata(slots.checked_add(remaining).ok_or_else(|| storage_fail("additive owner capacity overflow"))?)?;
+            self.facts.charged = true;
+            self.rows.try_reserve_exact(count).map_err(|_| storage_fail("additive owner row allocation failed"))?;
+            let mut statement = self.connection.prepare(fields_sql).map_err(|e| transform_sql_error("prepare additive owner rows", e))?;
+            let mut rows = statement.query([]).map_err(|e| transform_sql_error("query additive owner rows", e))?;
+            while let Some(row) = rows.next().map_err(|e| transform_sql_error("step additive owner rows", e))? {
+                if self.rows.len() == count { return Err(storage_fail("additive owner extra row")); }
+                self.rows.push(OwnerLinkageRow::default()); self.facts.acquired = self.rows.len();
+                let slot = self.rows.last_mut().unwrap();
+                match query {
+                    OwnerLinkageQuery::OldAccounts => {
+                        slot.account_id = Some(owner_linkage_text(row, 0, &mut remaining)?);
+                        slot.epoch_id = Some(owner_linkage_text(row, 1, &mut remaining)?);
+                        slot.manifest_hash = Some(owner_linkage_text(row, 2, &mut remaining)?);
+                    },
+                    OwnerLinkageQuery::Owners => {
+                        slot.account_id = Some(owner_linkage_text(row, 0, &mut remaining)?);
+                        slot.active_generation = Some(owner_linkage_integer(row, 1)?);
+                        slot.active_epoch_id = Some(owner_linkage_text(row, 2, &mut remaining)?);
+                        slot.active_manifest_hash = Some(owner_linkage_text(row, 3, &mut remaining)?);
+                        slot.owner_revision = Some(owner_linkage_integer(row, 4)?);
+                        slot.cutover_id = Some(owner_linkage_nullable_text(row, 5, &mut remaining)?);
+                    },
+                    OwnerLinkageQuery::Accounts => {
+                        slot.account_id = Some(owner_linkage_text(row, 0, &mut remaining)?);
+                        slot.epoch_id = Some(owner_linkage_text(row, 1, &mut remaining)?);
+                        slot.manifest_hash = Some(owner_linkage_text(row, 2, &mut remaining)?);
+                        slot.manifest_bytes = Some(owner_linkage_blob(row, 3, &mut remaining)?);
+                        slot.fee_policy_instance_id = Some(owner_linkage_text(row, 4, &mut remaining)?);
+                        slot.v1_epoch_id = Some(owner_linkage_text(row, 5, &mut remaining)?);
+                        slot.v1_manifest_hash = Some(owner_linkage_text(row, 6, &mut remaining)?);
+                        slot.v1_head_version = Some(owner_linkage_integer(row, 7)?);
+                        slot.v1_head_hash = Some(owner_linkage_text(row, 8, &mut remaining)?);
+                        slot.v1_projection_hash = Some(owner_linkage_text(row, 9, &mut remaining)?);
+                        slot.account_cutover_id = Some(owner_linkage_text(row, 10, &mut remaining)?);
+                    },
+                    OwnerLinkageQuery::Events => {
+                        slot.account_id = Some(owner_linkage_text(row, 0, &mut remaining)?);
+                    },
+                    OwnerLinkageQuery::Heads => {
+                        slot.account_id = Some(owner_linkage_text(row, 0, &mut remaining)?);
+                    },
+                }
+            }
+            if self.rows.len() != count || remaining != 0 { return Err(storage_fail("additive owner count/extent changed")); }
+            self.facts.eof = true; Ok(())
+        })();
+        // Actual query_row and Rows/Statement lexical scopes end on both paths.
+        // Ignored driver Drop results are not rewritten as successful facts.
+        self.facts.scopes_ended = true; self.facts.returned = Some(actual.is_ok()); actual
+    }
+}
+fn owner_linkage_claim(length: usize, remaining: &mut u64) -> StorageResult<()> {
+    *remaining = remaining.checked_sub(length as u64).ok_or_else(|| storage_fail("additive owner field extent changed"))?; Ok(())
+}
+fn owner_linkage_text(row: &rusqlite::Row<'_>, index: usize, remaining: &mut u64) -> StorageResult<String> {
+    let bytes = match row.get_ref(index).map_err(|e| transform_sql_error("read additive owner text", e))? {
+        rusqlite::types::ValueRef::Text(b) => b, _ => return Err(storage_fail("additive owner field type changed")),
+    };
+    owner_linkage_claim(bytes.len(), remaining)?;
+    let value = std::str::from_utf8(bytes).map_err(|_| storage_fail("additive owner text is not UTF8"))?;
+    let mut owned = String::new(); owned.try_reserve_exact(bytes.len()).map_err(|_| storage_fail("additive owner text allocation failed"))?;
+    owned.push_str(value); Ok(owned)
+}
+fn owner_linkage_nullable_text(row: &rusqlite::Row<'_>, index: usize, remaining: &mut u64) -> StorageResult<Option<String>> {
+    if matches!(row.get_ref(index).map_err(|e| transform_sql_error("read additive owner nullable text", e))?, rusqlite::types::ValueRef::Null) {
+        Ok(None)
+    } else { owner_linkage_text(row, index, remaining).map(Some) }
+}
+fn owner_linkage_blob(row: &rusqlite::Row<'_>, index: usize, remaining: &mut u64) -> StorageResult<Vec<u8>> {
+    let bytes = match row.get_ref(index).map_err(|e| transform_sql_error("read additive owner blob", e))? {
+        rusqlite::types::ValueRef::Blob(b) => b, _ => return Err(storage_fail("additive owner field type changed")),
+    };
+    owner_linkage_claim(bytes.len(), remaining)?;
+    let mut owned = Vec::new(); owned.try_reserve_exact(bytes.len()).map_err(|_| storage_fail("additive owner blob allocation failed"))?;
+    owned.extend_from_slice(bytes); Ok(owned)
+}
+fn owner_linkage_integer(row: &rusqlite::Row<'_>, index: usize) -> StorageResult<i64> {
+    match row.get_ref(index).map_err(|e| transform_sql_error("read additive owner integer", e))? {
+        rusqlite::types::ValueRef::Integer(v) => Ok(v), _ => Err(storage_fail("additive owner field type changed")),
+    }
+}
+fn owner_linkage_relations(fields: &OwnerLinkageFields) -> StorageResult<()> {
+    let [old, owners, accounts, events, heads] = &fields.rows;
+    for rows in &fields.rows {
+        if rows.windows(2).any(|w| w[0].account_id.as_deref().unwrap() >= w[1].account_id.as_deref().unwrap()) {
+            return Err(storage_fail("additive owner duplicate or unordered account"));
+        }
+    }
+    if owners.len() != old.len() { return Err(storage_fail("additive owner backfill gap")); }
+    for (i, row) in old.iter().enumerate() {
+        if old[..i].iter().any(|v| v.epoch_id == row.epoch_id) { return Err(storage_fail("additive owner duplicate V1 epoch")); }
+    }
+    for rows in [owners, accounts, events, heads] {
+        if rows.iter().any(|r| !old.iter().any(|v| v.account_id == r.account_id)) { return Err(storage_fail("additive owner orphan row")); }
+    }
+    for row in old {
+        let owner = owners.iter().find(|r| r.account_id == row.account_id).ok_or_else(|| storage_fail("additive owner missing owner"))?;
+        let account = accounts.iter().find(|r| r.account_id == row.account_id);
+        let event = events.iter().find(|r| r.account_id == row.account_id);
+        let head = heads.iter().find(|r| r.account_id == row.account_id);
+        match owner.active_generation.unwrap() {
+            1 => {
+                if !crate::trading::paper_book_v2::owner_v1_fields_match(owner.owner_revision.unwrap(),
+                    owner.cutover_id.as_ref().unwrap().as_deref(), owner.active_epoch_id.as_deref().unwrap(),
+                    owner.active_manifest_hash.as_deref().unwrap(), row.epoch_id.as_deref().unwrap(), row.manifest_hash.as_deref().unwrap())
+                    || account.is_some() || event.is_some() || head.is_some() { return Err(storage_fail("additive owner V1Active mismatch")); }
+            },
+            2 => {
+                let account = account.ok_or_else(|| storage_fail("additive owner missing V2 account"))?;
+                if event.is_none() || head.is_none() { return Err(storage_fail("additive owner missing V2 genesis roster")); }
+                if !crate::trading::paper_book_v2::owner_v2_fields_match(owner.owner_revision.unwrap(),
+                    owner.cutover_id.as_ref().unwrap().as_deref(), owner.active_epoch_id.as_deref().unwrap(),
+                    owner.active_manifest_hash.as_deref().unwrap(), account.epoch_id.as_deref().unwrap(),
+                    account.manifest_hash.as_deref().unwrap(), account.account_cutover_id.as_deref().unwrap())
+                    || old.iter().any(|v| v.epoch_id == account.epoch_id) { return Err(storage_fail("additive owner V2Active mismatch")); }
+            },
+            _ => return Err(storage_fail("additive owner unknown generation")),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod retained_owner_linkage_tests {
+    use super::*;
+    fn transformed(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> AdditiveStorageTransformed {
+        let copied = match AdditiveStorageCopied::create(original.into_additive_target_source().unwrap()) {
+            Ok(owner) => owner, Err(held) => panic!("owner linkage real Copied: {}", held.first_error()),
+        };
+        match copied.into_transformed() { Ok(owner) => owner, Err(held) => panic!("owner linkage real WAL: {}", held.first_error()) }
+    }
+    fn assert_complete(owner: &mut AdditiveStorageRetainedOwnerLinkage) {
+        let f = &mut owner.frame;
+        assert!(f.phase == OwnerLinkagePhase::Complete && f.fee.phase == FeeManifestPhase::Complete);
+        assert!(f.all_returns() && f.relations_returned == Some(true));
+        assert!(f.reads.iter().all(|r| r.started && r.types_checked && r.charged && r.eof && r.scopes_ended));
+        assert!(f.fields.rows.iter().all(|r| !r.is_empty()));
+        assert!(f.fields.rows[2].iter().all(|r| !r.manifest_bytes.as_ref().unwrap().is_empty()));
+        assert!(f.fee.fields.descriptor_bytes.is_some() && matches!(f.fee.validation, Some(Ok(()))));
+        assert!(f.fee.local.readonly.reader.is_none() && f.fee.local.readonly.active.is_none());
+        assert!(f.fee.local.readonly.facts.iter().all(|r| r.closed && r.original_tail_validated));
+        assert_eq!(f.fee.local.readonly.loan().unwrap().3, 2);
+        assert!(owner.active_accounts().all(|(_, generation, _, _)| generation == 2));
+    }
+    #[test]
+    fn task6_retained_owner_linkage_nonempty_same_reader_and_cold() {
+        super::super::tests::task6_with_cold_rows_backup_fixture_for_test(|original| {
+            let owner = transformed(original); let fd = owner.frame.base.target().unwrap().as_raw_fd();
+            let mut linked = match owner.into_retained_owner_linkage() {
+                Ok(owner) => owner, Err(held) => panic!("owner linkage real read: {}", held.first_error()),
+            };
+            assert_complete(&mut linked);
+            assert_eq!(linked.frame.fee.local.readonly.transform.base.target().unwrap().as_raw_fd(), fd);
+            let saved = (linked.frame.fee.local.readonly.transform.base.target_node.unwrap(),
+                linked.active_accounts().map(|(id, generation, epoch, hash)| (id.to_owned(), generation, epoch.to_owned(), hash.to_owned())).collect::<Vec<_>>(),
+                linked.frame.fee.local.readonly.transform.base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>());
+            drop(linked); saved
+        }, |(node, accounts, records), original| {
+            let mut linked = match AdditiveStorageRetainedOwnerLinkage::create_or_resume(original.into_additive_target_source().unwrap()) {
+                Ok(owner) => owner, Err(held) => panic!("owner linkage real cold read: {}", held.first_error()),
+            };
+            assert_complete(&mut linked); assert_eq!(linked.frame.fee.local.readonly.transform.base.target_node, Some(node));
+            assert_eq!(linked.active_accounts().map(|(id, generation, epoch, hash)| (id.to_owned(), generation, epoch.to_owned(), hash.to_owned())).collect::<Vec<_>>(), accounts);
+            assert_eq!(linked.frame.fee.local.readonly.transform.base.records.iter().flatten().map(|r| (r.node, r.bytes.clone())).collect::<Vec<_>>(), records);
+            drop(linked);
+        });
+    }
+    fn fixed_gate_connection() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE paper_ledger_account(account_id,epoch_id,manifest_hash);
+            CREATE TABLE paper_book_owner_v2(account_id,active_generation,active_epoch_id,active_manifest_hash,owner_revision,cutover_id);
+            CREATE TABLE paper_book_v2_account(account_id,epoch_id,manifest_hash,manifest_bytes,fee_policy_instance_id,v1_epoch_id,v1_manifest_hash,v1_head_version,v1_head_hash,v1_projection_hash,cutover_id);
+            CREATE TABLE paper_book_v2_event(account_id); CREATE TABLE paper_book_v2_head(account_id);
+            INSERT INTO paper_ledger_account VALUES('a','old','hash-old');
+            INSERT INTO paper_book_owner_v2 VALUES('a',2,'new','hash-new',2,'cut');
+            INSERT INTO paper_book_v2_account VALUES('a','new','hash-new',X'01','fee','old','hash-old',1,'head','projection','cut');
+            INSERT INTO paper_book_v2_event VALUES('a'); INSERT INTO paper_book_v2_head VALUES('a');").unwrap(); c
+    }
+    #[test]
+    fn task6_retained_owner_linkage_typed_presence_epoch_and_drift_refusals() {
+        // Arbitrary in-memory SQL proves only these fixed data gates, not a
+        // retained owner, complete genesis verifier, or financial capability.
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut source = original.into_additive_target_source().unwrap();
+            for case in ["v2", "v1", "type", "utf8", "missing", "duplicate", "orphan", "revision", "cutover", "epoch", "old_epoch", "generation", "v1_event", "missing_head"] {
+                let c = fixed_gate_connection();
+                let sql = match case {
+                    "v1" => "UPDATE paper_book_owner_v2 SET active_generation=1,active_epoch_id='old',active_manifest_hash='hash-old',owner_revision=1,cutover_id=NULL; DELETE FROM paper_book_v2_account; DELETE FROM paper_book_v2_event; DELETE FROM paper_book_v2_head;",
+                    "type" => "UPDATE paper_book_v2_account SET manifest_bytes='text';",
+                    "utf8" => "UPDATE paper_book_owner_v2 SET active_epoch_id=CAST(X'ff' AS TEXT);",
+                    "missing" => "DELETE FROM paper_book_owner_v2;",
+                    "duplicate" => "INSERT INTO paper_book_v2_event SELECT * FROM paper_book_v2_event;",
+                    "orphan" => "INSERT INTO paper_book_v2_head VALUES('orphan');",
+                    "revision" => "UPDATE paper_book_owner_v2 SET owner_revision=1;",
+                    "cutover" => "UPDATE paper_book_owner_v2 SET cutover_id='wrong';",
+                    "epoch" => "UPDATE paper_book_owner_v2 SET active_epoch_id='old'; UPDATE paper_book_v2_account SET epoch_id='old';",
+                    "old_epoch" => "INSERT INTO paper_ledger_account VALUES('b','old','other-hash'); INSERT INTO paper_book_owner_v2 VALUES('b',1,'old','other-hash',1,NULL);",
+                    "generation" => "UPDATE paper_book_owner_v2 SET active_generation=3;",
+                    "v1_event" => "UPDATE paper_book_owner_v2 SET active_generation=1,active_epoch_id='old',active_manifest_hash='hash-old',owner_revision=1,cutover_id=NULL; DELETE FROM paper_book_v2_account; DELETE FROM paper_book_v2_head;",
+                    "missing_head" => "DELETE FROM paper_book_v2_head;", _ => "",
+                };
+                c.execute_batch(sql).unwrap();
+                let mut fields = OwnerLinkageFields::default();
+                let mut facts: [OwnerLinkageReadFacts; 5] = std::array::from_fn(|_| OwnerLinkageReadFacts::default());
+                let work = source.storage_parts().unwrap().2; let before = work.metadata_used();
+                let actual = (|| {
+                    for query in OwnerLinkageQuery::ALL {
+                        OwnerLinkageReadLoan { connection: &c, work: &mut *work,
+                            rows: &mut fields.rows[query.slot()], facts: &mut facts[query.slot()] }.read(query)?;
+                    }
+                    work.metadata(1024)?; owner_linkage_relations(&fields)
+                })();
+                assert!(work.metadata_used() > before);
+                if matches!(case, "v1" | "v2") {
+                    actual.unwrap(); assert!(facts.iter().all(|r| r.eof && r.scopes_ended && r.returned == Some(true)));
+                } else {
+                    let expected = match case {
+                        "type" => "additive owner row types differ", "utf8" => "additive owner text is not UTF8",
+                        "missing" => "additive owner backfill gap", "duplicate" => "additive owner duplicate or unordered account",
+                        "orphan" => "additive owner orphan row", "old_epoch" => "additive owner duplicate V1 epoch",
+                        "generation" => "additive owner unknown generation", "v1_event" => "additive owner V1Active mismatch",
+                        "missing_head" => "additive owner missing V2 genesis roster", _ => "additive owner V2Active mismatch",
+                    };
+                    assert!(matches!(actual.unwrap_err(), GlobalSchemaV1Error::SelectionSnapshotChanged { detail } if detail == expected));
+                    if case == "type" { assert!(!facts[2].charged && fields.rows[2].is_empty()); }
+                    if case == "utf8" { assert!(facts[1].charged && fields.rows[1][0].account_id.is_some() && fields.rows[1][0].active_epoch_id.is_none()); }
+                }
+                c.close().unwrap();
+            }
+            drop(source);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = OwnerLinkageFrame::new(transformed(original).frame); assert!(f.fee.local.start(false));
+            let file = f.fee.local.readonly.transform.base.target().unwrap(); let mut byte = [0]; file.read_exact_at(&mut byte, 100).unwrap();
+            file.write_all_at(&[byte[0] ^ 1], 100).unwrap(); file.sync_all().unwrap();
+            let actual = f.fee.local.compare_second();
+            f.fee.local.readonly.transform.base.target().unwrap().write_all_at(&byte, 100).unwrap();
+            f.fee.local.readonly.transform.base.target().unwrap().sync_all().unwrap(); // Cleanup, never success.
+            let first = actual.unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail }
+                if detail == "additive readonly retained target bytes changed"));
+            f.fail(first); assert!(!f.finish() && f.reads.iter().all(|r| !r.started));
+            assert!(f.fields.rows.iter().all(Vec::is_empty)); drop(f);
+        });
+    }
+    #[test]
+    fn task6_retained_owner_linkage_same_work_unknown_late_and_busy_hold() {
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = OwnerLinkageFrame::new(transformed(original).frame); assert!(f.start(false));
+            let work = f.fee.local.readonly.loan().unwrap().2;
+            let remaining = 16 * MIB - work.metadata_used(); work.metadata(remaining).unwrap();
+            assert!(!f.finish()); assert!(f.reads.iter().all(|r| !r.started)); assert!(f.fields.rows.iter().all(Vec::is_empty));
+            let first = f.fee.local.readonly.transform.first.as_ref().unwrap().to_string();
+            let used = f.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert_eq!(f.fee.local.readonly.transform.first.as_ref().unwrap().to_string(), first); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = OwnerLinkageFrame::new(transformed(original).frame); assert!(f.start(false));
+            let actual = f.read_fixed(OwnerLinkageQuery::OldAccounts); actual.as_ref().unwrap();
+            let pointer = f.fields.rows[0][0].account_id.as_ref().unwrap().as_ptr();
+            assert!(f.reads[0].eof && f.reads[0].scopes_ended && f.returns[0].is_none());
+            let first = f.close_and_tail().unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSnapshotChanged { detail }
+                if detail == "additive owner close before relations returned"));
+            f.fail(first); f.returns[0] = Some(actual); // The actual late result stays owned even after first.
+            assert!(matches!(f.returns[0], Some(Ok(())))); assert_eq!(f.fields.rows[0][0].account_id.as_ref().unwrap().as_ptr(), pointer);
+            let used = f.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(f.reads[1..].iter().all(|r| !r.started) && f.relations_returned.is_none());
+            assert!(!f.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+        super::super::tests::task6_with_actual_rows_backup_for_test(|original| {
+            let mut f = OwnerLinkageFrame::new(transformed(original).frame); assert!(f.start(false)); assert!(f.advance_reads());
+            f.validate_fields().unwrap(); f.fee.local.readonly.prepare_busy_vm();
+            let first = f.close_and_tail().unwrap_err(); assert!(matches!(&first, GlobalSchemaV1Error::SelectionSqlite { operation: "close additive readonly", source }
+                if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)));
+            f.fail(first); assert!(f.fee.local.readonly.reader.is_some() && f.fields.rows[2][0].manifest_bytes.is_some());
+            let used = f.fee.local.readonly.loan().unwrap().2.metadata_used(); assert!(!f.finish());
+            assert_eq!(f.fee.local.readonly.loan().unwrap().2.metadata_used(), used);
+            assert!(!f.fee.local.readonly.facts[1].original_tail_validated);
+            assert!(f.fee.local.readonly.finalize_busy_once()); f.fee.local.readonly.cleanup_reader_once();
+            assert!(matches!(f.fee.local.readonly.cleanup_close, Some(Ok(()))));
+            assert!(f.fields.rows[2][0].manifest_bytes.is_some() && !f.fee.local.readonly.facts[1].original_tail_validated); drop(f);
+        });
+    }
+}

@@ -576,3 +576,14 @@ DEV已组合接入Task6选择器、六槽记录、真实复制/WAL转换、冷�
 Root完成限定lib编译（5m19），fresh摘要3、队列3与相关retention3、费用3、原integrity3、RO3及旧普通staging1，共19项全部退出0；主回执69dd483a。针对旧staging未动态经过抽取wrapper的具体覆盖缺口，另用相同制品运行一条existing exact Catalog7实际升级用例，经verify_v7_manifest_on→verify_manifest_row_on→shared fee helper，退出0/1PASS/3.71s（追加回执2abee8ee）。合计fresh20不同整方法，原19回执保持不改。旧base30闭合结果a4f7复用，Task6其中23项独立DATA496281通过。fresh同harness SHA509f096c在摘要运行后、其余16项前及结束后精确测量，21件源码与公共控制保持；不补造摘要运行前二进制SHA。旧staging用例验证原费用staging不可变与不同policy拒绝，其覆盖不等于抽取wrapper的动态覆盖。git diff检查通过，不追加例行check/build/clippy、全量或release。
 
 平台开发仅本地，生产仍是已部署的新闻四文件组合d9b4aabb/49518b30；启动和71条首轮采集已核验，实际推送窗口的新闻送达仍待验证。完整财务重放、operational schema8发行及monitor决策/资金接线、真实native/provider/layout/payment、远端长期留存和自然运行验收仍未完成。下一片是同第二live reader的真实typed owner/account关系校验，尚未应用；不能从已关闭费用owner新增reader或铸完整Financial资格。未远端push或合并。
+
+
+### 2026-10-06 账户与账本关联校验完成
+
+在已验证费用读取后、第二个仍存活的只读连接内，新增固定五组 typed 读取：旧账户、活动 owner、V2 账户、事件 account_id 与账本头 account_id。实际 COUNT、字段类型与字节长度先检查，同一 TargetWork 预付容量及复制，再逐字段保留到整体 frame；真实 EOF、词法资源结束和外层返回分别保存。校验重复、缺失、孤儿、代际 presence、revision/cutover/活动 epoch/hash 与不复用旧 epoch，关系成立后才走原 close 和完整来源/目标 tail。事件及 head 此片只读账户 roster，未完成 genesis 内容或审计重放。
+
+仅修改 additive target 与 paper_book_v2 两文件；A 的旧 211486 字节前缀完全保持，Book 原校验只抽出两个等价借用标量谓词，原 SQL、absence、旧 epoch、错误顺序、genesis/audit 保持。候选 Source 0e9d1095、独立 Source 7d01de4a、Root 自核 04e7f4e5、实际应用 8a810dee 精确绑定。没有增加 reader/pair/预算，也不从已关闭的费用 owner 重开连接。
+
+Root56411 限定 lib 编译 5m35，新增三项运行 66.09 秒、全部退出0；覆盖真实非空 warm/cold、类型/关系/UTF8 固定 gate 与实际目标漂移、预算不足、Unknown/late 字段保留与实际 Busy。Root41837 复用同一新产物运行费用三项（98.44 秒）及原账户校验两项（0.04/0.03 秒），全部退出0，共 fresh8 不同整方法。回执 68778462/8024bcb1；22件相关源码与公共控制、二进制 SHA0aaf96f6 在新增三项后及相关五项前后实际核对。没有补造新增三项之前的二进制 SHA，不追加 check/build/clippy/全量/release。独立 DATA e57f44ac 全文核对通过，本地提交包含两件源码与本交接文档。
+
+生产仍运行新闻组合修复 d9b4aabb/49518b30，实际新新闻送达仍待推送窗口证据；这组平台改动未部署。完整 genesis/audit/Financial 重放、operational schema8、monitor 决策与资金持久化接线、真实 native/provider/layout/payment、远端长期留存及自然验收仍待完成。Lz4/Zstd 已有源码正在有限合成，保留已通过的 Ring 优化；Root 明确用新组合审查及 fresh13 提案替换旧分立运行先后门，但新源码及运行尚未批准，不复用未运行结果或旧 APP922 作为当前控制。

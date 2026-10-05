@@ -296,6 +296,17 @@ fn verify_genesis_rows_with_work( old: &V1AccountRow, account: &V2AccountRow, ev
     Ok(())
 }
 
+// Shared scalar predicates only: callers retain their own presence, epoch,
+// SQL, audit and genesis obligations. These functions issue no authority.
+pub(crate) fn owner_v1_fields_match(revision: i64, cutover: Option<&str>,
+    active_epoch: &str, active_manifest: &str, old_epoch: &str, old_manifest: &str) -> bool {
+    revision == 1 && cutover.is_none() && active_epoch == old_epoch && active_manifest == old_manifest
+}
+pub(crate) fn owner_v2_fields_match(revision: i64, cutover: Option<&str>,
+    active_epoch: &str, active_manifest: &str, new_epoch: &str, new_manifest: &str, new_cutover: &str) -> bool {
+    revision == 2 && cutover == Some(new_cutover) && active_epoch == new_epoch && active_manifest == new_manifest
+}
+
 /// Row-level half of the CatalogV5 verifier. Caller first checks the exact
 /// schema/fee/review namespace; this function cannot issue cutover authority.
 pub(crate) fn verify_owner_rows_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
@@ -370,10 +381,8 @@ fn verify_owner_rows_in_transaction_on(conn: &mut SqliteConnection) -> Result<()
         match owner.active_generation {
             1 => {
                 require(
-                    owner.owner_revision == 1
-                        && owner.cutover_id.is_none()
-                        && owner.active_epoch_id == old.epoch_id
-                        && owner.active_manifest_hash == old.manifest_hash
+                    owner_v1_fields_match(owner.owner_revision, owner.cutover_id.as_deref(),
+                        &owner.active_epoch_id, &owner.active_manifest_hash, &old.epoch_id, &old.manifest_hash)
                         && !accounts.contains_key(&old.account_id)
                         && !events.contains_key(&old.account_id)
                         && !heads.contains_key(&old.account_id),
@@ -391,10 +400,9 @@ fn verify_owner_rows_in_transaction_on(conn: &mut SqliteConnection) -> Result<()
                     .remove(&old.account_id)
                     .ok_or_else(|| invalid("missing V2 head"))?;
                 require(
-                    owner.owner_revision == 2
-                        && owner.cutover_id.as_deref() == Some(account.cutover_id.as_str())
-                        && owner.active_epoch_id == account.epoch_id
-                        && owner.active_manifest_hash == account.manifest_hash
+                    owner_v2_fields_match(owner.owner_revision, owner.cutover_id.as_deref(),
+                        &owner.active_epoch_id, &owner.active_manifest_hash, &account.epoch_id,
+                        &account.manifest_hash, &account.cutover_id)
                         && !old_epochs.contains(&account.epoch_id),
                     "V2Active owner or epoch mismatch",
                 )?;
