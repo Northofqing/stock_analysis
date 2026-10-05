@@ -522,3 +522,14 @@ Root实际new3+prefix3+projection1共7项均通过，三会话退出0，同947c 
 只读八表方案df5ab1f0/独立PLAN8fe4cc93接受；为减少串行等待，先明确授权在reviewed f6父件上做Source-only准备，最终封存/审查/应用仍等待parent7与独审。现在父件已闭合且本地提交，RO8首版A/R及三项连接用例正在静态资源核对与精确父件重绑，尚未应用或执行。范围为真实两次只读typed6/rowid/sequence/REAL bits/双EOF与新表EOF、每次actual close及tail、冷5/6只读恢复，同owner/Work与旧Copied/WAL不变。
 
 Ring7已应用并本地提交45ad075e，不重跑该组；真实native/Financial门仍保留。新闻63ae676d仍仅本地，冻结365审批与旧生产状态保持，本检查点未上线、重启、重发、远端push或合并。平台整体未完成。
+
+
+### 2026-10-05 转换后只读八表校验完成
+
+Task6隔离树本地提交 `309a08fd`，工作树干净。在真实Transformed完整owner上接通两次只读typed rows/rowid/sqlite_sequence/REAL bits/双EOF及新增两表EOF比较；每次实际close成功后完整复核来源和目标尾状态，前次事实完整才允许下一reader。冷5/6恢复、真实Busy归还Connection、第一错误和累计工作账保持；原Copied/WAL条件不变。
+
+初始两轮预算失败原件保留，旧轮通过的单项不复用。最终仅删除新warm prepare的一次重复来源校验；真实转换/冷恢复来源验证、每次实际pair来源前后检查及每次close后完整来源tail全部保留，没有预算扩容、退款或重置。最终Source cdebba9e、独立Source33e04348、Root apply9fdc4310精确绑定。
+
+Root最终fresh新RO3+相关WAL3+exact projection1共7项通过，三个会话43994/70391/89786均退出0；新组编译5m19、运行128.73s，相关组复用产物运行51.97s与1.60s。闭合回执93993196、独立DATA2d241da4全文核对通过。仅确认相同打印harness路径947c，未测二进制SHA；git diff --check通过，未追加check/build/clippy/全量/release。详情见Task6隔离树 `TASK6_READONLY8_HANDOFF_20261005.md`。
+
+结果止于普通ReadonlyCompared owner；最终target/schema8发行、完整Financial prepare/render、真实native/provider及完整16MiB链路等仍待完成。Ring优化7项已通过并本地提交45ad075e，该已通过组不重跑。新闻63ae676d仅本地，冻结365精确审批及生产状态保持；本片未上线、重启、重发、push或合并。平台整体未完成。
