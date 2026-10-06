@@ -1,4 +1,10 @@
+use super::super::model_change_draft_store_v1::*;
 use super::*;
+use crate::evidence_retention::outbox_v1::{
+    LocalDisposition, OutboxFault, OutboxFixture, RecoveredPresence, TestCommitObservation,
+    UnverifiedOutbox,
+};
+use crate::evidence_retention::{TrustState, ValueError};
 
 fn at(day: u32) -> DateTime<Utc> {
     format!("2026-01-{day:02}T00:00:00Z").parse().unwrap()
@@ -266,4 +272,332 @@ fn model_change_draft_deadline_is_exclusive_and_cannot_auto_promote() {
         draft,
         recover_model_change_draft_v1(draft.canonical_bytes(), draft.draft_id()).unwrap()
     );
+}
+
+fn material_command(original: ModelChangeDraftV1) -> DraftMaterialCommand {
+    match prepare_draft_material(original) {
+        Ok(v) => v,
+        Err(v) => panic!("material preparation held {:?}", v.first_fault()),
+    }
+}
+
+fn material_open(f: &OutboxFixture) -> UnverifiedOutbox {
+    match f.open() {
+        Ok(v) => v,
+        Err(v) => panic!("actual material open held {:?}", v.first_fault()),
+    }
+}
+
+fn material_close(v: UnverifiedOutbox) {
+    if let Err(v) = v.close() {
+        panic!("actual material close held {:?}", v.first_fault());
+    }
+}
+
+fn material_stored(outcome: DraftMaterialOutcome) -> StoredDraftMaterial {
+    match outcome {
+        DraftMaterialOutcome::Stored(v) => v,
+        DraftMaterialOutcome::Held(v) => panic!("material Held {:?}", v.first_fault()),
+        DraftMaterialOutcome::Pending(v) => panic!("material Pending {:?}", v.first_fault()),
+        _ => panic!("unexpected recovered material"),
+    }
+}
+
+fn material_held(outcome: DraftMaterialOutcome) -> HeldDraftMaterial {
+    match outcome {
+        DraftMaterialOutcome::Held(v) => v,
+        _ => panic!("expected actual Held"),
+    }
+}
+
+fn material_recovered(outcome: DraftMaterialOutcome) -> RecoveredDraftMaterial {
+    match outcome {
+        DraftMaterialOutcome::Recovered(v) => v,
+        _ => panic!("expected actual closed readback"),
+    }
+}
+
+fn original_material(raw: &[u8], id: &str) -> DraftMaterialCommand {
+    material_command(recover_model_change_draft_v1(raw, id).unwrap())
+}
+
+#[test]
+fn model_draft_material_cold_reuse_and_family_conflict_keep_original_bytes() {
+    let r = request();
+    let original = build_model_change_draft_v1(&r).unwrap();
+    let raw = original.canonical_bytes().to_vec();
+    let id = original.draft_id().to_owned();
+    let pointer = original.canonical_bytes().as_ptr();
+    let command = material_command(original);
+    assert_eq!(command.original().canonical_bytes().as_ptr(), pointer);
+    let slot = command.family_slot().to_owned();
+    let envelope: serde_json::Value =
+        serde_json::from_slice(command.test_package().as_canonical_bytes()).unwrap();
+    assert_eq!(envelope["owner_domain"], "Attribution");
+    assert_eq!(
+        envelope["owner_schema_claim"],
+        "model-change-draft-material-v1"
+    );
+    assert_eq!(envelope["trust"], "Unverified");
+    assert_eq!(envelope["business_day_claim"], "1970-01-01");
+    assert_eq!(
+        envelope["window_start_claim"],
+        serde_json::json!({"unix_seconds":0,"nanosecond":0})
+    );
+    assert_eq!(
+        envelope["window_end_exclusive_claim"],
+        serde_json::json!({"unix_seconds":1,"nanosecond":0})
+    );
+    assert_eq!(envelope["claimed_record_count"], 1);
+    for field in [
+        "source_chain_before_claim",
+        "source_chain_after_claim",
+        "artifact_sha256_claim",
+        "activation_id_claim",
+    ] {
+        assert!(envelope[field].is_null());
+    }
+    assert_eq!(
+        hex::decode(envelope["body_hex"].as_str().unwrap()).unwrap(),
+        raw
+    );
+    let f = OutboxFixture::new();
+    let first = material_stored(command.persist(material_open(&f), 0));
+    assert_eq!(
+        (first.generation(), first.disposition(), first.trust()),
+        (1, LocalDisposition::Stored, TrustState::Unverified)
+    );
+    assert_eq!(first.original().canonical_bytes().as_ptr(), pointer);
+    assert_eq!(first.family_slot(), slot);
+    let cold =
+        material_recovered(original_material(&raw, &id).observe_previous(material_open(&f), 1));
+    assert_eq!(cold.presence(), RecoveredPresence::ExactUnverified);
+    assert_eq!(
+        (cold.original().canonical_bytes(), cold.trust()),
+        (raw.as_slice(), TrustState::Unverified)
+    );
+    assert_eq!(
+        cold.original_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::CommitUnknown)
+    );
+    let exact = material_stored(original_material(&raw, &id).persist(material_open(&f), 1));
+    assert_eq!(
+        (exact.generation(), exact.disposition()),
+        (2, LocalDisposition::ExactReuse)
+    );
+    let edits: &[fn(&mut ModelChangeDraftRequestV1)] = &[
+        |r| r.sample_policy.minimum_net_benchmark_excess_bps += 1,
+        |r| r.prospective.to = at(21),
+        |r| r.challenger.config_sha256 = "9".repeat(64),
+        |r| r.challenger.model_version = "TEST_CODE_model_v3".into(),
+    ];
+    for (i, edit) in edits.iter().enumerate() {
+        let mut changed = r.clone();
+        edit(&mut changed);
+        let command = material_command(build_model_change_draft_v1(&changed).unwrap());
+        assert_eq!(command.family_slot(), slot);
+        assert_ne!(command.original().canonical_bytes(), raw);
+        let stored = material_stored(command.persist(material_open(&f), i as i64 + 2));
+        assert_eq!(stored.disposition(), LocalDisposition::Conflict);
+    }
+    let mut count = material_open(&f);
+    assert_eq!(
+        (
+            count.generation(),
+            count.test_material_count(),
+            count.test_conflict_count()
+        ),
+        (6, 5, 10)
+    );
+    material_close(count);
+    let old =
+        material_recovered(original_material(&raw, &id).observe_previous(material_open(&f), 1));
+    assert_eq!(old.presence(), RecoveredPresence::ExactUnverified);
+    assert_eq!(old.original().canonical_bytes(), raw);
+}
+
+#[test]
+fn model_draft_material_actual_cas_busy_commit_unknown_and_close_keep_owners() {
+    let original = build_model_change_draft_v1(&request()).unwrap();
+    let raw = original.canonical_bytes();
+    let id = original.draft_id();
+    let f = OutboxFixture::new();
+    let a = material_open(&f);
+    let b = material_open(&f);
+    assert_eq!((a.generation(), b.generation()), (0, 0));
+    material_stored(original_material(raw, id).persist(a, 0));
+    let command = original_material(raw, id);
+    let pointer = command.original().canonical_bytes().as_ptr();
+    let stale = material_held(command.persist(b, 0));
+    assert_eq!(
+        stale.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::StaleGeneration)
+    );
+    assert_eq!(stale.original().canonical_bytes().as_ptr(), pointer);
+    assert!(stale.test_outbox().unwrap().test_command_retained());
+    drop(stale.drain_resources_once());
+    let mut a = material_open(&f);
+    let b = material_open(&f);
+    a.test_hold_transaction().unwrap();
+    let busy = material_held(original_material(raw, id).persist(b, 1));
+    assert_eq!(
+        busy.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::Busy)
+    );
+    assert!(busy.test_outbox().unwrap().test_connection_retained());
+    drop(busy.drain_resources_once());
+    if let Err(v) = a.test_rollback() {
+        panic!("actual rollback {:?}", v.first_fault());
+    }
+
+    let unknown = OutboxFixture::new();
+    let command = original_material(raw, id);
+    let pointer = command.original().canonical_bytes().as_ptr();
+    let pending = match command.persist(
+        material_open(&unknown).test_observation(TestCommitObservation::LoseResponse),
+        0,
+    ) {
+        DraftMaterialOutcome::Pending(v) => v,
+        _ => panic!("genuine response loss"),
+    };
+    assert_eq!(
+        pending.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::CommitUnknown)
+    );
+    assert_eq!(pending.original().canonical_bytes().as_ptr(), pointer);
+    assert_eq!(pending.trust(), TrustState::Unverified);
+    assert!(pending.test_actual_owner_retained());
+    let observed = material_recovered(pending.observe());
+    assert_eq!(observed.presence(), RecoveredPresence::ExactUnverified);
+    assert_eq!(observed.original().canonical_bytes().as_ptr(), pointer);
+    assert_eq!(
+        observed.original_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::CommitUnknown)
+    );
+    let mut count = material_open(&unknown);
+    assert_eq!((count.generation(), count.test_material_count()), (1, 1));
+    material_close(count);
+
+    let close = OutboxFixture::new();
+    let command = original_material(raw, id);
+    let pointer = command.original().canonical_bytes().as_ptr();
+    let failed = material_held(command.persist(material_open(&close).test_busy_vm(), 0));
+    assert_eq!(
+        failed.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::CloseHeld)
+    );
+    assert_eq!(failed.original().canonical_bytes().as_ptr(), pointer);
+    assert!(failed.test_outbox().unwrap().test_connection_retained());
+    let failed = failed.test_finalize_then_drain();
+    assert_eq!(
+        failed.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::CloseHeld)
+    );
+    assert!(!failed.test_outbox().unwrap().test_connection_retained());
+    assert_eq!(
+        failed
+            .drain_resources_once()
+            .original()
+            .canonical_bytes()
+            .as_ptr(),
+        pointer
+    );
+    let cold =
+        material_recovered(original_material(raw, id).observe_previous(material_open(&close), 1));
+    assert_eq!(cold.presence(), RecoveredPresence::ExactUnverified);
+}
+
+#[test]
+fn model_draft_material_same_work_and_changed_root_refuse_without_retry() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    let original = build_model_change_draft_v1(&request()).unwrap();
+    let raw = original.canonical_bytes();
+    let id = original.draft_id();
+    let f = OutboxFixture::new();
+    let mut short = material_open(&f);
+    assert_eq!(
+        short.test_spend_owned(8 * 1024 * 1024),
+        Err(OutboxFault::Work(ValueError::AllocationLimit))
+    );
+    let command = original_material(raw, id);
+    let pointer = command.original().canonical_bytes().as_ptr();
+    let failed = material_held(command.persist(short, 0));
+    assert_eq!(
+        failed.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::Work(ValueError::AllocationLimit))
+    );
+    assert_eq!(failed.original().canonical_bytes().as_ptr(), pointer);
+    assert!(failed.test_outbox().unwrap().test_command_retained());
+    drop(failed.drain_resources_once());
+    let mut pending = match original_material(raw, id).persist(
+        material_open(&f).test_observation(TestCommitObservation::LoseResponse),
+        0,
+    ) {
+        DraftMaterialOutcome::Pending(v) => v,
+        _ => panic!("actual pending"),
+    };
+    pending.test_exhaust_same_work();
+    let failed = material_held(pending.observe());
+    assert_eq!(
+        failed.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::CommitUnknown)
+    );
+    assert_eq!(failed.original().canonical_bytes(), raw);
+    assert!(failed.test_outbox().unwrap().test_connection_retained());
+    drop(failed.drain_resources_once());
+    let cold =
+        material_recovered(original_material(raw, id).observe_previous(material_open(&f), 1));
+    assert_eq!(cold.presence(), RecoveredPresence::ExactUnverified);
+
+    let foreign = OutboxFixture::new();
+    let outbox = material_open(&foreign);
+    fs::set_permissions(foreign.directory(), fs::Permissions::from_mode(0o755)).unwrap();
+    let failed = material_held(original_material(raw, id).persist(outbox, 0));
+    assert_eq!(
+        failed.first_fault(),
+        DraftMaterialFault::Outbox(OutboxFault::RootBinding)
+    );
+    assert_eq!(
+        (failed.original().canonical_bytes(), failed.trust()),
+        (raw, TrustState::Unverified)
+    );
+    assert!(failed.test_outbox().unwrap().test_command_retained());
+    drop(failed.drain_resources_once());
+    fs::set_permissions(foreign.directory(), fs::Permissions::from_mode(0o700)).unwrap();
+    let mut untouched = material_open(&foreign);
+    assert_eq!(
+        (untouched.generation(), untouched.test_material_count()),
+        (0, 0)
+    );
+    material_close(untouched);
+}
+
+#[test]
+fn model_draft_material_family_golden_and_absence_are_not_approval() {
+    let r = request();
+    let command = material_command(build_model_change_draft_v1(&r).unwrap());
+    assert_eq!(command.family_slot(), "model-change-draft-family-v1:sha256:525296a78e6e1c84caa6752eb7d50fa4ab567d0283e6b03483d1f74b4161826f");
+    let slot = command.family_slot().to_owned();
+    let mut scoped = r.clone();
+    scoped.challenger_paper_book_id = "TEST_CODE_second_book".into();
+    assert_ne!(
+        material_command(build_model_change_draft_v1(&scoped).unwrap()).family_slot(),
+        slot
+    );
+    scoped = r.clone();
+    scoped.challenger.strategy_version = "v3".into();
+    assert_ne!(
+        material_command(build_model_change_draft_v1(&scoped).unwrap()).family_slot(),
+        slot
+    );
+    let f = OutboxFixture::new();
+    let missing = material_recovered(command.observe_previous(material_open(&f), 1));
+    assert_eq!(missing.presence(), RecoveredPresence::MissingFactsUnknown);
+    assert_eq!(missing.trust(), TrustState::Unverified);
+    let mut empty = material_open(&f);
+    assert_eq!((empty.generation(), empty.test_material_count()), (0, 0));
+    material_close(empty);
+    assert_eq!(missing.original().request(), &r);
+    assert!(crate::decision::approved_paper_intent_v1::require_production_approval().is_err());
 }

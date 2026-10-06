@@ -759,3 +759,14 @@ Root独立用原globs/exclusions、记录的CI仓库前缀与已核Git路径重�
 新5/5实际PASS/EXIT0：内容身份变化、冷恢复及拒绝改写/晋级、版本/窗口/双账本、政策/文本预算、到期精确边界。927输入前后相同，manifest `95a3494181adaba051fefec0a92c516756371e22586430882bbdb7f82547322f`、log `9e8af3b66dccf817aee2465cd02e73bb603e1a3f67671e2bab1c439a775d7157`、harness `e13fcb1066cc32a0b63c00fda9999ec23a7f7a5bcf5e6511b3365b7dc72b93dd`。直接自审无另派独立审阅；本片只增新模块/注册与测试，复用限定lib编译，不重复全量/check/build/clippy/release或monitor dry-run。未部署平台。
 
 Windows后继已实际收件：f9cf实测CI原阈值35170/39817=88.33%，未达95；新19a2包20成员加manifest逐字节核对通过，原handler日志14PASS，Root仅包/日志回读，没有重建Git树或独立SDK源码评审/执行。两个包外Mac ACK `578d3f8b`/`d7bd808e`已成功发送原VM任务。GitHub API核对19a2同HEAD run37442001456实际已于09:29:42Z结束failure，coverage112197751056失败、audit112197751191成功；继续原95门禁修复，未生成运行候选、重绑R2或切换正式服务。
+
+
+## 2026-10-06 19:09 CST：治理Draft材料持久化
+
+`strategy/model_change_draft_store_v1.rs` 已接入既有 Task8 `UnverifiedOutbox`。新增普通Attribution材料namespace、固定schema `model-change-draft-material-v1`，不建新SQLite schema/账本。固定家族键绑定Champion/Challenger的strategy id/version及两个paper book；模型/config/code/rollback、窗口、时间和阈值排除在家族键外，改写完整原文被记录为Conflict，不能覆盖原提案。原声明时间仍在body；1970-01-01/[0,1)只是无时间分组哨兵。
+
+一次move保原不可变Draft及完整实际outbox返回。真实generation CAS、SQLite忙、COMMIT响应丢失、consuming-close失败、同Work短缺和根目录权限变化均保原文/指针、原owner与首错；Pending只observe，不自动enqueue。冷observe依原包全文和原generation回读实际membership，始终Unverified；Conflict表示保存了冲突材料，不是新候选获准。
+
+实际新增4/4 PASS、同当前harness原outbox quota/namespace/reuse/conflict及unknown-COMMIT/进程cut两项2/2 PASS，共fresh6不同完整方法。928输入保持；harness SHA `03d7443be59fdf0aaa6a8f3335e0bfd7b60cfd191d94a6d308e0f6100e9f81e2`，新4 log SHA `99bf79011640a9789adbd25aca10ddcfa9839aa95ce4bb7b86a823d7ba51333b`。原五完整Draft codec测试/helper正文实测不变，复用上轮证据；不重复全量/check/build/clippy/release/monitor dry-run。直接自审，本轮未安排独立审阅或部署。
+
+下一片补按保存标识直接载回原文，避免要求重启调用方仍持完整材料。此首片不是完整GovernanceRepository、真实注册时间、评审/晋级状态机或正式策略/决策关联；第5/7和资金/正向F2/Financial/native/PIT/同版SDK生产依赖保持未完成。
