@@ -19,6 +19,23 @@ use crate::news::aggregator::AdmittedGlobalNewsBatch;
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+#[path = "news_ai/critical_strength.rs"]
+mod critical_strength;
+#[path = "news_ai/global_critical.rs"]
+mod global_critical;
+#[cfg(test)]
+pub(crate) use global_critical::{test_fact as global_test_fact,test_result as global_test_result};
+pub use global_critical::{GlobalCriticalFact, GlobalCriticalIdentity, GlobalCriticalRequest, GlobalCriticalModelResult, GlobalCriticalEvidence, AuditedGlobalCriticalNews};
+#[path = "news_ai/critical_completion.rs"]
+mod critical_completion;
+pub use critical_completion::{AuditedNewsCritical, critical_news_completion_channel, CriticalCompletionSender,
+    CriticalCompletionReceiver, CriticalCompletionWait, CriticalCompletionSubmitted};
+#[cfg(test)]
+pub(crate) use critical_strength::test_result as critical_test_result;
+pub use critical_strength::{
+    canonical_critical_target, AuditedCriticalNews, CriticalModelResult,
+    CriticalNewsEvidence, NewsBaseIdentity,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -851,6 +868,9 @@ impl NewsAiAnalysisProfile {
                 ));
             }
         }
+        if self.is_critical() || self.is_global_critical() {
+            return Ok(());
+        }
         if self.system_sha256 != sha256_hex(NEWS_AI_SYSTEM_PROMPT_V1.as_bytes()) {
             return Err(NewsAiError::AnalysisAuditFailed(
                 "unsupported prompt system contract".to_owned(),
@@ -1055,6 +1075,12 @@ impl NewsAiRequest {
             identity.analysis_version(),
             chain,
         )?;
+        if identity.profile.is_critical() {
+            let mut prompt: serde_json::Value = serde_json::from_str(&request.normalized_prompt)
+                .map_err(|e|NewsAiError::AnalysisAuditFailed(e.to_string()))?;
+            prompt["required_output_schema"]["strength"] = serde_json::Value::String("integer 0..=100; importance for the predesignated target, independent of confidence".into());
+            request.normalized_prompt = serde_json::to_string(&prompt).map_err(|e|NewsAiError::AnalysisAuditFailed(e.to_string()))?;
+        }
         request.business_identity = Some(identity);
         Ok(request)
     }
@@ -1127,7 +1153,8 @@ pub fn parse_strict_model_output(response: &str) -> Result<StrictModelOutput, Ne
     Ok(output)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelCallReceipt {
     provider: String,
     model: String,
@@ -1567,7 +1594,13 @@ impl AuditedNewsAiAssessment {
             ));
         }
         validate_sha256("assessment audit record", assessment_audit_record_sha256)?;
-        let assessment = NewsAiAssessment::try_from_persisted(assessment)?;
+        let assessment = if business_identity.is_some_and(|identity| identity.profile.is_critical()) {
+            let identity = business_identity.expect("checked critical identity");
+            identity.validate_fact(&fact)?;
+            critical_strength::restore_assessment(assessment)?
+        } else {
+            NewsAiAssessment::try_from_persisted(assessment)?
+        };
         let expected_assessment_id = if let Some(identity) = business_identity {
             identity.validate_fact(&fact)?;
             if identity.analysis_version() != analysis_version {
@@ -4328,4 +4361,65 @@ mod tests {
             .expect_err("legacy interface must fail explicitly");
         assert_eq!(error.reason_code(), "model_unavailable");
     }
+    #[derive(Clone)]
+    struct CriticalCountingProvider(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl LlmProvider for CriticalCountingProvider {
+        fn name(&self) -> &'static str { "TEST_CODE_MODEL_PROVIDER" }
+        fn model(&self) -> &str { "TEST_CODE_MODEL_V1" }
+        async fn chat_json(&self,_:&str,_:&str)->Result<Value,LlmError> {
+            Err(LlmError::ReceiptUnavailable{provider:self.name().into(),model:self.model().into()})
+        }
+        async fn chat_json_with_receipt(&self,system:&str,user:&str)->Result<ReceiptBearingJson,LlmError> {
+            self.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            let raw=r#"{"impact":"positive","confidence":73,"uncertainty":"TEST_CODE risk","core_logic":"TEST_CODE contract","strength":91}"#;
+            Ok(ReceiptBearingJson::test_fixture(self.name(),self.model(),Some("TEST_CODE_request"),"TEST_CODE_response",system,user,raw,
+                instant("2026-07-27T01:00:04Z"),instant("2026-07-27T01:00:05Z")))
+        }
+    }
+
+    #[tokio::test]
+    async fn news_n01_pre_call_absent_unknown_and_real_receipt_contract() {
+        // Build a genuinely admitted source and the same market fixture as existing BR172 tests.
+        let observed_at=instant("2026-07-27T01:00:03Z");
+        let fact=AdmittedNewsFact::from_global(&global_record(observed_at),&news_batch(observed_at),"TEST_CODE_600519").unwrap();
+        // Test presentation must retain the source minimum even for a different admitted target.
+        let mut ordered = global_record(observed_at);
+        ordered.instruments = vec!["600600".into(), "600519".into(), "600600".into()];
+        let other = AdmittedNewsFact::from_global(&ordered,&news_batch(observed_at),"TEST_CODE_600600").unwrap();
+        assert_eq!(canonical_critical_target(&other).as_deref(),Some("TEST_CODE_600519"));
+        assert!(crate::risk::env_guard::validate_symbol_for_env("600519",crate::risk::env_guard::TradingEnv::Test).is_err());
+        assert!(crate::risk::env_guard::validate_symbol_for_env("TEST_CODE_600519",crate::risk::env_guard::TradingEnv::Test).is_ok());
+        let calls=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let analyzer=NewsAIAnalyzer::new(Arc::new(CriticalCountingProvider(calls.clone())));
+        let identity=NewsAiIdentityV3::from_fact(&fact,&analyzer.critical_identity_profile().unwrap()).unwrap();
+        let prepared=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for found in [Ok(true),Err("TEST_CODE Unknown".to_owned())] {
+            let counter=prepared.clone();
+            let result=analyzer.assess_critical_if_absent(identity.clone(),move |_|async move{found},move |_|async move {
+                counter.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                Err("TEST_CODE must not prepare".to_owned())
+            }).await;
+            assert!(result.is_err() || result.unwrap().is_none());
+        }
+        assert_eq!(prepared.load(std::sync::atomic::Ordering::SeqCst),0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0);
+        // The existing real fixture provides a market. Convert only its purpose, not its facts.
+        let (ordinary,_) = crate::database::news_ai::tests::core_assessment_for("TEST_CODE_N01_CALL","TEST_CODE_600519");
+        let fact=ordinary.fact.clone();
+        let identity=NewsAiIdentityV3::from_fact(&fact,&analyzer.critical_identity_profile().unwrap()).unwrap();
+        let request=NewsAiRequest::try_new_v3(ordinary.fact,ordinary.market,ordinary.optional_metrics,identity.clone(),ordinary.chain).unwrap();
+        let completed=analyzer.assess_critical_if_absent(identity,|_|async{Ok(false)},move |_|async move{Ok(request)}).await.unwrap().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
+        let evidence=completed.evidence(&"a".repeat(64)).unwrap();
+        evidence.validate().unwrap();
+        assert_eq!(evidence.strength(),91);
+        // Real provider output cannot move the selected target/content or its three receipt hashes.
+        for (container,field) in [("receipt","system_sha256"),("receipt","user_sha256"),("receipt","response_sha256"),("identity","target")] {
+            let mut value=serde_json::to_value(&evidence).unwrap(); value[container][field]=serde_json::json!("TEST_CODE_changed");
+            let changed: CriticalNewsEvidence=serde_json::from_value(value).unwrap();
+            assert!(changed.validate().is_err());
+        }
+    }
+
 }

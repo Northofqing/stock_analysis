@@ -666,3 +666,10 @@ Zstd 单次 seal 内成功组复用及 Lz4/相关控制已完成 fresh14：六�
 资金新增 cfg-only 固定执行 bridge 与原 owner 的只读观察接口，在真 constructor-isolated SQLite 覆盖 Cancel真正COMMIT+独立回读Complete、schema/子进程改动后的 Pending、stale/writer-tail首错及原非Clone input/T/累计Work保留。原生产 body和三个完整旧前缀保持。new3+related2共5项同版 fresh PASS，独立 Source/DATA接受；回执 `Root-paper-retained-fixed-success-fresh5-passed-receipt.json` SHA `69e51754c5c5bad3014eee6dcf78f22768d08196870152aa91713c2e3276711e`。本地提交仅DEV，不部署资金、不自动重跑SQL、不授资金批准/Financial/native/cutover或 consuming-close成功。
 
 下一步先完成公共 Global 的非交易时段准入定向验证和另次部署，再按真实能力推进平台接线。完整金融审计/hash/经济重放、生产 writer/catalog资格、真实构建 record/issuer/native/provider/layout、长期留存与自然运行验收仍未完成；不以局部测试把全平台标完成。
+
+
+## 2026-10-06 10:25 CST 接续：新闻已部署，平台融合继续
+
+生产新闻源码为 `813bfc19a500609bda58d2e254e5c36166d4584c`，monitor93285/bridge56417、原两库未替换；新10回归/release/61项隔离dry-run及启动观察完成，见[最新上线记录](docs/ops/2026-10-06-news-critical-score-rollout.md)。10:18:58真实新闻健康Updated，10:19:45missing不含News；账户Frozen/行情Unsafe仍在。实际AI调用仍有provider时间格式、uncertainty类型及复合audit拒绝，正在修复，不能称真实推送恢复。
+
+DEV最近已提交平台修复为 `a60014a75747c739bad9d71864946f51e516234f`；NEWS813与DEV三路融合正在进行，三处冲突已按双方功能解开但尚未完成测试/提交。原T+5 OutcomeTracker、真实prediction row/Card/Unit关联和原盘后报告已存在；后续业务片仅补逐项只读反馈，不新建重复Tracker或结果关联表。资金资格、全Financial/受控native发行、WG07真实接入、自然交易日观察与完整R05/R06复盘门仍须按既有边界完成，不能用新闻部署或本地测试替代。当前新提交未push远端。

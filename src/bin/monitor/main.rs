@@ -8554,6 +8554,27 @@ async fn poll_announcement_watch_load(
         .map_err(|error| format!("BR-138 explicit watch background task failed: {error}"))?
 }
 
+type ConceptIndexRefreshBatch = (
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, Vec<String>>,
+);
+type ConceptIndexRefreshTask = tokio::task::JoinHandle<Result<ConceptIndexRefreshBatch, String>>;
+
+async fn poll_concept_index_refresh(
+    task: &mut Option<ConceptIndexRefreshTask>,
+) -> Option<Result<ConceptIndexRefreshBatch, String>> {
+    if !task.as_ref()?.is_finished() {
+        return None;
+    }
+    let handle = task.take()?;
+    Some(
+        handle
+            .await
+            .map_err(|error| format!("BR-188 concept index background task failed: {error}"))
+            .and_then(|result| result),
+    )
+}
+
 fn merge_news_monitor_codes(
     holding_codes: Result<std::collections::HashSet<String>, String>,
     watch_codes: Option<&std::collections::HashSet<String>>,
@@ -8859,6 +8880,8 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         .unwrap_or(120);
 
     log::info!("[NewsMonitor] 启动（独立窗口，不随价格扫描器静默）");
+    let (critical_completion_tx, mut critical_completion_rx) =
+        stock_analysis::monitor::news_ai::critical_news_completion_channel();
     // Startup reads metadata and SQLite, including dedup and signal restoration.
     // Keep the ordered blocking work off the joined DataMode timer task.
     let (mut nm, mut sm, news_ai_producer) = initialize_news_monitor(move || {
@@ -8893,8 +8916,10 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         let mut nm = NewsMonitor::new();
         nm.restore_dedup();
 
-        let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime();
+        let news_ai_producer = news_ai_shadow::NewsAiProducer::from_runtime()
+            .with_critical_completion(critical_completion_tx);
         news_ai_producer.log_startup_banner();
+        log::info!("[NewsAI][BR244] designated N01 purpose shares existing call budget; new audited score and full authority required");
         news_ai_producer.schedule_tick(
             selection_v2_enabled,
             stock_analysis::calendar::current_session(),
@@ -8924,6 +8949,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let mut announcement_watch_load: Option<AnnouncementWatchLoadTask> = None;
+    let mut concept_index_refresh: Option<ConceptIndexRefreshTask> = None;
 
     // BR-244: one process-local owner preserves event/window dedup across all
     // news ticks. It carries no selection-ingress capability.
@@ -8935,16 +8961,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
         stock_analysis::news::aggregator::raw_v2::GlobalNewsSourceRegistry::new();
     let mut news_flash_gate = initialize_news_monitor(move || {
         let mut news_flash_gate = news_flash_gate;
-        log::warn!(
-            "{}",
-            crate::news_aggregator_init::NEWS_FLASH_CRITICAL_DISABLED_BANNER
-        );
-        push_templates::log_dispatcher_attempt(
-            "N-01",
-            false,
-            0,
-            "disabled=no_authoritative_strength_provider",
-        );
+        log::info!("[NewsFlash][BR244] raw SourceOnly path cannot mint scored N01; completion receiver registered, awaiting fresh model receipt, immutable score readback and delivery authority; configured model availability is reported by NewsAI new_analysis");
         let news_flash_startup_date = chrono::Local::now().date_naive();
         match stock_analysis::event::reconcile_news_flash_business_date(news_flash_startup_date) {
             Ok(snapshot) => {
@@ -8965,6 +8982,7 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
     .await;
 
     loop {
+        let monitor_config = stock_analysis::config::get_monitor_config();
         if !NewsMonitor::should_run() {
             publish_raw_news_source_recovery(&raw_news_sources);
             news_ai_producer.schedule_tick(
@@ -8972,7 +8990,9 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 stock_analysis::calendar::current_session(),
                 None,
             );
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            wait_for_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,
+                tokio::time::Instant::now()+tokio::time::Duration::from_secs(60),
+                monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
             continue;
         }
 
@@ -9013,6 +9033,14 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 .await
                 {
                     Ok(batch) => {
+                        match stock_analysis::news::aggregator::raw_v2::
+                            refresh_news_health_from_raw_batch(&batch)
+                        {
+                            Ok(refresh) => log::info!("[GlobalNews][NewsHealth] refresh={refresh:?} scope=content_freshness_only"),
+                            Err(error) => {
+                                log::warn!("[GlobalNews][NewsHealth] freshness not recorded: {error}");
+                            }
+                        }
                         let projection =
                             stock_analysis::news::aggregator::raw_v2::project_news_flash_events(
                                 &batch,
@@ -9056,7 +9084,6 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             }
             publish_raw_news_source_recovery(&raw_news_sources);
 
-            let monitor_config = stock_analysis::config::get_monitor_config();
             // BR-244: projection and every immutable failure audit complete
             // before the snapshot that may authorize reservation. The earlier
             // read is provider preflight only and is never reused for reserve.
@@ -9182,6 +9209,11 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             }
         }
 
+        // Preserve the original N02 CriticalFlash phase before handling queued
+        // N01 scores. Never await an unfinished model or drain to exhaustion.
+        drain_ready_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,
+            monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
+
         // One owner always recovers durable work, with optional same-tick live
         // analysis. Missing batches/activation/market windows never hide recovery.
         news_ai_producer.schedule_tick(
@@ -9271,49 +9303,44 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             }
         }
 
-        // L2 概念索引刷新（每5分钟一次）
-
-        if outer_tick.enter(NewsOuterTickPhase::L2)
-            && last_concept_refresh.elapsed().as_secs() >= 300
-        {
-            last_concept_refresh = std::time::Instant::now();
-
-            if let Some(our_codes) = &our_codes {
-                let codes = our_codes.clone();
-
-                match tokio::task::spawn_blocking(move || {
-                    // 同步HTTP在独立线程执行，不触发 runtime 冲突
-
-                    stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
-                })
-                .await
-                {
-                    Ok(Ok(index)) => {
-                        nm.linker_mut().replace_concept_index(index);
-
-                        log::info!(
-                            "[NewsMonitor][BR-188] L2 概念索引已更新（{}个板块关联）",
-                            nm.linker_ref().concept_count()
-                        );
-                    }
-
-                    Ok(Err(error)) => log::error!(
-                        "[NewsMonitor][BR-188] L2 概念索引完整批次拒绝，本轮保留上一份索引: {}",
-                        error
-                    ),
-
-                    Err(error) => log::error!(
-                        "[NewsMonitor][BR-188] L2 概念索引 blocking worker 失败，本轮保留上一份索引: {}",
-                        error
-                    ),
+        // A slow complete-batch refresh stays owned across ticks, so the next
+        // NewsFlash reservation can still run inside its five-minute window.
+        if outer_tick.enter(NewsOuterTickPhase::L2) {
+            match poll_concept_index_refresh(&mut concept_index_refresh).await {
+                Some(Ok((codes, index))) if our_codes.as_ref() == Some(&codes) => {
+                    nm.linker_mut().replace_concept_index(index);
+                    log::info!(
+                        "[NewsMonitor][BR-188] L2 概念索引已更新（{}个板块关联）",
+                        nm.linker_ref().concept_count()
+                    );
                 }
-            } else {
-                log::warn!("[NewsMonitor] L2 概念索引刷新跳过（标的来源不可用）");
+                Some(Ok(_)) => log::warn!(
+                    "[NewsMonitor][BR-188] L2 概念索引受众已变化，本轮保留上一份索引"
+                ),
+                Some(Err(error)) => log::error!(
+                    "[NewsMonitor][BR-188] L2 概念索引完整批次拒绝，本轮保留上一份索引: {}",
+                    error
+                ),
+                None => {}
             }
 
-            // v41: 周期刷新 banner (让 news_monitor_loop 的 D-01/I-02 用真 AccountMode)
+            if concept_index_refresh.is_none()
+                && last_concept_refresh.elapsed().as_secs() >= 300
+            {
+                last_concept_refresh = std::time::Instant::now();
+                if let Some(our_codes) = &our_codes {
+                    let codes = our_codes.clone();
+                    concept_index_refresh = Some(tokio::task::spawn_blocking(move || {
+                        stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
+                            .map(|index| (codes, index))
+                    }));
+                } else {
+                    log::warn!("[NewsMonitor] L2 概念索引刷新跳过（标的来源不可用）");
+                }
 
-            evaluate_account_mode_hook(false).await;
+                // Keep the account banner on the existing refresh cadence.
+                evaluate_account_mode_hook(false).await;
+            }
         }
 
         let mut pushed: Vec<AlertEvent> = Vec::new();
@@ -9550,8 +9577,52 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             if let Err(error) = outer_tick.finish() {
                 log::error!("[NewsMonitor][BR-138] outer tick contract failed: {error}");
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
+            let sleep_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(poll_secs);
+            wait_for_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,sleep_deadline,
+                monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
         }
+    }
+}
+
+async fn drain_ready_critical_completions(receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
+    gate: &mut crate::news_aggregator_init::NewsFlashGate,threshold:u8,max_per_day:u32) {
+    for _ in 0..5 {
+        let Some(score) = receiver.try_receive() else { break; };
+        reserve_completed_critical_news(gate,score,threshold,max_per_day).await;
+    }
+}
+async fn wait_for_critical_completions(receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
+    gate: &mut crate::news_aggregator_init::NewsFlashGate,deadline:tokio::time::Instant,threshold:u8,max_per_day:u32) {
+    loop {
+        match receiver.receive_until(deadline).await {
+            stock_analysis::monitor::news_ai::CriticalCompletionWait::Score(score) => {
+                reserve_completed_critical_news(gate,score,threshold,max_per_day).await;
+            }
+            stock_analysis::monitor::news_ai::CriticalCompletionWait::Deadline => break,
+            stock_analysis::monitor::news_ai::CriticalCompletionWait::Closed => {
+                tokio::time::sleep_until(deadline).await; break;
+            }
+        }
+    }
+}
+
+async fn reserve_completed_critical_news(gate: &mut crate::news_aggregator_init::NewsFlashGate,
+    score: stock_analysis::monitor::news_ai::AuditedNewsCritical,threshold:u8,max_per_day:u32) {
+    let now = chrono::Local::now();
+    if matches!(stock_analysis::event::runtime_delivery_audit_health(),stock_analysis::event::AuditHealth::Degraded{..}) {
+        log::error!("[NewsFlash][BR244] score completion refused: delivery audit degraded"); return;
+    }
+    let authority = match stock_analysis::event::reconcile_news_flash_business_date(now.date_naive()) {
+        Ok(value)=>value, Err(error)=>{log::error!("[NewsFlash][BR244] critical authority unavailable: {error}");return;}
+    };
+    let now=chrono::Local::now();
+    let reservations=match score {
+        stock_analysis::monitor::news_ai::AuditedNewsCritical::Equity(value)=>gate.reserve_critical_from_authority(&authority,value,now,threshold,max_per_day),
+        stock_analysis::monitor::news_ai::AuditedNewsCritical::Global(value)=>gate.reserve_global_critical_from_authority(&authority,value,now,threshold,max_per_day),
+    };
+    match reservations {
+        Ok(reservations)=>{crate::news_aggregator_init::push_flash_reservations(gate,reservations).await;}
+        Err(error)=>log::error!("[NewsFlash][BR244] critical completion refused: {error}"),
     }
 }
 
@@ -13825,11 +13896,11 @@ mod tests_post_session_review_scheduler {
             production
                 .matches("reconcile_news_flash_business_date(")
                 .count(),
-            3,
-            "startup, tick preflight, and fresh pre-reserve reads must use immutable authority"
+            4,
+            "startup, tick preflight, N02 reserve and scored N01 completion use immutable authority"
         );
-        assert!(production.contains("NEWS_FLASH_CRITICAL_DISABLED_BANNER"));
-        assert!(production.contains("disabled=no_authoritative_strength_provider"));
+        assert!(production.contains("raw SourceOnly path cannot mint scored N01"));
+        assert!(production.contains("awaiting fresh model receipt, immutable score readback and delivery authority"));
         assert_eq!(
             production.matches("project_news_flash_events(").count(),
             1,
@@ -13837,8 +13908,8 @@ mod tests_post_session_review_scheduler {
         );
         assert_eq!(
             production.matches("push_flash_reservations(").count(),
-            1,
-            "NewsFlash decisions must have one governed production delivery caller"
+            2,
+            "N02 tick and N01 completion use the same governed reservation dispatcher and sole Gate"
         );
         let projection = production
             .find("project_news_flash_events(")
@@ -14352,6 +14423,56 @@ mod tests_v17_7_announcement_wiring {
             .take()
             .expect("unfinished task remains owned by the next tick")
             .await;
+    }
+
+    #[tokio::test]
+    async fn news_concept_refresh_pending_keeps_worker_without_waiting() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut task = Some(tokio::task::spawn_blocking(move || {
+            release_rx.recv().expect("test releases the retained worker");
+            Err("TEST_CODE complete membership batch rejected".to_string())
+        }));
+        let worker_id = task.as_ref().unwrap().id();
+
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                poll_concept_index_refresh(&mut task),
+            )
+            .await
+            .expect("pending concept refresh must not delay the next news tick");
+            assert!(result.is_none());
+            assert_eq!(task.as_ref().unwrap().id(), worker_id);
+        }
+        release_tx.send(()).expect("release the background worker");
+        let result = task.take().unwrap().await.unwrap();
+        assert!(result.unwrap_err().contains("complete membership batch rejected"));
+    }
+
+    #[tokio::test]
+    async fn news_concept_refresh_completion_is_consumed_once_with_batch_identity() {
+        let codes = std::collections::HashSet::from(["TEST_CODE".to_string()]);
+        let index = std::collections::HashMap::from([(
+            "TEST_CONCEPT".to_string(),
+            vec!["TEST_CODE".to_string()],
+        )]);
+        for expected in [Ok((codes, index)), Err("TEST_CODE provider failure".to_string())] {
+            let completed = expected.clone();
+            let mut task = Some(tokio::spawn(async move { completed }));
+            let actual = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(result) = poll_concept_index_refresh(&mut task).await {
+                        break result;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the completed worker is collected by a later tick");
+            assert_eq!(actual, expected);
+            assert!(task.is_none());
+            assert!(poll_concept_index_refresh(&mut task).await.is_none());
+        }
     }
 
     #[test]

@@ -348,7 +348,7 @@ impl PushRecord {
                 "source_batch_id",
                 "source_content_sha256",
             ],
-            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION) => match env
+            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION) => match env
                 .payload
                 .get("news_flash_transaction_stage")
                 .and_then(serde_json::Value::as_str)
@@ -407,6 +407,21 @@ impl PushRecord {
             ],
         };
         let mut expected_fields = expected_fields.to_vec();
+        if audit_schema_version == Some(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION) {
+            if env.payload.get("news_flash_transaction_stage").and_then(serde_json::Value::as_str).is_none() {
+                return Err(PushRecordError::MissingField("news_flash_transaction_stage".into()));
+            }
+            expected_fields.push("news_critical_evidence");
+        }
+        if audit_schema_version == Some(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION) {
+            if env.payload.get("news_flash_transaction_stage").and_then(serde_json::Value::as_str).is_none() {
+                return Err(PushRecordError::MissingField("news_flash_transaction_stage".into()));
+            }
+            if env.entity_key.is_some() || env.payload.get("code").is_some_and(|v|!v.is_null()) {
+                return Err(PushRecordError::InvalidFieldValue("global N01 must have no code/entity_key".into()));
+            }
+            expected_fields.push("news_global_critical_evidence");
+        }
         if audit_schema_version == Some(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION) {
             for optional in [
                 "news_flash_failure_provider",
@@ -499,6 +514,8 @@ impl PushRecord {
                     | super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION
                     | super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION
             ) {
                 return Err(PushRecordError::InvalidFieldValue(format!(
@@ -593,7 +610,7 @@ impl PushRecord {
                 super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION => {
                     super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_RULE_IDS.as_slice()
                 }
-                super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION => {
+                super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION => {
                     super::envelope::NEWS_FLASH_DELIVERY_AUDIT_RULE_IDS.as_slice()
                 }
                 super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION => {
@@ -783,8 +800,7 @@ impl PushRecord {
             news_flash_terminal_observed_at,
             news_flash_terminal_reason_code,
             news_flash_transport_evidence_sha256,
-        ) = if audit_schema_version
-            == Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
+        ) = if matches!(audit_schema_version, Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION))
         {
             let sources_value = env
                 .payload
@@ -813,7 +829,18 @@ impl PushRecord {
                     return Err(PushRecordError::InvalidFieldValue(field.into()));
                 }
             }
-            if super::envelope::news_flash_evidence_sha256(&sources) != evidence {
+            let actual_evidence = if audit_schema_version == Some(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION) {
+                let score: crate::monitor::news_ai::GlobalCriticalEvidence = serde_json::from_value(env.payload.get("news_global_critical_evidence").cloned()
+                    .ok_or_else(||PushRecordError::MissingField("news_global_critical_evidence".into()))?)
+                    .map_err(|e|PushRecordError::InvalidFieldValue(e.to_string()))?;
+                score.digest().map_err(|e|PushRecordError::InvalidFieldValue(e.to_string()))?
+            } else if audit_schema_version == Some(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION) {
+                let score: crate::monitor::news_ai::CriticalNewsEvidence = serde_json::from_value(env.payload.get("news_critical_evidence").cloned()
+                    .ok_or_else(||PushRecordError::MissingField("news_critical_evidence".into()))?)
+                    .map_err(|e|PushRecordError::InvalidFieldValue(e.to_string()))?;
+                score.digest().map_err(|e|PushRecordError::InvalidFieldValue(e.to_string()))?
+            } else { super::envelope::news_flash_evidence_sha256(&sources) };
+            if actual_evidence != evidence {
                 return Err(PushRecordError::InvalidFieldValue(
                     "news_flash_evidence_sha256".into(),
                 ));
@@ -1193,11 +1220,13 @@ impl PushRecord {
                     | super::envelope::COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION
                     | super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION
+                    | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION
                     | super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION
             )
         ) {
             return Err(PushRecordError::InvalidFieldValue(
-                "authoritative delivery audit requires schema v2, v3, v4, v5 or v6".into(),
+                "authoritative delivery audit requires schema v2, v3, v4, v5, v6 or v7 or v8".into(),
             ));
         }
         Ok(record)

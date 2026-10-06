@@ -28,3 +28,12 @@ Root上一安装脚本用秒精度写effective_from，违反严格 UTC nanosecon
 09:15四源 available 合计71：20/19/20/12。09:16 fresh heartbeat/snapshot但全局仍Frozen/Unsafe，缺Quote/Kline/MoneyFlow/News/OrderBook；News的逐记录资格/状态正在诊断。部署回执及静态回退在 `/Users/zhangzhen/.local/share/stock-analysis-news-global-health-rollout-20261006`，final receipt SHA `b8ca8490b8d7fb114875958e901979487b95d725809ad01d41d6842d7bad70eb`。
 
 本版已有真正空instruments公共importance→完整audit/readback→同Gate/v8，原现5次工作/40次检查/5槽保持。公共Global实时批次仍受交易时段门，正在独立修正；未称假期即时推送、远端Accepted/N02自然窗口/30秒达成，也未部署资金或原生平台改动。
+
+
+## 10:14 CST 后继：假期公共新闻与实际拒绝原因
+
+新闻提交 `813bfc19a500609bda58d2e254e5c36166d4584c` 已部署。公共宏观新闻可在交易时段外进入原有单 worker，股票新闻仍沿用行情与时段准入；新增只读 NewsHealth 拒绝原因日志。新10项及独立复核通过，release与同制品61项隔离dry-run通过。monitor PID93285、bridge56417；两原数据库dev/ino保持，未复制或替换。未来activation为 `2026-10-06T02:13:14.965911000Z`，最终部署回执SHA `252250c6f9e9ea0880609d585b4b18b5fb842ac886cc54fc74a92fce236a2c73`，位于 `/Users/zhangzhen/.local/share/stock-analysis-news-public-session-rollout-20261006`。
+
+初次三源observation晚于消费者wall被拒、金十发布内容过期。源码确认batch墙钟采样位于四请求完成之后，尚未证实本地采样顺序或远端时钟故障。10:18:58真实金十fresh2触发Updated；10:19:45健康快照missing不再含News，整体仍Frozen/Unsafe，缺Quote/Kline/MoneyFlow/OrderBook。这只是该冻结窗口的新闻健康证据。
+
+真实AI轮次另暴露来源时间parser拒绝unix-ms/上海naive格式、模型将uncertainty输出为数字而严格schema要求解释字符串、少量schema成功后复合audit拒绝。新修复正在隔离Source阶段；没有通过放宽时效、评分、回执或配额恢复推送，尚未观察真实N01远端Accepted。已开始将NEWS修复三路合并到DEV，保留既有P05/OutcomeTracker/平台Source，未把合并中代码部署或声称完整平台完工。

@@ -569,7 +569,7 @@ impl AuditDispatcher {
         let expected_record = super::push_record::PushRecord::try_from_authoritative(envelope)
             .map_err(|error| ExactAuthorityAppendError::Verification(error.to_string()))?;
         let valid_news_flash_authority = match expected_record.audit_schema_version {
-            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION) => {
+            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION) => {
                 expected_record.news_flash_transaction_stage.is_some()
             }
             Some(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION) => true,
@@ -647,6 +647,33 @@ impl AuditDispatcher {
                 return Err(ExactAuthorityAppendError::Duplicate {
                     envelope_id: envelope.id.clone(),
                 });
+            }
+
+            // New N01 business key is checked under the SAME yearly writer lock.
+            // Complete old/new attempt lineage wins over a different revision/profile/hash.
+            if matches!(expected_record.audit_schema_version, Some(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION))
+                && expected_record.news_flash_transaction_stage.as_deref() == Some("SinkAttempt") {
+                let mut reader = read_file.try_clone().map_err(|e|ExactAuthorityAppendError::Persistence(e.to_string()))?;
+                reader.seek(SeekFrom::Start(0)).map_err(|e|ExactAuthorityAppendError::Persistence(e.to_string()))?;
+                let mut text = String::new(); reader.read_to_string(&mut text).map_err(|e|ExactAuthorityAppendError::Persistence(e.to_string()))?;
+                let mut envelopes = Vec::new();
+                for line in text.lines() {
+                    let row: serde_json::Value = serde_json::from_str(line).map_err(|e|ExactAuthorityAppendError::Verification(e.to_string()))?;
+                    envelopes.push(serde_json::from_value(row.get("envelope").cloned().ok_or_else(||ExactAuthorityAppendError::Verification("N01 history envelope missing".into()))?)
+                        .map_err(|e|ExactAuthorityAppendError::Verification(e.to_string()))?);
+                }
+                let day = expected_record.news_flash_business_date.ok_or_else(||ExactAuthorityAppendError::Verification("N01 day missing".into()))?;
+                let snapshot = super::reconcile_news_flash_envelopes(envelopes,day)
+                    .map_err(|e|ExactAuthorityAppendError::Verification(e.to_string()))?;
+                if !snapshot.critical_source_identity_complete() {
+                    return Err(ExactAuthorityAppendError::Verification("legacy N01 source/day identity Unknown; no new attempt".into()));
+                }
+                let key = expected_record.news_flash_decision_key.as_ref().ok_or_else(||ExactAuthorityAppendError::Verification("N01 event missing".into()))?;
+                if snapshot.blocked_critical_event_ids().contains(key) {
+                    revalidate_audit_leaf(capability,OsStr::new(&json_name),&read_identity).map_err(ExactAuthorityAppendError::Verification)?;
+                    FileExt::unlock(&lock_file).map_err(|e|ExactAuthorityAppendError::Persistence(e.to_string()))?;
+                    return Err(ExactAuthorityAppendError::Duplicate{envelope_id:envelope.id.clone()});
+                }
             }
 
             // ENGINEERING_RULES_V2 §4.3: build, hash, serialize and validate
@@ -973,10 +1000,9 @@ impl AuditDispatcher {
                 .payload
                 .get("audit_schema_version")
                 .and_then(serde_json::Value::as_u64);
-            if audit_schema_version
-                == Some(u64::from(
-                    super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION,
-                ))
+            if matches!(audit_schema_version, Some(version) if version == u64::from(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
+                || version == u64::from(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION)
+                    || version == u64::from(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION))
             {
                 super::push_record::PushRecord::try_from_authoritative(&envelope).map_err(
                     |error| format!("validate NewsFlash reconcile line {}: {error}", index + 1),
@@ -1856,12 +1882,25 @@ impl Dispatcher for AuditDispatcher {
             Some(version)
                 if version
                     == u64::from(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
+                    || version == u64::from(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION)
+                    || version == u64::from(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION)
                     || version
                         == u64::from(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION)
         ) {
-            return DispatchResult::Failed(
-                "BR-244 schema-v5/v6 NewsFlash authority requires the exact append API".into(),
-            );
+            let rejection = if envelope.payload.get("audit_schema_version").and_then(serde_json::Value::as_u64)
+                == Some(u64::from(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION)) {
+                "BR-244 schema-v8 GlobalCritical authority requires the exact append API"
+            } else if envelope
+                .payload
+                .get("audit_schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(u64::from(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION))
+            {
+                "BR-244 schema-v7 NewsFlash authority requires the exact append API"
+            } else {
+                "BR-244 schema-v5/v6 NewsFlash authority requires the exact append API"
+            };
+            return DispatchResult::Failed(rejection.into());
         }
 
         let record = match super::push_record::PushRecord::try_from_authoritative(&envelope) {
