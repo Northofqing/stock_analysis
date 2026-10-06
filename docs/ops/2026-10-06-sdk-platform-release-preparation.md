@@ -92,3 +92,13 @@ VM最新实际已从Mac原生主任务读取直接人类开发/远端提交/上�
 [现有security.yml运行37430519677](https://github.com/Northofqing/magic-market-data-rs/actions/runs/37430519677)创建2026-10-06T07:34:35Z，workflow_dispatch、head_sha精确cfdb；Root API独立看到audit成功、coverage job112160058874正在生成证据。这个记录尚无测量JSON、原80/95结果或新的SDK制品元组。旧R2eea二进制不能配cfdb。Gate A设计规定实际发布门合格后生成新runtime候选，CI期间不提前创建/运行候选；Root提出的并行离线构建优化以该具体规则为限，未执行新的SDK build或绕门。
 
 VM源码交接本轮已完成/idle，Root继续持有实际GitHub run/job观察句柄，结果出来后按已有授权续办原VM任务。下一最小切片取决于真实CI：失败保留JSON/日志并针对实际缺口修复；通过才冻结完整新SDK构建开始raw/Git/proto/工具链输入、正常release与实际OUT_DIR descriptor，另封新tuple。随后Mac新绑定/受影响测试/独立复核/新release和实际preview、精确双端维护窗口/activation人审、同实例业务RPC/bridge/生产观察仍必要。没有本轮新生产切换或完整M0–M7结论，原正式服务/认证/数据与78隔离保持。
+
+## 实测失败：关键覆盖率87.37%，原VM继续修复
+
+前节running/idle为当时快照。该同head CI在07:46Z完成：audit成功，coverage生成原JSON后由原checker退出1。整体68716/81598=84.21%满足80；关键34787/39817=87.37%未达95。没有结构无测量的猜测或门禁豁免。cfdb未创建新SDK runtime candidate，也未与旧R2混用。
+
+Root独立取回artifact11397775392与job112160058874完整日志/终态，上传ZIP3,908,965B/SHA `8a00488dc9a5c691a6f27a95f941e028ca577403bc65a62c9737831a0c938c56` 等于GitHub原digest；其中唯一coverage.json27,640,608B/SHA `1f9122ca8fe5e160b7455b0d5f3ce29d776f127498d1515a2fe6c6acc35645d1` 原字节保留。以未变critical globs/exclusions、实际CI仓库前缀与已核source路径独立重算，两个整数比与原checker输出完全一致；115实际critical文件、每glob正分母。Root没有改写原JSON/checker或把派生排序当原生测量。
+
+5030个critical未覆盖行，grpc_production.rs2469、derived_products230、tdx adapter175、router adapters154、eastmoney mx146。若分母保持，最低还需3040条真实生产行覆盖；新增external回归按真实handler/转换的成功、拒绝、错误和边界验证，不镜像实现，不把fixture赋予Native资格。进一步源码变化须新head定向验证/独立review/feature push/同head CI，不能复用cfdb失败结果写PASS。
+
+原件与派生完整排序封为共享 `windows-sdk-cfdb-coverage-ci-20261006.1`，8成员+manifest共9文件，32,125,268成员字节，manifestSHA `1105a958b39b879c7bc390aa32939a4ef159b34b2f631860b936d2912d972275`。原VM已收到续办消息，native list确认active；完整共享包发送成功尚待其实际收件ACK。原Gate A要求实际发布门合格后生成runtime candidate，Root接受该具体约束，未执行前述可选并行SDK构建。控制/人审/真实业务与生产观察继续待验，本轮没有新上线结果。

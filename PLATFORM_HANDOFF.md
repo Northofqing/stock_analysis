@@ -716,3 +716,11 @@ Root实际核验公开23文件包 `windows-critical-test-source-review-20261006.
 现有[security.yml运行37430519677](https://github.com/Northofqing/magic-market-data-rs/actions/runs/37430519677)于07:34:35Z触发，event=workflow_dispatch、head_sha精确cfdb。Root API快照看到audit job112160058704成功，coverage job112160058874正在Produce coverage evidence；此处尚无JSON、80/95结果或新SDK release tuple。不是上线记录。Gate A设计明确实际发布门合格后才生成runtime candidate，CI期间保持原正式服务。VM本轮已完成源码交接并idle；Root持有实际CI run/job句柄继续等待，结果出来后依原授权续办同一个VM任务，无需重复派源码审阅。
 
 接续顺序：实际CI结果/原JSON/阈值日志→必要缺口修复或合格后的SDK完整构建开始快照与新release tuple→Mac最小重绑/定向验证/独立复核/新release→具体维护窗口控制及精确activation人审→同实例真实RPC/桥接/生产观察。R2仍绑定eea/29a，不得混用cfdb；17:00未批准R2预览不触发切换。共享目录ACK、两审阅、publication-ci及mac-publication-readback原件均在Desktop主目录client-bundle包外，未推入Git；[发布准备记录](docs/ops/2026-10-06-sdk-platform-release-preparation.md)保留摘要。本轮没有新安装/停止/启动/Schema14或资金批准。
+
+### 后续实际结果：关键覆盖率未达标，原 VM 续办
+
+上述running是历史快照。该CI实际于07:46Z完成，audit成功、coverage原阈值step退出1：overall **68716/81598=84.21%** 满足80；critical **34787/39817=87.37%** 未达95。原JSON27,640,608B/SHA `1f9122ca8fe5e160b7455b0d5f3ce29d776f127498d1515a2fe6c6acc35645d1`，ZIP3,908,965B/SHA `8a00488dc9a5c691a6f27a95f941e028ca577403bc65a62c9737831a0c938c56` 与GitHub上传digest匹配。现已具备测量，阻断由结构/缺测量推进为实际关键覆盖率不足；cfdb仍无运行资格。
+
+Root独立用原globs/exclusions、记录的CI仓库前缀与已核Git路径重算两组整数，和原日志完全相同；115 measured critical files、每glob有正分母。原5030未覆盖行中grpc_production.rs占2469，其次derived_products230、tdx adapter175、router adapters154、eastmoney mx146。分母不变时还需至少3040条真实生产行覆盖，这是测试规划下界，不是测试数或上线承诺。
+
+完整9文件公开原JSON/ZIP/log/API终态/原阈值excerpt与派生排序包 `windows-sdk-cfdb-coverage-ci-20261006.1` 已封存/回读，manifestSHA `1105a958b39b879c7bc390aa32939a4ef159b34b2f631860b936d2912d972275`。已向原VM任务发送具体失败和最小行为回归续办要求，native list确认再次active；本轮不重复源码审阅或Rust suite、不降低阈值/排除生产代码。下一owner先读此真实失败及VM最新修复，不从旧running快照启动SDK build或部署。新SDK runtime candidate仍等待实际发布门；生产没有本轮切换。
