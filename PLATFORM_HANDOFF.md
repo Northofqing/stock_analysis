@@ -688,3 +688,11 @@ DEV最近已提交平台修复为 `a60014a75747c739bad9d71864946f51e516234f`；N
 NEWS后继合并 `7478bb4e44f424af5f9db3b1275c6cda93414231`，逐项反馈提交 `e6b4bff1a786d9869179770dea4499444ec2be63`。反馈只改tracker/re-export/tests三叶，沿原T+5、Card/Unit和完整尾部检查补只读逐项状态；原recorded/sample/linked分母保持，unsent/Pending/Manual/V1不成为已计数样本。完整隐藏行与容量先校验，再显示最多20项；没有新增关联表或另开推送。联合DEV新3+相关4+NEWS10共17个不同完整方法、15次actual run全通过；harness SHA b7667a6e2a24ab2c23b0924999df1916cdb29eff9645b951aa9adb20f10ddbfd，Source6/controls30前后保持，独立DATA 601a5d72接受。复用已成功DEV环境与依赖，无额外check/build/clippy/full。反馈仅本地提交，未部署平台。
 
 本批均未远端push，主目录源码未由本批改动。完整Financial内容哈希/经济重放、实际资金批准/seed/cutover、native record/issuer/provider/layout资格、Gate P/L/WG07与长期留存仍未完成；自然交易日/自然日验收、真实N01远端Accepted、N02窗口与30秒现场延迟仍待实际证据。不能以新闻上线或局部回归标记全平台完工。
+
+## 2026-10-06 用户“上线”：双端 SDK 发布准备
+
+本 chat `01a0e7e1-65ab-7df1-a39f-34c67ac65cb3` 接续发布；先核另一开发 chat 已 idle 和实际无 Cargo，再在独立候选根执行准备。生产仍是 f517 新闻修复/PID14998、桥接56417、durable schema9，78 Uncertain原样保留。旧 probe 本次真实 opening EXIT0，9静态路由与4新闻通过，非新版本证据。Windows实时Health为4e4995/517e0b4，Mac旧新闻从client-bundle匹配4e；a6开发分支的67pin尚未部署，两者不能混称现网。
+
+已核SDK eea9cc6源码包37+manifest=38件及公开ACK，Windows接收后正在同源release和必要发布检查；正式服务保持。a6预备1663输入完整封存，发现pin错配后主动停build，exit-15/536秒/原日志保留，无PASS或生产安装。改按依赖先准备eea SDK+现有新闻/bridge窄发布；从已上线的封存根精确复制748输入到Desktop外候选，待精确新公开bundle后build/dry-run/人审/双端切换。本轮不迁Schema14或开资金；e6逐项反馈与完整平台另批。
+
+1582输入及三件schema14兼容fallback原字节通过，但该fallback同样pin67，还没有与正式VM匹配的双端回退/activation，不可直接当上线回退。[准备记录](docs/ops/2026-10-06-sdk-platform-release-preparation.md)保留现场身份、旧RPC范围、Uncertain分组和下一切换门。新SDK业务RPC、完整平台、自然观察均pending，heartbeat保持。
