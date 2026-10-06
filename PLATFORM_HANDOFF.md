@@ -737,3 +737,12 @@ Root独立用原globs/exclusions、记录的CI仓库前缀与已核Git路径重�
 **第5、7项尚未整体完成。** 正式正向F2及审批发行、资金批准/seed/cutover、production catalog/Financial/native资格和实际调度仍有缺口；正式策略版本关联及评审/晋级/淘汰治理待接续。当前接口只接受既有批准能力，不能由历史拒绝记录或资金材料发行新许可。平台批次尚未上线，M0–M7及M8裁定保持未完成。
 
 并行上游已有新源码 `f9cfb600`：Root实际核对 `windows-grpc-handler-source-review-20261006.1` 的24成员加manifest（845418成员字节，manifest SHA `e30d5b2b25e5f779a33f942cfd259245320f9d48ef6fabac7f389c2e80378f13`），原日志新增9项PASS。包外Mac ACK SHA `d4bf8dac20515735ebd4514d34b80f27e8b69cf35951ad987912c3b3337bb623` 已写共享目录，并实际成功发送原VM任务，要求保留已有同HEAD CI、继续原95%门禁。此ACK仅包回读，未重建Git树/审查或重跑SDK，不是新coverage/发布资格；生产未切换。
+
+
+### 2026-10-06 17:24 CST 决策回执冷恢复
+
+上述首片已提交并实际推送 `d9468ed289ebe459497dbb6167753e41cb5e3a4f` 至 `stock_analysis/codex/platform-roadmap-implementation-20261002`；真实 `ls-remote` 核对相同 OID。
+
+后继补重启只读恢复入口，按原账户/epoch/决策引用从完整 execution reader 返回原 sealed RecordedCommandReceipt；无需新批准、行情窗口或时钟，没有 SQL mutation。空结果仅为本次合格快照未找到，不构成新下单许可。隔离 fixture 先实际提交/部分成交，再冷打开原库，在不调用 issuer/window 的情况下恢复原回执，原行及旧 financial payload 字节保持。
+
+新方法1 PASS、同当前 harness 的命令身份 golden/原 cold reopen exact retry/新 partial fill cold retry 三方法3 PASS，共 fresh4；925输入保持。当前 harness SHA `82f7320637c0cf71a589e165b27d2d6e27685d2214de49bc91ae84e4a0653187`、新 log SHA `3c14ea1c4cf4ecea7c798d55b8f3ecf003a0b0e7055623e327df360a35b05cbf`。首片报告与风控逻辑未改，首片10项是上一封存源码的实际证据，未声称当前全部重跑。本后继直接自审，未独立复核、部署或修改 monitor dispatch；第5/7整体与生产依赖仍保持未完成。

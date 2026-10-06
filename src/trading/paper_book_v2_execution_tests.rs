@@ -3368,3 +3368,63 @@ fn paper_decision_outcomes_check_full_report_bounds_and_preserve_empty_observati
     assert!(summarize_recorded_execution(&view).is_err());
     assert!(crate::decision::approved_paper_intent_v1::require_production_approval().is_err());
 }
+
+#[test]
+fn paper_decision_recover_cold_without_new_approval_or_market_window() {
+    let f = actual_v6_fixture();
+    let account = f.manifest.account_id.clone();
+    let epoch = f.manifest.epoch_id.clone();
+    let parent = "TEST_CODE_COLD_DECISION_RECOVERY";
+    let decision = format!("TEST_CODE_DECISION_{parent}");
+    let submitted = decision_submit_complete(
+        &f.original.db,
+        &account,
+        parent,
+        200,
+        actual_view(&f).head,
+        at(2),
+    );
+    actual_evaluate(&f, parent, "TEST_CODE_COLD_RECOVERY_FILL", 3, 100);
+    let current = actual_view(&f).head;
+    let before = actual_rows(&f.original.db);
+    let old_payloads = original_payloads(&f.original.db, &account);
+    let path = f.original.directory.path().join("TEST_CODE_paper_v5.db");
+    drop(f.original.db);
+    let reopened = DatabaseManager::open_frozen_catalog_for_isolated_test(path).unwrap();
+
+    // No issuer, facts acquisition, new market window or fixed clock is called
+    // after restart. Only an ordinary recorded receipt is returned.
+    let recovered =
+        recover_decision_submission_for_isolated_test(&reopened, &account, &epoch, &decision)
+            .unwrap()
+            .unwrap();
+    assert!(recovered.receipt().replayed);
+    assert_eq!(recovered.receipt().command_id, submitted.command_id);
+    assert_eq!(recovered.receipt().head, submitted.head);
+    assert_eq!(recovered.observed_head(), &current);
+    assert!(
+        matches!(recovered.request(), CommandRecord::Submit { intent, .. }
+        if intent.parent_id == parent && intent.investment_decision_id == decision)
+    );
+    assert!(recover_decision_submission_for_isolated_test(
+        &reopened,
+        &account,
+        "TEST_CODE_WRONG_EPOCH",
+        &decision
+    )
+    .unwrap()
+    .is_none());
+    assert!(recover_decision_submission_for_isolated_test(
+        &reopened,
+        &account,
+        &epoch,
+        "TEST_CODE_ABSENT_DECISION"
+    )
+    .unwrap()
+    .is_none());
+    assert!(
+        recover_decision_submission_for_isolated_test(&reopened, &account, &epoch, "\0").is_err()
+    );
+    assert_eq!(actual_rows(&reopened), before);
+    assert_eq!(original_payloads(&reopened, &account), old_payloads);
+}

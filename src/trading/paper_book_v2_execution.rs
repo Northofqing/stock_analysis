@@ -4859,13 +4859,17 @@ pub(crate) fn apply_retained_for_isolated_test<'db, 'a>(
 /// changed intent for the same decision must conflict, rather than create a
 /// second order. This identity conveys no approval or data qualification.
 fn decision_submission_command_id(intent: &IntentRecord) -> String {
+    decision_submission_identity(
+        &intent.account_id,
+        &intent.epoch_id,
+        &intent.investment_decision_id,
+    )
+}
+
+fn decision_submission_identity(account: &str, epoch: &str, decision: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"stock_analysis.paper_decision_submission.v1\0");
-    for value in [
-        intent.account_id.as_str(),
-        intent.epoch_id.as_str(),
-        intent.investment_decision_id.as_str(),
-    ] {
+    for value in [account, epoch, decision] {
         digest.update((value.len() as u64).to_be_bytes());
         digest.update(value.as_bytes());
     }
@@ -4964,4 +4968,62 @@ pub(crate) fn submit_approved_decision_for_isolated_test<'db, 'a>(
         ));
     }
     retained_execution_run(db, input, Some(now))
+}
+
+fn recover_decision_submission_on_manager(
+    db: &DatabaseManager,
+    account: &str,
+    epoch: &str,
+    decision: &str,
+) -> Result<Option<RecordedCommandReceipt>, LedgerError> {
+    require(
+        [account, epoch, decision].into_iter().all(budget::token),
+        "decision recovery identity invalid",
+    )?;
+    let command = decision_submission_identity(account, epoch, decision);
+    read_checked_on_actual_manager(
+        db,
+        |conn, _authority| {
+            let recorded = recover_command_body_on(conn, account, &command)?;
+            if let Some(original) = &recorded {
+                match original.request() {
+                    CommandRecord::Submit { intent, .. }
+                        if intent.account_id == account
+                            && intent.epoch_id == epoch
+                            && intent.investment_decision_id == decision => {}
+                    _ => return Err(LedgerError::IdentityConflict),
+                }
+            }
+            Ok(recorded)
+        },
+        |_, _| Ok(()),
+    )
+}
+
+/// Read an original decision submission after restart, without asking for a
+/// new approval/window or executing SQL mutations. None is only absence in
+/// this qualified snapshot; neither outcome authorizes a new submission.
+pub(crate) fn recover_decision_submission_actual(
+    account: &str,
+    epoch: &str,
+    decision: &str,
+) -> Result<Option<RecordedCommandReceipt>, LedgerError> {
+    let db = DatabaseManager::try_get().ok_or_else(|| {
+        LedgerError::EvidenceUnavailable("production database singleton unavailable".into())
+    })?;
+    recover_decision_submission_on_manager(db, account, epoch, decision)
+}
+
+#[cfg(test)]
+pub(crate) fn recover_decision_submission_for_isolated_test(
+    db: &DatabaseManager,
+    account: &str,
+    epoch: &str,
+    decision: &str,
+) -> Result<Option<RecordedCommandReceipt>, LedgerError> {
+    require(
+        db.has_isolated_p05_consumer_origin(),
+        "test reader requires actual isolated manager",
+    )?;
+    recover_decision_submission_on_manager(db, account, epoch, decision)
 }
