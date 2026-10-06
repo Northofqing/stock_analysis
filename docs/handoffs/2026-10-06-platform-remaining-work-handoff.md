@@ -108,14 +108,14 @@ H01/H02 是资金和真实执行的资格前置；普通材料、纯逻辑和必
 
 | ID / 优先级 | 剩余动作 | 前置与完成标准 | owner |
 | --- | --- | --- | --- |
-| H07 / P0 并行 | 修实际 SDK 关键覆盖率缺口和 audit 网络故障；生成合格新 tuple，Mac 最小重绑/构建/复核，再做受审维护窗口切换 | 同 HEAD 原80/95/checker、audit等发布门合格；精确 source/binary/descriptor/原始输入封存；Mac新制品/activation人审；同实例真实业务RPC、桥接及观察 | 原 Windows任务＋Mac发布 owner |
+| H07 / P0 并行 | 修实际 SDK 关键覆盖率缺口；f57c的audit单项重试已通过，新源码仍需同HEAD发布门；生成合格新 tuple，Mac 最小重绑/构建/复核，再做受审维护窗口切换 | 同 HEAD 原80/95/checker、audit等发布门合格；精确 source/binary/descriptor/原始输入封存；Mac新制品/activation人审；同实例真实业务RPC、桥接及观察 | 原 Windows任务＋Mac发布 owner |
 | H08 / P1 并行 | 完成真实 source→gateway→health→消费者资格：MoneyFlows/BoardFlows、公告完整覆盖、exact historical/PIT、D14、D17/D20及 R08 Confirmed；对新 SDK 同版业务路径验收 | request/instrument/provider/时间窗/整数价量/tick-band-halt-lifecycle-liquidity/逐代码终态/修订原件完整；缺失维持 typed unavailable，capability/Health 不作业务证据 | Windows合同/原件，Mac准入/消费；按 WG04–WG12 逐项 |
 
 **最新 SDK 阻断（本次读取共享状态）：**
 
 - SDK `f57c114190436e6ec96faa60910c127925ffbcfc`，CI `37446154439`。
 - overall `69302/81598=84.93%` 满足80；critical `35372/39817=88.84%` 未达95。分母不变时还需2455条真实生产行覆盖，不是2455个测试。
-- audit 因拉取 RustSec advisory DB 的网络 I/O 错误失败，尚无完成的漏洞扫描结论。原失败与重试分别保留；该故障不需要重复已结束的 coverage，源码变化则按新 HEAD 验证。
+- 首次audit因拉取RustSec advisory DB的网络I/O失败；后继仅重试该失败job，f57c同run attempt2的audit112328508220已完成并通过。Mac实际核对四份证据长度/SHA、同head/run/attempt及原coverage的执行时间/steps/失败完全相同；原失败不抹除。coverage仍88.84<95，新源码需新HEAD门禁。详见 [重试终态](/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/windows-f57c-audit-retry-20261006.1.terminal-receipt.json)。
 - 原 thresholds/globs/checker/准入保持。原 SDK R2、Health、离线2061测试或源码审阅不能代替发布门。
 - WG07 本地 explicit-window/持久消费机制和 Windows 日期字段映射已有有限代码证据；真实 native range/selection/session、historical availability/as_of/revision/correction、同源完整生命周期/lossless 原件和生产 profile 仍缺。
 - 新闻四源/实际模型名与发布时点的修复已部署；N01远端 Accepted、N02自然窗口和现场30秒指标仍需对应真实证据。R08 Planned 与 Confirmed 分开；新官方发布 RPC 的扩建需产品用途裁定。
@@ -206,3 +206,5 @@ Windows原任务：**R08 FuturesDelivery 上游合同与部署**，thread=`01a0e
 - Windows接续已确认：本次补读 [Windows主交接](/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/WINDOWS_CODEX_HANDOFF_20261002.md)、[Mac下一步清单](/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/MAC_CODEX_NEXT_STEPS_20261006.md)与f57c源/CI/audit报告，核两个包和已有ACK原件；续办消息成功发送，对方实际active并确认ACK后继续audit失败检查及覆盖缺口。最新88.84%/audit网络失败保持，不记发布完成。Rubin/Muse与财务披露的查询实体、窗口、逐来源命中/失败和原标题/链接/日期须独立验收，不用SDK行覆盖率替代。
 
 本机原日志、失败回执、源码前后清单及最终harness身份见 [H02执行计划](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/.planning/2026-10-06-financial-content-hashes/task_plan.md)。这些本机证据不默认随Git交付，测试子集也不作为M0–M7全部完成证明。
+
+H02源码已提交并推送为 `4ee64e79871893d81d504717cd6989eaf57b507f`，实际远端OID与本地相同。其后Windows交回上述同f57c审计单项重试通过，原coverage失败保持；最新消息另报告新增11项财报入口测试/受影响库122项本地通过，全workspace尚在进行，未提供新提交的95%测量或合格release元组。第10节先前audit网络失败是首次失败快照，后继状态以本段和H07首段为准。

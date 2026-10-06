@@ -820,3 +820,5 @@ Windows最新f57c原CI run37446154439测得critical35372/39817=88.84%，仍低�
 这只关闭H02的普通audit内容子片，原links-only仍ContentHashesNotChecked。V1 event/manifest/projection内容、完整Genesis/经济/Financial、真实SQL/provider/native资格及operational schema8/平台schema14/资金B/正向F2仍待完成，生产没有安装本批。下一切片在仍活着的第二窗口接V1内容校验，不能从已关闭的LocalAuditContentChecked再开第三reader或发行Financial。
 
 已补读Windows主交接、MAC_CODEX_NEXT_STEPS和f57c失败报告，逐件复核源28/CI10文件及两个已有包外ACK。SDK最新实测仍critical88.84<95、audit公告库网络失败、正式4e不变；真实Rubin/Muse及年报/半年报/业绩预告/减持查询验收独立。续办消息已成功发送原Windows任务；随后wait_threads实际回报active/inProgress，对方确认两ACK与全部文件一致，并开始仅重试失败audit job和定位下一覆盖切片。此为收件/开工证据，未交合格新release tuple或业务RPC通过。
+
+本片源码正式提交并push为 `4ee64e79871893d81d504717cd6989eaf57b507f`，远端完整OID已读回一致。后继Windows回报f57c同run37446154439 attempt2仅audit112328508220重试通过；Mac实际校验terminal receipt所列4件长度/SHA、原run.head_sha/attempt及coverage原执行时间/steps/失败完全相同，未重测覆盖率，workflow仍因88.84<95失败。原网络故障和首次失败包保留；前段audit网络失败是首次快照。新增11财报入口测试/受影响库122项本地通过为Windows消息，全workspace未结束、新HEAD coverage未交，不能算真实财报查询或新SDK发布通过。最后cursor `01fd0a89-06f4-4387-b2f0-04271ac501a0:2`，原任务active。
