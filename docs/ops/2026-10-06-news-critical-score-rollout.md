@@ -37,3 +37,14 @@ Root上一安装脚本用秒精度写effective_from，违反严格 UTC nanosecon
 初次三源observation晚于消费者wall被拒、金十发布内容过期。源码确认batch墙钟采样位于四请求完成之后，尚未证实本地采样顺序或远端时钟故障。10:18:58真实金十fresh2触发Updated；10:19:45健康快照missing不再含News，整体仍Frozen/Unsafe，缺Quote/Kline/MoneyFlow/OrderBook。这只是该冻结窗口的新闻健康证据。
 
 真实AI轮次另暴露来源时间parser拒绝unix-ms/上海naive格式、模型将uncertainty输出为数字而严格schema要求解释字符串、少量schema成功后复合audit拒绝。新修复正在隔离Source阶段；没有通过放宽时效、评分、回执或配额恢复推送，尚未观察真实N01远端Accepted。已开始将NEWS修复三路合并到DEV，保留既有P05/OutcomeTracker/平台Source，未把合并中代码部署或声称完整平台完工。
+
+
+## 2026-10-06 12:12 CST 后继：时间解析、严格输出和请求模型回执
+
+已部署 `f517f45c91ec9489f63d0156a1b8f9cf45400c3b`。Global fact/v2 recovery统一复用四源native publication parser；提示明确importance整数、uncertainty/core_logic非空解释字符串；分别绑定真实请求模型名和上游返回名。Global v1历史字节/严格回执合同保持。新4+相关6=10项及独立Source/DATA通过；首次SDK失败保留，修复实际构建环境后两目标release32m35s、同版61项隔离dry-run通过，无外发/审计追加。
+
+新monitor PID14998、bridge56417、原两库dev/ino保持；future9 activation `2026-10-06T03:59:53.997478000Z`。首五轮观察INCOMPLETE原件保留；不重启followup2实际看到数据库初始化、完成receiver、四源采集与NewsHealth刷新。Source740、实际二进制/cwd/库路径核对通过。[最终followup2回执](/Users/zhangzhen/.local/share/stock-analysis-news-input-contract-rollout-20261006/final-deployment-followup2-receipt.json)，SHA `1b1ce343ccc6ccd09c8cbb0a5cd55531c90e5e003bb5a7124b68b6c04480cc27`；monitor SHA `a7376a14cde1f6be3025d6dbbdedf61401c34154f3da928a8e3db30c4950d20b`。
+
+真实公共宏观审计由部署前0增至只读快照20条；requested deepseek-chat、upstream deepseek-flash，最近5项importance2–35。12:09:17健康快照News不再missing，整体仍Frozen/Unsafe、缺Quote/Kline/MoneyFlow/OrderBook。间歇source observation future拒绝仍可见，未放宽校验，也未以audit成功声称N01远端Accepted/N02自然窗口/30秒验收。
+
+平台后继合并 `7478bb4e44f424af5f9db3b1275c6cda93414231` 和逐项结果反馈 `e6b4bff1a786d9869179770dea4499444ec2be63` 已本地提交；联合17项及独立DATA通过。Outcome反馈未部署，完整Financial/native/资金与自然运行验收仍未完成；本批未远端push。

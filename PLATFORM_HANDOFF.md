@@ -673,3 +673,18 @@ Zstd 单次 seal 内成功组复用及 Lz4/相关控制已完成 fresh14：六�
 生产新闻源码为 `813bfc19a500609bda58d2e254e5c36166d4584c`，monitor93285/bridge56417、原两库未替换；新10回归/release/61项隔离dry-run及启动观察完成，见[最新上线记录](docs/ops/2026-10-06-news-critical-score-rollout.md)。10:18:58真实新闻健康Updated，10:19:45missing不含News；账户Frozen/行情Unsafe仍在。实际AI调用仍有provider时间格式、uncertainty类型及复合audit拒绝，正在修复，不能称真实推送恢复。
 
 DEV最近已提交平台修复为 `a60014a75747c739bad9d71864946f51e516234f`；NEWS813与DEV三路融合正在进行，三处冲突已按双方功能解开但尚未完成测试/提交。原T+5 OutcomeTracker、真实prediction row/Card/Unit关联和原盘后报告已存在；后续业务片仅补逐项只读反馈，不新建重复Tracker或结果关联表。资金资格、全Financial/受控native发行、WG07真实接入、自然交易日观察与完整R05/R06复盘门仍须按既有边界完成，不能用新闻部署或本地测试替代。当前新提交未push远端。
+
+
+## 2026-10-06 12:12 CST 新闻输入合同上线与逐项结果反馈提交
+
+平台首轮三路融合已本地提交 `c10750ad6c6a53adb6c4863929fc6cf314bc580f`。保留 NEWS 公共时段/单 worker/完成接收器与 DEV 的 P05、OutcomeTracker、持久化及平台接线；monitor 1+9、lib 7 共17项实际通过。原 E0063 与磁盘不足记录保留，未重复全量测试。
+
+新闻后继 `f517f45c91ec9489f63d0156a1b8f9cf45400c3b` 修正四源原生发布时间解析、严格 JSON 解释字符串提示，以及真实请求模型名与上游返回模型名的分别绑定。Global v1 历史合同保持；新增 v2 保持原评分阈值、额度、时效与股票准入。隔离 NEWS 新4+相关6=10项及独立 Source/DATA 通过。首次 SDK 失败保留，指定实际 SDK/clang 后重试成功；两目标 release32m35s，同制品61类隔离 dry-run 全通过，external_process_attempted=0、receipt_audit_appended=0。
+
+该新闻版本已部署至原生产根。monitor PID14998 / bridge56417；Source740、制品/cwd与原两库路径/dev/ino核对通过，未复制替换数据库。activation effective_from=`2026-10-06T03:59:53.997478000Z`。首五轮观察INCOMPLETE原件保留；不重启followup2实际看到DB初始化、完成receiver、四源首轮采集与NewsHealth刷新。[最终followup2回执](/Users/zhangzhen/.local/share/stock-analysis-news-input-contract-rollout-20261006/final-deployment-followup2-receipt.json)，SHA `1b1ce343ccc6ccd09c8cbb0a5cd55531c90e5e003bb5a7124b68b6c04480cc27`。
+
+部署前公共宏观评分表为0；上线后两次只读快照分别为5和20条真实 global_critical_v2 审计。实际 requested=deepseek-chat、upstream=deepseek-flash 分别绑定。第二次最近5项importance2–35，不把评分或采集等同远端送达。12:09:17健康快照fresh，missing不再含News；整体仍Frozen/Unsafe，缺Quote/Kline/MoneyFlow/OrderBook、account_metrics_complete=false。间歇source observation future拒绝仍有原件，未放宽未来/300秒/整源校验。
+
+NEWS后继合并 `7478bb4e44f424af5f9db3b1275c6cda93414231`，逐项反馈提交 `e6b4bff1a786d9869179770dea4499444ec2be63`。反馈只改tracker/re-export/tests三叶，沿原T+5、Card/Unit和完整尾部检查补只读逐项状态；原recorded/sample/linked分母保持，unsent/Pending/Manual/V1不成为已计数样本。完整隐藏行与容量先校验，再显示最多20项；没有新增关联表或另开推送。联合DEV新3+相关4+NEWS10共17个不同完整方法、15次actual run全通过；harness SHA b7667a6e2a24ab2c23b0924999df1916cdb29eff9645b951aa9adb20f10ddbfd，Source6/controls30前后保持，独立DATA 601a5d72接受。复用已成功DEV环境与依赖，无额外check/build/clippy/full。反馈仅本地提交，未部署平台。
+
+本批均未远端push，主目录源码未由本批改动。完整Financial内容哈希/经济重放、实际资金批准/seed/cutover、native record/issuer/provider/layout资格、Gate P/L/WG07与长期留存仍未完成；自然交易日/自然日验收、真实N01远端Accepted、N02窗口与30秒现场延迟仍待实际证据。不能以新闻上线或局部回归标记全平台完工。
