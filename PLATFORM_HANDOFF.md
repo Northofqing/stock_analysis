@@ -724,3 +724,16 @@ Root实际核验公开23文件包 `windows-critical-test-source-review-20261006.
 Root独立用原globs/exclusions、记录的CI仓库前缀与已核Git路径重算两组整数，和原日志完全相同；115 measured critical files、每glob有正分母。原5030未覆盖行中grpc_production.rs占2469，其次derived_products230、tdx adapter175、router adapters154、eastmoney mx146。分母不变时还需至少3040条真实生产行覆盖，这是测试规划下界，不是测试数或上线承诺。
 
 完整9文件公开原JSON/ZIP/log/API终态/原阈值excerpt与派生排序包 `windows-sdk-cfdb-coverage-ci-20261006.1` 已封存/回读，manifestSHA `1105a958b39b879c7bc390aa32939a4ef159b34b2f631860b936d2912d972275`。已向原VM任务发送具体失败和最小行为回归续办要求，native list确认再次active；本轮不重复源码审阅或Rust suite、不降低阈值/排除生产代码。下一owner先读此真实失败及VM最新修复，不从旧running快照启动SDK build或部署。新SDK runtime candidate仍等待实际发布门；生产没有本轮切换。
+
+## 2026-10-06 17:10 CST：按用户顺序推进决策执行与归因首片
+
+用户明确回复“可以”，授权先做整体欠项第5项，再接第7项。当前源码仍由本 chat 独占，基线 `863984c0`，使用原隔离功能分支。持久计划为本地 `.planning/2026-10-06-decision-attribution-priority/task_plan.md`；其原日志和回执未推入 Git，新 clone 可从本节及真实测试源码复现。
+
+- `paper_book_v2_execution.rs` 新增决策提交入口，消费原非序列化 `ApprovedPaperIntentV1`，命令身份绑定账户/epoch/决策引用。首次提交保留原 CAS、资金/风险、时效、命名空间与 retained writer；显式重提仅在完整意图相等时回原命令回执，改变意图冲突。旧 ExactCommand 语义保持。Held/Pending 留原输入与返回，不自动重放。
+- `performance/paper_decision_outcomes_v1.rs` 经原完整 execution reader 关联决策引用、父订单、原成交/observation ID、精确微元模型费用/继承买费及原已实现结果。保留未成交/部分成交/撤单余量，完整数量和引用一致性检查；固定父单/成交数量及分配前文本预算。输出为普通只读报告，明确 `ReferenceOnly` 和策略版本 `NotRecorded`，无批准能力或策略胜率结论。
+- 真实验证：限定 lib 编译成功，新增 **7/7 PASS**；同一封存 harness 再执行原部分成交/no-fill/撤单/回执、原 cold reopen/exact retry、原 retained COMMIT/Pending 三项，**3/3 PASS**。合计 fresh10 不同完整方法，925件源码/控制输入前后相同，harness SHA `20b624ee3cc396b7a53bba272930a18184be6ab3848df59daab78cbc749a17f6`；新7最终 log SHA `1341ebf657ea1048a43d118bdc8cbbc7f87150548ea9bab6aaf6fea67ee28a7d`。未追加全量测试、check/build/clippy或release/monitor dry-run；本片未改变 monitor dispatch。
+- 首轮 E0308/0方法与第二轮5PASS/2FAIL原件保留。后两项为测试错误类型预期及提前触发读回钩子，修正为原精确错误和先取 head、后装钩子/hits=1；生产函数自第二轮起保持。直接自审了全意图比较、初始CAS、命名空间与 Pending 所有权；本轮未另派独立审阅者，不记独立 Approved。
+
+**第5、7项尚未整体完成。** 正式正向F2及审批发行、资金批准/seed/cutover、production catalog/Financial/native资格和实际调度仍有缺口；正式策略版本关联及评审/晋级/淘汰治理待接续。当前接口只接受既有批准能力，不能由历史拒绝记录或资金材料发行新许可。平台批次尚未上线，M0–M7及M8裁定保持未完成。
+
+并行上游已有新源码 `f9cfb600`：Root实际核对 `windows-grpc-handler-source-review-20261006.1` 的24成员加manifest（845418成员字节，manifest SHA `e30d5b2b25e5f779a33f942cfd259245320f9d48ef6fabac7f389c2e80378f13`），原日志新增9项PASS。包外Mac ACK SHA `d4bf8dac20515735ebd4514d34b80f27e8b69cf35951ad987912c3b3337bb623` 已写共享目录，并实际成功发送原VM任务，要求保留已有同HEAD CI、继续原95%门禁。此ACK仅包回读，未重建Git树/审查或重跑SDK，不是新coverage/发布资格；生产未切换。

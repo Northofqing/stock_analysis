@@ -6,6 +6,7 @@ pub mod attribution_replay;
 pub mod economic_position;
 pub mod fee_evidence;
 pub mod fee_policy;
+pub mod paper_decision_outcomes_v1;
 pub mod report;
 pub mod snapshot;
 

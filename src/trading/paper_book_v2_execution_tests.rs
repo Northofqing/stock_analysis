@@ -2965,3 +2965,406 @@ fn paper_retained_fixed_checkpoint_child_readback_keeps_both_commands() {
     assert_eq!(original_payloads(&f.original.db, &f.manifest.account_id), f.original.old_payloads);
     drop(frame); // Explicit fixture teardown; no automatic replay/recovery.
 }
+
+fn decision_submit_complete(
+    db: &DatabaseManager,
+    account: &str,
+    parent: &str,
+    quantity: u32,
+    expected: HeadIdentity,
+    now: DateTime<Utc>,
+) -> PaperV2Receipt {
+    use crate::database::global_schema_v1::paper_v6::RetainedPaperWriteOutcome;
+    let approved = actual_approval(db, account, parent, Side::Sell, quantity, 2);
+    let frame =
+        match submit_approved_decision_for_isolated_test(db, account, expected, approved, now) {
+            RetainedPaperWriteOutcome::Complete(frame) => frame,
+            _ => panic!("actual decision submission and independent readback must complete"),
+        };
+    let (_, acquired) = match frame.finish_complete() {
+        Ok(owned) => owned,
+        Err(_) => panic!("complete frame must retain its actual return"),
+    };
+    acquired.receipt().clone()
+}
+
+#[test]
+fn paper_decision_submit_reuses_original_after_partial_fill_and_cold_reopen() {
+    let f = actual_v6_fixture();
+    let account = f.manifest.account_id.clone();
+    let parent = "TEST_CODE_DECISION_RETRY_PARENT";
+    let first = decision_submit_complete(
+        &f.original.db,
+        &account,
+        parent,
+        200,
+        actual_view(&f).head,
+        at(2),
+    );
+    assert!(!first.replayed);
+    actual_evaluate(&f, parent, "TEST_CODE_DECISION_PARTIAL", 3, 100);
+    let changed_head = actual_view(&f).head;
+    assert!(changed_head.version > first.head.version);
+    let before = actual_rows(&f.original.db);
+    let retry = decision_submit_complete(
+        &f.original.db,
+        &account,
+        parent,
+        200,
+        changed_head.clone(),
+        at(4),
+    );
+    assert!(retry.replayed);
+    assert_eq!(retry.command_id, first.command_id);
+    assert_eq!(retry.head, first.head);
+    assert_eq!(actual_rows(&f.original.db), before);
+    assert_eq!(actual_view(&f).projection.parents[parent].filled, 100);
+    assert_eq!(
+        original_payloads(&f.original.db, &account),
+        f.original.old_payloads
+    );
+
+    let path = f.original.directory.path().join("TEST_CODE_paper_v5.db");
+    drop(f.original.db);
+    let reopened = DatabaseManager::open_frozen_catalog_for_isolated_test(path).unwrap();
+    // The recorded approval is unchanged; a later head/time is only a read
+    // witness. Staleness must not turn this into a fresh fill or second order.
+    let cold = decision_submit_complete(
+        &reopened,
+        &account,
+        parent,
+        200,
+        changed_head,
+        at(59) + chrono::Duration::minutes(5),
+    );
+    assert_eq!(cold, retry);
+    assert_eq!(actual_rows(&reopened), before);
+}
+
+#[test]
+fn paper_decision_submit_conflict_and_foreign_namespace_hold_original_approval() {
+    use crate::database::global_schema_v1::paper_v6::RetainedPaperWriteOutcome;
+    let f = actual_v6_fixture();
+    let account = &f.manifest.account_id;
+    let parent = "TEST_CODE_DECISION_CONFLICT_PARENT";
+    decision_submit_complete(
+        &f.original.db,
+        account,
+        parent,
+        200,
+        actual_view(&f).head,
+        at(2),
+    );
+    let before = actual_rows(&f.original.db);
+    let changed = actual_approval(&f.original.db, account, parent, Side::Sell, 100, 2);
+    let original_buffer = changed.record().investment_decision_id.as_ptr();
+    let held = match submit_approved_decision_for_isolated_test(
+        &f.original.db,
+        account,
+        actual_view(&f).head,
+        changed,
+        at(3),
+    ) {
+        RetainedPaperWriteOutcome::Held(frame) => frame,
+        _ => panic!("changed intent at the same decision must conflict"),
+    };
+    let (input, acquired, _, error, _) = held.observe_fixed_execution_for_test();
+    assert!(matches!(error, Some(LedgerError::IdentityConflict)));
+    assert!(acquired.is_none());
+    assert!(
+        matches!(&input.command, PaperV2Command::Submit { approved, .. }
+        if approved.record().investment_decision_id.as_ptr() == original_buffer)
+    );
+    drop(held);
+    assert_eq!(actual_rows(&f.original.db), before);
+
+    // A new decision still consumes the initial CAS; only a matching prior
+    // committed decision may ignore a later caller's observation head.
+    let new_approval = actual_approval(
+        &f.original.db,
+        account,
+        "TEST_CODE_DECISION_STALE_HEAD_PARENT",
+        Side::Sell,
+        100,
+        2,
+    );
+    let held = match submit_approved_decision_for_isolated_test(
+        &f.original.db,
+        account,
+        head(),
+        new_approval,
+        at(3),
+    ) {
+        RetainedPaperWriteOutcome::Held(frame) => frame,
+        _ => panic!("first submission cannot bypass the original CAS"),
+    };
+    assert!(matches!(
+        held.observe_fixed_execution_for_test().3,
+        Some(LedgerError::VersionChanged)
+    ));
+    drop(held);
+    assert_eq!(actual_rows(&f.original.db), before);
+
+    let foreign = actual_v6_fixture();
+    let approval = actual_approval(
+        &foreign.original.db,
+        &foreign.manifest.account_id,
+        parent,
+        Side::Sell,
+        200,
+        2,
+    );
+    let held = match submit_approved_decision_for_isolated_test(
+        &f.original.db,
+        account,
+        actual_view(&f).head,
+        approval,
+        at(4),
+    ) {
+        RetainedPaperWriteOutcome::Held(frame) => frame,
+        _ => panic!("identical values from another namespace cannot approve a retry"),
+    };
+    let (_, acquired, _, error, _) = held.observe_fixed_execution_for_test();
+    assert!(matches!(error, Some(LedgerError::IntegrityFailure(why))
+        if why == "actual intent owner/namespace differs"));
+    assert!(acquired.is_none());
+    drop(held);
+    assert_eq!(actual_rows(&f.original.db), before);
+}
+
+#[test]
+fn paper_decision_submit_command_identity_golden_and_namespace_scope() {
+    let g = genesis(20_000_000_000, vec![]);
+    let m = manifest(&g, 10_000_000_000, 10_000_000_000);
+    let mut record = intent(&m, "TEST_CODE_GOLD_PARENT", Side::Buy, 100, 2);
+    let id = decision_submission_command_id(&record);
+    // Independently calculated SHA-256: fixed domain followed by three
+    // big-endian u64 lengths and their UTF-8 account/epoch/decision values.
+    assert_eq!(
+        id,
+        "paper-decision-submit-v1:7ec1c07b9273c98a185d5e82303c7d8f36f3f1c147c29bb1e08dd8a6246e5e6c"
+    );
+    record.quantity = 200;
+    record.parent_id = "TEST_CODE_CHANGED_PARENT".into();
+    assert_eq!(decision_submission_command_id(&record), id);
+    record.epoch_id.push('2');
+    assert_ne!(decision_submission_command_id(&record), id);
+    record.epoch_id.pop();
+    record.account_id.push('2');
+    assert_ne!(decision_submission_command_id(&record), id);
+    record.account_id.pop();
+    record.investment_decision_id.push('2');
+    assert_ne!(decision_submission_command_id(&record), id);
+}
+
+#[test]
+fn paper_decision_submit_postcommit_pending_is_retained_without_resubmission() {
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWriteOutcome, RetainedPaperWritePhase,
+    };
+    let f = actual_v6_fixture();
+    let account = &f.manifest.account_id;
+    let parent = "TEST_CODE_DECISION_PENDING_PARENT";
+    let approved = actual_approval(&f.original.db, account, parent, Side::Sell, 100, 2);
+    let id = decision_submission_command_id(approved.record());
+    let expected = actual_view(&f).head;
+    let db_path = f.original.directory.path().join("TEST_CODE_paper_v5.db");
+    let hits = std::rc::Rc::new(std::cell::Cell::new(0));
+    let hit = hits.clone();
+    let guard = crate::database::install_retained_readback_after_checkpoint_hook(move || {
+        hit.set(hit.get() + 1);
+        let mut conn = SqliteConnection::establish(db_path.to_str().unwrap()).unwrap();
+        diesel::sql_query("CREATE TABLE TEST_CODE_decision_postcommit_cut(value INTEGER)")
+            .execute(&mut conn)
+            .unwrap();
+    });
+    let frame = match submit_approved_decision_for_isolated_test(
+        &f.original.db,
+        account,
+        expected,
+        approved,
+        at(2),
+    ) {
+        RetainedPaperWriteOutcome::Pending(frame) => frame,
+        _ => panic!("committed decision with failed fresh catalog check must remain Pending"),
+    };
+    drop(guard);
+    assert_eq!(hits.get(), 1);
+    assert_eq!(
+        frame.phase(),
+        RetainedPaperWritePhase::CommittedReadbackPending
+    );
+    let (input, acquired, _, _, _) = frame.observe_fixed_execution_for_test();
+    assert!(
+        matches!(&input.command, PaperV2Command::Submit { command_id, .. } if command_id == &id)
+    );
+    assert!(acquired.is_some_and(|value| !value.receipt.replayed && value.receipt.command_id == id));
+    let frame = match frame.finish_complete() {
+        Err(frame) => frame,
+        Ok(_) => panic!("Pending cannot release a successful decision"),
+    };
+    let outcome = frame.run_once(
+        |_, _, _, _| panic!("Pending must never execute again"),
+        |_, _, _, _, _| panic!("Pending must never recreate readback"),
+    );
+    assert!(matches!(outcome, RetainedPaperWriteOutcome::Pending(_)));
+    // Ordinary fixture inspection after the deliberately invalid catalog;
+    // this connection does not issue a business reader or execution authority.
+    let mut conn = f.original.db.get_conn().unwrap();
+    let rows = sql_rows(&mut conn).unwrap();
+    assert_eq!(rows.parents.len(), 1);
+    assert_eq!(
+        rows.events
+            .iter()
+            .filter(|event| event.command_id == id)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn paper_decision_outcomes_preserve_partial_cancel_lineage_and_modeled_costs() {
+    use crate::performance::paper_decision_outcomes_v1::{
+        summarize_recorded_execution, RecordedDecisionLinkageV1, StrategyVersionEvidenceV1,
+    };
+    let f = actual_v6_fixture();
+    let account = &f.manifest.account_id;
+    let parent = "TEST_CODE_LINEAGE_PARTIAL_PARENT";
+    decision_submit_complete(
+        &f.original.db,
+        account,
+        parent,
+        200,
+        actual_view(&f).head,
+        at(2),
+    );
+    actual_evaluate(&f, parent, "TEST_CODE_LINEAGE_PARTIAL_FILL", 3, 100);
+    apply_for_isolated_test(
+        &f.original.db,
+        account,
+        PaperV2Command::Cancel {
+            command_id: "TEST_CODE_LINEAGE_CANCEL".into(),
+            expected: actual_view(&f).head,
+            parent_id: parent.into(),
+        },
+        at(4),
+    )
+    .unwrap();
+    actual_submit(&f, "TEST_CODE_LINEAGE_UNFILLED_PARENT", Side::Sell, 100, 5);
+    let before = actual_rows(&f.original.db);
+    let view = actual_view(&f);
+    let report = summarize_recorded_execution(&view).unwrap();
+    assert_eq!(report.orders.len(), 2);
+    assert_eq!(report.fills.len(), 1);
+    assert_eq!(report.observed_head_version, view.head.version);
+    assert_eq!(report.observed_head_hash, view.head.event_hash);
+    assert_eq!(
+        report.decision_linkage,
+        RecordedDecisionLinkageV1::ReferenceOnly
+    );
+    assert_eq!(
+        report.strategy_version_evidence,
+        StrategyVersionEvidenceV1::NotRecorded
+    );
+    let row = report
+        .orders
+        .iter()
+        .find(|row| row.parent_id == parent)
+        .unwrap();
+    assert_eq!(
+        row.investment_decision_reference,
+        format!("TEST_CODE_DECISION_{parent}")
+    );
+    assert_eq!(row.status, "Cancelled");
+    assert_eq!(
+        (
+            row.requested_quantity,
+            row.filled_quantity,
+            row.remaining_quantity,
+            row.cancelled_quantity
+        ),
+        (200, 100, 0, 100)
+    );
+    assert_eq!(row.fill_count, 1);
+    assert_eq!(row.filled_notional_micro_cny, 1_000_000_000);
+    // The explicit Shanghai scenario charges 5 CNY commission and 0.5 CNY tax.
+    assert_eq!(row.modeled_fee_micro_cny, 5_500_000);
+    assert_eq!(
+        row.inherited_buy_fee_micro_cny,
+        view.projection.fills[0].inherited_buy_fee_micro_cny
+    );
+    assert_eq!(
+        row.realized_pnl_micro_cny,
+        view.projection.fills[0].realized_pnl_micro_cny
+    );
+    assert_eq!(report.fills[0].fill_id, view.projection.fills[0].fill_id);
+    assert_eq!(report.fills[0].parent_id, parent);
+    assert_eq!(
+        report.fills[0].observation_id,
+        "TEST_CODE_LINEAGE_PARTIAL_FILL"
+    );
+    let working = report
+        .orders
+        .iter()
+        .find(|row| row.parent_id != parent)
+        .unwrap();
+    assert_eq!((working.fill_count, working.realized_pnl_micro_cny), (0, 0));
+    assert_eq!(working.status, "Working");
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["decision_linkage"], "ReferenceOnly");
+    assert_eq!(json["strategy_version_evidence"], "NotRecorded");
+    assert_eq!(actual_rows(&f.original.db), before);
+}
+
+#[test]
+fn paper_decision_outcomes_reject_orphans_duplicate_fills_and_hidden_quantity_mismatch() {
+    use crate::performance::paper_decision_outcomes_v1::summarize_recorded_execution;
+    let f = actual_v6_fixture();
+    let parent = "TEST_CODE_LINEAGE_INTEGRITY_PARENT";
+    actual_submit(&f, parent, Side::Sell, 200, 2);
+    actual_evaluate(&f, parent, "TEST_CODE_LINEAGE_INTEGRITY_FILL", 3, 100);
+    let mut view = actual_view(&f);
+    view.projection.fills[0].parent_id = "TEST_CODE_ORPHAN_PARENT".into();
+    assert!(summarize_recorded_execution(&view).is_err());
+    view.projection.fills[0].parent_id = parent.into();
+    let duplicate = view.projection.fills[0].clone();
+    view.projection.fills.push(duplicate);
+    assert!(summarize_recorded_execution(&view).is_err());
+    view.projection.fills.pop();
+    view.projection.parents.get_mut(parent).unwrap().filled = 200;
+    view.projection.parents.get_mut(parent).unwrap().remaining = 0;
+    assert!(summarize_recorded_execution(&view).is_err());
+    view.projection.parents.get_mut(parent).unwrap().filled = 100;
+    view.projection.parents.get_mut(parent).unwrap().remaining = 100;
+    view.projection.fills[0].model.total_fee_micro_cny += 1;
+    assert!(summarize_recorded_execution(&view).is_err());
+    view.projection.fills[0].model.total_fee_micro_cny -= 1;
+    assert!(summarize_recorded_execution(&view).is_ok());
+}
+
+#[test]
+fn paper_decision_outcomes_check_full_report_bounds_and_preserve_empty_observation() {
+    use crate::performance::paper_decision_outcomes_v1::summarize_recorded_execution;
+    let f = actual_v6_fixture();
+    let empty = summarize_recorded_execution(&actual_view(&f)).unwrap();
+    assert!(empty.orders.is_empty() && empty.fills.is_empty());
+    actual_submit(&f, "TEST_CODE_LINEAGE_BOUND_PARENT", Side::Sell, 100, 2);
+    let mut view = actual_view(&f);
+    view.projection
+        .parents
+        .values_mut()
+        .next()
+        .unwrap()
+        .intent
+        .investment_decision_id = "x".repeat(257);
+    assert!(summarize_recorded_execution(&view).is_err());
+    view = actual_view(&f);
+    let parent = view.projection.parents.values().next().unwrap().clone();
+    for index in 0..1024 {
+        view.projection
+            .parents
+            .insert(format!("TEST_CODE_BOUND_{index}"), parent.clone());
+    }
+    assert!(summarize_recorded_execution(&view).is_err());
+    assert!(crate::decision::approved_paper_intent_v1::require_production_approval().is_err());
+}

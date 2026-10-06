@@ -4704,6 +4704,7 @@ fn descriptor_reason(fields:&BTreeMap<&str, &str>, key:DescriptorField, w:&mut F
 pub(crate) struct RetainedExecutionInput<'a> {
     account: &'a str,
     command: PaperV2Command,
+    replay_contract: SubmissionReplayContract,
     actual: Option<ActualExecutionBinding>,
     sampled_at: Option<DateTime<Utc>>,
     record: Option<CommandRecord>,
@@ -4711,17 +4712,28 @@ pub(crate) struct RetainedExecutionInput<'a> {
     binding: Option<SqlBinding>,
     recorded_windows: Vec<WindowRecord>,
 }
+#[derive(Clone, Copy)]
+enum SubmissionReplayContract {
+    ExactCommand,
+    ApprovedDecision,
+}
 pub(crate) struct RetainedExecutionAcquired {
     receipt: PaperV2Receipt,
     binding: SqlBinding,
     fresh_request: Option<CommandRecord>,
+}
+impl RetainedExecutionAcquired {
+    pub(crate) fn receipt(&self) -> &PaperV2Receipt {
+        &self.receipt
+    }
 }
 type RetainedExecutionOutcome<'db, 'a> =
     crate::database::global_schema_v1::paper_v6::RetainedPaperWriteOutcome<
         'db, RetainedExecutionInput<'a>, RetainedExecutionAcquired, LedgerError>;
 
 fn retained_execution_input(account: &str, command: PaperV2Command) -> RetainedExecutionInput<'_> {
-    RetainedExecutionInput { account, command, actual: None, sampled_at: None,
+    RetainedExecutionInput { account, command, replay_contract: SubmissionReplayContract::ExactCommand,
+        actual: None, sampled_at: None,
         record: None, receipt: None, binding: None, recorded_windows: Vec::new() }
 }
 fn retained_execution_command_id(command: &PaperV2Command) -> &str {
@@ -4780,10 +4792,10 @@ fn retained_execution_run<'db, 'a>(
             let record_result = retained_execution_record(input, &actual, sampled_at);
             input.actual = Some(actual);
             record_result?;
-            input.receipt = Some(append_on(conn, input.account,
+            input.receipt = Some(append_retained_submission_on(conn, input.account,
                 retained_execution_command_id(&input.command),
                 input.record.as_ref().expect("actual record retained").clone(),
-                input.sampled_at.expect("actual time retained"))?);
+                input.sampled_at.expect("actual time retained"), input.replay_contract)?);
             input.binding = Some(SqlBinding::capture(conn)?);
             #[cfg(test)]
             if db.has_isolated_p05_consumer_origin() {
@@ -4839,6 +4851,117 @@ pub(crate) fn apply_retained_for_isolated_test<'db, 'a>(
     if !db.has_isolated_p05_consumer_origin() {
         return RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(
             input, PaperCatalog6Error::Catalog6RequalificationRequired));
+    }
+    retained_execution_run(db, input, Some(now))
+}
+
+/// Decision-scoped command identity excludes the mutable execution head. A
+/// changed intent for the same decision must conflict, rather than create a
+/// second order. This identity conveys no approval or data qualification.
+fn decision_submission_command_id(intent: &IntentRecord) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"stock_analysis.paper_decision_submission.v1\0");
+    for value in [
+        intent.account_id.as_str(),
+        intent.epoch_id.as_str(),
+        intent.investment_decision_id.as_str(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    format!(
+        "paper-decision-submit-v1:{}",
+        hex::encode(digest.finalize())
+    )
+}
+
+fn append_retained_submission_on(
+    conn: &mut SqliteConnection,
+    account: &str,
+    command: &str,
+    request: CommandRecord,
+    now: DateTime<Utc>,
+    replay_contract: SubmissionReplayContract,
+) -> Result<PaperV2Receipt, LedgerError> {
+    if matches!(replay_contract, SubmissionReplayContract::ApprovedDecision) {
+        let CommandRecord::Submit { intent, .. } = &request else {
+            return Err(LedgerError::IdentityConflict);
+        };
+        require(
+            command == decision_submission_command_id(intent),
+            "decision submission command identity differs",
+        )?;
+        if let Some(original) = recover_command_body_on(conn, account, command)? {
+            // Both the complete financial reader and the original opaque
+            // approval/namespace binding ran before this comparison. Only the
+            // initial CAS head may differ on an explicit later resubmission.
+            match original.request() {
+                CommandRecord::Submit { intent: stored, .. } if stored == intent => {
+                    return Ok(original.receipt().clone());
+                }
+                _ => return Err(LedgerError::IdentityConflict),
+            }
+        }
+    }
+    append_on(conn, account, command, request, now)
+}
+
+fn decision_submission_input(
+    account: &str,
+    expected: HeadIdentity,
+    approved: ApprovedPaperIntentV1,
+) -> RetainedExecutionInput<'_> {
+    let command_id = decision_submission_command_id(approved.record());
+    let mut input = retained_execution_input(
+        account,
+        PaperV2Command::Submit {
+            command_id,
+            expected,
+            approved,
+        },
+    );
+    input.replay_contract = SubmissionReplayContract::ApprovedDecision;
+    input
+}
+
+/// Submit one already approved decision through the original retained writer.
+/// The caller cannot provide a command ID, manufacture an approval from a
+/// stored record, or turn a Held/Pending frame into an automatic retry.
+pub(crate) fn submit_approved_decision_actual(
+    account: &str,
+    expected: HeadIdentity,
+    approved: ApprovedPaperIntentV1,
+) -> RetainedExecutionOutcome<'static, '_> {
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWrite, RetainedPaperWriteOutcome,
+    };
+    let input = decision_submission_input(account, expected, approved);
+    match DatabaseManager::try_get() {
+        Some(db) => retained_execution_run(db, input, None),
+        None => RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(
+            input,
+            PaperCatalog6Error::Authority,
+        )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn submit_approved_decision_for_isolated_test<'db, 'a>(
+    db: &'db DatabaseManager,
+    account: &'a str,
+    expected: HeadIdentity,
+    approved: ApprovedPaperIntentV1,
+    now: DateTime<Utc>,
+) -> RetainedExecutionOutcome<'db, 'a> {
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWrite, RetainedPaperWriteOutcome,
+    };
+    let input = decision_submission_input(account, expected, approved);
+    if !db.has_isolated_p05_consumer_origin() {
+        return RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(
+            input,
+            PaperCatalog6Error::Catalog6RequalificationRequired,
+        ));
     }
     retained_execution_run(db, input, Some(now))
 }
