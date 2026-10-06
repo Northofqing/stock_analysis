@@ -11,6 +11,7 @@ struct AuditContentFacts {
     started: bool,
     callee_reached: bool,
     callee_returned: Option<bool>,
+    return_retained: bool,
     checked_rows: usize,
     tail_row: Option<usize>,
 }
@@ -140,6 +141,7 @@ impl AuditContentFrame {
         if !self.facts.started
             || !self.facts.callee_reached
             || self.facts.callee_returned != Some(actual.is_ok())
+            || self.facts.return_retained
             || self.result.is_some()
             || !matches!(
                 self.raw.phase,
@@ -149,6 +151,7 @@ impl AuditContentFrame {
             return Err(actual);
         }
         self.result = Some(actual);
+        self.facts.return_retained = true;
         if self.raw.first() {
             return Ok(());
         } // Preserve late return and original first error.
@@ -172,6 +175,7 @@ impl AuditContentFrame {
             || !self.facts.started
             || !self.facts.callee_reached
             || self.facts.callee_returned != Some(true)
+            || !self.facts.return_retained
             || !matches!(self.result, Some(Ok(())))
             || self.unaccepted.is_some()
         {
@@ -183,7 +187,9 @@ impl AuditContentFrame {
         self.raw.phase = RawV1AuditLinksPhase::Complete;
         Ok(())
     }
-    fn finish(&mut self) -> bool {
+    // Success here keeps the original second reader open for the next content
+    // scan. Only the consuming entry's final close can produce a checked owner.
+    fn advance_content(&mut self) -> bool {
         if !self.begin() {
             return false;
         }
@@ -202,6 +208,12 @@ impl AuditContentFrame {
         if self.raw.first() {
             return false;
         }
+        true
+    }
+    fn finish(&mut self) -> bool {
+        if !self.advance_content() {
+            return false;
+        }
         match self.close_and_tail() {
             Ok(()) => true,
             Err(first) => {
@@ -211,6 +223,9 @@ impl AuditContentFrame {
         }
     }
 }
+
+#[path = "global_schema_v1_event_projection_content.rs"]
+mod v1_event_projection;
 
 fn real(row: &V1AuditInputRow, index: usize) -> StorageResult<f64> {
     match row.cells[index] {

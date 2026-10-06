@@ -4815,7 +4815,7 @@ struct RawV1AuditGateFacts {
     checked_rows: usize, checked_heads: usize, tail_row: Option<usize>, returned: Option<bool>,
 }
 #[derive(PartialEq, Eq)]
-enum RawV1AuditContentHashes { NotChecked, AuditOnlyChecked }
+enum RawV1AuditContentHashes { NotChecked, AuditOnlyChecked, AuditAndV1EventProjectionChecked }
 struct RawV1AuditLinksFrame {
     input: V1AuditInputsFrame, phase: RawV1AuditLinksPhase,
     gates: [RawV1AuditGateFacts; 2], returns: [Option<StorageResult<()>>; 2],

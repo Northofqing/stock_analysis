@@ -3,6 +3,7 @@
 > 核对时间：2026-10-06 21:55–22:02 CST。源码基线：`9a71f6069847a1350480203399264d3b757a1c68`。
 > 本文是当前接续入口，历史证据保留在 [PLATFORM_HANDOFF.md](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/PLATFORM_HANDOFF.md)。源码、测试、候选制品、生产接线和自然观察分别记录。
 > 后继开发更新：H02原审计内容哈希首片新5＋相关6通过，详情见第10节。第2/3节及文档检查记录是初稿时的基线；本批源码未部署，当前Git以本批提交为准。
+> 2026-10-07 后继：V1 事件/存储投影内容校验与审计返回保全修复见 [最新开发接续](2026-10-07-v1-content-development.md)。初稿与第10节的旧测试身份保持历史范围，最终源码证据另列于该文档。
 
 ## 1. 结论与范围
 

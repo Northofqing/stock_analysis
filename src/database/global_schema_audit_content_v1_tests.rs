@@ -641,3 +641,55 @@ fn task6_audit_content_retains_busy_close_and_rejects_target_drift() {
         drop(frame);
     });
 }
+
+#[test]
+fn task6_audit_content_failed_return_is_retained_once() {
+    fixtures::task6_with_actual_rows_backup_for_test(|original| {
+        let mut frame = prepared(original);
+        frame.raw.input.fields.rows[3][0].cells[3] =
+            Some(V1AuditInputCell::Text("changed basis".into()));
+        assert!(frame.begin());
+        let actual = frame.evaluate().unwrap();
+        assert!(actual.is_err());
+        frame.retain(actual).unwrap();
+        assert!(frame.result.is_none() && frame.facts.return_retained);
+        let first = frame
+            .raw
+            .input
+            .genesis
+            .owner
+            .fee
+            .local
+            .readonly
+            .transform
+            .first
+            .as_ref()
+            .unwrap() as *const GlobalSchemaV1Error;
+        let duplicate = storage_fail("TEST_CODE duplicate after failed return");
+        let ptr = match &duplicate {
+            GlobalSchemaV1Error::SelectionSnapshotChanged { detail } => detail.as_ptr(),
+            _ => unreachable!(),
+        };
+        let same = frame.retain(Err(duplicate)).unwrap_err();
+        assert!(
+            matches!(&same, Err(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) if detail.as_ptr() == ptr)
+        );
+        assert_eq!(
+            frame
+                .raw
+                .input
+                .genesis
+                .owner
+                .fee
+                .local
+                .readonly
+                .transform
+                .first
+                .as_ref()
+                .unwrap() as *const GlobalSchemaV1Error,
+            first
+        );
+        assert!(frame.result.is_none() && frame.facts.callee_returned == Some(false));
+        drop(frame);
+    });
+}
