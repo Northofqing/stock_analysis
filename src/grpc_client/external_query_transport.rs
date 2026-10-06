@@ -19,10 +19,10 @@ pub(crate) const EXTERNAL_QUERY_DECODE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES: usize =
     EXTERNAL_QUERY_DECODE_LIMIT_BYTES + 5;
 const EXTERNAL_WIRE_MATERIAL: &str = "external-unary-response-evidence-v1";
-// The 2026-09-28.2 public bundle compiles to this client descriptor. The VM
+// The 65 RPC SDK candidate compiles to this client descriptor. The VM
 // build identity's server contract digest is a distinct release identity.
 pub(crate) const EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256: &str =
-    "59158661146ff429f092c49584601147080b9e631e941e4acb2d96fe7a22bf7b";
+    "14fe7134ba6b9018d773c88d71744cdd52381081e70dd04a558c3147b4a9ea06";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum ExternalQueryMethod {

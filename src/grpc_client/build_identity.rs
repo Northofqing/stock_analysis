@@ -6,6 +6,8 @@ use super::external_pb::magic::market::v1::{BuildIdentity, HealthResponse};
 use serde::{Deserialize, Serialize};
 
 const PUBLIC_BUNDLE_METADATA: &str = include_str!("../../client-bundle/bundle-metadata.json");
+const ARCHIVED_20260928_METADATA: &str =
+    include_str!("../../contracts/external_v1_history/20260928.2/bundle-metadata.json");
 // V1-V3 recorded no expected-policy receipt. Their explicit legacy policy is
 // this frozen public release, never the current bundle or a response's claim.
 const HISTORICAL_V3_METADATA: &str =
@@ -36,6 +38,7 @@ struct ExpectedBuildIdentity {
 pub(crate) struct BuildIdentityTrust {
     current: ExpectedBuildIdentity,
     historical_v3: ExpectedBuildIdentity,
+    archived_20260928: ExpectedBuildIdentity,
     current_descriptor: &'static str,
 }
 
@@ -75,6 +78,10 @@ impl BuildIdentityTrust {
             && digest == policy_sha256(&self.historical_v3, descriptor)
         {
             return Some(self.historical_v3.clone());
+        } else if super::archived_external_20260928::accepts_descriptor(descriptor)
+            && digest == policy_sha256(&self.archived_20260928, descriptor)
+        {
+            return Some(self.archived_20260928.clone());
         }
         // Explicit compiled test release, never learned from response/env. This
         // only verifies a recorded receipt; it does not change live A's pin.
@@ -93,6 +100,7 @@ impl BuildIdentityTrust {
         Ok(Self {
             current: expected_identity()?,
             historical_v3: parse_expected_identity(HISTORICAL_V3_METADATA)?,
+            archived_20260928: parse_expected_identity(ARCHIVED_20260928_METADATA)?,
             current_descriptor:
                 super::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
         })
@@ -298,6 +306,45 @@ pub(crate) fn test_historical_build_identity() -> BuildIdentity {
     }
 }
 
+// Public old-production GetHealth receipt shape from the sealed SDK evidence.
+// This fixture is historical evidence, never an expected current identity.
+#[cfg(test)]
+pub(crate) fn test_archived_20260928_health() -> HealthResponse {
+    use super::external_pb::magic::market::v1::RuntimeObservability;
+    HealthResponse {
+        request_id: "sdk-date-release-preflight-20261006-GetHealth".into(),
+        live: true,
+        ready: true,
+        state: "ready".into(),
+        observability: Some(RuntimeObservability {
+            process_started_at_unix_ms: 1791029431735,
+            uptime_millis: 231721599,
+            query_started: 20093,
+            query_succeeded: 20028,
+            query_failed: 65,
+            query_cancelled: 1,
+            query_in_flight: 0,
+            query_rejected: 0,
+            query_timed_out: 0,
+            query_duration_micros_total: 2571960202,
+            query_duration_micros_max: 10657523,
+            unary_concurrency_limit: 16,
+            unary_concurrency_available: 16,
+            blocking_concurrency_limit: 8,
+            blocking_concurrency_available: 8,
+        }),
+        build_identity: Some(BuildIdentity {
+            service_version: "0.2.0".into(),
+            source_revision: "4e4995f8d3f2c7cd504d1dec0f238e6d4b4fc02c".into(),
+            contract_sha256: "0c4485545dbfd0979a7d5ea206c840f39fd504ed62fb7eef92f1940bdc9c2f41"
+                .into(),
+            binary_sha256: "517e0b4c31bb42330f4bc2a0395e3af385a164212414a65775bed40c9eb87ae3"
+                .into(),
+            identity_error: String::new(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +441,67 @@ mod tests {
             qualify_public_health(&response),
             Err(BuildIdentityError::NotReady)
         );
+    }
+    #[test]
+    fn sep28_recorded_policy_binds_old_descriptor_and_observed_health_only() {
+        let trust = BuildIdentityTrust::bundled().unwrap();
+        let descriptor = super::super::archived_external_20260928::DESCRIPTOR_SHA256;
+        let policy = "de9a897d7e35f35bdd475b4133f002b27e9dfb40cb029aeb81d590ac3e70f54a";
+        assert_eq!(policy_sha256(&trust.archived_20260928, descriptor), policy);
+        let old_health = test_archived_20260928_health();
+        assert_eq!(
+            trust.recorded_health(policy, descriptor, &old_health),
+            Ok(())
+        );
+        assert!(trust.current_health(&old_health).is_err());
+        assert!(qualify_public_health(&old_health).is_err());
+        assert!(!trust.accepts_recorded_policy(policy, trust.current_descriptor()));
+        assert!(!trust.accepts_recorded_policy(&trust.current_policy_sha256(), descriptor));
+        assert!(trust
+            .recorded_health(policy, trust.current_descriptor(), &old_health)
+            .is_err());
+        let candidate_health = HealthResponse {
+            build_identity: Some(test_public_build_identity()),
+            ..old_health.clone()
+        };
+        assert!(trust
+            .recorded_health(policy, descriptor, &candidate_health)
+            .is_err());
+        let live = super::super::connection_qualification::ConnectionGeneration::new(trust);
+        assert!(live
+            .observe_health(&old_health.request_id, &old_health)
+            .is_err());
+        assert!(live.require_qualified().is_err());
+    }
+
+    #[test]
+    fn declared_candidate_health_matches_compiled_expectation_in_test_only() {
+        // These readiness fields are synthetic: the SDK candidate has not been probed.
+        let health = HealthResponse {
+            request_id: "TEST_CODE_DECLARED_CANDIDATE_NOT_OBSERVED".into(),
+            live: true,
+            ready: true,
+            build_identity: Some(BuildIdentity {
+                service_version: "0.2.0".into(),
+                source_revision: "eea9cc6eea57725da1bc602dd66de68448c8d8ab".into(),
+                contract_sha256: "abf28a3e0028488a7579da4d961e1a7c1408482bdc0500122c1956d225e480cf"
+                    .into(),
+                binary_sha256: "29a686802e80b9aa99a518b3adb68b664330b6572cc3ab4e3cb23fa51b6f29c1"
+                    .into(),
+                identity_error: String::new(),
+            }),
+            ..Default::default()
+        };
+        let metadata: serde_json::Value = serde_json::from_str(PUBLIC_BUNDLE_METADATA).unwrap();
+        assert_eq!(
+            metadata["identity_binding_state"],
+            "ExpectedCandidateOnlyNotObserved"
+        );
+        assert_eq!(qualify_public_health(&health), Ok(()));
+        let trust = BuildIdentityTrust::bundled().unwrap();
+        assert_eq!(trust.current_health(&health), Ok(()));
+        let live = super::super::connection_qualification::ConnectionGeneration::new(trust);
+        live.observe_health(&health.request_id, &health).unwrap();
+        live.require_qualified().unwrap();
     }
 }

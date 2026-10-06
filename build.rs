@@ -62,6 +62,22 @@ fn main() {
         )
         .expect("compile frozen historical External contract");
     println!("cargo:rerun-if-changed={history_source}");
+    // The former current V4 release remains an independent messages-only
+    // decoder; it cannot acquire a live connection qualification.
+    let archived_source = "contracts/external_v1_history/20260928.2/market.proto";
+    let archived_dir = out_dir.join("external_history_20260928");
+    std::fs::create_dir_all(&archived_dir).expect("create archived External output");
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(false)
+        .out_dir(&archived_dir)
+        .file_descriptor_set_path(archived_dir.join("descriptor.bin"))
+        .compile_protos(
+            &[Path::new(archived_source)],
+            &[Path::new("contracts/external_v1_history/20260928.2")],
+        )
+        .expect("compile frozen Sep28 External contract");
+    println!("cargo:rerun-if-changed={archived_source}");
     // An explicit additive TEST_CODE release, compiled independently from A.
     // Only cfg(test) modules include these messages; never a runtime registry.
     let upgrade_dir = out_dir.join("external_test_upgrade_b");

@@ -8,6 +8,7 @@ use prost::Message;
 pub(crate) enum ExternalDecoder {
     Current,
     ArchivedA,
+    Archived20260928,
     #[cfg(test)]
     TestB,
 }
@@ -27,6 +28,9 @@ impl ExternalDecoder {
         if historical_external::accepts_descriptor(descriptor) {
             return Ok(Self::ArchivedA);
         }
+        if super::archived_external_20260928::accepts_descriptor(descriptor) {
+            return Ok(Self::Archived20260928);
+        }
         #[cfg(test)]
         if descriptor == test_b::descriptor() {
             return Ok(Self::TestB);
@@ -41,6 +45,9 @@ impl ExternalDecoder {
     ) -> Result<(u32, String), GrpcError> {
         if matches!(self, Self::ArchivedA) {
             return historical_external::request_context(health, bytes);
+        }
+        if matches!(self, Self::Archived20260928) {
+            return super::archived_external_20260928::request_context(health, bytes);
         }
         #[cfg(test)]
         if matches!(self, Self::TestB) {
@@ -67,6 +74,9 @@ impl ExternalDecoder {
         if matches!(self, Self::ArchivedA) {
             return historical_external::query_request(bytes);
         }
+        if matches!(self, Self::Archived20260928) {
+            return super::archived_external_20260928::query_request(bytes);
+        }
         // A→B continuation is supported only for the identical canonical
         // GlobalNews request shape. Frozen plan validation checks its identity;
         // this verifies current decoder compatibility without rewriting bytes.
@@ -82,6 +92,7 @@ impl ExternalDecoder {
     pub(crate) fn health(self, bytes: &[u8]) -> Result<current::HealthResponse, GrpcError> {
         match self {
             Self::ArchivedA => historical_external::health(bytes),
+            Self::Archived20260928 => super::archived_external_20260928::health(bytes),
             Self::Current => canonical(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -96,6 +107,7 @@ impl ExternalDecoder {
     ) -> Result<current::CapabilitiesResponse, GrpcError> {
         match self {
             Self::ArchivedA => historical_external::capabilities(bytes),
+            Self::Archived20260928 => super::archived_external_20260928::capabilities(bytes),
             Self::Current => canonical(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -109,6 +121,7 @@ impl ExternalDecoder {
         // bytes. The caller rejects forbidden wire fields after capture.
         match self {
             Self::ArchivedA => historical_external::query(bytes),
+            Self::Archived20260928 => super::archived_external_20260928::query(bytes),
             Self::Current => decode(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -120,6 +133,7 @@ impl ExternalDecoder {
     pub(crate) fn error_detail(self, bytes: &[u8]) -> Option<current::ErrorDetail> {
         match self {
             Self::ArchivedA => historical_external::error_detail(bytes),
+            Self::Archived20260928 => super::archived_external_20260928::error_detail(bytes),
             Self::Current => current::ErrorDetail::decode(bytes).ok(),
             #[cfg(test)]
             Self::TestB => {
@@ -228,5 +242,168 @@ pub(crate) mod test_b {
                 "/external_test_upgrade_b/descriptor.bin"
             ))))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::external_query_transport::{
+        compiled_descriptor_sha256, ExternalQueryMethod, ExternalWireEvidenceV1,
+        ExternalWireMaterialV1, EXTERNAL_QUERY_DECODE_LIMIT_BYTES,
+    };
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn archived() -> ExternalDecoder {
+        ExternalDecoder::for_descriptor(super::super::archived_external_20260928::DESCRIPTOR_SHA256)
+            .unwrap()
+    }
+
+    fn with_unknown_field(mut bytes: Vec<u8>) -> Vec<u8> {
+        // Unknown varint field 127, retaining the former query/status contract.
+        bytes.extend_from_slice(&[0xf8, 0x07, 0x01]);
+        bytes
+    }
+
+    #[test]
+    fn current_65_rpc_descriptor_matches_compiled_bytes() {
+        assert_eq!(
+            EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+            "14fe7134ba6b9018d773c88d71744cdd52381081e70dd04a558c3147b4a9ea06"
+        );
+        assert_eq!(
+            compiled_descriptor_sha256(),
+            EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256
+        );
+        assert!(matches!(
+            ExternalDecoder::for_descriptor(EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256),
+            Ok(ExternalDecoder::Current)
+        ));
+        assert!(matches!(archived(), ExternalDecoder::Archived20260928));
+        assert!(ExternalDecoder::for_descriptor(&"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn sep28_control_raw_decodes_known_fields_and_rejects_unknown_fields() {
+        let decoder = archived();
+        let context = current::RequestContext {
+            protocol_version: 1,
+            request_id: "TEST_CODE_OLD_CONTROL".into(),
+        };
+        let health_request = current::HealthRequest {
+            context: Some(context.clone()),
+        }
+        .encode_to_vec();
+        let cap_request = current::CapabilitiesRequest {
+            context: Some(context.clone()),
+        }
+        .encode_to_vec();
+        let query_request = current::QueryRequest {
+            context: Some(context.clone()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            decoder.request_context(true, &health_request).unwrap(),
+            (1, context.request_id.clone())
+        );
+        assert_eq!(
+            decoder.request_context(false, &cap_request).unwrap(),
+            (1, context.request_id)
+        );
+        decoder.query_request(&query_request).unwrap();
+        assert!(decoder
+            .request_context(true, &with_unknown_field(health_request))
+            .is_err());
+        assert!(decoder
+            .request_context(false, &with_unknown_field(cap_request))
+            .is_err());
+        assert!(decoder
+            .query_request(&with_unknown_field(query_request))
+            .is_err());
+        let health = super::super::build_identity::test_archived_20260928_health();
+        let raw_health = health.encode_to_vec();
+        assert_eq!(decoder.health(&raw_health).unwrap(), health);
+        assert_eq!(
+            decoder.health(&raw_health).unwrap().encode_to_vec(),
+            raw_health
+        );
+        assert!(decoder.health(&with_unknown_field(raw_health)).is_err());
+        let caps = current::CapabilitiesResponse {
+            request_id: "TEST_CODE_OLD_CONTROL".into(),
+            capabilities: vec![current::Capability {
+                operation: current::Operation::GlobalNews as i32,
+                provider: "Jin10".into(),
+                runtime_available: true,
+                ..Default::default()
+            }],
+        };
+        let raw_caps = caps.encode_to_vec();
+        assert_eq!(decoder.capabilities(&raw_caps).unwrap(), caps);
+        assert_eq!(
+            decoder.capabilities(&raw_caps).unwrap().encode_to_vec(),
+            raw_caps
+        );
+        assert!(decoder.capabilities(&with_unknown_field(raw_caps)).is_err());
+    }
+
+    #[test]
+    fn sep28_query_and_status_project_known_fields_while_retaining_raw_evidence() {
+        let decoder = archived();
+        let query = current::QueryResponse {
+            request_id: "TEST_CODE_OLD_QUERY".into(),
+            operation: current::Operation::GlobalNews as i32,
+            selected_provider: "Jin10".into(),
+            complete: true,
+            records: vec![current::CanonicalPayload {
+                schema: "magic.market.global_news".into(),
+                schema_version: 2,
+                content_type: "application/json".into(),
+                data: b"[]".to_vec(),
+            }],
+            ..Default::default()
+        };
+        let raw_query = with_unknown_field(query.encode_to_vec());
+        assert_eq!(decoder.query(&raw_query).unwrap(), query);
+        assert_ne!(query.encode_to_vec(), raw_query);
+        let evidence = ExternalWireEvidenceV1 {
+            material: "external-unary-response-evidence-v1".into(),
+            profile: "ExternalV1".into(),
+            method: ExternalQueryMethod::GlobalNews,
+            client_descriptor_sha256: super::super::archived_external_20260928::DESCRIPTOR_SHA256
+                .into(),
+            evidence: ExternalWireMaterialV1::Payload {
+                payload_sha256: hex::encode(Sha256::digest(&raw_query)),
+                protobuf_payload: raw_query.clone(),
+                decode_limit_bytes: EXTERNAL_QUERY_DECODE_LIMIT_BYTES,
+            },
+        };
+        let restored: ExternalWireEvidenceV1 =
+            serde_json::from_slice(&serde_json::to_vec(&evidence).unwrap()).unwrap();
+        restored
+            .validate_descriptor(
+                ExternalQueryMethod::GlobalNews,
+                super::super::archived_external_20260928::DESCRIPTOR_SHA256,
+            )
+            .unwrap();
+        assert_eq!(restored.payload().unwrap(), raw_query.as_slice());
+        assert!(restored.validate(ExternalQueryMethod::GlobalNews).is_err());
+        let detail = current::ErrorDetail {
+            request_id: "TEST_CODE_OLD_QUERY".into(),
+            operation: current::Operation::GlobalNews as i32,
+            provider: "Jin10".into(),
+            reason_code: "TEST_CODE_OLD_STATUS".into(),
+            retryable: true,
+            ..Default::default()
+        };
+        let raw_detail = with_unknown_field(detail.encode_to_vec());
+        let status = tonic::Status::with_details(
+            tonic::Code::Unavailable,
+            "old status",
+            raw_detail.clone().into(),
+        );
+        assert_eq!(decoder.error_detail(status.details()).unwrap(), detail);
+        assert_eq!(status.details(), raw_detail.as_slice());
+        assert_ne!(detail.encode_to_vec(), raw_detail);
     }
 }

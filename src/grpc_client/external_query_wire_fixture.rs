@@ -794,6 +794,8 @@ external_query_wire_service!(
     t0_evidence,
     outcome_daily_bars,
     upper_limit_pool_review,
+    official_publications,
+    official_publication,
 );
 
 #[derive(Clone, Copy)]

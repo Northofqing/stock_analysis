@@ -970,6 +970,8 @@ external_control_data_service!(
     t0_evidence,
     outcome_daily_bars,
     upper_limit_pool_review,
+    official_publications,
+    official_publication,
     semantic_search,
     current_auction_observations,
     economic_release_observations,
