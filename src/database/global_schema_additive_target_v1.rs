@@ -4815,7 +4815,7 @@ struct RawV1AuditGateFacts {
     checked_rows: usize, checked_heads: usize, tail_row: Option<usize>, returned: Option<bool>,
 }
 #[derive(PartialEq, Eq)]
-enum RawV1AuditContentHashes { NotChecked }
+enum RawV1AuditContentHashes { NotChecked, AuditOnlyChecked }
 struct RawV1AuditLinksFrame {
     input: V1AuditInputsFrame, phase: RawV1AuditLinksPhase,
     gates: [RawV1AuditGateFacts; 2], returns: [Option<StorageResult<()>>; 2],
@@ -4837,14 +4837,20 @@ impl AdditiveStorageTransformed {
 impl AdditiveStorageLocalRawV1AuditLinksChecked {
     pub(super) fn create_or_resume(source: rows::AdditiveRowsTargetSource)
         -> std::result::Result<Self, AdditiveStorageRawV1AuditLinksHeld> {
-        let base = AdditiveStorageCopied { source, managed: None, directory: None, anchor: None, fresh: false,
-            original: None, rows: None, records: std::array::from_fn(|_| None), pending: None,
-            target: None, target_node: None, copied: None, census_files: std::array::from_fn(|_| None),
-            codec: AdditiveRecordCodecState::new(), copy_issued: false, rejected_copy_return: None,
-            copy_return_failed: false, copy_return_error: None, copy_origin_return_error: None };
-        RawV1AuditLinksFrame::new(TransformFrame::new(base)).run(true)
+        raw_v1_audit_links_cold_frame(source).run(true)
     }
 }
+fn raw_v1_audit_links_cold_frame(source: rows::AdditiveRowsTargetSource) -> RawV1AuditLinksFrame {
+    let base = AdditiveStorageCopied { source, managed: None, directory: None, anchor: None, fresh: false,
+        original: None, rows: None, records: std::array::from_fn(|_| None), pending: None,
+        target: None, target_node: None, copied: None, census_files: std::array::from_fn(|_| None),
+        codec: AdditiveRecordCodecState::new(), copy_issued: false, rejected_copy_return: None,
+        copy_return_failed: false, copy_return_error: None, copy_origin_return_error: None };
+    RawV1AuditLinksFrame::new(TransformFrame::new(base))
+}
+
+#[path = "global_schema_audit_content_v1.rs"]
+mod audit_content;
 impl RawV1AuditLinksFrame {
     fn new(transform: TransformFrame) -> Self {
         Self { input: V1AuditInputsFrame::new(transform), phase: RawV1AuditLinksPhase::Fresh,

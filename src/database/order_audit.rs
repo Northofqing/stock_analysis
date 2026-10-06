@@ -35,7 +35,7 @@ use crate::trading::paper_replay_financial_work_v1::{
 
 pub(crate) const AUDIT_CHAIN_GENESIS: &str = "BR086_ORDER_AUDIT_GENESIS_V1";
 
-#[derive(Debug, Clone, PartialEq, QueryableByName, Serialize)]
+#[derive(Debug, Clone, PartialEq, QueryableByName)]
 pub(crate) struct CanonicalOrderAuditRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub(crate) id: i64,
@@ -63,6 +63,46 @@ pub(crate) struct CanonicalOrderAuditRow {
     pub(crate) failure_reason: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub(crate) created_at: String,
+}
+
+/// Borrowed historical wire fields; this carries no audit/financial authority.
+#[derive(Serialize)]
+pub(crate) struct CanonicalOrderAuditView<'a> {
+    id: i64,
+    business_order_id: &'a str,
+    source: &'a str,
+    decision_basis: &'a str,
+    side: &'a str,
+    code: &'a str,
+    requested_price: f64,
+    execution_price: Option<f64>,
+    quantity: i64,
+    quote_observed_at: Option<&'a str>,
+    outcome: &'a str,
+    failure_reason: Option<&'a str>,
+    created_at: &'a str,
+}
+impl<'a> CanonicalOrderAuditView<'a> {
+    pub(crate) fn new(id: i64, record: OrderAuditRecord<'a>, created_at: &'a str) -> Self {
+        Self {
+            id, business_order_id: record.business_order_id, source: record.source,
+            decision_basis: record.decision_basis, side: record.side, code: record.code,
+            requested_price: record.requested_price, execution_price: record.execution_price,
+            quantity: record.quantity, quote_observed_at: record.quote_observed_at,
+            outcome: record.outcome, failure_reason: record.failure_reason, created_at,
+        }
+    }
+}
+impl Serialize for CanonicalOrderAuditRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        CanonicalOrderAuditView::new(self.id, OrderAuditRecord {
+            business_order_id: &self.business_order_id, source: &self.source,
+            decision_basis: &self.decision_basis, side: &self.side, code: &self.code,
+            requested_price: self.requested_price, execution_price: self.execution_price,
+            quantity: self.quantity, quote_observed_at: self.quote_observed_at.as_deref(),
+            outcome: &self.outcome, failure_reason: self.failure_reason.as_deref(),
+        }, &self.created_at).serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, QueryableByName)]

@@ -2,7 +2,7 @@
 
 更新日期：2026-10-06（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
 
-最新整体余项和接续顺序见 [2026-10-06 整体设计剩余工作交接](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/docs/handoffs/2026-10-06-platform-remaining-work-handoff.md)：按 M0–M8 映射七组余项、H01–H17 任务卡、最近六项已推送源码及双端上线前置。其代码基线为 `9a71f6069`，各运行结论带证据时间；以下历史记录保留。
+最新整体余项和接续顺序见 [2026-10-06 整体设计剩余工作交接](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/docs/handoffs/2026-10-06-platform-remaining-work-handoff.md)：按 M0–M8 映射七组余项、H01–H17 任务卡、最近六项已推送源码及双端上线前置。初稿代码基线为 `9a71f6069`；第10节和本文件末节补充后继H02原审计内容哈希首片，新5＋相关6已通过。各运行结论带证据时间；以下历史记录保留。
 
 ## 1. 接手目标与授权
 
@@ -806,3 +806,17 @@ Windows最新f57c原CI run37446154439测得critical35372/39817=88.84%，仍低�
 跨端续办接口超时后，另写共享 [原SDK续办交接](/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/MAC_SDK_COVERAGE_CONTINUATION_20261006.md)，1946B/SHA `a3388319b67ec17ac968896838b11d99ccf77f1f9a5a70952fcf242e27c9007b`。针对同一原VM任务/f57c/2455关键行缺口，要求先查既有工作和CI、分开处理RustSec网络失败、回传同HEAD原95门禁证据。只确认共享文件已写，尚无Windows收件/开工反馈；不重复dispatch或称新SDK有发布资格。
 
 第5/7整项继续未完成：真实资金B/审批发行及seed/cutover、正式正向F2来源与执行资格、Financial/native/catalog完整验证、正式策略版本到决策/订单的持久关联、治理真实评审/阶段/人工晋级和同输入/PIT/完整成本证据。上述冷读只解决普通材料恢复，不是资金审批或完整GovernanceRepository；生产仍待同版SDK/RPC、具体activation及原动态门禁。下一owner从本节、真实feature HEAD与最新VM状态接续，不重跑已闭合10项。
+
+## 2026-10-06 后继：H02 原审计内容哈希首片
+
+用户同意优先推进账本财务校验与恢复。代码从6a661d371接续，新增global_schema_audit_content_v1及其测试；原CanonicalOrderAuditRow共用只借用的Serialize视图，保持历史13字段顺序、REAL/nullable/Unicode及历史legacy接受口径。
+
+新的consuming warm/cold入口先完成原typed输入和Audit/V1链接，在第二个仍存活的原readonly窗口、同一16MiB累计TargetWork中，预付固定及每行最坏escaping额度再流式重算BR086_ORDER_AUDIT_V1。没有克隆owned审计行、创建payload Vec/hex String、重开reader或重置预算。真实结果、late/duplicate返回、原inputs/source及first error均归同一frame；审计通过后仍需actual close和original/target tail才返回LocalAuditContentChecked。
+
+首轮5方法3PASS/2FAIL：新fixture错误要求预算拒绝后reader仍Some，实际旧cleanup消费关闭成功；后继warm/cold被原测试锁Poison阻断。原失败log cad3ab4b保留。纠正fixture断言并加入首行预付少一字节的控制；新入口可见性限原global_schema_v1 namespace。最终新5/5 PASS；同harness原raw-links3、BR086 canonical/legacy2、history fixed-output/hash1全部通过，共11个不同完整方法，全部会话退出0。
+
+931源码输入前后相同，manifest `4d3c62af58bd0d83129a7732c1c10c9bc6aedcfb2d4ae3c38c50a31b1f2f12a5`，harness `5d0d4ded654c03381074b149cedcc87edccf64d61ac5ea2a5cbfd944befe2691`。新组log `bb418a66b6ab11ea41b616f5943f151f8b4282659fcfbf6193526aad328f3686`；相关logs `51158001800f2d7efe53139bd235d46b4ce6d4c242ebb76ed06d0177c17a8ae7`、`226179c53f68ccd1da38f0d1e11b99ccacfaf3686942228eeb1eaddc0855a4ac`、`9543684ff8c9cad6c051d0044e5b9a94b2e3b882f91f207ad57c9f0b6b8e4b1e`。本轮直接自审，没有新独立Approved；未追加全量/check/build/clippy/release或生产操作。本地原回执见 `.planning/2026-10-06-financial-content-hashes/`。
+
+这只关闭H02的普通audit内容子片，原links-only仍ContentHashesNotChecked。V1 event/manifest/projection内容、完整Genesis/经济/Financial、真实SQL/provider/native资格及operational schema8/平台schema14/资金B/正向F2仍待完成，生产没有安装本批。下一切片在仍活着的第二窗口接V1内容校验，不能从已关闭的LocalAuditContentChecked再开第三reader或发行Financial。
+
+已补读Windows主交接、MAC_CODEX_NEXT_STEPS和f57c失败报告，逐件复核源28/CI10文件及两个已有包外ACK。SDK最新实测仍critical88.84<95、audit公告库网络失败、正式4e不变；真实Rubin/Muse及年报/半年报/业绩预告/减持查询验收独立。续办消息已成功发送原Windows任务；随后wait_threads实际回报active/inProgress，对方确认两ACK与全部文件一致，并开始仅重试失败audit job和定位下一覆盖切片。此为收件/开工证据，未交合格新release tuple或业务RPC通过。

@@ -2,6 +2,7 @@
 
 > 核对时间：2026-10-06 21:55–22:02 CST。源码基线：`9a71f6069847a1350480203399264d3b757a1c68`。
 > 本文是当前接续入口，历史证据保留在 [PLATFORM_HANDOFF.md](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/PLATFORM_HANDOFF.md)。源码、测试、候选制品、生产接线和自然观察分别记录。
+> 后继开发更新：H02原审计内容哈希首片新5＋相关6通过，详情见第10节。第2/3节及文档检查记录是初稿时的基线；本批源码未部署，当前Git以本批提交为准。
 
 ## 1. 结论与范围
 
@@ -194,3 +195,14 @@ Windows原任务：**R08 FuturesDelivery 上游合同与部署**，thread=`01a0e
 ## 9. 交接文档完成检查
 
 本文以当前Git/源码入口、已存在原回执、最新共享状态和本次生产身份读取核对。仅文档变更：检查本地链接/任务编号/内容一致性及 `git diff --check`；不因交接重新编译或重跑此前已通过用例。整体完成率和全部上线日期暂不给无证据百分比或承诺，按H01–H17的验收逐项减少余项。
+
+## 10. 后继H02原审计内容哈希首片（2026-10-06）
+
+从初稿后HEAD6a661d371继续开发，入口为 [audit content](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/database/global_schema_audit_content_v1.rs)、[原审计wire视图](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/database/order_audit.rs)；直接验收代码见 [定向测试](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/database/global_schema_audit_content_v1_tests.rs)。
+
+- 已完成：原typed输入/两项链接后的同第二live reader审计内容扫描；13字段与历史JSON共用顺序/数值/null/Unicode语义；同16MiB累计Work预付后流式domain/hash/固定lower-hex比对；成功仍需实际关闭和原来源/目标tail。warm/cold保原target/记录/输入，失败保实际返回/first，Busy保实际连接直到证明清理完成。
+- 实际验证：最终新5＋原raw-links3＋BR0862＋history fixed wire/hash1共11个不同完整方法，0FAIL/0ignored，全部退出0；931输入保持，harness SHA `5d0d4ded654c03381074b149cedcc87edccf64d61ac5ea2a5cbfd944befe2691`。首轮fixture状态预期错误和继发锁Poison原件保留。直接自审，无新独立Approved；本次没有全量/release/安装或生产业务读写。
+- H02仍剩：V1 event/manifest/projection内容和完整Genesis/执行/裁定/经济重放；真实SQL/capture/COMMIT/source-tail/provider资格与H01汇合。下一内容扫描在仍存活的第二窗口追加；已关闭的LocalAuditContentChecked不允许新增reader或升级成Financial。H03–H06及整体阶段仍按原卡验收。
+- Windows接续已确认：本次补读 [Windows主交接](/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/WINDOWS_CODEX_HANDOFF_20261002.md)、[Mac下一步清单](/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/MAC_CODEX_NEXT_STEPS_20261006.md)与f57c源/CI/audit报告，核两个包和已有ACK原件；续办消息成功发送，对方实际active并确认ACK后继续audit失败检查及覆盖缺口。最新88.84%/audit网络失败保持，不记发布完成。Rubin/Muse与财务披露的查询实体、窗口、逐来源命中/失败和原标题/链接/日期须独立验收，不用SDK行覆盖率替代。
+
+本机原日志、失败回执、源码前后清单及最终harness身份见 [H02执行计划](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/.planning/2026-10-06-financial-content-hashes/task_plan.md)。这些本机证据不默认随Git交付，测试子集也不作为M0–M7全部完成证明。
