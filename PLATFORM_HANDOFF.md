@@ -706,3 +706,13 @@ Desktop外R2 source751件全部与Git3f字节一致，normalrelease三个binary�
 Windows2023测试/Clippy/doc/合规实际通过、规范Git1092文件和21工具控制已双端核验；但原coverage结构门实跑拒绝4处critical内联测试，无实测coverage/同eeaCI，不得用工具控制代替。原keepalive全局同名唯一实例，start/stop绑定正式根与agent，不能并行候选，未按改名/换端口旁路。VM已直接读取本主任务的人类开发/协调/提交远端/上线指令，确认授权、开始另立四处测试搬移修复/独立review/CI，保留eea原封存与正式4e。之后需新SDK精确tuple、Mac重绑、受审维护窗口方案、精确activation人审与动态单实例/数据门，再同版业务RPC和观察。不能批准或切换已知不满足SDK门的eea候选。
 
 当前生产仍f517/4e/schema9、原两DB dev/ino、78Uncertain隔离保持。Schema14/e6/资金/Financial/native/WG07及自然窗口另按既有计划推进；全部上线目标尚未达到，heartbeat保持ACTIVE。下一owner先读此节及最新VM交付，不重跑14项已过源码测试，不把R1或未批准JSON当上线许可。
+
+## 2026-10-06 SDK 覆盖率修复已推送，精确 HEAD CI 正在运行
+
+Windows 新源码 `cfdb27683cd06ed51fbfb1c8f4c129067b21c935`（父eea、tree `29391f4e011c3b16310d161f57f672dede5c1259`）已推送 `codex/coverage-critical-tests-20261006`。仅8个Rust路径的四处测试外置及1份设计；61原测试体、断言与四个生产前缀保持，checker/80/95/critical集合未改。新源303受影响库测试、workspace2023通过/3ignored、doctest12通过/3ignored，以及fmt/check/Clippy/rustdoc/暂存后合规已完成；两独立Standards/Spec审阅0源码发现。Windows文档checker初次原生崩溃与未跟踪合规失败保留，333链接同命令复现退出0不表示崩溃已修复。
+
+Root实际核验公开23文件包 `windows-critical-test-source-review-20261006.1`（manifest `6c3e62f4a3667c877ce23eb26c658565f0f5f4560b442f334f76b175574749a5`），从规范eea1092加9Git增量独立重建1097blob tree，原日志计数和61原测试正文匹配。6 checked raw相同、3为CRLF前缀/LF新尾部，其真实snapshot SHA已重建匹配。原生286B commit对象重算SHA-1精确cfdb；Root通过GitHub API独立核对commit/tree/parent和远端feature ref。Root核验器三项EOL/trace假设失败及诊断修正另存，未改封存包或重复Rust suite。
+
+现有[security.yml运行37430519677](https://github.com/Northofqing/magic-market-data-rs/actions/runs/37430519677)于07:34:35Z触发，event=workflow_dispatch、head_sha精确cfdb。Root API快照看到audit job112160058704成功，coverage job112160058874正在Produce coverage evidence；此处尚无JSON、80/95结果或新SDK release tuple。不是上线记录。Gate A设计明确实际发布门合格后才生成runtime candidate，CI期间保持原正式服务。VM本轮已完成源码交接并idle；Root持有实际CI run/job句柄继续等待，结果出来后依原授权续办同一个VM任务，无需重复派源码审阅。
+
+接续顺序：实际CI结果/原JSON/阈值日志→必要缺口修复或合格后的SDK完整构建开始快照与新release tuple→Mac最小重绑/定向验证/独立复核/新release→具体维护窗口控制及精确activation人审→同实例真实RPC/桥接/生产观察。R2仍绑定eea/29a，不得混用cfdb；17:00未批准R2预览不触发切换。共享目录ACK、两审阅、publication-ci及mac-publication-readback原件均在Desktop主目录client-bundle包外，未推入Git；[发布准备记录](docs/ops/2026-10-06-sdk-platform-release-preparation.md)保留摘要。本轮没有新安装/停止/启动/Schema14或资金批准。

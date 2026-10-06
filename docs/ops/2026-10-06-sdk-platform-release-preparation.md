@@ -80,3 +80,15 @@ CLI实际输出紧凑五字段、九位UTC纳秒Z与单LF。指定不存在的�
 完整R2公共交付包 `client-bundle/mac-sdk-eea-release-r2-20261006.1`，40成员+manifest共41件，83,525,028成员字节，manifest SHA `2b7c1131890b74f24e9b7a84cb45859453c36f12bc7ecfefaad8007d810e1807`。含全部751 Git匹配源字节、三binary、原测试/失败与独立review、完整构建/dry-run/preview证据；私有env/Token/证书/密钥/DB不在包内。已成功发送原VM任务要求独立回读；未把工具发送成功写成对方已验收。
 
 VM最新实际已从Mac原生主任务读取直接人类开发/远端提交/上线原文，确认授权并开始四处测试搬移和独立审查/CI，不再重复要求同一开发授权。它保持原4e与控制文件。源码与工具本地验收完成，SDK新同版coverage/运行证据、精确人审、双端切换及生产观察仍未完成；M0–M7和M8最终裁定不因此关闭。
+
+## SDK 修复提交、独立读回与实际 CI
+
+新SDK机械修复为 `cfdb27683cd06ed51fbfb1c8f4c129067b21c935`，父eea、tree `29391f4e011c3b16310d161f57f672dede5c1259`；非force推送至 `codex/coverage-critical-tests-20261006` 并由Root GitHub API独立核对远端精确OID。仅四处cfg(test)/path外置、四个新测试文件及设计，共9路径；生产逻辑、原61测试/辅助/断言、合同、依赖、准入、critical集合/checker和80/95保持。
+
+新源原日志由Root独立解析：受影响三库303通过/0失败/0ignored；workspace2023通过/0失败/3ignored；doctest12通过/0失败/3ignored。fmt、all-targets/all-features check、Clippy -D warnings、rustdoc、暂存后原合规及diff检查退出0。两个独立Standards/Spec报告均0源码发现；Spec没有独立检查此前结构RED/GREEN工具输出，不把报告补造为实测coverage。Windows原docs checker执行0xC0000005崩溃、初次4未跟踪文件合规拒绝仍封存；同checker/命令/源码的333存在性检查复现退出0，不声称原生崩溃已修复。
+
+公开23文件增量/日志包 `windows-critical-test-source-review-20261006.1` manifest SHA `6c3e62f4a3667c877ce23eb26c658565f0f5f4560b442f334f76b175574749a5`。Root逐项长度/SHA/安全路径核对，9个canonical Git blob加规范eea基线独立重建1097blob tree；原生286B commit正文重算SHA-1精确cfdb，GitHub返回同tree/parent。61原body经独立formatter与新body匹配，生产LF前缀相同。6个checked raw相同，3个原CRLF前缀+新LF尾部重建真实source snapshot SHA；完整Git规范归档不冒称Windows全工作区构建开始快照。Root的三次核验器假设失败另存后按实际字节/trace修正，包未改、Rust suite和21控制未重跑。包外Mac ACK已由Windows实际读取核验；R2的41文件和751受控来源也已取得Windows独立ACK。
+
+[现有security.yml运行37430519677](https://github.com/Northofqing/magic-market-data-rs/actions/runs/37430519677)创建2026-10-06T07:34:35Z，workflow_dispatch、head_sha精确cfdb；Root API独立看到audit成功、coverage job112160058874正在生成证据。这个记录尚无测量JSON、原80/95结果或新的SDK制品元组。旧R2eea二进制不能配cfdb。Gate A设计规定实际发布门合格后生成新runtime候选，CI期间不提前创建/运行候选；Root提出的并行离线构建优化以该具体规则为限，未执行新的SDK build或绕门。
+
+VM源码交接本轮已完成/idle，Root继续持有实际GitHub run/job观察句柄，结果出来后按已有授权续办原VM任务。下一最小切片取决于真实CI：失败保留JSON/日志并针对实际缺口修复；通过才冻结完整新SDK构建开始raw/Git/proto/工具链输入、正常release与实际OUT_DIR descriptor，另封新tuple。随后Mac新绑定/受影响测试/独立复核/新release和实际preview、精确双端维护窗口/activation人审、同实例业务RPC/bridge/生产观察仍必要。没有本轮新生产切换或完整M0–M7结论，原正式服务/认证/数据与78隔离保持。
