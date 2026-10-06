@@ -1,10 +1,13 @@
 //! Durable ordinary Draft material through the existing Unverified outbox.
 //! This is neither a registration-time witness nor a governance/approval issuer.
 
-use super::model_change_draft_v1::ModelChangeDraftV1;
+use super::model_change_draft_v1::{
+    recover_model_change_draft_v1, ModelChangeDraftErrorV1, ModelChangeDraftV1,
+};
 use crate::evidence_retention::outbox_v1::{
-    EnqueueOutcome, HeldOutbox, LocalDisposition, OutboxFault, PendingOutbox, RecoveredPresence,
-    RecoveredUnverified, RecoveryOutcome, StoredUnverified, UnverifiedOutbox,
+    EnqueueOutcome, HeldOutbox, LocalDisposition, MaterialReadObservation, MaterialReadOutcome,
+    OutboxFault, PendingOutbox, RecoveredPresence, RecoveredUnverified, RecoveryOutcome,
+    StoredUnverified, UnverifiedOutbox,
 };
 use crate::evidence_retention::{
     draft_from_claims, DraftClaimsRef, OwnerDomain, TrustState, UnverifiedEvidencePackageDraft,
@@ -31,6 +34,7 @@ enum OutboxReturn {
 struct Frame {
     original: ModelChangeDraftV1,
     slot: String,
+    package_id: String,
     package: Option<UnverifiedEvidencePackageDraft>,
     returned: Option<OutboxReturn>,
     first: Option<DraftMaterialFault>,
@@ -143,6 +147,7 @@ pub(crate) fn prepare_draft_material(
     let mut frame = Frame {
         original,
         slot: String::new(),
+        package_id: String::new(),
         package: None,
         returned: None,
         first: None,
@@ -171,6 +176,7 @@ pub(crate) fn prepare_draft_material(
     match draft_from_claims(claims, frame.original.canonical_bytes()) {
         Ok(package) => {
             frame.package = Some(package);
+            frame.package_id = frame.package.as_ref().unwrap().id().to_owned();
             Ok(DraftMaterialCommand { frame })
         }
         Err(error) => {
@@ -267,6 +273,9 @@ impl StoredDraftMaterial {
     pub(crate) fn family_slot(&self) -> &str {
         &self.frame.slot
     }
+    pub(crate) fn package_id(&self) -> &str {
+        &self.frame.package_id
+    }
     pub(crate) fn generation(&self) -> i64 {
         match self.frame.returned.as_ref() {
             Some(OutboxReturn::Stored(v)) => v.generation,
@@ -340,5 +349,228 @@ impl PendingDraftMaterial {
             panic!("actual Pending")
         };
         assert!(v.test_exhaust_same_work().is_err());
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DraftMaterialReadFault {
+    Input,
+    Outbox(OutboxFault),
+    Envelope,
+    Draft(ModelChangeDraftErrorV1),
+}
+
+enum ReadReturn {
+    Open(UnverifiedOutbox),
+    Held(HeldOutbox),
+    Observed(MaterialReadObservation),
+}
+
+struct ReadFrame {
+    package_id: String,
+    draft_id: String,
+    returned: Option<ReadReturn>,
+    body: Option<Vec<u8>>,
+    original: Option<ModelChangeDraftV1>,
+    first: Option<DraftMaterialReadFault>,
+}
+
+#[must_use = "this read owns the original ordinary material observation"]
+pub(crate) struct DraftMaterialRead {
+    frame: ReadFrame,
+}
+#[must_use = "Held retains the exact query, acquired material and actual failure owner"]
+pub(crate) struct HeldDraftMaterialRead {
+    frame: ReadFrame,
+}
+
+fn material_id(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|v| {
+        v.len() == 64
+            && v.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The containing package was already decoded by the original strict outbox
+/// codec. Borrow only; no serde Value tree or caller-declared raw SQL is used.
+#[derive(serde::Deserialize)]
+struct DraftBodyLoan<'a> {
+    owner_domain: OwnerDomain,
+    owner_schema_claim: &'a str,
+    logical_slot_claim: &'a str,
+    business_day_claim: &'a str,
+    window_start_claim: UtcInstantClaim,
+    window_end_exclusive_claim: UtcInstantClaim,
+    claimed_record_count: Option<u64>,
+    #[serde(borrow)]
+    source_chain_before_claim: Option<&'a str>,
+    #[serde(borrow)]
+    source_chain_after_claim: Option<&'a str>,
+    #[serde(borrow)]
+    artifact_sha256_claim: Option<&'a str>,
+    #[serde(borrow)]
+    activation_id_claim: Option<&'a str>,
+    body_encoding: &'a str,
+    body_length: u64,
+    body_hex: &'a str,
+}
+
+impl ReadFrame {
+    fn read(&mut self) -> Result<(), DraftMaterialReadFault> {
+        use DraftMaterialReadFault as E;
+        if !material_id(&self.package_id, "retention-package-draft-v1:")
+            || !material_id(&self.draft_id, "model-change-draft-v1:sha256:")
+        {
+            return Err(E::Input);
+        }
+        let Some(ReadReturn::Open(outbox)) = self.returned.take() else {
+            unreachable!("actual input owner")
+        };
+        let result = outbox.read_material(self.package_id.clone()); // Fixed bounded query.
+        self.returned = Some(match result {
+            MaterialReadOutcome::Observed(v) => ReadReturn::Observed(v),
+            MaterialReadOutcome::Held(v) => ReadReturn::Held(v),
+        }); // Retain the entire genuine callee return before further decoding.
+        let observed = match self.returned.as_ref().unwrap() {
+            ReadReturn::Observed(v) => v,
+            ReadReturn::Held(v) => return Err(E::Outbox(v.first_fault())),
+            _ => unreachable!("complete actual return"),
+        };
+        let Some(package) = observed.material() else {
+            return Ok(());
+        };
+        let loan: DraftBodyLoan<'_> =
+            serde_json::from_slice(package.as_canonical_bytes()).map_err(|_| E::Envelope)?;
+        if loan.owner_domain != OwnerDomain::Attribution
+            || loan.owner_schema_claim != MATERIAL_SCHEMA
+            || loan.business_day_claim != "1970-01-01"
+            || loan.window_start_claim
+                != (UtcInstantClaim {
+                    unix_seconds: 0,
+                    nanosecond: 0,
+                })
+            || loan.window_end_exclusive_claim
+                != (UtcInstantClaim {
+                    unix_seconds: 1,
+                    nanosecond: 0,
+                })
+            || loan.claimed_record_count != Some(1)
+            || loan.source_chain_before_claim.is_some()
+            || loan.source_chain_after_claim.is_some()
+            || loan.artifact_sha256_claim.is_some()
+            || loan.activation_id_claim.is_some()
+            || loan.body_encoding != "hex"
+            || loan.body_length > 64 * 1024
+            || loan.body_hex.len() != loan.body_length as usize * 2
+        {
+            return Err(E::Envelope);
+        }
+        // This bounded post-read decode begins after the genuine native owner
+        // has completed its read/rollback/close. No Held Work is reset or reused.
+        self.body = Some(vec![0; loan.body_length as usize]);
+        hex::decode_to_slice(loan.body_hex, self.body.as_mut().unwrap())
+            .map_err(|_| E::Envelope)?;
+        let original = recover_model_change_draft_v1(self.body.as_ref().unwrap(), &self.draft_id)
+            .map_err(E::Draft)?;
+        self.original = Some(original); // Keep actual decoder return across the last check.
+        if family_slot(self.original.as_ref().unwrap()) != loan.logical_slot_claim {
+            return Err(E::Envelope);
+        }
+        Ok(())
+    }
+}
+
+/// Caller needs the two saved content IDs, never the original entire Draft.
+/// Neither a found declaration nor absence provides registration/approval proof.
+pub(crate) fn read_draft_material(
+    outbox: UnverifiedOutbox,
+    package_id: String,
+    draft_id: String,
+) -> Result<DraftMaterialRead, HeldDraftMaterialRead> {
+    let mut frame = ReadFrame {
+        package_id,
+        draft_id,
+        returned: Some(ReadReturn::Open(outbox)),
+        body: None,
+        original: None,
+        first: None,
+    };
+    match frame.read() {
+        Ok(()) => Ok(DraftMaterialRead { frame }),
+        Err(error) => {
+            frame.first = Some(error);
+            Err(HeldDraftMaterialRead { frame })
+        }
+    }
+}
+
+impl DraftMaterialRead {
+    pub(crate) fn original(&self) -> Option<&ModelChangeDraftV1> {
+        self.frame.original.as_ref()
+    }
+    pub(crate) fn observed_generation(&self) -> i64 {
+        match self.frame.returned.as_ref() {
+            Some(ReadReturn::Observed(v)) => v.observed_generation(),
+            _ => unreachable!("actual completed read"),
+        }
+    }
+    pub(crate) fn trust(&self) -> TrustState {
+        TrustState::Unverified
+    }
+    pub(crate) fn other_family_materials(&self) -> usize {
+        match self.frame.returned.as_ref() {
+            Some(ReadReturn::Observed(v)) => v.other_slot_materials(),
+            _ => unreachable!("actual completed read"),
+        }
+    }
+}
+
+impl HeldDraftMaterialRead {
+    pub(crate) fn first_fault(&self) -> &DraftMaterialReadFault {
+        self.frame.first.as_ref().expect("actual read fault")
+    }
+    pub(crate) fn package_id(&self) -> &str {
+        &self.frame.package_id
+    }
+    pub(crate) fn draft_id(&self) -> &str {
+        &self.frame.draft_id
+    }
+    pub(crate) fn drain_resources_once(mut self) -> Self {
+        self.frame.returned = match self.frame.returned.take() {
+            Some(ReadReturn::Open(v)) => match v.close() {
+                Ok(()) => None,
+                Err(v) => Some(ReadReturn::Held(v)),
+            },
+            Some(ReadReturn::Held(v)) => Some(ReadReturn::Held(v.drain_resources_once())),
+            other => other,
+        };
+        self
+    }
+}
+
+#[cfg(test)]
+impl HeldDraftMaterialRead {
+    pub(super) fn test_outbox(&self) -> Option<&HeldOutbox> {
+        match self.frame.returned.as_ref() {
+            Some(ReadReturn::Held(v)) => Some(v),
+            _ => None,
+        }
+    }
+    pub(super) fn test_observed_material(&self) -> Option<&UnverifiedEvidencePackageDraft> {
+        match self.frame.returned.as_ref() {
+            Some(ReadReturn::Observed(v)) => v.material(),
+            _ => None,
+        }
+    }
+    pub(super) fn test_original(&self) -> Option<&ModelChangeDraftV1> {
+        self.frame.original.as_ref()
+    }
+    pub(super) fn test_finalize_then_drain(mut self) -> Self {
+        let Some(ReadReturn::Held(v)) = self.frame.returned.take() else {
+            panic!("actual read Held")
+        };
+        self.frame.returned = Some(ReadReturn::Held(v.test_finalize_then_drain()));
+        self
     }
 }

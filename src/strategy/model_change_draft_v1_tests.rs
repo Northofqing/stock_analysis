@@ -601,3 +601,297 @@ fn model_draft_material_family_golden_and_absence_are_not_approval() {
     assert_eq!(missing.original().request(), &r);
     assert!(crate::decision::approved_paper_intent_v1::require_production_approval().is_err());
 }
+
+fn material_read_ok(value: Result<DraftMaterialRead, HeldDraftMaterialRead>) -> DraftMaterialRead {
+    match value {
+        Ok(v) => v,
+        Err(v) => panic!("material read Held {:?}", v.first_fault()),
+    }
+}
+fn material_read_held(
+    value: Result<DraftMaterialRead, HeldDraftMaterialRead>,
+) -> HeldDraftMaterialRead {
+    match value {
+        Err(v) => v,
+        Ok(_) => panic!("expected actual read Held"),
+    }
+}
+
+#[test]
+fn model_draft_read_cold_uses_saved_ids_and_reports_other_family_material() {
+    let r = request();
+    let f = OutboxFixture::new();
+    let stored = material_stored(
+        material_command(build_model_change_draft_v1(&r).unwrap()).persist(material_open(&f), 0),
+    );
+    let package_id = stored.package_id().to_owned();
+    let draft_id = stored.original().draft_id().to_owned();
+    let expected = stored.original().canonical_bytes().to_vec();
+    drop(stored); // No Draft object or raw bytes are passed to the reader.
+    let cold = material_read_ok(read_draft_material(
+        material_open(&f),
+        package_id.clone(),
+        draft_id.clone(),
+    ));
+    assert_eq!(cold.original().unwrap().canonical_bytes(), expected);
+    assert_eq!(cold.original().unwrap().request(), &r);
+    assert_eq!(
+        (
+            cold.observed_generation(),
+            cold.other_family_materials(),
+            cold.trust()
+        ),
+        (1, 0, TrustState::Unverified)
+    );
+    let mut changed = r;
+    changed.sample_policy.maximum_drawdown_bps += 1;
+    let conflict = material_stored(
+        material_command(build_model_change_draft_v1(&changed).unwrap())
+            .persist(material_open(&f), 1),
+    );
+    assert_eq!(conflict.disposition(), LocalDisposition::Conflict);
+    let new_id = conflict.package_id().to_owned();
+    let new_draft_id = conflict.original().draft_id().to_owned();
+    drop(conflict);
+    let old = material_read_ok(read_draft_material(material_open(&f), package_id, draft_id));
+    assert_eq!(old.original().unwrap().canonical_bytes(), expected);
+    assert_eq!(
+        (old.observed_generation(), old.other_family_materials()),
+        (2, 1)
+    );
+    let conflicted = material_read_ok(read_draft_material(material_open(&f), new_id, new_draft_id));
+    assert_eq!(conflicted.original().unwrap().request(), &changed);
+    assert_eq!(conflicted.other_family_materials(), 1);
+    let mut unchanged = material_open(&f);
+    assert_eq!(
+        (
+            unchanged.generation(),
+            unchanged.test_material_count(),
+            unchanged.test_conflict_count()
+        ),
+        (2, 2, 1)
+    );
+    material_close(unchanged);
+}
+
+#[test]
+fn model_draft_read_rejects_wrong_ids_scope_time_size_and_family_after_actual_read() {
+    use crate::evidence_retention::outbox_v1::EnqueueOutcome;
+    use crate::evidence_retention::{
+        draft_from_claims, DraftClaimsRef, OwnerDomain, UtcInstantClaim,
+    };
+    let original = build_model_change_draft_v1(&request()).unwrap();
+    let raw = original.canonical_bytes();
+    let draft_id = original.draft_id();
+    let command = material_command(build_model_change_draft_v1(&request()).unwrap());
+    let slot = command.family_slot().to_owned();
+    drop(command);
+    // Each package is genuinely stored through the same native outbox; these
+    // are ordinary declarations, never foreign approval capabilities.
+    for case in 0..5 {
+        let large = vec![b'a'; 64 * 1024 + 1];
+        let claims = DraftClaimsRef {
+            owner_domain: if case == 0 {
+                OwnerDomain::Data
+            } else {
+                OwnerDomain::Attribution
+            },
+            owner_schema_claim: "model-change-draft-material-v1",
+            logical_slot_claim: if case == 3 {
+                "TEST_CODE_wrong_family"
+            } else {
+                &slot
+            },
+            business_day_claim: "1970-01-01",
+            window_start_claim: UtcInstantClaim {
+                unix_seconds: 0,
+                nanosecond: 0,
+            },
+            window_end_exclusive_claim: UtcInstantClaim {
+                unix_seconds: if case == 1 { 2 } else { 1 },
+                nanosecond: 0,
+            },
+            claimed_record_count: Some(1),
+            source_chain_before_claim: None,
+            source_chain_after_claim: None,
+            artifact_sha256_claim: None,
+            activation_id_claim: None,
+        };
+        let package = draft_from_claims(claims, if case == 2 { &large } else { raw }).unwrap();
+        let package_id = package.id().to_owned();
+        let f = OutboxFixture::new();
+        match material_open(&f).enqueue(package, 0) {
+            EnqueueOutcome::Stored(_) => (),
+            _ => panic!("actual ordinary material store"),
+        }
+        let requested_id = if case == 4 {
+            format!("model-change-draft-v1:sha256:{}", "0".repeat(64))
+        } else {
+            draft_id.to_owned()
+        };
+        let held = material_read_held(read_draft_material(
+            material_open(&f),
+            package_id.clone(),
+            requested_id.clone(),
+        ));
+        assert_eq!(held.package_id(), package_id);
+        assert_eq!(held.draft_id(), requested_id);
+        assert_eq!(held.test_observed_material().unwrap().id(), package_id);
+        if case == 4 {
+            assert_eq!(
+                held.first_fault(),
+                &DraftMaterialReadFault::Draft(ModelChangeDraftErrorV1::IdentityMismatch)
+            );
+        } else {
+            assert_eq!(held.first_fault(), &DraftMaterialReadFault::Envelope);
+        }
+        if case == 3 {
+            assert_eq!(held.test_original().unwrap().canonical_bytes(), raw);
+        } else {
+            assert!(held.test_original().is_none());
+        }
+        drop(held.drain_resources_once());
+        let mut unchanged = material_open(&f);
+        assert_eq!(
+            (unchanged.generation(), unchanged.test_material_count()),
+            (1, 1)
+        );
+        material_close(unchanged);
+    }
+}
+
+#[test]
+fn model_draft_read_close_changed_root_and_same_work_keep_actual_query_and_material() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    let f = OutboxFixture::new();
+    let stored = material_stored(
+        material_command(build_model_change_draft_v1(&request()).unwrap())
+            .persist(material_open(&f), 0),
+    );
+    let package_id = stored.package_id().to_owned();
+    let draft_id = stored.original().draft_id().to_owned();
+    let close = material_open(&f).test_busy_vm();
+    let held = material_read_held(read_draft_material(
+        close,
+        package_id.clone(),
+        draft_id.clone(),
+    ));
+    assert_eq!(
+        held.first_fault(),
+        &DraftMaterialReadFault::Outbox(OutboxFault::CloseHeld)
+    );
+    assert!(held.test_outbox().unwrap().test_connection_retained());
+    assert_eq!(
+        held.test_outbox().unwrap().test_read_id(),
+        Some(package_id.as_str())
+    );
+    assert_eq!(
+        held.test_outbox()
+            .unwrap()
+            .test_selected_material()
+            .unwrap()
+            .id(),
+        package_id
+    );
+    let held = held.test_finalize_then_drain();
+    assert_eq!(
+        held.first_fault(),
+        &DraftMaterialReadFault::Outbox(OutboxFault::CloseHeld)
+    );
+    assert!(!held.test_outbox().unwrap().test_connection_retained());
+    assert_eq!(
+        held.test_outbox()
+            .unwrap()
+            .test_selected_material()
+            .unwrap()
+            .id(),
+        package_id
+    );
+    drop(held.drain_resources_once());
+    let mut short = material_open(&f);
+    assert_eq!(
+        short.test_spend_owned(8 * 1024 * 1024),
+        Err(OutboxFault::Work(ValueError::AllocationLimit))
+    );
+    let held = material_read_held(read_draft_material(
+        short,
+        package_id.clone(),
+        draft_id.clone(),
+    ));
+    assert_eq!(
+        held.first_fault(),
+        &DraftMaterialReadFault::Outbox(OutboxFault::Work(ValueError::AllocationLimit))
+    );
+    assert_eq!(
+        held.test_outbox().unwrap().test_read_id(),
+        Some(package_id.as_str())
+    );
+    drop(held.drain_resources_once());
+    let outbox = material_open(&f);
+    fs::set_permissions(f.directory(), fs::Permissions::from_mode(0o755)).unwrap();
+    let held = material_read_held(read_draft_material(
+        outbox,
+        package_id.clone(),
+        draft_id.clone(),
+    ));
+    assert_eq!(
+        held.first_fault(),
+        &DraftMaterialReadFault::Outbox(OutboxFault::RootBinding)
+    );
+    assert!(held.test_outbox().unwrap().test_connection_retained());
+    drop(held.drain_resources_once());
+    fs::set_permissions(f.directory(), fs::Permissions::from_mode(0o700)).unwrap();
+    let original = material_read_ok(read_draft_material(material_open(&f), package_id, draft_id));
+    assert_eq!(
+        original.original().unwrap().canonical_bytes(),
+        stored.original().canonical_bytes()
+    );
+}
+
+#[test]
+fn model_draft_read_invalid_input_and_absence_do_not_reconstruct_or_approve() {
+    let f = OutboxFixture::new();
+    let draft_id = build_model_change_draft_v1(&request())
+        .unwrap()
+        .draft_id()
+        .to_owned();
+    let absent_id = format!("retention-package-draft-v1:{}", "0".repeat(64));
+    let missing = material_read_ok(read_draft_material(
+        material_open(&f),
+        absent_id,
+        draft_id.clone(),
+    ));
+    assert!(missing.original().is_none());
+    assert_eq!(
+        (
+            missing.observed_generation(),
+            missing.other_family_materials(),
+            missing.trust()
+        ),
+        (0, 0, TrustState::Unverified)
+    );
+    let invalid = "TEST_CODE_invalid".repeat(4096);
+    let pointer = invalid.as_ptr();
+    let held = material_read_held(read_draft_material(
+        material_open(&f).test_busy_vm(),
+        invalid,
+        draft_id,
+    ));
+    assert_eq!(held.first_fault(), &DraftMaterialReadFault::Input);
+    assert_eq!(held.package_id().as_ptr(), pointer);
+    let held = held.drain_resources_once();
+    assert_eq!(held.first_fault(), &DraftMaterialReadFault::Input);
+    assert!(held.test_outbox().unwrap().test_connection_retained());
+    let held = held.test_finalize_then_drain();
+    assert_eq!(held.first_fault(), &DraftMaterialReadFault::Input);
+    assert_eq!(held.package_id().as_ptr(), pointer);
+    drop(held.drain_resources_once());
+    let mut unchanged = material_open(&f);
+    assert_eq!(
+        (unchanged.generation(), unchanged.test_material_count()),
+        (0, 0)
+    );
+    material_close(unchanged);
+    assert!(crate::decision::approved_paper_intent_v1::require_production_approval().is_err());
+}

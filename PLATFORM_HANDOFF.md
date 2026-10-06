@@ -770,3 +770,20 @@ Windows后继已实际收件：f9cf实测CI原阈值35170/39817=88.33%，未达9
 实际新增4/4 PASS、同当前harness原outbox quota/namespace/reuse/conflict及unknown-COMMIT/进程cut两项2/2 PASS，共fresh6不同完整方法。928输入保持；harness SHA `03d7443be59fdf0aaa6a8f3335e0bfd7b60cfd191d94a6d308e0f6100e9f81e2`，新4 log SHA `99bf79011640a9789adbd25aca10ddcfa9839aa95ce4bb7b86a823d7ba51333b`。原五完整Draft codec测试/helper正文实测不变，复用上轮证据；不重复全量/check/build/clippy/release/monitor dry-run。直接自审，本轮未安排独立审阅或部署。
 
 下一片补按保存标识直接载回原文，避免要求重启调用方仍持完整材料。此首片不是完整GovernanceRepository、真实注册时间、评审/晋级状态机或正式策略/决策关联；第5/7和资金/正向F2/Financial/native/PIT/同版SDK生产依赖保持未完成。
+
+
+## 2026-10-06 19:33 CST：治理Draft按保存标识冷读完成
+
+材料持久化首片已实际提交并推送 `4167b7c4d82c318d40e59b97daea8743341df23a`；远端 `stock_analysis/codex/platform-roadmap-implementation-20261002` 完整OID一致。
+
+后继在原 `UnverifiedOutbox` 增加按原package ID的读回。沿原固定根/namespace/native main proof与同一累计Work，在 `BEGIN DEFERRED` 快照中执行原全库存quota、canonical、typed SQL及外键检查；移动实际原package，仅在真实ROLLBACK、consuming close及root/main尾复验成功后返回。读取不新增material/attempt/conflict行。读取路径仍用既有open流程，不能将其称为零文件副作用；没有增加新SQL schema或自由路径入口。
+
+Draft层只需保存的package ID和Draft内容ID即可恢复原完整canonical材料，不再要求重启调用方持有全文。取得真正native返回后才做有界借用envelope/hex解析，明确检查Attribution/schema/无时间哨兵/空来源声明/64KiB上限/原Draft内容身份及家族键。相同家族的其他材料数是快照中的普通计数，不能当作人审冲突裁定。未找到只表示该快照无原件，不能重建材料、重提订单或铸造批准。
+
+真实close失败保查询、实际已取得package、原connection/first fault；输入错误先保原String后拒绝；同Work耗尽、root权限漂移及后续资源排放保持原错误。范围/时间/大小/家族/错误Draft ID均经真实outbox存取后拒绝，家族末检失败仍保实际decoder返回。
+
+新增4/4 PASS；同一当前harness重跑材料写入四项及原outbox两项6/6 PASS，共fresh10不同完整方法。928输入前后保持；manifest `367949fb2898d53ccafa6f5735fa7bd99b290911ceb607ebfdba1d49516fa274`，harness SHA `d7b4a4b61889976d597b62b23f7700cf1080faa86e197a02358d80695fc868a6`，新增4 log SHA `79b7ea82d3a837ac4a6887530449e1d4f59f19d0adac6366d6464f119b4bb638`。回执 `slice-governance-material-read-receipt.json` / `slice-governance-material-read-related-receipt.json` 留本地计划目录。原Draft核心合同文件保持；未重跑全量/check/build/clippy/release/monitor dry-run。直接自审，没有另派独立审阅或记独立Approved。
+
+第5/7仍未整体完成：正式正向F2/资金B审批/seed/cutover、Financial/native/catalog及生产接线；真实策略版本到决策/订单的关联；真实评审证据、预注册时间、同输入/PIT/完整成本与治理状态机仍待实现。当前仅Unverified/DeclaredReferencesOnly Draft子集，无Promoted、人审或交易能力；本批没有生产安装或库迁移。
+
+Windows最新f57c原CI run37446154439测得critical35372/39817=88.84%，仍低于原95；overall84.93%满足80。audit job因RustSec advisory DB网络读取失败，没有完成漏洞扫描结论。Root实际核验coverage包9成员加manifest（manifestSHA `a97a575864f428bbaa3954e95b282508f77d4758a2cb61896147ad0b36a0d8c5`）与source-review包27成员加manifest（`f3421094238060b04ad1cea1fa327bcb3ebfc9d7c6491723d296b3006298d72a`）全部成员bytes/SHA，并读原阈值/审计失败摘录；这只是包回读，没有独立重建f57c树或执行SDK。包外Mac ACK已保存共享目录。向原VM任务续办接口返回 `Timed out waiting for MCP response to fs/createDirectory`，无法确认本次消息送达，不重复投递或称那边已开工。原正式Windows4e/Macf517/R2 eea与78Uncertain保持；新SDK仍无上线资格。

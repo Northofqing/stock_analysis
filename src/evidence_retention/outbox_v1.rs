@@ -98,6 +98,22 @@ pub(crate) enum EnqueueOutcome { Stored(StoredUnverified), Held(HeldOutbox), Pen
 #[must_use]
 pub(crate) enum RecoveryOutcome { Observed(RecoveredUnverified), Held(HeldOutbox), Pending(PendingOutbox) }
 
+/// Ordinary material read from a checked local snapshot. Absence is never
+/// permission to resubmit or manufacture the original facts.
+pub(crate) struct MaterialReadObservation {
+    material: Option<UnverifiedEvidencePackageDraft>,
+    observed_generation: i64,
+    other_slot_materials: usize,
+}
+impl MaterialReadObservation {
+    pub(crate) fn material(&self) -> Option<&UnverifiedEvidencePackageDraft> { self.material.as_ref() }
+    pub(crate) fn observed_generation(&self) -> i64 { self.observed_generation }
+    pub(crate) fn other_slot_materials(&self) -> usize { self.other_slot_materials }
+    pub(crate) fn trust(&self) -> TrustState { TrustState::Unverified }
+}
+#[must_use]
+pub(crate) enum MaterialReadOutcome { Observed(MaterialReadObservation), Held(HeldOutbox) }
+
 struct Frame {
     // The cfg VM precedes the connection in destruction order. Explicit test
     // finalize is required for the Busy-close continuation; Drop is abandonment.
@@ -112,6 +128,8 @@ struct Frame {
     init_path: PathBuf, namespace_path: PathBuf, journal_path: PathBuf, work: Work, first: Option<OutboxFault>,
     errors: [Option<SqlError>; 3], inventory: Vec<UnverifiedEvidencePackageDraft>,
     command: Option<UnverifiedEvidencePackageDraft>, generation: i64, command_generation: Option<i64>,
+    read_id: Option<String>, selected_material: Option<UnverifiedEvidencePackageDraft>,
+    other_slot_materials: usize,
     disposition: Option<LocalDisposition>, tx: TxState, rollback_attempted: bool, close_attempted: bool,
     init_locked: bool, lease_locked: bool, initialized: bool,
     #[cfg(test)] observation: TestCommitObservation,
@@ -134,6 +152,8 @@ impl Frame {
             namespace_lock: None, journal: None, census: None, root_path: route.to_path_buf(), data_path,
             directory_path, main_path, init_path, namespace_path, journal_path, work, first, errors: [None, None, None], inventory: Vec::new(),
             command: None, generation: 0, command_generation: None, disposition: None,
+            read_id: None, selected_material: None,
+            other_slot_materials: 0,
             tx: TxState::None, rollback_attempted: false, close_attempted: false,
             init_locked: false, lease_locked: false, initialized: false,
             #[cfg(test)] observation: TestCommitObservation::Normal }
@@ -505,6 +525,53 @@ impl UnverifiedOutbox {
     }
     pub(crate) fn generation(&self) -> i64 { self.frame.generation }
     pub(crate) fn trust(&self) -> TrustState { TrustState::Unverified }
+    /// Select by original package ID in a read transaction, returning the
+    /// original acquired value only after rollback and consuming close succeed.
+    pub(crate) fn read_material(mut self, id: String) -> MaterialReadOutcome {
+        self.frame.read_id = Some(id); // Retain the exact query before admission.
+        let result = (|| -> Result<(), OutboxFault> {
+            if self.frame.first.is_some() || !self.frame.initialized {
+                return Err(self.frame.first.unwrap_or(OutboxFault::ForeignShape));
+            }
+            let query_bytes = {
+                let id = self.frame.read_id.as_ref().unwrap();
+                if !super::id_ok(id, super::DP) { return Err(OutboxFault::ForeignShape); }
+                id.len()
+            };
+            self.frame.charge(query_bytes)?;
+            FileExt::try_lock_shared(&self.frame.init_lock.as_ref().unwrap().file)
+                .map_err(|_| OutboxFault::Busy)?;
+            self.frame.init_locked = true;
+            self.frame.binding_tail(false)?;
+            self.frame.execute("BEGIN DEFERRED")?;
+            self.frame.tx = TxState::Active;
+            self.frame.read_inventory()?;
+            if let Some(index) = self.frame.inventory.iter()
+                .position(|value| Some(&value.id) == self.frame.read_id.as_ref()) {
+                // Move the genuine whole decoder return; no re-created package.
+                self.frame.selected_material = Some(self.frame.inventory.remove(index));
+                let selected = self.frame.selected_material.as_ref().unwrap();
+                self.frame.other_slot_materials = self.frame.inventory.iter().filter(|old|
+                    old.owner == selected.owner && old.day == selected.day && old.slot == selected.slot
+                ).count();
+            }
+            self.frame.execute("ROLLBACK")?;
+            self.frame.tx = TxState::RolledBack;
+            self.frame.finish_close()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => MaterialReadOutcome::Observed(MaterialReadObservation {
+                material: self.frame.selected_material.take(),
+                observed_generation: self.frame.generation,
+                other_slot_materials: self.frame.other_slot_materials,
+            }),
+            Err(fault) => {
+                self.frame.fault(fault);
+                MaterialReadOutcome::Held(HeldOutbox { frame: self.frame })
+            }
+        }
+    }
     pub(crate) fn enqueue(mut self, draft: UnverifiedEvidencePackageDraft, expected_generation: i64) -> EnqueueOutcome {
         self.frame.command = Some(draft); // Own the caller's real value before any admission/phase decision.
         match self.frame.enqueue(expected_generation) {
@@ -620,6 +687,8 @@ impl UnverifiedOutbox {
 impl HeldOutbox {
     pub(crate) fn test_connection_retained(&self) -> bool { self.frame.connection.is_some() }
     pub(crate) fn test_command_retained(&self) -> bool { self.frame.command.is_some() }
+    pub(crate) fn test_read_id(&self) -> Option<&str> { self.frame.read_id.as_deref() }
+    pub(crate) fn test_selected_material(&self) -> Option<&UnverifiedEvidencePackageDraft> { self.frame.selected_material.as_ref() }
     pub(super) fn test_inventory_retained(&self) -> bool { !self.frame.inventory.is_empty() }
     pub(crate) fn test_finalize_then_drain(mut self) -> Self {
         let mut vm = self.frame.vm.take().expect("real held VM");
