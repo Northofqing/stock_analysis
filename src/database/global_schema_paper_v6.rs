@@ -1461,3 +1461,35 @@ mod tests {
         drop(frame); // Explicit fixture teardown, not production recovery/retry.
     }
 }
+
+
+// A specialized cfg-only short loan of the fixed execution's actual owner.
+// Work's address identifies two observations in the same stable test placement;
+// it is not a persistent origin/connection witness across moves.
+#[cfg(test)]
+impl<'db, 'a> RetainedPaperWrite<
+    'db,
+    crate::trading::paper_book_v2_execution::RetainedExecutionInput<'a>,
+    crate::trading::paper_book_v2_execution::RetainedExecutionAcquired,
+    crate::trading::paper_ledger::LedgerError,
+> {
+    pub(crate) fn observe_fixed_execution_for_test(&self) -> (
+        &crate::trading::paper_book_v2_execution::RetainedExecutionInput<'a>,
+        Option<&crate::trading::paper_book_v2_execution::RetainedExecutionAcquired>,
+        Option<(usize, usize)>,
+        Option<&crate::trading::paper_ledger::LedgerError>,
+        (bool, bool, bool),
+    ) {
+        let work = self.session.as_ref().map(|session| {
+            (&session.work as *const RefCell<CopyWork> as usize,
+                session.work.borrow().remaining_for_test())
+        });
+        let consumer = match self.callback_fault.as_ref() {
+            Some(RetainedPaperCallbackFault::Consumer(error)) => Some(error),
+            _ => None,
+        };
+        (&self.input, self.value.as_ref(), work, consumer,
+            (self.first_fault == Some(RetainedPaperFirstFault::Callback),
+                self.driver_boundary.is_some(), self.readback_boundary.is_some()))
+    }
+}

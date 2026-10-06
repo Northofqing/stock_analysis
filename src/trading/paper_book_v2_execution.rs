@@ -4823,3 +4823,22 @@ pub(crate) fn retained_execution_command_for_test<'i, 'a>(
 ) -> &'i PaperV2Command {
     &input.command
 }
+
+
+/// The existing constructor-issued Test manager is the only permitted source of
+/// this fixed-clock route. Input is owned before that origin check can fail.
+#[cfg(test)]
+pub(crate) fn apply_retained_for_isolated_test<'db, 'a>(
+    db: &'db DatabaseManager,
+    account: &'a str,
+    command: PaperV2Command,
+    now: DateTime<Utc>,
+) -> RetainedExecutionOutcome<'db, 'a> {
+    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWrite, RetainedPaperWriteOutcome};
+    let input = retained_execution_input(account, command);
+    if !db.has_isolated_p05_consumer_origin() {
+        return RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(
+            input, PaperCatalog6Error::Catalog6RequalificationRequired));
+    }
+    retained_execution_run(db, input, Some(now))
+}

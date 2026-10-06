@@ -17,3 +17,14 @@
 运行回执与静态回退备份在 `/Users/zhangzhen/.local/share/stock-analysis-news-critical-rollout-20261006`；最终回执 `deployment-final-receipt-fix6.json` SHA `0b238b73648808cc8f1084ac8bb6a85222968d0001a6c556f81511eeebdd293c`。回退只恢复同根源码、二进制与 activation，保留当前 DB/WAL/审计/投递状态。
 
 尚未验收自然 N01 scored event/远端 Accepted、N02 自然窗口或30秒现场延时。真实空 instruments 宏观消息的独立 GlobalCritical purpose 正在另一个 Source 包开发，尚未纳入本版本；非空非法证券不回退为宏观。
+
+
+## 09:16 CST 后继：Global importance 与 News freshness
+
+部署提交 `1c7aeca770fbd05276f1f05760cc69c916620300`；Source17/完整740输入、monitor与activation_prepare均安装，monitor PID85249 / bridge56417，原DB身份保持。release monitor SHA `d04e64ab569cf3856eeb1c949211d577220e192ae9950f7b196f33ee2364b944`，最终17定向回归及独立DATA接受，release与同版61项dry-run成功，未外发演练消息。
+
+Root上一安装脚本用秒精度写effective_from，违反严格 UTC nanosecond时间格式，导致后续激活校验宽映射proposal_missing及59项未激活模板。保留原ACT/审批、两次拒绝演练、只改同瞬时时间格式的修复记录及独立诊断；61项约束未降低。新安装使用9位纳秒，实际新配置 hash `bccc907659fbf1464294de3e53d4f35adec89b2b87660280a5f64806fe110edf`，生效 `2026-10-06T01:14:01.833356000Z`。本节纠正上节旧activation格式，不将旧启动/采集证据扩成有效selection资格。
+
+09:15四源 available 合计71：20/19/20/12。09:16 fresh heartbeat/snapshot但全局仍Frozen/Unsafe，缺Quote/Kline/MoneyFlow/News/OrderBook；News的逐记录资格/状态正在诊断。部署回执及静态回退在 `/Users/zhangzhen/.local/share/stock-analysis-news-global-health-rollout-20261006`，final receipt SHA `b8ca8490b8d7fb114875958e901979487b95d725809ad01d41d6842d7bad70eb`。
+
+本版已有真正空instruments公共importance→完整audit/readback→同Gate/v8，原现5次工作/40次检查/5槽保持。公共Global实时批次仍受交易时段门，正在独立修正；未称假期即时推送、远端Accepted/N02自然窗口/30秒达成，也未部署资金或原生平台改动。

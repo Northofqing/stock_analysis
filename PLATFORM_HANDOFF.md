@@ -651,3 +651,18 @@ Zstd 单次 seal 内成功组复用及 Lz4/相关控制已完成 fresh14：六�
 资金 retained writer 两叶已加入普通资源 owner：callback返回T先入外槽，后续tail/真实COMMIT/reader错误保持原input/T/session/累计Work，不自动重跑；原borrowed/default路径不改。new4+related4真实8项PASS，Source/Data独立复核通过。直接apply_retained_actual只证普通singleton无constructor-origin时Unopened拒绝仍保原Cancel三个String buffer和首错；该切口尚未创建retained session/CopyWork，未证明fixed成功postCOMMIT或资金审批。generic另证真实COMMIT/reader与deferredFK callee错误。
 
 资金实现仅DEV，未部署资金/Financial/native资格；原NotIssued资料存储继续保持。当前下一业务主线是真实empty instruments宏观N01独立importance审计到同Gate/v8投递，共享现5次额度/40次检查/5槽，N02顺序与原日quota/threshold不变。宏观Source包未apply、未测试或上线。
+
+
+## 2026-10-06 09:16 CST 公共宏观新闻审计上线与固定资金执行隔离验证
+
+新闻提交 `1c7aeca770fbd05276f1f05760cc69c916620300` 已部署至原生产根。真正空 instruments 的公共宏观消息使用独立 importance receipt 与不可变 SQLite 全文证据，再进入原单一 Gate/v8 投递；非空非法证券不回退为宏观。混合工作仍共享每轮5次、40次检查及5个 completion 槽，N02/旧日 quota 与账户风险规则保持。新的 News 健康只接受实际原始批次中通过校验且发布/观察均在300秒内的内容，同一旧发布不能因轮询续期。
+
+最终17项定向回归全部通过并独立 DATA 接受；生产 release 两目标成功，同一制品61项 dry-run通过且 external_process_attempted/receipt_audit_appended=0。新闻 release monitor SHA `d04e64ab569cf3856eeb1c949211d577220e192ae9950f7b196f33ee2364b944`。Root发现并修正上次安装脚本将激活时间写成秒精度的错误：严格纳秒解析此前拒绝 activation，N01/N02在演练中成为 Disabled/59项。原件、两次拒绝演练与同一时刻的规范化修复证据保留，61项标准未降低；新的安装脚本使用9位纳秒 UTC Z。
+
+新的 activation config hash `bccc907659fbf1464294de3e53d4f35adec89b2b87660280a5f64806fe110edf`，effective_from `2026-10-06T01:14:01.833356000Z`。单 monitor PID85249，桥接PID56417保持；Source740、实际二进制、cwd和原两库路径/dev/ino核对一致，未复制替换DB。09:15首轮四源 available 共71条（Eastmoney20、Jin10 19、CLS20、ThePaper12），数量不证明每条新鲜或远端Accepted。闭合部署回执位于 `/Users/zhangzhen/.local/share/stock-analysis-news-global-health-rollout-20261006/final-deployment-receipt.json`，SHA `b8ca8490b8d7fb114875958e901979487b95d725809ad01d41d6842d7bad70eb`。
+
+09:16实际 Health snapshot/heartbeat fresh，仍 Frozen/Unsafe、account_metrics_complete=false，缺 Quote/Kline/MoneyFlow/News/OrderBook。新闻健康的现场 News 缺失正在有限诊断，不能由 batch source_at 或 available 数量代替实际逐记录资格；账户最新实际汇总9月28日且原超仓冻结仍未由真实新账户事实解除。公共 Global 的实时分析仍被旧 selection+交易时段门阻断，独立后继正在唯一 shadow 叶修正；普通/canonical证券保原门，当前不能称假期实时推送或30秒/远端Accepted已验收。
+
+资金新增 cfg-only 固定执行 bridge 与原 owner 的只读观察接口，在真 constructor-isolated SQLite 覆盖 Cancel真正COMMIT+独立回读Complete、schema/子进程改动后的 Pending、stale/writer-tail首错及原非Clone input/T/累计Work保留。原生产 body和三个完整旧前缀保持。new3+related2共5项同版 fresh PASS，独立 Source/DATA接受；回执 `Root-paper-retained-fixed-success-fresh5-passed-receipt.json` SHA `69e51754c5c5bad3014eee6dcf78f22768d08196870152aa91713c2e3276711e`。本地提交仅DEV，不部署资金、不自动重跑SQL、不授资金批准/Financial/native/cutover或 consuming-close成功。
+
+下一步先完成公共 Global 的非交易时段准入定向验证和另次部署，再按真实能力推进平台接线。完整金融审计/hash/经济重放、生产 writer/catalog资格、真实构建 record/issuer/native/provider/layout、长期留存与自然运行验收仍未完成；不以局部测试把全平台标完成。
