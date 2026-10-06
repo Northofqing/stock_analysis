@@ -14,6 +14,7 @@ pub const COUNTED_DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 3;
 pub const SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 4;
 pub const NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 5;
 pub const NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION: u32 = 7;
+pub const NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION: u32 = 8;
 pub const NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION: u32 = 6;
 pub const DELIVERY_SUBJECT_HASH_DOMAIN: &str = "stock_analysis.delivery_subject.v2";
 pub const DELIVERY_IDENTITY_HASH_DOMAIN: &str = "stock_analysis.delivery_identity.v2";
@@ -231,6 +232,8 @@ impl NewsFlashTransactionStage {
 pub struct PushDeliveryEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub news_critical_evidence: Option<crate::monitor::news_ai::CriticalNewsEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub news_global_critical_evidence: Option<crate::monitor::news_ai::GlobalCriticalEvidence>,
     pub kind: String,
     pub outcome: String,
     pub decision_status: String,
@@ -370,6 +373,7 @@ impl PushDeliveryEvent {
             source_batch_id: None,
             source_content_sha256: None,
             news_critical_evidence: None,
+            news_global_critical_evidence: None,
             news_flash_sources: None,
             news_flash_reservation_sha256: None,
             news_flash_evidence_sha256: None,
@@ -758,6 +762,7 @@ impl DomainEvent for PushDeliveryEvent {
                 | NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION
                 | NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION
                 | NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION
+                | NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION
         ) {
             return Err(EnvelopeError::InvalidDeliveryAuditField(
                 "audit_schema_version".into(),
@@ -783,7 +788,7 @@ impl DomainEvent for PushDeliveryEvent {
             SOURCE_BATCH_DELIVERY_AUDIT_SCHEMA_VERSION => {
                 SOURCE_BATCH_DELIVERY_AUDIT_RULE_IDS.as_slice()
             }
-            NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION => {
+            NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION => {
                 NEWS_FLASH_DELIVERY_AUDIT_RULE_IDS.as_slice()
             }
             NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION => NEWS_FLASH_FAILURE_AUDIT_RULE_IDS.as_slice(),
@@ -958,10 +963,13 @@ impl DomainEvent for PushDeliveryEvent {
                 "non-source-batch audit must not contain source batch lineage".into(),
             ));
         }
+        if self.audit_schema_version != NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION && self.news_global_critical_evidence.is_some() {
+            return Err(EnvelopeError::InvalidDeliveryAuditField("global evidence requires schema v8".into()));
+        }
         if self.audit_schema_version != NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION && self.news_critical_evidence.is_some() {
             return Err(EnvelopeError::InvalidDeliveryAuditField("critical evidence requires schema v7".into()));
         }
-        if matches!(self.audit_schema_version, NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION) {
+        if matches!(self.audit_schema_version, NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION) {
             let sources = self
                 .news_flash_sources
                 .as_deref()
@@ -990,7 +998,18 @@ impl DomainEvent for PushDeliveryEvent {
                 .news_flash_render_sha256
                 .as_deref()
                 .expect("NewsFlash hashes checked");
-            let actual_evidence = if self.audit_schema_version == NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION {
+            let actual_evidence = if self.audit_schema_version == NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION {
+                let score = self.news_global_critical_evidence.as_ref().ok_or_else(||EnvelopeError::InvalidDeliveryAuditField("global N01 evidence missing".into()))?;
+                let source = score.source().map_err(|e|EnvelopeError::InvalidDeliveryAuditField(e.to_string()))?;
+                score.validate_delivery(self.news_flash_business_date.ok_or_else(||EnvelopeError::InvalidDeliveryAuditField("global N01 day missing".into()))?,
+                    self.news_flash_attempt_observed_at.ok_or_else(||EnvelopeError::InvalidDeliveryAuditField("global N01 attempt time missing".into()))?)
+                    .map_err(|e|EnvelopeError::InvalidDeliveryAuditField(e.to_string()))?;
+                if self.kind != "news_flash_critical_v1" || self.news_flash_transaction_stage.is_none()
+                    || sources != [source].as_slice() || self.news_flash_decision_key.as_deref() != Some(score.event_id().map_err(|e|EnvelopeError::InvalidDeliveryAuditField(e.to_string()))?.as_str()) {
+                    return Err(EnvelopeError::InvalidDeliveryAuditField("global N01 source/purpose/code/business binding changed".into()));
+                }
+                score.digest().map_err(|e|EnvelopeError::InvalidDeliveryAuditField(e.to_string()))?
+            } else if self.audit_schema_version == NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION {
                 let score = self.news_critical_evidence.as_ref().ok_or_else(||EnvelopeError::InvalidDeliveryAuditField("N01 score missing".into()))?;
                 let source = score.source().map_err(|e|EnvelopeError::InvalidDeliveryAuditField(e.to_string()))?;
                 score.validate_delivery(self.news_flash_business_date.ok_or_else(||EnvelopeError::InvalidDeliveryAuditField("N01 day missing".into()))?,

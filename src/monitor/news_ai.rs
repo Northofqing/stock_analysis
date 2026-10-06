@@ -21,9 +21,14 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 #[path = "news_ai/critical_strength.rs"]
 mod critical_strength;
+#[path = "news_ai/global_critical.rs"]
+mod global_critical;
+#[cfg(test)]
+pub(crate) use global_critical::{test_fact as global_test_fact,test_result as global_test_result};
+pub use global_critical::{GlobalCriticalFact, GlobalCriticalIdentity, GlobalCriticalRequest, GlobalCriticalModelResult, GlobalCriticalEvidence, AuditedGlobalCriticalNews};
 #[path = "news_ai/critical_completion.rs"]
 mod critical_completion;
-pub use critical_completion::{critical_news_completion_channel, CriticalCompletionSender,
+pub use critical_completion::{AuditedNewsCritical, critical_news_completion_channel, CriticalCompletionSender,
     CriticalCompletionReceiver, CriticalCompletionWait, CriticalCompletionSubmitted};
 #[cfg(test)]
 pub(crate) use critical_strength::test_result as critical_test_result;
@@ -863,7 +868,7 @@ impl NewsAiAnalysisProfile {
                 ));
             }
         }
-        if self.is_critical() {
+        if self.is_critical() || self.is_global_critical() {
             return Ok(());
         }
         if self.system_sha256 != sha256_hex(NEWS_AI_SYSTEM_PROMPT_V1.as_bytes()) {

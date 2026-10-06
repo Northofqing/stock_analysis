@@ -1,5 +1,14 @@
 //! Bounded ownership handoff; it neither mints scores nor owns a delivery gate.
-use super::AuditedCriticalNews;
+use super::{AuditedCriticalNews, AuditedGlobalCriticalNews};
+
+/// The same five slots own either genuine audited purpose; no constructor capability.
+#[derive(Debug)]
+pub enum AuditedNewsCritical { Equity(AuditedCriticalNews), Global(AuditedGlobalCriticalNews) }
+impl AuditedNewsCritical {
+    pub fn evidence_sha256(&self)->&str { match self { Self::Equity(s)=>s.evidence_sha256(),Self::Global(s)=>s.evidence_sha256() } }
+}
+impl From<AuditedCriticalNews> for AuditedNewsCritical { fn from(value:AuditedCriticalNews)->Self { Self::Equity(value) } }
+impl From<AuditedGlobalCriticalNews> for AuditedNewsCritical { fn from(value:AuditedGlobalCriticalNews)->Self { Self::Global(value) } }
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc::{self, OwnedPermit};
 
@@ -8,29 +17,29 @@ struct State {
     closed: bool,
     // Transfer of the same five queue/permit slots after receiver closure.
     // Kept until the last producer/receiver/slot owner ends; never replayed.
-    retained: Vec<AuditedCriticalNews>,
+    retained: Vec<AuditedNewsCritical>,
 }
 fn state_lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 #[derive(Clone)]
 pub struct CriticalCompletionSender {
-    sender: mpsc::Sender<AuditedCriticalNews>,
+    sender: mpsc::Sender<AuditedNewsCritical>,
     state: Arc<Mutex<State>>,
 }
 pub struct CriticalCompletionReceiver {
-    receiver: mpsc::Receiver<AuditedCriticalNews>,
+    receiver: mpsc::Receiver<AuditedNewsCritical>,
     state: Arc<Mutex<State>>,
 }
 pub struct CriticalCompletionSlot {
-    permit: OwnedPermit<AuditedCriticalNews>,
+    permit: OwnedPermit<AuditedNewsCritical>,
     state: Arc<Mutex<State>>,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct CriticalCompletionClosed;
 #[derive(Debug, PartialEq, Eq)]
 pub enum CriticalCompletionSubmitted { Queued, RetainedReceiverClosed }
-pub enum CriticalCompletionWait { Score(AuditedCriticalNews), Deadline, Closed }
+pub enum CriticalCompletionWait { Score(AuditedNewsCritical), Deadline, Closed }
 
 /// Fixed capacity; opaque slots must be acquired before the existing model call.
 pub fn critical_news_completion_channel() -> (CriticalCompletionSender, CriticalCompletionReceiver) {
@@ -52,7 +61,8 @@ impl CriticalCompletionSender {
 impl CriticalCompletionSlot {
     /// No fallible send after acquiring an actual score. Close and submit share
     /// one short lock: a score is queued or moves into the retained owner.
-    pub fn submit(self, score: AuditedCriticalNews) -> CriticalCompletionSubmitted {
+    pub fn submit(self, score: impl Into<AuditedNewsCritical>) -> CriticalCompletionSubmitted {
+        let score = score.into();
         let mut state = state_lock(&self.state);
         if state.closed {
             state.retained.push(score);
@@ -79,7 +89,7 @@ impl CriticalCompletionReceiver {
             },
         }
     }
-    pub fn try_receive(&mut self) -> Option<AuditedCriticalNews> { self.receiver.try_recv().ok() }
+    pub fn try_receive(&mut self) -> Option<AuditedNewsCritical> { self.receiver.try_recv().ok() }
     pub fn close(&mut self) {
         let mut state = state_lock(&self.state);
         state.closed = true;

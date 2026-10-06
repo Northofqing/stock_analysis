@@ -2907,9 +2907,11 @@ pub(super) async fn push_news_flash_v3(
             attempt_ordinal: reservation.attempt_ordinal(),
             observed_at: attempt_observed_at,
         };
-    let attempt_result = match reservation.critical_score() {
-        Some(score) => stock_analysis::event::publish_critical_news_flash_attempt(attempt_input,score),
-        None => stock_analysis::event::publish_news_flash_attempt(attempt_input),
+    let attempt_result = match (reservation.critical_score(),reservation.global_critical_score()) {
+        (Some(score),None) => stock_analysis::event::publish_critical_news_flash_attempt(attempt_input,score),
+        (None,Some(score)) => stock_analysis::event::publish_global_critical_news_flash_attempt(attempt_input,score),
+        (None,None) => stock_analysis::event::publish_news_flash_attempt(attempt_input),
+        (Some(_),Some(_)) => Err(stock_analysis::event::NewsFlashDeliveryAuditError::InvalidInput("two N01 purposes in reservation".into())),
     };
     let attempt = match attempt_result {
         Ok(attempt) => attempt,

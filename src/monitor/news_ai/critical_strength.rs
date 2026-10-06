@@ -343,3 +343,12 @@ impl CriticalNewsEvidence {
         Ok(())
     }
 }
+
+impl NewsBaseIdentity {
+    pub(super) fn from_exact_parts(provider:&str,item:&str,title:&str,summary:Option<&str>,content:Option<&str>)->Self {
+        let mut revision=Sha256::new();revision.update(b"BR172_NEWS_TEXT_REVISION_V1\0");
+        for value in [Some(title),summary,content] { revision.update([u8::from(value.is_some())]);if let Some(value)=value { hash_field(&mut revision,value); } }
+        Self { provider:provider.into(),item_id:item.into(),text_revision:hex::encode(revision.finalize()) }
+    }
+    pub(crate) fn same_text_revision(&self,other:&Self)->bool { self.text_revision==other.text_revision }
+}

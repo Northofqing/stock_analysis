@@ -569,7 +569,7 @@ impl AuditDispatcher {
         let expected_record = super::push_record::PushRecord::try_from_authoritative(envelope)
             .map_err(|error| ExactAuthorityAppendError::Verification(error.to_string()))?;
         let valid_news_flash_authority = match expected_record.audit_schema_version {
-            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION) => {
+            Some(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION) => {
                 expected_record.news_flash_transaction_stage.is_some()
             }
             Some(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION) => true,
@@ -651,7 +651,7 @@ impl AuditDispatcher {
 
             // New N01 business key is checked under the SAME yearly writer lock.
             // Complete old/new attempt lineage wins over a different revision/profile/hash.
-            if expected_record.audit_schema_version == Some(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION)
+            if matches!(expected_record.audit_schema_version, Some(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION | super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION))
                 && expected_record.news_flash_transaction_stage.as_deref() == Some("SinkAttempt") {
                 let mut reader = read_file.try_clone().map_err(|e|ExactAuthorityAppendError::Persistence(e.to_string()))?;
                 reader.seek(SeekFrom::Start(0)).map_err(|e|ExactAuthorityAppendError::Persistence(e.to_string()))?;
@@ -1001,7 +1001,8 @@ impl AuditDispatcher {
                 .get("audit_schema_version")
                 .and_then(serde_json::Value::as_u64);
             if matches!(audit_schema_version, Some(version) if version == u64::from(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
-                || version == u64::from(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION))
+                || version == u64::from(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION)
+                    || version == u64::from(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION))
             {
                 super::push_record::PushRecord::try_from_authoritative(&envelope).map_err(
                     |error| format!("validate NewsFlash reconcile line {}: {error}", index + 1),
@@ -1882,10 +1883,14 @@ impl Dispatcher for AuditDispatcher {
                 if version
                     == u64::from(super::envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
                     || version == u64::from(super::envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION)
+                    || version == u64::from(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION)
                     || version
                         == u64::from(super::envelope::NEWS_FLASH_FAILURE_AUDIT_SCHEMA_VERSION)
         ) {
-            let rejection = if envelope
+            let rejection = if envelope.payload.get("audit_schema_version").and_then(serde_json::Value::as_u64)
+                == Some(u64::from(super::envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION)) {
+                "BR-244 schema-v8 GlobalCritical authority requires the exact append API"
+            } else if envelope
                 .payload
                 .get("audit_schema_version")
                 .and_then(serde_json::Value::as_u64)

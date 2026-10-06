@@ -8279,6 +8279,11 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                     .await
                 {
                     Ok(batch) => {
+                        if let Err(error) = stock_analysis::news::aggregator::raw_v2::
+                            refresh_news_health_from_raw_batch(&batch)
+                        {
+                            log::warn!("[GlobalNews][NewsHealth] freshness not recorded: {error}");
+                        }
                         let projection =
                             stock_analysis::news::aggregator::raw_v2::project_news_flash_events(
                                 &batch,
@@ -8839,7 +8844,7 @@ async fn wait_for_critical_completions(receiver: &mut stock_analysis::monitor::n
 }
 
 async fn reserve_completed_critical_news(gate: &mut crate::news_aggregator_init::NewsFlashGate,
-    score: stock_analysis::monitor::news_ai::AuditedCriticalNews,threshold:u8,max_per_day:u32) {
+    score: stock_analysis::monitor::news_ai::AuditedNewsCritical,threshold:u8,max_per_day:u32) {
     let now = chrono::Local::now();
     if matches!(stock_analysis::event::runtime_delivery_audit_health(),stock_analysis::event::AuditHealth::Degraded{..}) {
         log::error!("[NewsFlash][BR244] score completion refused: delivery audit degraded"); return;
@@ -8847,7 +8852,12 @@ async fn reserve_completed_critical_news(gate: &mut crate::news_aggregator_init:
     let authority = match stock_analysis::event::reconcile_news_flash_business_date(now.date_naive()) {
         Ok(value)=>value, Err(error)=>{log::error!("[NewsFlash][BR244] critical authority unavailable: {error}");return;}
     };
-    match gate.reserve_critical_from_authority(&authority,score,chrono::Local::now(),threshold,max_per_day) {
+    let now=chrono::Local::now();
+    let reservations=match score {
+        stock_analysis::monitor::news_ai::AuditedNewsCritical::Equity(value)=>gate.reserve_critical_from_authority(&authority,value,now,threshold,max_per_day),
+        stock_analysis::monitor::news_ai::AuditedNewsCritical::Global(value)=>gate.reserve_global_critical_from_authority(&authority,value,now,threshold,max_per_day),
+    };
+    match reservations {
         Ok(reservations)=>{crate::news_aggregator_init::push_flash_reservations(gate,reservations).await;}
         Err(error)=>log::error!("[NewsFlash][BR244] critical completion refused: {error}"),
     }

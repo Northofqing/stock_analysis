@@ -13,9 +13,7 @@
 //! 全批准入已把 OrderBook 接入真实 provider。因此 OrderBook Missing 或超过其 600s
 //! 预算会使 DataMode 降为 Degraded；只有 Quote 断流会使其进入 Unsafe。
 
-#[cfg(test)]
-use chrono::Utc;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Utc};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -649,19 +647,113 @@ pub fn input_from_pairs(
     }
 }
 
-static LAST_CAPABILITY_SUCCESS: OnceLock<RwLock<HashMap<Capability, Instant>>> = OnceLock::new();
+#[derive(Default)]
+pub(crate) struct CapabilitySuccesses {
+    observed: HashMap<Capability, Instant>,
+    news: Option<NewsPublicationSuccess>,
+}
 
-fn capability_successes() -> &'static RwLock<HashMap<Capability, Instant>> {
-    LAST_CAPABILITY_SUCCESS.get_or_init(|| RwLock::new(HashMap::new()))
+struct NewsPublicationSuccess {
+    published_at: DateTime<Utc>,
+    anchor: Instant,
+    last_wall_observation: DateTime<Utc>,
+    last_monotonic_observation: Instant,
+}
+
+impl CapabilitySuccesses {
+    pub(crate) fn input_at(
+        &self,
+        now: Instant,
+        critical_max_age_secs: u64,
+        orderbook_max_age_secs: u64,
+    ) -> DataHealthInput {
+        input_from_successes_at(
+            &self.observed,
+            now,
+            critical_max_age_secs,
+            orderbook_max_age_secs,
+        )
+    }
+
+    fn retain_news_publication(
+        &mut self,
+        qualified: &crate::news::aggregator::raw_v2::QualifiedNewsPublication,
+    ) -> Result<crate::news::aggregator::raw_v2::NewsHealthRefresh, String> {
+        use crate::news::aggregator::raw_v2::NewsHealthRefresh;
+        let published_at = qualified.published_at();
+        let wall = qualified.wall_observation();
+        let monotonic = qualified.monotonic_observation();
+        let age = wall
+            .signed_duration_since(published_at)
+            .to_std()
+            .map_err(|_| "qualified News publication is after observation".to_owned())?;
+        if age > Duration::from_secs(NEWS_MAX_AGE_SECS) {
+            return Err("qualified News publication exceeded its original budget".to_owned());
+        }
+        let anchor = monotonic
+            .checked_sub(age)
+            .ok_or_else(|| "News publication cannot be projected to monotonic time".to_owned())?;
+        if let Some(previous) = self.news.as_mut() {
+            if wall < previous.last_wall_observation
+                || monotonic < previous.last_monotonic_observation
+            {
+                return Err("News observation clock moved backwards".to_owned());
+            }
+            if published_at <= previous.published_at {
+                // Remember the valid observation, never renew the content's anchor.
+                previous.last_wall_observation = wall;
+                previous.last_monotonic_observation = monotonic;
+                return Ok(NewsHealthRefresh::Retained);
+            }
+            if anchor < previous.anchor {
+                return Err("new News publication would regress its monotonic anchor".to_owned());
+            }
+        }
+        self.news = Some(NewsPublicationSuccess {
+            published_at,
+            anchor,
+            last_wall_observation: wall,
+            last_monotonic_observation: monotonic,
+        });
+        self.observed.insert(Capability::News, anchor);
+        Ok(NewsHealthRefresh::Updated)
+    }
+}
+
+static LAST_CAPABILITY_SUCCESS: OnceLock<RwLock<CapabilitySuccesses>> = OnceLock::new();
+
+fn capability_successes() -> &'static RwLock<CapabilitySuccesses> {
+    LAST_CAPABILITY_SUCCESS.get_or_init(|| RwLock::new(CapabilitySuccesses::default()))
 }
 
 /// Record a capability only after its production source and quality checks succeed.
+/// News requires the opaque raw batch qualification, never a fetch-time stamp.
 pub fn mark_capability_success(capability: Capability) -> Result<(), String> {
+    if capability == Capability::News {
+        return Err("News requires an admitted fresh publication".to_owned());
+    }
     capability_successes()
         .write()
         .map_err(|_| "capability success tracker write lock poisoned".to_string())?
+        .observed
         .insert(capability, Instant::now());
     Ok(())
+}
+
+pub(crate) fn mark_qualified_news_success(
+    qualified: &crate::news::aggregator::raw_v2::QualifiedNewsPublication,
+) -> Result<crate::news::aggregator::raw_v2::NewsHealthRefresh, String> {
+    mark_qualified_news_success_on(capability_successes(), qualified)
+}
+
+pub(crate) fn mark_qualified_news_success_on(
+    successes: &RwLock<CapabilitySuccesses>,
+    qualified: &crate::news::aggregator::raw_v2::QualifiedNewsPublication,
+) -> Result<crate::news::aggregator::raw_v2::NewsHealthRefresh, String> {
+    successes
+        .write()
+        .map_err(|_| "capability success tracker write lock poisoned".to_string())?
+        .retain_news_publication(qualified)
 }
 
 fn input_from_successes_at(
@@ -697,8 +789,7 @@ pub fn current_data_health_input(
     let successes = capability_successes()
         .read()
         .map_err(|_| "capability success tracker read lock poisoned".to_string())?;
-    Ok(input_from_successes_at(
-        &successes,
+    Ok(successes.input_at(
         Instant::now(),
         critical_max_age_secs,
         orderbook_max_age_secs,

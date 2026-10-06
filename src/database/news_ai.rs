@@ -7,6 +7,10 @@
 
 #[path = "news_ai/critical_strength.rs"]
 mod critical_strength;
+#[path = "news_ai/global_critical.rs"]
+mod global_critical;
+#[cfg(test)]
+pub(crate) use global_critical::tests::fixture as global_test_fixture;
 
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use diesel::connection::SimpleConnection;
@@ -1928,6 +1932,7 @@ pub(super) fn create_schema(conn: &mut SqliteConnection) -> Result<(), String> {
         .map_err(|error| format!("BR-172 create NewsAI assessment schema: {error}"))?;
     conn.batch_execute(critical_strength::SCHEMA)
         .map_err(|error| format!("BR244 score schema: {error}"))?;
+    conn.batch_execute(global_critical::SCHEMA).map_err(|e|format!("global N01 immutable schema: {e}"))?;
     validate_news_ai_assessment_chain(conn).map_err(|error| error.to_string())?;
     validate_news_ai_delivery_audit(conn)
         .map(|_| ())

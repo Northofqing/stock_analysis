@@ -22,7 +22,7 @@ struct ScoreRow {
     #[diesel(sql_type=Text)] evidence_json: String,
     #[diesel(sql_type=Text)] evidence_sha256: String,
 }
-fn validate_scores(conn: &mut SqliteConnection) -> NewsAiAssessmentAuditResult<()> {
+pub(super) fn validate_scores(conn: &mut SqliteConnection) -> NewsAiAssessmentAuditResult<()> {
     let rows = diesel::sql_query("SELECT assessment_id,news_base_sha256,evidence_json,evidence_sha256 FROM news_ai_n01_score ORDER BY assessment_id")
         .load::<ScoreRow>(conn)?;
     for row in rows {
@@ -52,6 +52,7 @@ fn validate_scores(conn: &mut SqliteConnection) -> NewsAiAssessmentAuditResult<(
 pub(super) fn has_base(conn: &mut SqliteConnection, fact: &AdmittedNewsFact) -> NewsAiAssessmentAuditResult<bool> {
     validate_news_ai_assessment_chain(conn)?;
     validate_scores(conn)?;
+    let global_match = super::global_critical::has_equity_base(conn,fact)?;
     let expected = NewsBaseIdentity::from_fact(fact).map_err(|e|audit(e.to_string()))?;
     let provider = source_provider_tag(fact.provider())?;
     let mut found = false;
@@ -68,7 +69,7 @@ pub(super) fn has_base(conn: &mut SqliteConnection, fact: &AdmittedNewsFact) -> 
         }
         found |= actual == expected;
     }
-    Ok(found)
+    Ok(found || global_match)
 }
 
 pub(super) fn append(conn: &mut SqliteConnection, result: CriticalModelResult)

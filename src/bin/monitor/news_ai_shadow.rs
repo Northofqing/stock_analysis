@@ -423,9 +423,9 @@ async fn run_same_tick_batches(
         log::warn!("[NewsAI] no qualified pre-call model profile; live analysis skipped");
         return;
     };
-    let candidates = exact_candidates(&batches, &profile);
+    let candidates = mixed_candidates(&batches, &profile,analyzer.as_ref().expect("qualified analyzer profile"));
     if candidates.is_empty() {
-        log::debug!("[NewsAI][BR-172] no exact source-bound equity target");
+        log::debug!("[NewsAI][BR-172] no exact source-bound equity or empty-instrument global candidate");
     }
     let mut budget = CandidateVisitBudget::with_worked(
         candidates.len(),
@@ -434,23 +434,30 @@ async fn run_same_tick_batches(
     );
     while let Some(index) = budget.next_index() {
         let candidate = &candidates[index];
-        let designated = AdmittedNewsFact::from_admitted_global(&candidate.batch, candidate.record_index, &candidate.target_code)
-            .ok().and_then(|fact| stock_analysis::monitor::news_ai::canonical_critical_target(&fact))
-            .as_deref() == Some(candidate.target_code.as_str());
-        let outcome = if designated && critical_sender.is_some() {
-            assess_critical_candidate(analyzer.as_ref(), &status, candidate, critical_sender.as_ref().expect("checked sender")).await
-        } else {
-            assess_candidate(analyzer.as_ref(), &status, candidate).await
+        let key=candidate.key();
+        let outcome=match candidate {
+            MixedCandidate::Equity(candidate)=> {
+                let designated = AdmittedNewsFact::from_admitted_global(&candidate.batch, candidate.record_index, &candidate.target_code)
+                    .ok().and_then(|fact| stock_analysis::monitor::news_ai::canonical_critical_target(&fact))
+                    .as_deref() == Some(candidate.target_code.as_str());
+                if designated && critical_sender.is_some() {
+                    assess_critical_candidate(analyzer.as_ref(), &status, candidate, critical_sender.as_ref().expect("checked sender")).await
+                } else { assess_candidate(analyzer.as_ref(), &status, candidate).await }
+            }
+            MixedCandidate::Global { fact,.. }=>match critical_sender.as_ref() {
+                Some(sender)=>assess_global_critical_candidate(analyzer.as_ref(),&status,fact.clone(),sender).await,
+                None=>Err("global completion owner unavailable".into()),
+            },
         };
         let did_work = match outcome {
             Ok(CandidateOutcome::Governed { existing, delivery }) => {
-                stats.record_governed(&candidate.key, existing, delivery)
+                stats.record_governed(key, existing, delivery)
             }
             Ok(CandidateOutcome::AwaitingDeliveryRecovery { existing }) => {
                 stats.deferred += 1;
                 log::warn!(
                     "[NewsAI][BR-172] assessment retained for governed delivery recovery key={} existing={} governed_delivery_recovery={}",
-                    candidate.key,
+                    key,
                     existing,
                     status.governed_delivery_recovery
                 );
@@ -464,7 +471,7 @@ async fn run_same_tick_batches(
                 stats.failed += 1;
                 log::warn!(
                     "[NewsAI][BR-172] candidate failed key={} error={error}",
-                    candidate.key
+                    key
                 );
                 true
             }
@@ -1650,6 +1657,56 @@ mod tests {
         assert!(first.iter().all(|c| c.target_code=="600519" || c.target_code=="600600"));
     }
 
+    #[tokio::test]
+    async fn news_global_n01_mixed_candidates_call_budget_and_slot_refusal() {
+        use stock_analysis::llm::{LlmError,LlmProvider,ReceiptBearingJson};
+        use std::task::Poll;
+        struct Provider(Arc<AtomicUsize>);
+        #[async_trait]
+        impl LlmProvider for Provider {
+            fn name(&self)->&'static str { "TEST_CODE_GLOBAL_PROVIDER" }
+            fn model(&self)->&str { "TEST_CODE_GLOBAL_MODEL" }
+            async fn chat_json(&self,_:&str,_:&str)->Result<serde_json::Value,LlmError> { panic!("receipt seam only") }
+            async fn chat_json_with_receipt(&self,_:&str,_:&str)->Result<ReceiptBearingJson,LlmError> {
+                self.0.fetch_add(1,Ordering::SeqCst);Err(LlmError::ReceiptUnavailable{provider:self.name().into(),model:self.model().into()})
+            }
+        }
+        let calls=Arc::new(AtomicUsize::new(0));let analyzer=NewsAIAnalyzer::new(Arc::new(Provider(calls.clone())));let profile=analyzer.identity_profile().unwrap();
+        let old=v3_revision_batch();let template=old.records()[0].clone();let mut records=old.records().to_vec();
+        for i in 0..45 { let mut r=template.clone();r.item_id=format!("TEST_CODE_GLOBAL_{i}");r.title=format!("TEST_CODE macro {i}");r.instruments.clear();records.push(r); }
+        let mut invalid=template.clone();invalid.item_id="TEST_CODE_INVALID_NONEMPTY".into();invalid.instruments=vec!["not-a-stock".into()];records.push(invalid);
+        let batch=AdmittedGlobalNewsBatch::from_parts(records,old.evidence().clone());let candidates=mixed_candidates(&[batch.clone(),batch.clone()],&profile,&analyzer);
+        assert_eq!(candidates.iter().filter(|c|matches!(c,MixedCandidate::Equity(_))).count(),2);
+        assert_eq!(candidates.iter().filter(|c|matches!(c,MixedCandidate::Global{..})).count(),45);
+        assert_eq!(candidates.iter().map(MixedCandidate::key).collect::<std::collections::BTreeSet<_>>().len(),47);
+        let mut reversed=batch.records().to_vec();reversed.reverse();let backwards=AdmittedGlobalNewsBatch::from_parts(reversed,batch.evidence().clone());
+        assert_eq!(candidates.iter().map(MixedCandidate::key).collect::<Vec<_>>(),mixed_candidates(&[backwards],&profile,&analyzer).iter().map(MixedCandidate::key).collect::<Vec<_>>());
+        for recovered in [0,2,5] {
+            let (tx,_rx)=stock_analysis::monitor::news_ai::critical_news_completion_channel();let before=calls.load(Ordering::SeqCst);let mut budget=CandidateVisitBudget::with_worked(candidates.len(),0,recovered);
+            while let Some(index)=budget.next_index() {
+                // Same cursor and shared work counter: ordinary and global visits consume one allowance.
+                match &candidates[index] {
+                    MixedCandidate::Global{fact,..}=> {
+                        let mut slot=None;
+                        assert!(analyzer.assess_global_critical_if_absent(fact.clone(),|_|async{Ok(false)},|r|async {
+                            slot=Some(tx.reserve().await.map_err(|_|"closed".to_owned())?);Ok(r)
+                        }).await.is_err());drop(slot);
+                    }
+                    MixedCandidate::Equity(_)=> { assert!(Provider(calls.clone()).chat_json_with_receipt("TEST_CODE ordinary system","TEST_CODE ordinary input").await.is_err()); }
+                }
+                budget.record_work(true); // real backend attempt failed; production counts failed attempts
+            }
+            assert_eq!(calls.load(Ordering::SeqCst)-before,5-recovered);assert_eq!(budget.worked,5);assert!(budget.inspected<=40);
+        }
+        let mut history_only=CandidateVisitBudget::new(candidates.len(),0);while history_only.next_index().is_some() { history_only.record_work(false); }assert_eq!(history_only.inspected,40);
+        let (tx,mut rx)=stock_analysis::monitor::news_ai::critical_news_completion_channel();let mut held=Vec::new();for _ in 0..5 { held.push(tx.reserve().await.unwrap()); }
+        let fact=candidates.iter().find_map(|c|if let MixedCandidate::Global{fact,..}=c {Some(fact.clone())}else{None}).unwrap();let before=calls.load(Ordering::SeqCst);
+        let mut pending=Box::pin(analyzer.assess_global_critical_if_absent(fact.clone(),|_|async{Ok(false)},|r|async { let _slot=tx.reserve().await.map_err(|_|"closed".to_owned())?;Ok(r) }));
+        std::future::poll_fn(|cx| { assert!(pending.as_mut().poll(cx).is_pending());Poll::Ready(()) }).await;drop(pending);assert_eq!(calls.load(Ordering::SeqCst),before);
+        rx.close();drop(held);assert!(analyzer.assess_global_critical_if_absent(fact,|_|async{Ok(false)},|r|async { let _slot=tx.reserve().await.map_err(|_|"closed".to_owned())?;Ok(r) }).await.is_err());assert_eq!(calls.load(Ordering::SeqCst),before);
+        // Library SQLite/receipt/event wholes prove successful token handoff; this bin whole does not simulate live delivery.
+    }
+
 }
 
 async fn assess_critical_candidate(
@@ -1702,4 +1759,48 @@ async fn assess_critical_candidate(
         CandidateExecution::CreateAssessmentOnly => Ok(CandidateOutcome::AwaitingDeliveryRecovery{existing:false}),
         _ => unreachable!("typed availability checked before acquisition"),
     }
+}
+
+enum MixedCandidate {
+    Equity(NewsAiCandidate),
+    Global { key:String,fact:stock_analysis::monitor::news_ai::GlobalCriticalFact },
+}
+impl MixedCandidate {
+    fn key(&self)->&str { match self { Self::Equity(c)=>&c.key,Self::Global{key,..}=>key } }
+}
+fn mixed_candidates(batches:&[AdmittedGlobalNewsBatch],profile:&NewsAiAnalysisProfile,analyzer:&NewsAIAnalyzer)->Vec<MixedCandidate> {
+    let mut all=BTreeMap::new();
+    for c in exact_candidates(batches,profile) { all.insert(c.key.clone(),MixedCandidate::Equity(c)); }
+    for batch in batches {
+        for (index,record) in batch.records().iter().enumerate() {
+            if !record.instruments.is_empty() { continue; } // Invalid/non-A-share is never Global.
+            let fact=match stock_analysis::monitor::news_ai::GlobalCriticalFact::from_admitted(batch,index) {
+                Ok(value)=>value,Err(error)=>{log::warn!("[NewsAI] global source refused: {error}");continue;}
+            };
+            let key=match analyzer.global_critical_identity(&fact) { Ok(id)=>id.digest(),Err(error)=>{log::warn!("[NewsAI] global profile refused: {error}");continue;} };
+            all.entry(key.clone()).or_insert(MixedCandidate::Global{key,fact});
+        }
+    }all.into_values().collect()
+}
+async fn assess_global_critical_candidate(analyzer:Option<&NewsAIAnalyzer>,status:&NewsAiRuntimeStatus,
+    fact:stock_analysis::monitor::news_ai::GlobalCriticalFact,sender:&stock_analysis::monitor::news_ai::CriticalCompletionSender)->Result<CandidateOutcome,String> {
+    let execution=status.candidate_execution(false);
+    if execution==CandidateExecution::RejectNewAnalysisUnavailable { return Err("receipt-bearing news_ai unavailable".into()); }
+    let analyzer=analyzer.ok_or_else(||"receipt-bearing news_ai unavailable".to_owned())?;
+    let mut slot=None;let owner=&mut slot;
+    let result=analyzer.assess_global_critical_if_absent(fact,
+        |fact|async move { tokio::task::spawn_blocking(move||stock_analysis::database::get_db().has_audited_global_news_base(&fact)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string()) },
+        |request|async move {
+            *owner=Some(sender.reserve().await.map_err(|_|"global completion receiver closed before model call".to_owned())?);
+            Ok(request)
+        }).await?;
+    let Some(result)=result else { return Ok(CandidateOutcome::AwaitingDeliveryRecovery{existing:true}); };
+    let slot=slot.take().ok_or_else(||"global completion slot missing".to_owned())?;
+    let completion=tokio::task::spawn_blocking(move|| {
+        let score=stock_analysis::database::get_db().append_audited_global_critical_news(result).map_err(|e|e.to_string())?;
+        Ok::<_,String>(slot.submit(score))
+    }).await.map_err(|e|e.to_string())??;
+    if completion==stock_analysis::monitor::news_ai::CriticalCompletionSubmitted::RetainedReceiverClosed { log::warn!("[NewsAI] global audited score retained after receiver closure; no historical remint"); }
+    // This purpose has no stock prediction/delivery record. Its sole sink is the existing NewsFlashGate.
+    Ok(CandidateOutcome::AwaitingDeliveryRecovery{existing:false})
 }
