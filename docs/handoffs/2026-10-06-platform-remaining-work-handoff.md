@@ -208,3 +208,9 @@ Windows原任务：**R08 FuturesDelivery 上游合同与部署**，thread=`01a0e
 本机原日志、失败回执、源码前后清单及最终harness身份见 [H02执行计划](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/.planning/2026-10-06-financial-content-hashes/task_plan.md)。这些本机证据不默认随Git交付，测试子集也不作为M0–M7全部完成证明。
 
 H02源码已提交并推送为 `4ee64e79871893d81d504717cd6989eaf57b507f`，实际远端OID与本地相同。其后Windows交回上述同f57c审计单项重试通过，原coverage失败保持；最新消息另报告新增11项财报入口测试/受影响库122项本地通过，全workspace尚在进行，未提供新提交的95%测量或合格release元组。第10节先前audit网络失败是首次失败快照，后继状态以本段和H07首段为准。
+
+## 11. Windows问题同步（2026-10-06 23:15 CST）
+
+用户直接要求把Windows问题同步解决。详见[双端解决记录](2026-10-06-windows-sync-resolution.md)：原财报WIP后继检查为模块49/库122/workspace2072 PASS、0FAIL、3ignored，但第9步原文档checker以0xC0000005崩溃；原日志/包装器/版本及两组诊断包已回读ACK。冻结输入/LF副本各333次成功仍不能证明原生崩溃修复，Windows继续定位实际launcher/解释器及异常栈。尚无新commit/同HEAD95%CI/release，H07仍open。
+
+Mac已补4成员验收输入包：Rubin/Muse官方文章和精确查询窗口、现网前三A股及财报/披露类型、官方SEC原index核实的两个CIK/10-K、客户端compat/v2消费缺口。原包中CompanyFilings可dispatch表述已在包外勘误并回传；operation名不能代替实际方法准入和consumer。三份Windows新包全部长度/hash/成员集合核验只证明字节回读，未重跑WindowsSDK或执行真实业务。源码仍4ee64e7；本段为文档接续，不改生产身份或财务/资金/Uncertain裁定。
