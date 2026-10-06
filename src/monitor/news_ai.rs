@@ -374,41 +374,7 @@ impl AdmittedNewsFact {
         target_code: &str,
     ) -> Result<Self, NewsAiError> {
         validate_code(target_code)?;
-        validate_batch_evidence(batch)?;
-        if batch.source
-            != expected_global_source(batch.provider).ok_or_else(|| {
-                NewsAiError::NewsEvidenceMismatch(format!(
-                    "provider {} is not an admitted global-news provider",
-                    provider_tag(batch.provider)
-                ))
-            })?
-        {
-            return Err(NewsAiError::NewsEvidenceMismatch(
-                "global-news provider/source contract differs from BR-166".to_owned(),
-            ));
-        }
-        validate_source_evidence(&record.evidence, batch)?;
-        let observed_at = parse_observed_at(&batch.observed_at)?;
-        if record.observed_at != observed_at {
-            return Err(NewsAiError::NewsEvidenceMismatch(
-                "global record observation differs from batch".to_owned(),
-            ));
-        }
-        let record_source_at = record.evidence.source_at().ok_or_else(|| {
-            NewsAiError::NewsEvidenceMismatch(
-                "global record provider publication time is missing".to_owned(),
-            )
-        })?;
-        if parse_source_at(batch.provider, record_source_at)? != record.published_at {
-            return Err(NewsAiError::NewsEvidenceMismatch(
-                "global record publication time differs from record evidence".to_owned(),
-            ));
-        }
-        if record.published_at > record.observed_at {
-            return Err(NewsAiError::NewsEvidenceMismatch(
-                "global record was published after observation".to_owned(),
-            ));
-        }
+        validate_global_record_evidence(record, batch)?;
         if !record
             .instruments
             .iter()
@@ -2341,6 +2307,38 @@ fn validate_batch_evidence(batch: &BatchEvidence) -> Result<(), NewsAiError> {
         ));
     }
     parse_observed_at(&batch.observed_at)?;
+    Ok(())
+}
+
+/// Use the admitted provider's existing wire-time contract without rewriting raw evidence.
+fn validate_global_record_evidence(
+    record: &GlobalNewsRecord, batch: &BatchEvidence,
+) -> Result<(), NewsAiError> {
+    use crate::data_gateway::global_news::{GlobalNewsProvider, parse_global_news_provider_time,
+        validate_global_news_batch_evidence};
+    let provider = match batch.provider {
+        ProviderId::Eastmoney => GlobalNewsProvider::Eastmoney,
+        ProviderId::Cailianpress => GlobalNewsProvider::Cailianpress,
+        ProviderId::Jin10 => GlobalNewsProvider::Jin10,
+        ProviderId::ThePaper => GlobalNewsProvider::ThePaper,
+        _ => return Err(NewsAiError::NewsEvidenceMismatch("global_provider_unsupported".into())),
+    };
+    let (_, observed) = validate_global_news_batch_evidence(provider, batch)
+        .map_err(|_| NewsAiError::NewsEvidenceMismatch("global_batch_evidence_invalid".into()))?;
+    validate_source_evidence(&record.evidence, batch)?;
+    if record.observed_at != observed {
+        return Err(NewsAiError::NewsEvidenceMismatch("global_observation_mismatch".into()));
+    }
+    let raw_source = record.evidence.source_at().ok_or_else(||
+        NewsAiError::NewsEvidenceMismatch("global_publication_missing".into()))?;
+    let published = parse_global_news_provider_time(provider, raw_source)
+        .map_err(|_| NewsAiError::NewsEvidenceMismatch("global_publication_invalid".into()))?;
+    if published != record.published_at {
+        return Err(NewsAiError::NewsEvidenceMismatch("global_publication_mismatch".into()));
+    }
+    if record.published_at > record.observed_at {
+        return Err(NewsAiError::NewsEvidenceMismatch("global_publication_after_observation".into()));
+    }
     Ok(())
 }
 
