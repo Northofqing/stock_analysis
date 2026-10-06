@@ -18,7 +18,8 @@ pub use verifier::{
 #[path = "prediction_outcome_tracker.rs"]
 mod outcome_tracker;
 pub use outcome_tracker::{
-    OutcomeDailyWeeklyObservation, OutcomePeriodObservation, OutcomeSampleCounts, OutcomeTracker,
+    OutcomeDailyWeeklyObservation, OutcomeItemDeliveryStatus, OutcomeItemFeedback,
+    OutcomeItemFeedbackRow, OutcomePeriodObservation, OutcomeSampleCounts, OutcomeTracker,
     PhysicalLinkedOutcomeCounts, PhysicalLinkedOutcomeObservation,
 };
 
