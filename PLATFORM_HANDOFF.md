@@ -746,3 +746,16 @@ Root独立用原globs/exclusions、记录的CI仓库前缀与已核Git路径重�
 后继补重启只读恢复入口，按原账户/epoch/决策引用从完整 execution reader 返回原 sealed RecordedCommandReceipt；无需新批准、行情窗口或时钟，没有 SQL mutation。空结果仅为本次合格快照未找到，不构成新下单许可。隔离 fixture 先实际提交/部分成交，再冷打开原库，在不调用 issuer/window 的情况下恢复原回执，原行及旧 financial payload 字节保持。
 
 新方法1 PASS、同当前 harness 的命令身份 golden/原 cold reopen exact retry/新 partial fill cold retry 三方法3 PASS，共 fresh4；925输入保持。当前 harness SHA `82f7320637c0cf71a589e165b27d2d6e27685d2214de49bc91ae84e4a0653187`、新 log SHA `3c14ea1c4cf4ecea7c798d55b8f3ecf003a0b0e7055623e327df360a35b05cbf`。首片报告与风控逻辑未改，首片10项是上一封存源码的实际证据，未声称当前全部重跑。本后继直接自审，未独立复核、部署或修改 monitor dispatch；第5/7整体与生产依赖仍保持未完成。
+
+
+## 2026-10-06 17:36 CST：治理提案预注册合同
+
+冷恢复后继已实际提交推送 `69cceef8294e9976d8e955a07964efa503d1d1c4`，真实远端 feature ref 一致。继续第7项，在 `strategy/model_change_draft_v1.rs` 实现 BR-042 的不可变普通 Draft 材料：固定 Champion/Challenger/rollback 的策略、模型、声明源码和配置 hash、两个独立 paper book、训练/验证/前瞻窗、共用输入/基准/成交/成本政策、T+1/5/20成熟样本/市场状态/成本后表现/回撤/尾部风险/可用率/多重比较/经济容量阈值，以及假设/变更/风险和反事实说明。
+
+全部字段参与域分离内容身份，无政策默认值。输入与文本边界先检再复制；恢复先限64KiB，再检封闭schema、完整约束、原canonical字节和调用者保存的内容ID。版本别名、同一paper book、重叠窗口和晚于验证窗的声明注册时间拒绝；到期只读分类为Expired，材料仍保留原文。容量阈值是策略承载要求，不是实际投资总资金 B。
+
+**仅 `DeclaredReferencesOnly` Draft 合同**：时间/版本/hash是声明，不能冒充真实注册时间、运行制品、同输入/PIT、资金批准或人审；无配置/订单写入或Promoted转换。完整治理repository及Reviewed→Shadow→PaperChallenger→人工晋级/退役的真实证据链、正式策略版本与决策/账本关联仍未完成，不能关闭第5/7项。
+
+新5/5实际PASS/EXIT0：内容身份变化、冷恢复及拒绝改写/晋级、版本/窗口/双账本、政策/文本预算、到期精确边界。927输入前后相同，manifest `95a3494181adaba051fefec0a92c516756371e22586430882bbdb7f82547322f`、log `9e8af3b66dccf817aee2465cd02e73bb603e1a3f67671e2bab1c439a775d7157`、harness `e13fcb1066cc32a0b63c00fda9999ec23a7f7a5bcf5e6511b3365b7dc72b93dd`。直接自审无另派独立审阅；本片只增新模块/注册与测试，复用限定lib编译，不重复全量/check/build/clippy/release或monitor dry-run。未部署平台。
+
+Windows后继已实际收件：f9cf实测CI原阈值35170/39817=88.33%，未达95；新19a2包20成员加manifest逐字节核对通过，原handler日志14PASS，Root仅包/日志回读，没有重建Git树或独立SDK源码评审/执行。两个包外Mac ACK `578d3f8b`/`d7bd808e`已成功发送原VM任务。GitHub API核对19a2同HEAD run37442001456实际已于09:29:42Z结束failure，coverage112197751056失败、audit112197751191成功；继续原95门禁修复，未生成运行候选、重绑R2或切换正式服务。

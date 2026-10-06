@@ -30,6 +30,7 @@ pub mod core;
 pub mod lot;
 pub mod multi_factor;
 pub mod multi_timeframe;
+pub mod model_change_draft_v1;
 pub mod research_fill_v2;
 pub mod research_portfolio_v2;
 pub mod research_run_descriptor_v2;
