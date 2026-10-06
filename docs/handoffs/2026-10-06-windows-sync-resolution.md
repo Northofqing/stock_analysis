@@ -54,3 +54,15 @@ Mac输入包外 `CLIENT_GAPS_ERRATA.md` 的SHA为 `8f491579a1f72ae0cf8c483244cab
 4. 具体候选具备后复核原认证、监听/写入owner、单实例控制、停止方式与回退，并按精确activation人审发布。取得同版真实逐来源新闻/财报/披露及native/R08证据与生产观察，逐项关闭H07–H08。
 
 本轮Mac仅材料、源码阅读与字节核验，没有Rust修改、Cargo、release、安装、重启、真实业务请求或资金/Uncertain裁定。整体H01–H17和M0–M7仍按[整体交接](2026-10-06-platform-remaining-work-handoff.md)验收，不把同步材料完成记成全部上线完成。私有详细执行证据在 `.planning/2026-10-06-windows-sync-resolution/`，不默认随Git交付。
+
+## 6. 后继披露正反基准与原生排查（23:32 CST）
+
+Windows已在 `WINDOWS_MAC_SYNC_RESPONSE_20261006.md` 确认前包可用于需求验收，列出真正缺项：年报/减持正基准、新新闻来源准入、合格同HEAD release与真实业务回执。Mac继续补 `mac-disclosure-reference-inputs-20261006.1`：2成员8322字节、3文件含manifest，manifest SHA `d8b42930f0203ae615df8405c44ef5ef0af2d006ab30a06189b829886c919278`，已逐成员回读并发送Windows。
+
+- 年报/半年报/预告：002916的[2025年报](https://static.cninfo.com.cn/finalpage/2026-03-13/1225006760.PDF)、[2026半年报](https://static.cninfo.com.cn/finalpage/2026-08-27/1225512708.PDF)、[半年预告](https://static.cninfo.com.cn/finalpage/2026-07-14/1225421321.PDF)，已独立读原PDF的相关标题、证券代码和原报告期间。预告签署7月13日与URL日期7月14日保留为不同字段；没有提取财务数字，也不跨Provider填Hithink的期间null。
+- 减持计划正基准：605178[2026-005计划](https://static.cninfo.com.cn/finalpage/2026-01-30/1224956431.PDF)，已读原标题/证券身份和计划段落；只能支持计划类型，不能据此认定执行完成。
+- 两个实际分类反例：688548[承诺不减持](https://static.cninfo.com.cn/finalpage/2026-07-23/1225437974.PDF)不能按“减持”关键词误分成计划/进展/完成；605178[异动公告](https://static.cninfo.com.cn/finalpage/2026-02-26/1224984774.PDF)引用旧2026-005，不产生新减持事件。均已读相关原段落，原三issuer/2026窗口不变。减持进展/完成及回购股份处置正基准仍未核实。
+
+上述公开原文是有界验收参考，不是RPC命中或正文Provider准入。只保存有限标题/身份/日期/分类条件与URL，未复制PDF全文。URL路径日期只有日精度，未伪造实际发布时间/时区。
+
+Windows新修复turn `01a111cd-de1f-7180-94f8-7e6d315288ee` 实际active，正在使用已有Win32调试API区分进程。第一次调试观测记录launcher、3个真实Bash及rg都退出0，没有抓到访问违例；调试时序可能影响复现，故继续少量无调试器采样取得失败时各进程退出码。仍未提供根因、正式checker修复、新提交95%CI或运行候选。Mac文档前提交 `448cb929d20c6bf134af45e711e64271f1cce94e` 已推送且实际remote匹配，不能由文档提交推定SDK修复完成。
