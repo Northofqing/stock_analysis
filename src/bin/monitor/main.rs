@@ -8279,10 +8279,13 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                     .await
                 {
                     Ok(batch) => {
-                        if let Err(error) = stock_analysis::news::aggregator::raw_v2::
+                        match stock_analysis::news::aggregator::raw_v2::
                             refresh_news_health_from_raw_batch(&batch)
                         {
-                            log::warn!("[GlobalNews][NewsHealth] freshness not recorded: {error}");
+                            Ok(refresh) => log::info!("[GlobalNews][NewsHealth] refresh={refresh:?} scope=content_freshness_only"),
+                            Err(error) => {
+                                log::warn!("[GlobalNews][NewsHealth] freshness not recorded: {error}");
+                            }
                         }
                         let projection =
                             stock_analysis::news::aggregator::raw_v2::project_news_flash_events(

@@ -34,12 +34,44 @@ static NEWS_AI_BATCH_PERMIT: Lazy<Arc<Semaphore>> = Lazy::new(|| Arc::new(Semaph
 // advanced after each bounded scan without concurrent writers.
 static NEXT_NEWS_AI_CANDIDATE: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveNewsAiScope {
+    EquityAndPublic,
+    PublicGlobalOnly,
+}
+
+fn live_news_ai_scope(
+    selection_enabled: bool,
+    session: MarketSession,
+    batches: &[AdmittedGlobalNewsBatch],
+    public_completion_available: bool,
+) -> Option<LiveNewsAiScope> {
+    if batches.is_empty() {
+        return None;
+    }
+    if selection_enabled && (session.is_trading() || session.is_auction()) {
+        // Keep the original mixed callback, including an empty-record batch.
+        return Some(LiveNewsAiScope::EquityAndPublic);
+    }
+    if public_completion_available && batches.iter().any(|batch| {
+        batch.records().iter().enumerate().any(|(index, record)| {
+            record.instruments.is_empty()
+                && stock_analysis::monitor::news_ai::GlobalCriticalFact::from_admitted(batch, index).is_ok()
+        })
+    }) {
+        Some(LiveNewsAiScope::PublicGlobalOnly)
+    } else {
+        None
+    }
+}
+
 /// One scheduling seam owns both kinds of work and their shared single-flight
 /// permit. Futures are supplied at the database/provider boundary.
 fn schedule_news_ai_tick<R, RF, A, AF>(
     permits: &Arc<Semaphore>,
     selection_enabled: bool,
     session: MarketSession,
+    public_completion_available: bool,
     batches: Option<Vec<AdmittedGlobalNewsBatch>>,
     recover: R,
     analyze: A,
@@ -47,11 +79,12 @@ fn schedule_news_ai_tick<R, RF, A, AF>(
 where
     R: FnOnce(usize) -> RF + Send + 'static,
     RF: Future<Output = usize> + Send,
-    A: FnOnce(Vec<AdmittedGlobalNewsBatch>, usize) -> AF + Send + 'static,
+    A: FnOnce(Vec<AdmittedGlobalNewsBatch>, usize, LiveNewsAiScope) -> AF + Send + 'static,
     AF: Future<Output = ()> + Send,
 {
-    let batches = batches.filter(|batches| {
-        selection_enabled && (session.is_trading() || session.is_auction()) && !batches.is_empty()
+    let batches = batches.and_then(|batches| {
+        live_news_ai_scope(selection_enabled, session, &batches, public_completion_available)
+            .map(|scope| (batches, scope))
     });
     let permit = permits.clone().try_acquire_owned().ok()?;
     Some(tokio::spawn(async move {
@@ -70,8 +103,8 @@ where
             );
             return;
         }
-        if let Some(batches) = batches {
-            analyze(batches, used).await;
+        if let Some((batches, scope)) = batches {
+            analyze(batches, used, scope).await;
         }
     }))
 }
@@ -299,9 +332,10 @@ impl NewsAiProducer {
             &NEWS_AI_BATCH_PERMIT,
             selection_enabled,
             session,
+            critical_sender.is_some(),
             batches,
             move |limit| run_durable_recovery(recovery_status, limit),
-            move |batches, used| run_same_tick_batches(batches, analyzer, status, used, critical_sender),
+            move |batches, used, scope| run_same_tick_batches(batches, analyzer, status, used, critical_sender, scope),
         )
         .is_none()
         {
@@ -414,6 +448,7 @@ async fn run_same_tick_batches(
     status: NewsAiRuntimeStatus,
     recovered_work: usize,
     critical_sender: Option<stock_analysis::monitor::news_ai::CriticalCompletionSender>,
+    scope: LiveNewsAiScope,
 ) {
     let mut stats = NewsAiRunStats::default();
     let Some(profile) = analyzer
@@ -423,7 +458,7 @@ async fn run_same_tick_batches(
         log::warn!("[NewsAI] no qualified pre-call model profile; live analysis skipped");
         return;
     };
-    let candidates = mixed_candidates(&batches, &profile,analyzer.as_ref().expect("qualified analyzer profile"));
+    let candidates = scoped_candidates(&batches, &profile, analyzer.as_ref().expect("qualified analyzer profile"), scope);
     if candidates.is_empty() {
         log::debug!("[NewsAI][BR-172] no exact source-bound equity or empty-instrument global candidate");
     }
@@ -1166,13 +1201,14 @@ mod tests {
                 &Arc::new(Semaphore::new(1)),
                 selection,
                 session,
+                false,
                 batches,
                 move |limit| async move {
                     assert_eq!(limit, 5);
                     observed_recovered.fetch_add(1, Ordering::SeqCst);
                     1
                 },
-                move |_, _| async move {
+                move |_, _, _| async move {
                     observed_analysis.fetch_add(1, Ordering::SeqCst);
                 },
             )
@@ -1200,6 +1236,7 @@ mod tests {
             &permits,
             true,
             MarketSession::Morning,
+            false,
             Some(vec![scheduling_batch()]),
             move |limit| async move {
                 assert_eq!(limit, 2, "live work retains a bounded share");
@@ -1208,7 +1245,8 @@ mod tests {
                 wait.notified().await;
                 2
             },
-            move |batches, used| async move {
+            move |batches, used, scope| async move {
+                assert_eq!(scope, LiveNewsAiScope::EquityAndPublic);
                 assert_eq!(batches.len(), 1);
                 let mut budget = CandidateVisitBudget::with_worked(20, 0, used);
                 let mut worked = 0;
@@ -1226,9 +1264,10 @@ mod tests {
             &permits,
             false,
             MarketSession::Closed,
+            false,
             None,
             |_| async { panic!("concurrent recovery must not execute") },
-            |_, _| async { panic!("concurrent analysis must not execute") },
+            |_, _, _| async { panic!("concurrent analysis must not execute") },
         )
         .is_none());
         release.notify_one();
@@ -1239,9 +1278,10 @@ mod tests {
             &permits,
             false,
             MarketSession::Closed,
+            false,
             None,
             |_| async { 0 },
-            |_, _| async { panic!("no live admission") },
+            |_, _, _| async { panic!("no live admission") },
         )
         .expect("the worker releases its permit after both branches");
         next.await.unwrap();
@@ -1707,6 +1747,228 @@ mod tests {
         // Library SQLite/receipt/event wholes prove successful token handoff; this bin whole does not simulate live delivery.
     }
 
+
+    struct PublicGlobalCountingProvider(Arc<AtomicUsize>);
+    #[async_trait]
+    impl stock_analysis::llm::LlmProvider for PublicGlobalCountingProvider {
+        fn name(&self) -> &'static str { "TEST_CODE_PUBLIC_GLOBAL_PROVIDER" }
+        fn model(&self) -> &str { "TEST_CODE_PUBLIC_GLOBAL_MODEL" }
+        async fn chat_json(&self, _: &str, _: &str) -> Result<serde_json::Value, stock_analysis::llm::LlmError> {
+            panic!("receipt-bearing path only")
+        }
+        async fn chat_json_with_receipt(&self, _: &str, _: &str) -> Result<stock_analysis::llm::ReceiptBearingJson, stock_analysis::llm::LlmError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            // No public receipt mint, model transport or successful score stub.
+            Err(stock_analysis::llm::LlmError::ReceiptUnavailable { provider: "TEST_CODE_PUBLIC_GLOBAL_PROVIDER".into(), model: "TEST_CODE_PUBLIC_GLOBAL_MODEL".into() })
+        }
+    }
+
+    fn public_global_batch(count: usize) -> AdmittedGlobalNewsBatch {
+        let old = v3_revision_batch();
+        let mut records = old.records().to_vec();
+        for index in 0..count {
+            let mut record = old.records()[0].clone();
+            record.item_id = format!("TEST_CODE_PUBLIC_GLOBAL_{index}");
+            record.title = format!("TEST_CODE macro revision {index}");
+            record.content = Some(format!("TEST_CODE disclosed macro source {index}"));
+            record.instruments.clear();
+            records.push(record);
+        }
+        let mut invalid = old.records()[0].clone();
+        invalid.item_id = "TEST_CODE_PUBLIC_INVALID_NONEMPTY".into();
+        invalid.instruments = vec!["not-a-stock".into()];
+        records.push(invalid);
+        AdmittedGlobalNewsBatch::from_parts(records, old.evidence().clone())
+    }
+
+    struct PublicGlobalChildGuard(Option<std::process::Child>);
+    impl Drop for PublicGlobalChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                if !matches!(child.try_wait(), Ok(Some(_))) { let _ = child.kill(); let _ = child.wait(); }
+            }
+        }
+    }
+
+    fn public_global_sqlite_child(test: &str) -> bool {
+        const CASE: &str = "TEST_CODE_NEWS_PUBLIC_GLOBAL_CHILD";
+        const ROOT: &str = "TEST_CODE_NEWS_PUBLIC_GLOBAL_ROOT";
+        if std::env::var(CASE).ok().as_deref() == Some(test) {
+            assert!(stock_analysis::risk::env_guard::runtime_is_test_process());
+            assert_eq!(stock_analysis::risk::env_guard::current_env(), stock_analysis::risk::env_guard::TradingEnv::Test);
+            let root = std::path::PathBuf::from(std::env::var_os(ROOT).expect("parent-owned isolated root"));
+            assert_eq!(root.canonicalize().unwrap(), root);
+            assert!(root.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+            assert!(root.file_name().unwrap().to_string_lossy().starts_with("TEST_CODE_NEWS_PUBLIC_"));
+            assert!(stock_analysis::database::DatabaseManager::try_get().is_none());
+            stock_analysis::database::DatabaseManager::init(Some(root.join("TEST_CODE_NEWS_PUBLIC.db"))).unwrap();
+            return true;
+        }
+        let root = tempfile::Builder::new().prefix("TEST_CODE_NEWS_PUBLIC_").tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let mut child = PublicGlobalChildGuard(Some(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1", "--format=pretty", "--color=never"])
+            .env(CASE, test).env(ROOT, &canonical).env("STOCK_ENV_MODE", "test")
+            .current_dir(&canonical).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit())
+            .spawn().unwrap()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if child.0.as_mut().unwrap().try_wait().unwrap().is_some() { break; }
+            assert!(std::time::Instant::now() < deadline, "isolated public Global SQLite test timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.0.take().unwrap().wait_with_output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "isolated public Global child failed: {} {stdout}", output.status);
+        assert!(stdout.contains(&format!("test {test} ... ok")), "exact child whole absent: {stdout}");
+        assert!(stdout.contains("1 passed; 0 failed"), "exact child count differs: {stdout}");
+        use sha2::Digest;
+        println!("PUBLIC_GLOBAL_CHILD_CLOSED case={test} status={} count=1 stdout_bytes={} stdout_sha256={:x}",
+            output.status, stdout.len(), sha2::Sha256::digest(stdout.as_bytes()));
+        false
+    }
+
+    #[tokio::test]
+    async fn news_public_global_scheduler_session_matrix_keeps_equity_gated() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let analyzer = NewsAIAnalyzer::new(Arc::new(PublicGlobalCountingProvider(calls.clone())));
+        let profile = analyzer.identity_profile().unwrap();
+        let batch = public_global_batch(2);
+        let baseline = mixed_candidates(&[batch.clone()], &profile, &analyzer);
+        assert_eq!(baseline.iter().filter(|c| matches!(c, MixedCandidate::Equity(_))).count(), 2);
+        assert_eq!(baseline.iter().filter(|c| matches!(c, MixedCandidate::Global { .. })).count(), 2);
+        for selection in [false, true] {
+            for session in [MarketSession::Auction, MarketSession::Morning, MarketSession::Afternoon,
+                MarketSession::Closed, MarketSession::LunchBreak, MarketSession::AfterHours] {
+                let expected = if selection && (session.is_trading() || session.is_auction()) {
+                    LiveNewsAiScope::EquityAndPublic
+                } else { LiveNewsAiScope::PublicGlobalOnly };
+                let observed = Arc::new(AtomicUsize::new(0)); let seen = observed.clone();
+                let expected_keys = baseline.iter().filter(|c| expected == LiveNewsAiScope::EquityAndPublic || matches!(c, MixedCandidate::Global { .. }))
+                    .map(|c| c.key().to_owned()).collect::<Vec<_>>();
+                let analyzer = analyzer.clone(); let profile = profile.clone(); let original = batch.clone();
+                schedule_news_ai_tick(&Arc::new(Semaphore::new(1)), selection, session, true, Some(vec![batch.clone()]),
+                    |limit| async move { assert_eq!(limit, 2); 0 },
+                    move |batches, used, scope| async move {
+                        assert_eq!(used, 0); assert_eq!(scope, expected);
+                        assert_eq!(batches[0].records().len(), original.records().len());
+                        let candidates = scoped_candidates(&batches, &profile, &analyzer, scope);
+                        assert_eq!(candidates.iter().map(|c| c.key().to_owned()).collect::<Vec<_>>(), expected_keys);
+                        for candidate in &candidates {
+                            if let MixedCandidate::Global { fact, .. } = candidate {
+                                assert_eq!(fact.batch_id(), original.evidence().batch_id);
+                                assert!(original.records().iter().any(|r| r.item_id == fact.item_id() && r.instruments.is_empty()));
+                            } else { assert_eq!(scope, LiveNewsAiScope::EquityAndPublic); }
+                        }
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    }).unwrap().await.unwrap();
+                assert_eq!(observed.load(Ordering::SeqCst), 1);
+            }
+        }
+        let mut malformed = batch.evidence().clone(); malformed.source = "TEST_CODE_BAD_PROVIDER_CONTRACT".into();
+        for (owner, batches) in [(true, None), (true, Some(Vec::new())), (true, Some(vec![scheduling_batch()])),
+            (true, Some(vec![v3_revision_batch()])), (false, Some(vec![batch.clone()])),
+            (true, Some(vec![AdmittedGlobalNewsBatch::from_parts(batch.records().to_vec(), malformed)]))] {
+            schedule_news_ai_tick(&Arc::new(Semaphore::new(1)), false, MarketSession::Closed, owner, batches,
+                |limit| async move { assert_eq!(limit, 5); 0 },
+                |_, _, _| async { panic!("off-session missing/invalid public source must recover only") }).unwrap().await.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "classification does not call the model");
+    }
+
+    #[tokio::test]
+    async fn news_public_global_single_worker_shared_allowance_and_cursor() {
+        const TEST: &str = "news_ai_shadow::tests::news_public_global_single_worker_shared_allowance_and_cursor";
+        if !public_global_sqlite_child(TEST) { return; }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let analyzer = NewsAIAnalyzer::new(Arc::new(PublicGlobalCountingProvider(calls.clone())));
+        let status = NewsAiRuntimeStatus::from_capabilities(NewAnalysisCapability::Enabled, GovernedDeliveryRecoveryCapability::DisabledLaunchStage);
+        let batch = public_global_batch(45); let profile = analyzer.identity_profile().unwrap();
+        let candidates = scoped_candidates(&[batch.clone(), batch.clone()], &profile, &analyzer, LiveNewsAiScope::PublicGlobalOnly);
+        assert_eq!(candidates.len(), 45); assert!(candidates.iter().all(|c| matches!(c, MixedCandidate::Global { .. })));
+        let mut budget = CandidateVisitBudget::with_worked(candidates.len(), 0, 2);
+        let mut visited = Vec::new();
+        while let Some(index) = budget.next_index() { visited.push(index); budget.record_work(true); }
+        assert_eq!(visited, vec![0, 1, 2]); assert_eq!(budget.next_start(), 3);
+        let mut history_budget = CandidateVisitBudget::new(candidates.len(), 0);
+        while history_budget.next_index().is_some() { history_budget.record_work(false); }
+        assert_eq!(history_budget.inspected, 40); assert_eq!(history_budget.next_start(), 40);
+        let permits = Arc::new(Semaphore::new(1)); let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new()); let began = started.clone(); let wait = release.clone();
+        let (tx, _rx) = stock_analysis::monitor::news_ai::critical_news_completion_channel();
+        NEXT_NEWS_AI_CANDIDATE.store(0, Ordering::Relaxed);
+        let task = schedule_news_ai_tick(&permits, false, MarketSession::Closed, true, Some(vec![batch.clone()]),
+            move |limit| async move { assert_eq!(limit, 2); began.notify_one(); wait.notified().await; 2 },
+            move |batches, used, scope| run_same_tick_batches(batches, Some(analyzer), status, used, Some(tx), scope)).unwrap();
+        started.notified().await;
+        assert!(schedule_news_ai_tick(&permits, true, MarketSession::Morning, true, Some(vec![batch.clone()]),
+            |_| async { panic!("second worker must not recover") }, |_, _, _| async { panic!("second worker must not analyze") }).is_none());
+        release.notify_one(); task.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "real ExactAbsent SQLite + failed receipt attempts share five with recovery");
+        assert_eq!(NEXT_NEWS_AI_CANDIDATE.load(Ordering::Relaxed), 3);
+        let next_analyzer = NewsAIAnalyzer::new(Arc::new(PublicGlobalCountingProvider(calls.clone())));
+        let next_status = NewsAiRuntimeStatus::from_capabilities(NewAnalysisCapability::Enabled, GovernedDeliveryRecoveryCapability::DisabledLaunchStage);
+        let (next_tx, _next_rx) = stock_analysis::monitor::news_ai::critical_news_completion_channel();
+        schedule_news_ai_tick(&permits, false, MarketSession::AfterHours, true, Some(vec![batch]),
+            |limit| async move { assert_eq!(limit, 2); 2 },
+            move |batches, used, scope| run_same_tick_batches(batches, Some(next_analyzer), next_status, used, Some(next_tx), scope)).unwrap().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(NEXT_NEWS_AI_CANDIDATE.load(Ordering::Relaxed), 6, "same cursor advances across the next public tick");
+        schedule_news_ai_tick(&permits, false, MarketSession::Closed, true, None,
+            |limit| async move { assert_eq!(limit, 5); 0 }, |_, _, _| async { panic!("outside-window None must remain recovery only") }).unwrap().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn news_public_global_unknown_and_slot_ownership_before_call() {
+        const TEST: &str = "news_ai_shadow::tests::news_public_global_unknown_and_slot_ownership_before_call";
+        if !public_global_sqlite_child(TEST) { return; }
+        use diesel::connection::SimpleConnection;
+        use diesel::RunQueryDsl;
+        use std::task::Poll;
+        let db = stock_analysis::database::get_db(); let batch = public_global_batch(1);
+        let fact = stock_analysis::monitor::news_ai::GlobalCriticalFact::from_admitted(&batch, 2).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let analyzer = NewsAIAnalyzer::new(Arc::new(PublicGlobalCountingProvider(calls.clone())));
+        assert!(!db.has_audited_global_news_base(&fact).unwrap(), "real empty SQLite history is ExactAbsent");
+        let identity = analyzer.global_critical_identity(&fact).unwrap().digest();
+        let (tx, mut rx) = stock_analysis::monitor::news_ai::critical_news_completion_channel();
+        let disabled = NewsAiRuntimeStatus::from_capabilities(NewAnalysisCapability::DisabledModelProviderUnavailable, GovernedDeliveryRecoveryCapability::Enabled);
+        assert!(assess_global_critical_candidate(Some(&analyzer), &disabled, fact.clone(), &tx).await.is_err());
+        let mut slots = Vec::new(); for _ in 0..5 { slots.push(tx.reserve().await.unwrap()); }
+        let mut pending = Box::pin(analyzer.assess_global_critical_if_absent(fact.clone(),
+            |fact| async move { db.has_audited_global_news_base(&fact).map_err(|e| e.to_string()) },
+            |request| async { let _slot = tx.reserve().await.map_err(|_| "closed".to_owned())?; Ok(request) }));
+        std::future::poll_fn(|cx| { assert!(pending.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+        drop(pending); assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(analyzer.global_critical_identity(&fact).unwrap().digest(), identity);
+        drop(slots.pop());
+        slots.push(tx.reserve().await.unwrap()); // Cancelled waiter did not steal/leak the fifth slot.
+        rx.close(); drop(slots);
+        assert!(analyzer.assess_global_critical_if_absent(fact.clone(),
+            |fact| async move { db.has_audited_global_news_base(&fact).map_err(|e| e.to_string()) },
+            |request| async { let _slot = tx.reserve().await.map_err(|_| "closed".to_owned())?; Ok(request) }).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0); assert_eq!(tx.retained_count(), 0);
+        assert!(!db.has_audited_global_news_base(&fact).unwrap());
+        {
+            let mut conn = db.get_conn().unwrap();
+            // Actual constrained row; malformed evidence is a corruption fixture,
+            // never a model result, audit capability or a synthetic lookup Err.
+            conn.batch_execute("INSERT INTO news_ai_global_critical_v1(seq,assessment_id,evidence_json,evidence_sha256,previous_hash,record_hash) VALUES(1,'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee','{}','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','BR244_GLOBAL_CRITICAL_GENESIS_V1','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')").unwrap();
+        }
+        let error = db.has_audited_global_news_base(&fact).unwrap_err();
+        assert!(error.to_string().contains("missing field"));
+        let prepare_count = Arc::new(AtomicUsize::new(0)); let prepares = prepare_count.clone();
+        let unknown = analyzer.assess_global_critical_if_absent(fact.clone(),
+            |fact| async move { db.has_audited_global_news_base(&fact).map_err(|e| e.to_string()) },
+            move |request| async move { prepares.fetch_add(1, Ordering::SeqCst); Ok(request) }).await;
+        assert!(unknown.err().unwrap().contains("missing field"));
+        assert_eq!(prepare_count.load(Ordering::SeqCst), 0); assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(analyzer.global_critical_identity(&fact).unwrap().digest(), identity);
+        #[derive(diesel::QueryableByName)]
+        struct Count { #[diesel(sql_type = diesel::sql_types::BigInt)] count: i64 }
+        let mut conn = db.get_conn().unwrap();
+        assert_eq!(diesel::sql_query("SELECT COUNT(*) AS count FROM news_ai_global_critical_v1").get_result::<Count>(&mut *conn).unwrap().count, 1);
+    }
 }
 
 async fn assess_critical_candidate(
@@ -1782,6 +2044,21 @@ fn mixed_candidates(batches:&[AdmittedGlobalNewsBatch],profile:&NewsAiAnalysisPr
         }
     }all.into_values().collect()
 }
+fn scoped_candidates(
+    batches: &[AdmittedGlobalNewsBatch],
+    profile: &NewsAiAnalysisProfile,
+    analyzer: &NewsAIAnalyzer,
+    scope: LiveNewsAiScope,
+) -> Vec<MixedCandidate> {
+    let mut candidates = mixed_candidates(batches, profile, analyzer);
+    if scope == LiveNewsAiScope::PublicGlobalOnly {
+        // Remove every equity purpose before it can consume the shared work
+        // counter or enter a market request / BR-172 governed delivery.
+        candidates.retain(|candidate| matches!(candidate, MixedCandidate::Global { .. }));
+    }
+    candidates
+}
+
 async fn assess_global_critical_candidate(analyzer:Option<&NewsAIAnalyzer>,status:&NewsAiRuntimeStatus,
     fact:stock_analysis::monitor::news_ai::GlobalCriticalFact,sender:&stock_analysis::monitor::news_ai::CriticalCompletionSender)->Result<CandidateOutcome,String> {
     let execution=status.candidate_execution(false);

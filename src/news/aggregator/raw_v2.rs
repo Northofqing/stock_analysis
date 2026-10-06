@@ -617,6 +617,39 @@ impl QualifiedNewsPublication {
     }
 }
 
+// Read-only bounded diagnostics; this helper cannot qualify or refresh News.
+fn log_news_health_feed_observation(
+    attempt: &RawGlobalNewsFeedAttempt,
+    batch: &RawNewsAggregationBatch,
+    wall: DateTime<Utc>,
+    freshest: Option<DateTime<Utc>>,
+    reason: &'static str,
+    fresh_records: usize,
+) {
+    if !log::log_enabled!(log::Level::Info) {
+        return;
+    }
+    let registration = attempt.registration();
+    let records = match &attempt.terminal {
+        RawGlobalNewsTerminal::Available { records, .. } => records.as_slice(),
+        RawGlobalNewsTerminal::VerifiedEmpty { .. } | RawGlobalNewsTerminal::Unavailable(_) => &[],
+    };
+    let evidence_observed = attempt.terminal.evidence().and_then(|evidence| {
+        parse_global_news_observed_at(registration.provider, &evidence.observed_at).ok()
+    });
+    log::info!(
+        "[GlobalNews][NewsHealth] feed={} reason={} count={} count_capped={} fresh_records={} wall={} batch_observed={} evidence_observed={:?} record_published_min={:?} record_published_max={:?} record_observed_min={:?} record_observed_max={:?} batch_freshest_candidate_published={:?}",
+        registration.feed_name, reason, records.len().min(REGISTERED_GLOBAL_NEWS_LIMIT as usize),
+        records.len() > REGISTERED_GLOBAL_NEWS_LIMIT as usize, fresh_records,
+        wall, batch.observed_at(), evidence_observed,
+        records.iter().take(REGISTERED_GLOBAL_NEWS_LIMIT as usize).map(|record| record.published_at).min(),
+        records.iter().take(REGISTERED_GLOBAL_NEWS_LIMIT as usize).map(|record| record.published_at).max(),
+        records.iter().take(REGISTERED_GLOBAL_NEWS_LIMIT as usize).map(|record| record.observed_at).min(),
+        records.iter().take(REGISTERED_GLOBAL_NEWS_LIMIT as usize).map(|record| record.observed_at).max(),
+        freshest,
+    );
+}
+
 fn qualify_news_publication_at(
     batch: &RawNewsAggregationBatch,
     env: crate::risk::env_guard::TradingEnv,
@@ -633,6 +666,19 @@ fn qualify_news_publication_at(
                 attempt.registration() != RegisteredGlobalNewsFeed::for_provider(provider)
             })
     {
+        // The original gate above decides; repeated scalar reads only name its reason.
+        let reason = if batch.observed_at() > wall {
+            "batch_observation_future"
+        } else if batch.attempts().len() != REGISTERED_PROVIDERS.len() {
+            "provider_count_mismatch"
+        } else {
+            "provider_registration_order_mismatch"
+        };
+        log::info!(
+            "[GlobalNews][NewsHealth] feed=roster reason={} count={} count_capped={} wall={} batch_observed={} batch_freshest_candidate_published=None",
+            reason, batch.attempts().len().min(REGISTERED_PROVIDERS.len()),
+            batch.attempts().len() > REGISTERED_PROVIDERS.len(), wall, batch.observed_at(),
+        );
         return None;
     }
     let budget = std::time::Duration::from_secs(crate::monitor::data_mode::NEWS_MAX_AGE_SECS);
@@ -640,6 +686,12 @@ fn qualify_news_publication_at(
     for attempt in batch.attempts() {
         let registration = attempt.registration();
         let RawGlobalNewsTerminal::Available { records, evidence } = &attempt.terminal else {
+            let reason = match &attempt.terminal {
+                RawGlobalNewsTerminal::VerifiedEmpty { .. } => "verified_empty_not_content_freshness",
+                RawGlobalNewsTerminal::Unavailable(_) => "unavailable_not_content_freshness",
+                RawGlobalNewsTerminal::Available { .. } => "non_available_branch",
+            };
+            log_news_health_feed_observation(attempt, batch, wall, freshest, reason, 0);
             continue;
         };
         if records.is_empty()
@@ -660,9 +712,37 @@ fn qualify_news_publication_at(
                     || record.observed_at > wall
             })
         {
+            // Pure revalidation is diagnostic only, after the unchanged atomic gate refused.
+            let reason = if records.is_empty() {
+                "available_records_empty"
+            } else if records.len() > registration.max_limit as usize {
+                "available_record_limit_exceeded"
+            } else if registration.source_contract != registration.provider.source() {
+                "provider_source_contract_mismatch"
+            } else if validate_global_news_batch_evidence(registration.provider, evidence).is_err() {
+                "batch_evidence_invalid"
+            } else if !news_flash_identity_allowed_for_env(env, &[
+                registration.provider.wire_name(), evidence.source.as_str(), evidence.batch_id.as_str(),
+            ]) {
+                "batch_identity_rejected_for_environment"
+            } else {
+                records.iter().take(REGISTERED_GLOBAL_NEWS_LIMIT as usize).find_map(|record| {
+                    if let Err(reason) = validate_news_flash_record(registration.provider, record, evidence, env) {
+                        Some(reason)
+                    } else if record.published_at > record.observed_at {
+                        Some("record_publication_after_observation")
+                    } else if record.observed_at > wall {
+                        Some("record_observation_future")
+                    } else {
+                        None
+                    }
+                }).unwrap_or("provider_atomic_guard_rejected")
+            };
+            log_news_health_feed_observation(attempt, batch, wall, freshest, reason, 0);
             continue;
         }
         // Admission is provider-atomic. Stale but valid siblings remain raw facts.
+        let mut diagnostic_fresh_records = 0;
         for record in records {
             let Ok(publication_age) = wall.signed_duration_since(record.published_at).to_std() else {
                 continue;
@@ -674,8 +754,12 @@ fn qualify_news_publication_at(
                 freshest = Some(freshest.map_or(record.published_at, |prior| {
                     prior.max(record.published_at)
                 }));
+                diagnostic_fresh_records += 1;
             }
         }
+        log_news_health_feed_observation(attempt, batch, wall, freshest,
+            if diagnostic_fresh_records > 0 { "fresh_available_content" }
+            else { "no_publication_and_observation_within_age_budget" }, diagnostic_fresh_records);
     }
     freshest.map(|published_at| QualifiedNewsPublication {
         published_at,
