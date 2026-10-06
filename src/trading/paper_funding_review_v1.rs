@@ -669,6 +669,7 @@ fn validate_cash_partitions(c: &CashPartitions, w: &mut Work) -> Result<(), Erro
 
 // This sibling loan is an owning historical material, not an approval or a
 // recovered DatabaseConnectionAuthority. There is no caller-selected slot/time.
+pub(super) const MATERIAL_REVIEW_LIMIT: usize = codec::REVIEW_LIMIT;
 pub(super) struct MaterialReviewSource {
     original: StoredFundingReviewV1,
     work: Work,
@@ -682,6 +683,10 @@ pub(super) struct MaterialReviewSource {
     started: bool,
     ready: bool,
 }
+
+#[cfg(test)]
+#[path = "paper_funding_material_read_v1_tests.rs"]
+mod material_read_tests;
 impl MaterialReviewSource {
     pub(super) fn new(original: StoredFundingReviewV1) -> Self {
         // Move the whole genuine return before admission, decoding or copying.
@@ -690,6 +695,7 @@ impl MaterialReviewSource {
             first: None, started: false, ready: false }
     }
     pub(super) fn canonical(&self) -> &[u8] { self.original.canonical_bytes() }
+    pub(super) fn original(&self) -> &StoredFundingReviewV1 { &self.original }
     pub(super) fn review_id(&self) -> &str { self.original.review_id() }
     pub(super) fn proposal_id(&self) -> &str { self.original.proposal_id() }
     pub(super) fn tuple(&self) -> Option<&[u8]> { self.tuple.as_deref() }

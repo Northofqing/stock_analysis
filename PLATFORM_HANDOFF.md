@@ -787,3 +787,20 @@ Draft层只需保存的package ID和Draft内容ID即可恢复原完整canonical�
 第5/7仍未整体完成：正式正向F2/资金B审批/seed/cutover、Financial/native/catalog及生产接线；真实策略版本到决策/订单的关联；真实评审证据、预注册时间、同输入/PIT/完整成本与治理状态机仍待实现。当前仅Unverified/DeclaredReferencesOnly Draft子集，无Promoted、人审或交易能力；本批没有生产安装或库迁移。
 
 Windows最新f57c原CI run37446154439测得critical35372/39817=88.84%，仍低于原95；overall84.93%满足80。audit job因RustSec advisory DB网络读取失败，没有完成漏洞扫描结论。Root实际核验coverage包9成员加manifest（manifestSHA `a97a575864f428bbaa3954e95b282508f77d4758a2cb61896147ad0b36a0d8c5`）与source-review包27成员加manifest（`f3421094238060b04ad1cea1fa327bcb3ebfc9d7c6491723d296b3006298d72a`）全部成员bytes/SHA，并读原阈值/审计失败摘录；这只是包回读，没有独立重建f57c树或执行SDK。包外Mac ACK已保存共享目录。向原VM任务续办接口返回 `Timed out waiting for MCP response to fs/createDirectory`，无法确认本次消息送达，不重复投递或称那边已开工。原正式Windows4e/Macf517/R2 eea与78Uncertain保持；新SDK仍无上线资格。
+
+
+## 2026-10-06 19:51 CST：资金复核材料按保存标识冷恢复
+
+治理读端已实际提交/push `775a6fd288e3a04cd10eb5a490e85afefd6c1165`，真实远端feature OID一致。后继补第5项原资金复核材料的同类恢复缺口：`StoredFundingMaterial` 暴露原package ID，`read_funding_material` 只需要保存的package ID+review ID，经原Task8真实只读快照/rollback/consuming-close载回原材料。原固定根、namespace、typed SQL/canonical与累计native Work均沿用，不增加SQL schema、账本、自由路径或enqueue重试。
+
+成功native阶段结束后，借用固定PaperLedger/schema/无时间哨兵/空来源声明的envelope；先限原单一REVIEW_LIMIT=768KiB再解hex。沿既有严格 `read_stored_funding_review` 及 owning `MaterialReviewSource` 检原proposal/review内容身份、历史算术和资金家族键，先保整个真实callee返回再检查期待ID/家族。错误保精确query、原package/body、已取得review及实际native owner；首错不会被资源drain覆盖。Cold test实际先保存两种同家族材料并释放funding fixture，恢复仅持两ID/outbox，原一致/不一致结论、cash分区及完整原文保持。
+
+恢复仍为 **HistoricalObservationOnly / NotIssued / Unverified**；ConsistentProposal不发行B、可花资金、seed/cutover批准或执行intent，None只表示合格快照没有指定原件。错误owner/schema/时间/家族/内容ID、伪造Approved和超出768KiB body均经真实outbox存取后拒绝，超限body在业务分配前拒绝。CloseHeld保真正已选材料/connection，invalid input在验证前保原String指针，真实资源排放后仍保原首错。
+
+第一轮实际2PASS/1FAIL/EXIT101：伪造批准夹具经serde_json::Value重排字段，原codec先拒绝NonCanonical。修正仅保持原字段顺序并替换唯一approval_state值，仍检查原Schema拒绝；929输入逐项核对，仅新测试文件变动，生产源码保持第一轮相同。原失败log SHA `a6e5e719f9c1c9dba3f0d0ba04612b6e39527ecf80933aa6c6c10db2c8c21be2` 留存。
+
+最终新增3/3 PASS，原资金材料写入/CAS/Unknown/close/false approval/same Work三项及治理读端四项7/7 PASS，共当前源码fresh10不同完整方法。929输入保持；manifest `a005185192757e384d6b2b13cdb794c6b14b650c854c9968f03fdb3d12051ebe`，harness SHA `09bdcd59ab8fc610da62b139ee995b847821bf458868450a99f48dfacdfff6fb`，新3 log SHA `0301d4716fbc29e696d336fb7b4fed6a31d9f0369f0a62717ddd2008c7aefcef`。本地回执 `slice-funding-material-read-fixturefix-receipt.json` / `slice-funding-material-read-related-receipt.json` 留存。直接自审；没有独立Approved、全量/check/build/clippy/release/monitor dry-run或生产变更。
+
+跨端续办接口超时后，另写共享 [原SDK续办交接](/Users/zhangzhen/Desktop/Quant/stock_analysis/client-bundle/MAC_SDK_COVERAGE_CONTINUATION_20261006.md)，1946B/SHA `a3388319b67ec17ac968896838b11d99ccf77f1f9a5a70952fcf242e27c9007b`。针对同一原VM任务/f57c/2455关键行缺口，要求先查既有工作和CI、分开处理RustSec网络失败、回传同HEAD原95门禁证据。只确认共享文件已写，尚无Windows收件/开工反馈；不重复dispatch或称新SDK有发布资格。
+
+第5/7整项继续未完成：真实资金B/审批发行及seed/cutover、正式正向F2来源与执行资格、Financial/native/catalog完整验证、正式策略版本到决策/订单的持久关联、治理真实评审/阶段/人工晋级和同输入/PIT/完整成本证据。上述冷读只解决普通材料恢复，不是资金审批或完整GovernanceRepository；生产仍待同版SDK/RPC、具体activation及原动态门禁。下一owner从本节、真实feature HEAD与最新VM状态接续，不重跑已闭合10项。
