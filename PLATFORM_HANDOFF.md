@@ -696,3 +696,13 @@ NEWS后继合并 `7478bb4e44f424af5f9db3b1275c6cda93414231`，逐项反馈提交
 已核SDK eea9cc6源码包37+manifest=38件及公开ACK，Windows接收后正在同源release和必要发布检查；正式服务保持。a6预备1663输入完整封存，发现pin错配后主动停build，exit-15/536秒/原日志保留，无PASS或生产安装。改按依赖先准备eea SDK+现有新闻/bridge窄发布；从已上线的封存根精确复制748输入到Desktop外候选，待精确新公开bundle后build/dry-run/人审/双端切换。本轮不迁Schema14或开资金；e6逐项反馈与完整平台另批。
 
 1582输入及三件schema14兼容fallback原字节通过，但该fallback同样pin67，还没有与正式VM匹配的双端回退/activation，不可直接当上线回退。[准备记录](docs/ops/2026-10-06-sdk-platform-release-preparation.md)保留现场身份、旧RPC范围、Uncertain分组和下一切换门。新SDK业务RPC、完整平台、自然观察均pending，heartbeat保持。
+
+## 2026-10-06 14:30 CST SDK 窄候选与激活工具验收完成，发布仍阻断
+
+独立分支 `codex/sdk-eea-rollout-20261006` 已提交/push `10b43b3b`、`3f0b29cd`，远端完整OID一致。前者编译65当前合同、保留4e/63 archived-only解码与原未知字段行为；后者新增只读未批准code-only激活预览，完整配置字节须相等，实际根原材料只替换候选源码revision。两任务实际7+7定向lib通过，任务与最终整分支独立复核均0问题；68既有warning、最初E0046和原候选根guard拒绝保留。
+
+Desktop外R2 source751件全部与Git3f字节一致，normalrelease三个binary退出0/716秒，同最终monitor61dryrun退出0/外部0/receipt0。release-linked原prepare仍拒绝非生产候选根；actual-root preview与prepare原hash一致，candidate API/CLI新hash一致，未来9nanoZ/5字段/单LF及不创建指定DB实际通过。新monitor SHAa9ddb1a0…、probe dd52f36e…、prepare414be27f…，精确证据见[发布准备记录](docs/ops/2026-10-06-sdk-platform-release-preparation.md)。41件公共原件已共享给VM独立回读，manifestSHA `2b7c1131890b74f24e9b7a84cb45859453c36f12bc7ecfefaad8007d810e1807`，不含认证或DB。R2仍绑定eea，未安装/未人审。
+
+Windows2023测试/Clippy/doc/合规实际通过、规范Git1092文件和21工具控制已双端核验；但原coverage结构门实跑拒绝4处critical内联测试，无实测coverage/同eeaCI，不得用工具控制代替。原keepalive全局同名唯一实例，start/stop绑定正式根与agent，不能并行候选，未按改名/换端口旁路。VM已直接读取本主任务的人类开发/协调/提交远端/上线指令，确认授权、开始另立四处测试搬移修复/独立review/CI，保留eea原封存与正式4e。之后需新SDK精确tuple、Mac重绑、受审维护窗口方案、精确activation人审与动态单实例/数据门，再同版业务RPC和观察。不能批准或切换已知不满足SDK门的eea候选。
+
+当前生产仍f517/4e/schema9、原两DB dev/ino、78Uncertain隔离保持。Schema14/e6/资金/Financial/native/WG07及自然窗口另按既有计划推进；全部上线目标尚未达到，heartbeat保持ACTIVE。下一owner先读此节及最新VM交付，不重跑14项已过源码测试，不把R1或未批准JSON当上线许可。
