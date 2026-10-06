@@ -219,6 +219,154 @@ pub fn prepare_activation_config_hash(
     })
 }
 
+/// Unapproved, read-only prediction for a candidate with identical configuration.
+///
+/// These diagnostics grant no release, board, persistence, or live capability.
+/// After installing the reviewed static inputs, the actual production prepare
+/// must return the same config hash before activation is allowed.
+///
+/// ```compile_fail
+/// use stock_analysis::selection::config_activation_v2::{
+///     CodeOnlyActivationPreview, PreparedConfigActivation,
+/// };
+/// fn authorize(preview: CodeOnlyActivationPreview) -> PreparedConfigActivation {
+///     preview.into()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct CodeOnlyActivationPreview {
+    pub config_hash: String,
+    pub config_snapshot_json_hash: String,
+    pub board_artifact_valid_from: String,
+    pub board_artifact_expires_at: String,
+}
+
+/// Predict a code-only candidate hash using the validated actual-root snapshot.
+/// Candidate board files are compared as bytes, never loaded as release evidence.
+pub fn prepare_code_only_activation_preview(
+    candidate_root: impl AsRef<Path>,
+    now: DateTime<Utc>,
+) -> Result<CodeOnlyActivationPreview, ConfigActivationPreparationError> {
+    let contract = ConfigActivationGateContract::checked_in();
+    contract.validate()?;
+    let actual_root = validate_repository_root(crate::production_root::production_root())?;
+    let candidate_root = validate_repository_root(candidate_root.as_ref())?;
+    let actual = prepare_snapshot(&actual_root, now, &contract)?;
+    let candidate_revision = compute_executable_revision(&candidate_root)?;
+    validate_code_only_config_inputs(&actual.executable_revision, &candidate_revision)?;
+    // The chain is parsed before the original revision scan. Bind that parsed
+    // snapshot to the same bytes, just as prepare_snapshot binds board inputs.
+    let chain_input = actual
+        .executable_revision
+        .preimage
+        .files_sorted
+        .iter()
+        .find(|file| file.relative_path == CHAIN_CONFIG_RELATIVE_PATH)
+        .ok_or_else(|| {
+            ConfigActivationPreparationError::new(
+                "code_only_preview_actual_inputs_changed",
+                "parsed chain config is missing from the executable revision",
+            )
+        })?;
+    if chain_input.content_sha256 != actual.config_snapshot.chain_config_bytes_hash {
+        return Err(ConfigActivationPreparationError::new(
+            "code_only_preview_actual_inputs_changed",
+            "chain config changed between snapshot parsing and revision scanning",
+        ));
+    }
+
+    // Reuse the stable two-pass scanner to detect content or path-set changes
+    // across snapshot preparation and candidate comparison on both roots.
+    for (root, expected, code) in [
+        (
+            actual_root.as_path(),
+            &actual.executable_revision,
+            "code_only_preview_actual_inputs_changed",
+        ),
+        (
+            candidate_root.as_path(),
+            &candidate_revision,
+            "code_only_preview_candidate_inputs_changed",
+        ),
+    ] {
+        if compute_executable_revision(root)? != *expected {
+            return Err(ConfigActivationPreparationError::new(
+                code,
+                "executable inputs changed during code-only preview",
+            ));
+        }
+    }
+
+    let mut predicted_snapshot = actual.config_snapshot.clone();
+    predicted_snapshot.executable_revision = candidate_revision.hash;
+    predicted_snapshot.validate()?;
+    let config_snapshot_json_hash = sha256_bytes(canonical_json(&predicted_snapshot)?.as_bytes());
+    let config_hash = sha256_json(&predicted_snapshot)?;
+    if config_snapshot_json_hash != config_hash {
+        return Err(ConfigActivationPreparationError::new(
+            "config_snapshot_hash_disagreement",
+            "canonical JSON byte hash and typed config hash differ",
+        ));
+    }
+    Ok(CodeOnlyActivationPreview {
+        config_hash,
+        config_snapshot_json_hash,
+        board_artifact_valid_from: actual.board_artifact_valid_from,
+        board_artifact_expires_at: actual.board_artifact_expires_at,
+    })
+}
+
+fn validate_code_only_config_inputs(
+    actual: &ExecutableRevisionSnapshot,
+    candidate: &ExecutableRevisionSnapshot,
+) -> Result<(), ConfigActivationPreparationError> {
+    // The original scanner supplies the complete sorted paths, lengths and
+    // hashes, with only selection_activation.v1.json excluded.
+    let config_inputs = |revision: &ExecutableRevisionSnapshot| {
+        revision
+            .preimage
+            .files_sorted
+            .iter()
+            .filter(|file| file.relative_path.starts_with("config/"))
+            .map(|file| {
+                (
+                    file.relative_path.clone(),
+                    (file.byte_len, file.content_sha256.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let actual_inputs = config_inputs(actual);
+    let candidate_inputs = config_inputs(candidate);
+    for (path, expected) in &actual_inputs {
+        match candidate_inputs.get(path) {
+            None => {
+                return Err(ConfigActivationPreparationError::new(
+                    "code_only_preview_config_missing",
+                    path,
+                ));
+            }
+            Some(found) if found != expected => {
+                return Err(ConfigActivationPreparationError::new(
+                    "code_only_preview_config_changed",
+                    path,
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(path) = candidate_inputs
+        .keys()
+        .find(|path| !actual_inputs.contains_key(*path))
+    {
+        return Err(ConfigActivationPreparationError::new(
+            "code_only_preview_config_added",
+            path,
+        ));
+    }
+    Ok(())
+}
+
 /// Full gate materials: stages 1-5 including the activation file's existence,
 /// config-hash match and chronology (used by the production activation gate).
 pub fn prepare_activation_materials(
@@ -1418,6 +1566,175 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn code_only_preview_reference() -> (PathBuf, DateTime<Utc>) {
+        let root = crate::production_root::production_root();
+        assert_eq!(
+            root,
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "preview tests must use the compile-bound worktree, never production"
+        );
+        let artifact: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(BOARD_BINDINGS_PATH)).expect("read checked-in board window"),
+        )
+        .expect("parse checked-in board window");
+        let valid_from = timestamp(artifact["valid_from"].as_str().expect("board valid_from"));
+        let now = valid_from + chrono::Duration::seconds(1);
+        assert!(now < timestamp(artifact["expires_at"].as_str().expect("board expires_at")));
+        (root.to_owned(), now)
+    }
+
+    fn code_only_preview_candidate(reference_root: &Path) -> TestFixture {
+        let fixture = TestFixture::new();
+        for relative in enumerate_executable_inputs(reference_root).expect("reference inputs") {
+            let destination = fixture.root.join(&relative);
+            fs::create_dir_all(destination.parent().expect("input parent"))
+                .expect("candidate dirs");
+            let bytes = read_stable_regular_file(&reference_root.join(&relative), &relative)
+                .expect("stable reference bytes");
+            fs::write(destination, bytes).expect("copy candidate input");
+        }
+        fixture
+    }
+
+    #[test]
+    fn code_only_preview_identical_inputs_predict_actual_hash_and_exclude_only_activation() {
+        let (root, now) = code_only_preview_reference();
+        let candidate = code_only_preview_candidate(&root);
+        let actual = prepare_activation_config_hash(&root, now).expect("actual reference prepare");
+        // The activation file is the scanner's sole exclusion, even if its
+        // candidate bytes could never serve as an approved activation file.
+        fs::write(
+            candidate.root.join(ACTIVATION_FILE_RELATIVE_PATH),
+            b"unapproved preview\n",
+        )
+        .expect("candidate activation bytes");
+        let predicted = prepare_code_only_activation_preview(&candidate.root, now)
+            .expect("identical code/config preview");
+        assert_eq!(predicted.config_hash, actual.config_hash);
+        assert_eq!(
+            predicted.config_snapshot_json_hash,
+            actual.config_snapshot_json_hash
+        );
+        assert_eq!(
+            predicted.board_artifact_valid_from,
+            actual.board_artifact_valid_from
+        );
+        assert_eq!(
+            predicted.board_artifact_expires_at,
+            actual.board_artifact_expires_at
+        );
+    }
+
+    #[test]
+    fn code_only_preview_source_change_preserves_every_other_snapshot_field() {
+        let (root, now) = code_only_preview_reference();
+        let candidate = code_only_preview_candidate(&root);
+        let actual = prepare_snapshot(&root, now, &ConfigActivationGateContract::checked_in())
+            .expect("actual reference snapshot");
+        let source_path = candidate.root.join("src/lib.rs");
+        let mut source = fs::read(&source_path).expect("candidate source");
+        source.push(b'\n');
+        fs::write(source_path, source).expect("one extra source byte");
+        let candidate_revision =
+            compute_executable_revision(&candidate.root).expect("candidate revision");
+        let mut expected = actual.config_snapshot.clone();
+        expected.executable_revision = candidate_revision.hash.clone();
+        let predicted = prepare_code_only_activation_preview(&candidate.root, now)
+            .expect("code-only prediction");
+        assert_ne!(candidate_revision.hash, actual.executable_revision.hash);
+        assert_ne!(predicted.config_hash, actual.config_hash);
+        assert_eq!(
+            predicted.config_hash,
+            sha256_json(&expected).expect("expected full snapshot")
+        );
+        assert_eq!(
+            predicted.config_snapshot_json_hash,
+            sha256_bytes(
+                canonical_json(&expected)
+                    .expect("expected canonical snapshot")
+                    .as_bytes()
+            )
+        );
+        assert_eq!(
+            predicted.board_artifact_valid_from,
+            actual.board_artifact_valid_from
+        );
+        assert_eq!(
+            predicted.board_artifact_expires_at,
+            actual.board_artifact_expires_at
+        );
+    }
+
+    #[test]
+    fn code_only_preview_rejects_changed_config_even_when_semantics_are_equal() {
+        let (root, now) = code_only_preview_reference();
+        let candidate = code_only_preview_candidate(&root);
+        let path = candidate.root.join(CHAIN_CONFIG_RELATIVE_PATH);
+        let mut bytes = fs::read(&path).expect("chain bytes");
+        bytes.push(b'\n');
+        fs::write(path, bytes).expect("change config bytes");
+        let error = prepare_code_only_activation_preview(&candidate.root, now)
+            .expect_err("config byte change must fail closed");
+        assert_eq!(error.code, "code_only_preview_config_changed");
+        assert_eq!(error.detail, CHAIN_CONFIG_RELATIVE_PATH);
+    }
+
+    #[test]
+    fn code_only_preview_rejects_added_config() {
+        let (root, now) = code_only_preview_reference();
+        let candidate = code_only_preview_candidate(&root);
+        fs::write(candidate.root.join("config/TEST_CODE_extra.json"), b"{}\n")
+            .expect("extra config");
+        let error = prepare_code_only_activation_preview(&candidate.root, now)
+            .expect_err("additional config must fail closed");
+        assert_eq!(error.code, "code_only_preview_config_added");
+        assert_eq!(error.detail, "config/TEST_CODE_extra.json");
+    }
+
+    #[test]
+    fn code_only_preview_rejects_missing_config() {
+        let (root, now) = code_only_preview_reference();
+        let candidate = code_only_preview_candidate(&root);
+        fs::remove_file(candidate.root.join(BOARD_BINDING_PROPOSAL_PATH))
+            .expect("remove candidate proposal");
+        let error = prepare_code_only_activation_preview(&candidate.root, now)
+            .expect_err("missing candidate proposal must fail closed");
+        assert_eq!(error.code, "code_only_preview_config_missing");
+        assert_eq!(error.detail, BOARD_BINDING_PROPOSAL_PATH);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn code_only_preview_rejects_config_symlink_and_symlink_root() {
+        use std::os::unix::fs::symlink;
+        let (root, now) = code_only_preview_reference();
+        let candidate = code_only_preview_candidate(&root);
+        let chain = candidate.root.join(CHAIN_CONFIG_RELATIVE_PATH);
+        fs::remove_file(&chain).expect("remove candidate chain");
+        symlink(root.join(CHAIN_CONFIG_RELATIVE_PATH), chain).expect("symlink config");
+        let error = prepare_code_only_activation_preview(&candidate.root, now)
+            .expect_err("candidate config symlink must fail closed");
+        assert_eq!(error.code, "executable_input_symlink_forbidden");
+        let root_link = candidate.root.join("TEST_CODE_root_link");
+        symlink(&root, &root_link).expect("symlink root");
+        let error = prepare_code_only_activation_preview(root_link, now)
+            .expect_err("symlink candidate root must fail closed");
+        assert_eq!(error.code, "repository_root_invalid");
+    }
+
+    #[test]
+    fn code_only_preview_rejects_invalid_and_missing_roots() {
+        let (_, now) = code_only_preview_reference();
+        let candidate = TestFixture::new();
+        let error = prepare_code_only_activation_preview(candidate.root.join("Cargo.toml"), now)
+            .expect_err("regular file cannot be a candidate root");
+        assert_eq!(error.code, "repository_root_invalid");
+        let error =
+            prepare_code_only_activation_preview(candidate.root.join("TEST_CODE_missing"), now)
+                .expect_err("missing candidate root must fail closed");
+        assert_eq!(error.code, "repository_root_unavailable");
     }
 
     #[test]

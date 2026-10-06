@@ -10,12 +10,20 @@
 //!     校验现有材料, 输出 expected_config_hash + 可直接落盘的
 //!     selection_activation.v1.json (到 stdout)。
 //!
+//!   selection_activation_prepare preview-code-only <candidate-root> <reviewed_by> <effective_from>
+//!     只读预测配置字节完全相同的候选源码激活 hash, 不初始化数据库。
+//!     输出未批准预览; 人工 review、安装静态输入后必须重查实际 production hash。
+//!
 //! 仪式: executable_revision 覆盖全部 src/+config/ 文件 — 任何代码/配置改动
 //! 都会使 expected_config_hash 失效, 需重新 prepare + 人工 review。
 
 use chrono::{DateTime, Utc};
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("preview-code-only") {
+        std::process::exit(cmd_preview_code_only(&args[1..]));
+    }
     // BR-159: TDX gateway 审计需要 core 数据库 (gateway_result 落库)。
     let database_path =
         std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
@@ -26,7 +34,6 @@ fn main() {
         eprintln!("core 数据库初始化失败 ({database_path}): {error}");
         std::process::exit(1);
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("seal-board") => cmd_seal_board(&args[1..]),
         Some("print-activation") => cmd_print_activation(&args[1..]),
@@ -35,7 +42,7 @@ fn main() {
             2
         }
         None => {
-            eprintln!("用法: selection_activation_prepare <seal-board|print-activation> ...");
+            eprintln!("用法: selection_activation_prepare <seal-board|print-activation|preview-code-only> ...");
             2
         }
     };
@@ -172,6 +179,56 @@ fn cmd_print_activation(args: &[String]) -> i32 {
         Err(error) => {
             eprintln!(
                 "[激活] 材料校验失败: code={} detail={}",
+                error.code, error.detail
+            );
+            1
+        }
+    }
+}
+
+fn cmd_preview_code_only(args: &[String]) -> i32 {
+    if args.len() != 3 {
+        eprintln!(
+            "用法: preview-code-only <candidate-root> <reviewed_by> <effective_from RFC3339>"
+        );
+        return 2;
+    }
+    let effective_from = match DateTime::parse_from_rfc3339(&args[2]) {
+        Ok(parsed) => parsed.with_timezone(&Utc),
+        Err(error) => {
+            eprintln!("effective_from 解析失败: {error}");
+            return 2;
+        }
+    };
+    let now = Utc::now();
+    if effective_from <= now {
+        eprintln!("effective_from 必须在未来 (门未生效前不能提前激活): {effective_from}");
+        return 2;
+    }
+    match stock_analysis::selection::config_activation_v2::prepare_code_only_activation_preview(
+        &args[0], now,
+    ) {
+        Ok(preview) => {
+            let reviewed_by = serde_json::to_string(&args[1]).expect("serialize reviewer string");
+            let json = format!(
+                "{{\"schema_version\":\"selection-config-activation-v1\",\
+                 \"expected_config_hash\":\"{}\",\
+                 \"effective_from\":\"{}\",\
+                 \"reviewed_by\":{},\
+                 \"reviewed_at\":\"{}\"}}",
+                preview.config_hash,
+                rfc3339(effective_from),
+                reviewed_by,
+                rfc3339(now)
+            );
+            println!("{json}");
+            eprintln!("[未批准预览] config_hash={}", preview.config_hash);
+            eprintln!("[未批准预览] 必须人工 review; 安装已审静态字节后重新运行 print-activation 核对实际 production hash。hash 不同则禁止 activation/start 并回滚。");
+            0
+        }
+        Err(error) => {
+            eprintln!(
+                "[未批准预览] 材料校验失败: code={} detail={}",
                 error.code, error.detail
             );
             1
