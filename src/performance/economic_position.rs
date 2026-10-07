@@ -975,11 +975,20 @@ pub fn select_economic_rows_through(
 pub fn query_effective_fills_through(
     as_of_date: NaiveDate,
 ) -> Result<crate::trading::paper_ledger::VerifiedEffectiveFillSet, String> {
+    let db = crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| "economic-position database is not initialized".to_owned())?;
+    query_effective_fills_through_from_database(db, as_of_date)
+}
+
+/// Same verified epoch/legacy selection as the runtime wrapper, using an
+/// explicit manager. A read-only CLI session cannot activate or seed a ledger.
+pub fn query_effective_fills_through_from_database(
+    db: &crate::database::DatabaseManager,
+    as_of_date: NaiveDate,
+) -> Result<crate::trading::paper_ledger::VerifiedEffectiveFillSet, String> {
     use crate::trading::paper_ledger::{
         EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, PaperLedger,
     };
-    let db = crate::database::DatabaseManager::try_get()
-        .ok_or_else(|| "economic-position database is not initialized".to_owned())?;
     let (scope, history) = match std::env::var(crate::trading::paper_ledger_runtime::BINDING_ENV) {
         Ok(raw) => (
             EffectiveFillScope::Epoch(

@@ -151,3 +151,27 @@ Windows 新源码 e1dc7ef1588bda8076067e86b540b07311146c21 已实际推至main�
 H04的接续先直接复用这些资料制作精确 seed/资金分配材料。真正剩余的是正式策略预算与持仓分配授权、完整Financial资格、唯一批准issuer及生产模拟账本接线；历史总资产记录本身不签发可花预算。已有资料整理和实现不再等待用户重复提供持仓/现金；只有具体方案仍需用户作出的选择，才在材料完成后提出。
 
 原始金额、逐仓明细及查询/日志回读保存于本机忽略目录 `.planning/2026-10-07-full-platform-rollout/existing-account-position-readback.json`，未纳入远端。此次只读核验及文档更正通过内容复核与 `git diff --check`，无行为修改，不运行Cargo；未更改快照时间、96小时门、生产库、activation或实例。
+
+## 账户资料复用与只读探针修复（2026-10-07）
+
+用户追问未完成原因后，继续实际功能开发。原 `account_metrics_probe` 虽标注只读，却调用 `DatabaseManager::init`；该初始化会切换WAL、运行迁移并安装其它表，不能用于生产资料的只读验收。后继改为复用原 `AttributionDatabaseSession::ReadOnly`：先捕获并重验主库/WAL/SHM，形成会话持有的私有副本，再以只读连接读副本；不注册全局manager。该会话已有一致性、清理和拒绝合同，未新建第二套快照流程。
+
+两个既有账户/持仓accessor增加显式manager读入口，原runtime wrapper继续调用相同SQL和排序。effective-fill查询也提取相同manager入口；epoch/LegacyRaw范围、原目录/审计/费用验证及opaque结果保持，探针通过原 `report_from_effective` 重建净口径，未直接读raw成交或用记录数签发账本完整性。
+
+探针现在要求显式 `--db`，拒绝缺参数和未知写入参数；缺文件不会创建数据库。先显示已保存的资产、现金及持仓快照的数量/有效时间/来源，再区分来源缺失、时间绑定、未来/非法事实、present-but-stale及账本锚拒绝。确认空仓与缺持仓分别处理；总资产低于现金加证券市值、空仓与非零证券市值矛盾也会拒绝。非负其它资产残差保留，原确认时间和96小时规则不变。这是来源诊断和局部指标观察，没有批准资金、seed、正式决策、运行能力或上线资格。
+
+使用范围：
+
+```sh
+cargo run --locked --offline --bin account_metrics_probe -- --db /absolute/path/to/completed-isolated-copy.db
+```
+
+会话复制和重复核验完整数据库，优先使用已经完成的隔离副本；活跃源在捕获期间变化会按原合同拒绝，不能忽略WAL后强行读取。操作输出包含账户资料，应保留在本机；不是生产monitor的高频刷新入口。时效/当日盈亏不满足时仍退出1，不能把“资料存在”当作风控指标已可用。
+
+本批实际定向结果、最终源码身份和提交以下继回执为准；完整Financial、正式B/分配授权、正向issuer及H04–H06生产接线仍未完成。本轮没有安装、重启、重发activation或写生产库，旧Wave批准未被复用。
+
+本批最终输入前后哈希一致：探针9项、原账户/持仓5项、原经济归因8项，合计22次定向测试执行全部通过，格式/diff检查通过。初轮9项只覆盖初版探针，最终9项另绑定金额矛盾、其它资产残差、确认空仓及数量边界的后继代码；库相关13项的3个实际输入与初/最终源码清单相同，复用其结果。普通库886项、库测试152项既存warning保留；未运行或宣称新Strict Clippy、完整工作区、release、同制品dry-run或真实业务RPC通过。本批直接复核了只读会话、原SQL/epoch路由、来源与拒绝顺序及净成本路径，没有新的独立reviewer批准。
+
+15:53 CST正式根只读检查：monitor14998、bridge56417及两个binary/activation三SHA与原件一致；main/durable inode不变，durable仍schema9、78 Uncertain。现网正常过程中的Delivered由995变为996，RejectedDurable3988和ManualResolvedRejected6不变，不能将新增投递归于本未部署切片。Health退出1，Frozen/Unsafe，仍缺Quote/MoneyFlow/OrderBook；最新确认资料有效时间仍9月28日。正式资金/决策/账本和完整发布门均保持开放。
+
+原95a48784d的Rust CI37575710633失败日志此次成功读取，原件71543字节、SHA `9537e556b5f405bcbc7b207293669b0133cec260b52476085b4f7273c93ebf40`：current source/symbol/enum证据不一致、RFC/WBS provisional等严格架构问题依旧存在。它是本批之前的原CI，不能签发本批最终源码通过；compliance/coverage在本次读取时仍进行中。Windows最新交接和原任务cursor57已读，包外ACK仅文件读取；原89.33%关键覆盖仍未过95%。已按用户原协调授权再次派发实际handler/adapter开发及同版SDK/RPC续行，发送成功不等于已完成或已有合格新运行元组。

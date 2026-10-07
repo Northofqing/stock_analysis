@@ -100,6 +100,14 @@ fn save_user_position_snapshot_with_conn(
 
 pub fn latest_user_position_snapshot() -> Result<Option<UserPositionSnapshot>, String> {
     let db = crate::database::DatabaseManager::get();
+    latest_user_position_snapshot_from_database(db)
+}
+
+/// Reuse confirmed holdings from an explicit read session without initializing
+/// the singleton or reconciling the mutable local position projection.
+pub fn latest_user_position_snapshot_from_database(
+    db: &crate::database::DatabaseManager,
+) -> Result<Option<UserPositionSnapshot>, String> {
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     latest_user_position_snapshot_with_conn(&mut conn)
 }

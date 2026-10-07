@@ -81,9 +81,15 @@ fn save_with_conn(conn: &mut SqliteConnection, summary: &UserAccountSummary) -> 
 }
 
 pub fn latest() -> Result<Option<UserAccountSummary>, String> {
-    let mut conn = crate::database::DatabaseManager::get()
-        .get_conn()
-        .map_err(|e| e.to_string())?;
+    latest_from_database(crate::database::DatabaseManager::get())
+}
+
+/// Read the existing fact from an explicit manager, including a read-only
+/// detached session. This does not initialize or migrate the database.
+pub fn latest_from_database(
+    db: &crate::database::DatabaseManager,
+) -> Result<Option<UserAccountSummary>, String> {
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     latest_with_conn(&mut conn)
 }
 
