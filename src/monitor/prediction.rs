@@ -11,6 +11,7 @@ pub use samples::{
 };
 #[path = "prediction_verifier.rs"]
 mod verifier;
+pub(crate) use verifier::read_exact_close_on;
 pub use verifier::{
     verify_due_predictions, verify_one, PredictionVerificationReport, VerifyOutcome,
 };

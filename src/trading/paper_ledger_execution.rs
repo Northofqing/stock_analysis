@@ -13,8 +13,70 @@ pub struct ExecuteIntent {
     pub signal: PaperSignal,
     pub price_intent: PriceIntent,
     pub quote_price: Money,
+    /// Independent dated price authority, acquired before entering the lock.
+    pub price_qualification: ExecutionPriceQualification,
     /// Whole current inventory plus the traded security, acquired outside the lock.
     pub marks: Vec<Mark>,
+}
+#[derive(Clone, Debug)]
+pub struct ExecutionPriceQualification {
+    code: String,
+    effective_on: NaiveDate,
+    band: crate::data_gateway::QualifiedPriceBand,
+}
+impl ExecutionPriceQualification {
+    pub fn acquire(code: &str, effective_on: NaiveDate) -> Result<Self, LedgerError> {
+        let band =
+            crate::data_provider::limit_status::qualified_price_band_for_code(code, effective_on)
+                .map_err(|error| LedgerError::EvidenceUnavailable(error.to_string()))?;
+        Ok(Self {
+            code: code.into(),
+            effective_on,
+            band,
+        })
+    }
+    fn require(
+        &self,
+        code: &str,
+        effective_on: NaiveDate,
+        signal: Money,
+        quote: Money,
+    ) -> Result<(), LedgerError> {
+        if self.code != code || self.effective_on != effective_on {
+            return Err(LedgerError::EvidenceUnavailable(
+                "independent price authority code/session mismatch".into(),
+            ));
+        }
+        for price in [signal, quote] {
+            self.band
+                .validate_price_micros(price.micros())
+                .map_err(|error| {
+                    LedgerError::EvidenceUnavailable(format!(
+                        "independent execution price authority rejected: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(code: &str, effective_on: NaiveDate) -> Self {
+        assert!(code.starts_with("TEST_CODE_"));
+        Self {
+            code: code.into(),
+            effective_on,
+            band: crate::data_gateway::QualifiedPriceBand::new(
+                crate::data_gateway::SecurityBoard::Main,
+                false,
+                1,
+                1,
+                i64::MAX,
+                effective_on,
+                effective_on,
+                "TEST_CODE_isolated_explicit_broad_band_v1",
+            )
+            .unwrap(),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PriceIntent {
@@ -259,6 +321,12 @@ impl PaperLedger<'_> {
             ));
         }
         fresh(signal.quote_observed_at, now)?;
+        intent.price_qualification.require(
+            &signal.code,
+            day(now),
+            price,
+            intent.quote_price,
+        )?;
         if now < view.as_of {
             return Err(LedgerError::EvidenceUnavailable(
                 "execution before cutover/head".into(),

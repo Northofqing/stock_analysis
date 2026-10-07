@@ -5150,7 +5150,7 @@ pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool
     let should_enqueue_candidate = matches!(snapshot.action.as_ref(), Some(NewsAction::BuyDip));
     let params = build_news_to_idea_from_snapshot(&snapshot);
     let snap_size = snapshot.reasons.len();
-    let result = push_news_to_idea("", banner, params).await;
+    let result = push_news_to_idea(&snapshot.code, banner, params).await;
     if result {
         if should_enqueue_candidate {
             if let Err(error) = enqueue_candidate_from_d01(&snapshot).await {
@@ -16900,6 +16900,13 @@ pub async fn push_news_to_idea(
     banner: &BannerCtx,
     params: NewsToIdeaParams<'_>,
 ) -> bool {
+    let bound_code = match news_to_idea_bound_code(code, params.code) {
+        Ok(code) => code.to_owned(),
+        Err(reason) => {
+            log::error!("[D-01] {reason}");
+            return false;
+        }
+    };
     let text = render_news_to_idea(banner, params);
     // 2026-09-20: D-01 升级 counted (MU-d01)。生产 (news loop daily) 与
     // --push 手工工具共用此 funnel, 转一处全覆盖 (I-02 同形态)。counted
@@ -16908,7 +16915,7 @@ pub async fn push_news_to_idea(
     // 锚定 + D01 memo 补偿)。
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
     let today = chrono::Local::now().date_naive();
-    match build_news_to_idea_counted_binding(today, code, &hhmm, &text).and_then(|binding| {
+    match build_news_to_idea_counted_binding(today, &bound_code, &hhmm, &text).and_then(|binding| {
         crate::presentation_registry::acquire_token(
             "D-01-news-to-idea",
             crate::notify::PushKind::NewsToIdea,
@@ -16926,6 +16933,37 @@ pub async fn push_news_to_idea(
             log::error!("[D-01][BR-196] counted 准备失败: {reason}");
             false
         }
+    }
+}
+
+fn news_to_idea_bound_code<'a>(caller_code: &str, rendered_code: &'a str) -> Result<&'a str, String> {
+    if rendered_code.is_empty() || (!caller_code.is_empty() && caller_code != rendered_code) {
+        return Err("D-01 rendered security and counted ticket identity disagree".into());
+    }
+    Ok(rendered_code)
+}
+
+#[cfg(test)]
+mod d01_identity_regression_tests {
+    use super::*;
+    #[test]
+    fn rendered_security_owns_legacy_empty_scope_and_rejects_a_different_explicit_ticket() {
+        assert_eq!(news_to_idea_bound_code("", "600000").unwrap(), "600000");
+        assert_eq!(news_to_idea_bound_code("600000", "600000").unwrap(), "600000");
+        assert!(news_to_idea_bound_code("600519", "600000").is_err());
+        assert!(news_to_idea_bound_code("600000", "").is_err());
+        let code = news_to_idea_bound_code("", "600000").unwrap();
+        let binding = build_news_to_idea_counted_binding(
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap(),
+            code,
+            "09:31",
+            "TEST_CODE d01 entity card",
+        )
+        .unwrap();
+        let canonical: serde_json::Value =
+            serde_json::from_slice(binding.source_binding_canonical()).unwrap();
+        assert_eq!(canonical["code"], "600000");
+        assert!(binding.schedule_occurrence_identity().contains(":600000:"));
     }
 }
 

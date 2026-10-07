@@ -6,6 +6,7 @@
 //! 用法:
 //!   STOCK_DB=data/stock_analysis.db cargo run --bin backfill_daily
 //!   STOCK_DB=data/stock_analysis.db cargo run --bin backfill_daily -- 000001,600519,002415
+//!   STOCK_DB=data/stock_analysis.db cargo run --bin backfill_daily -- --outcomes
 //!
 //! 设计: 与 `backfill_predictions.rs` 保持一致风格 — 直接调用 lib 公共 API,
 //!       不复用 monitor 的 pipeline (避免触发 dry-run 的全套分析)。
@@ -34,6 +35,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stock_list_env = env::var("STOCK_LIST").ok();
     let arg1 = env::args().nth(1);
 
+    let outcome_mode = arg1.as_deref() == Some("--outcomes");
+    if outcome_mode && env::args().count() != 2 {
+        return Err(
+            "--outcomes takes no stock-list or extra arguments; range comes from original rows"
+                .into(),
+        );
+    }
     let stock_codes: Vec<String> = match arg1.or(stock_list_env) {
         Some(s) => s
             .split(',')
@@ -56,6 +64,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = env::var("STOCK_DB").ok().map(PathBuf::from);
     DatabaseManager::init(db_path.clone())?;
     let db = DatabaseManager::get();
+
+    if outcome_mode {
+        use stock_analysis::monitor::outcome_data::{refresh_outcome_data_page, OutcomeDataScope};
+        let through = stock_analysis::monitor::prediction::completed_session_as_of_at(
+            stock_analysis::monitor::prediction::shanghai_now(),
+        )?;
+        let mut cursor = None;
+        let mut incomplete = false;
+        let mut requested = 0;
+        loop {
+            let page = refresh_outcome_data_page(
+                db,
+                through,
+                OutcomeDataScope::PendingHistory,
+                cursor.as_deref(),
+                25,
+            )
+            .await?;
+            println!("[backfill_daily] candidate observations; no Delivered/profit qualification: {page:?}");
+            incomplete |= !page.errors.is_empty()
+                || !page.missing_dates.is_empty()
+                || page.authority_deferred_bars > 0;
+            requested += page.requested_instruments;
+            if page.requested_instruments == 0 {
+                break;
+            }
+            cursor = page.next_code;
+        }
+        if requested == 0 || incomplete {
+            return Err("outcome history incomplete: missing observations or authority; no zero returns or completion claim".into());
+        }
+        return Ok(());
+    }
 
     // 3. 初始化统一历史日线 Gateway
     let gateway = HistoricalBarsGateway::new();

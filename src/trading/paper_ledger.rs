@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod execution;
 use execution::apply_fact;
 pub(crate) use execution::OrderFact;
-pub use execution::{ExecuteIntent, PriceIntent, ValuationBatch};
+pub use execution::{ExecuteIntent, ExecutionPriceQualification, PriceIntent, ValuationBatch};
 #[path = "paper_ledger_adjudication.rs"]
 mod adjudication;
 pub(crate) use adjudication::{

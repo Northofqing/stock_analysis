@@ -39,6 +39,8 @@ mod g5b_schema12_migration_tests;
 mod p05_schema13_migration_tests;
 #[path = "prediction_outcome_tracker_tests.rs"]
 mod prediction_outcome_tracker_tests;
+#[path = "news_outcomes_tests.rs"]
+mod news_outcomes_tests;
 
 static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(1);
 

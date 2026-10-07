@@ -54,6 +54,9 @@ pub use status::{DeliveryStateCount, DeliveryStatusSnapshot, DELIVERY_STATUS_STA
 
 #[path = "coordinator_candidate_board.rs"]
 mod candidate_board;
+#[path = "coordinator_news_to_idea.rs"]
+mod news_to_idea;
+pub use news_to_idea::{NewsToIdeaCardObservation, NewsToIdeaTerminal};
 pub use candidate_board::{
     CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
     CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2,

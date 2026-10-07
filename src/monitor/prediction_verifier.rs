@@ -69,7 +69,7 @@ fn read_exact_close(db: &DatabaseManager, code: &str, date: &str) -> Result<Opti
     read_exact_close_on(&mut conn, code, date)
 }
 
-pub(super) fn read_exact_close_on(
+pub(crate) fn read_exact_close_on(
     conn: &mut diesel::SqliteConnection,
     code: &str,
     date: &str,

@@ -6570,4 +6570,68 @@ pub(super) async fn log_prediction_outcome_report() {
         Ok(Err(reason)) => log::warn!("[OutcomeTracker] unavailable reason={reason}"),
         Err(_) => log::warn!("[OutcomeTracker] unavailable reason=report_worker"),
     }
+    log_news_outcome_reports().await;
+}
+
+/// Observe original cards through the already cached owner. Database reads do
+/// not issue facts; files retain each content revision without overwriting old
+/// reports. This worker performs no provider, sink, reconciliation or migration.
+async fn log_news_outcome_reports() {
+    let namespace = match resolve_runtime_namespace() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let cached = match health::cached_state(&namespace) {
+        Ok(Some(state)) => state,
+        _ => {
+            log::warn!("[news-outcome] unavailable reason=original_counted_owner_absent");
+            return;
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let db = stock_analysis::database::DatabaseManager::try_get()
+            .ok_or("news_outcome_db_absent")?;
+        let now = stock_analysis::monitor::prediction::shanghai_now();
+        let through = stock_analysis::monitor::prediction::completed_session_as_of_at(now)?;
+        let mut cursor: Option<String> = None;
+        let mut visited = 0;
+        loop {
+            let dates = cached.coordinator.read_news_to_idea_business_dates(
+                &through.to_string(), cursor.as_deref(), 32,
+            ).map_err(|error| error.to_string())?;
+            if dates.is_empty() {
+                log::info!("[news-outcome] original-date scan exhausted dates={visited}; missing windows remain unresolved");
+                return Ok::<(), String>(());
+            }
+            if visited + dates.len() > 128 {
+                return Err(format!("news_outcome_date_extent_exceeded continuation_after={}", cursor.as_deref().unwrap_or("none")));
+            }
+            for date in &dates {
+                let observed = (|| {
+                    let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                        .map_err(|error| error.to_string())?;
+                    let report = stock_analysis::monitor::news_outcomes::read_news_outcomes(
+                        db, cached.coordinator.as_ref(), date, now,
+                    )?;
+                    let bytes = report.render_markdown()?;
+                    let path = stock_analysis::performance::report::persist_report_revision(
+                        std::path::Path::new("data/news_outcome_original_cards"), date,
+                        bytes.as_bytes(),
+                    )?;
+                    log::info!("[news-outcome] date={date} original_cards={} physically_accepted={} observations_only revision={}", report.original_cards, report.physically_accepted_cards, path.display());
+                    Ok::<(), String>(())
+                })();
+                if let Err(reason) = observed {
+                    log::warn!("[news-outcome] date={date} unavailable reason={reason}");
+                }
+            }
+            visited += dates.len();
+            cursor = dates.last().cloned();
+        }
+    }).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(reason)) => log::warn!("[news-outcome] unavailable reason={reason}"),
+        Err(_) => log::warn!("[news-outcome] unavailable reason=report_worker"),
+    }
 }

@@ -19,7 +19,7 @@ pub use coordinator::{
     DeliveryStatusSnapshot, DurableDeliveryCoordinator, G5bCountedDayFactV1,
     G5bCountedDaySnapshotV1, G5bCountedObservationV1, G5bCountedTerminalV1,
     HoldingPlanOccurrenceObservation, HoldingPlanOwnedOccurrence, HoldingPlanPrepareOutcome,
-    HoldingPlanReceiptKind,
+    HoldingPlanReceiptKind, NewsToIdeaCardObservation, NewsToIdeaTerminal,
     P05ChildReceiptObservation, P05InvalidationRenderFacts, P05NonAcceptedTerminal,
     P05StoredUnitPhase, P05StoredUnitSnapshot, DELIVERY_STATUS_STATES,
 };

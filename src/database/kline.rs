@@ -6,11 +6,18 @@ use diesel::prelude::*;
 use log::{info, warn};
 
 use crate::data_gateway::historical_bars::AdmittedDailyBars;
+use crate::data_gateway::{
+    QualifiedListingStatus, QualifiedSuspensionStatus, QualifiedTradingFacts,
+};
 use crate::models::{AnalysisResultRecord, NewAnalysisResult, NewStockDaily, StockDaily};
 use crate::schema::{analysis_result, stock_daily};
 
 use super::DatabaseManager;
-use super::{AnalysisContext, DbConnection, StockDailyRecord};
+use super::{AnalysisContext, StockDailyRecord};
+
+#[cfg(test)]
+#[path = "kline_trading_facts_tests.rs"]
+mod trading_facts_tests;
 
 impl DatabaseManager {
     fn persist_validated_kline_data(
@@ -162,7 +169,7 @@ impl DatabaseManager {
         reason = "internal UPSERT boundary mirrors the stock_daily row schema"
     )]
     fn upsert_daily_record(
-        conn: &mut DbConnection,
+        conn: &mut diesel::SqliteConnection,
         code: &str,
         date: NaiveDate,
         open: Option<f64>,
@@ -389,6 +396,117 @@ impl DatabaseManager {
             .into());
         }
         self.persist_validated_kline_data(code, batch.records(), &evidence.source)
+    }
+
+    /// Bind admitted observations to independent, date-specific authority in
+    /// one transaction. Bars alone never issue trading status. The current
+    /// production facts gateway is unavailable, so this seam cannot fill its
+    /// missing contract from prices, volumes or the absence of a halt event.
+    pub fn save_admitted_kline_with_trading_facts(
+        &self,
+        batch: &AdmittedDailyBars,
+        facts: &[QualifiedTradingFacts],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use diesel::sql_types::{Integer, Text};
+        let fail = |message: String| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+        let code = batch.target_code();
+        if code.trim().is_empty()
+            || batch.records().is_empty()
+            || batch.evidence().source.trim().is_empty()
+            || batch.evidence().batch_id.trim().is_empty()
+            || batch.evidence().observed_at.trim().is_empty()
+            || facts.len() != batch.records().len()
+        {
+            return Err(
+                fail("daily bars require exactly one admitted fact per date".into()).into(),
+            );
+        }
+        let mut by_date = std::collections::BTreeMap::new();
+        for fact in facts {
+            let request = fact.request();
+            if request.instrument().code() != code
+                || request.instrument().asset_class() != crate::market_domain::AssetClass::Equity
+                || !matches!(
+                    request.instrument().exchange(),
+                    crate::market_domain::Exchange::Shanghai
+                        | crate::market_domain::Exchange::Shenzhen
+                        | crate::market_domain::Exchange::Beijing
+                )
+                || !crate::calendar::verified_a_share_trading_day(request.effective_on())
+                    .map_err(fail)?
+                || by_date.insert(request.effective_on(), fact).is_some()
+            {
+                return Err(
+                    fail("daily trading-fact identity/date mismatch or duplicate".into()).into(),
+                );
+            }
+        }
+        // Complete admission before acquiring the write lock; no Gateway call
+        // or partial status set can escape the transaction below.
+        let mut states = Vec::with_capacity(batch.records().len());
+        let mut dates = std::collections::BTreeSet::new();
+        for bar in batch.records() {
+            if !dates.insert(bar.date) {
+                return Err(fail("duplicate admitted daily-bar date".into()).into());
+            }
+            let fact = by_date.get(&bar.date).ok_or_else(|| {
+                fail(format!("missing admitted trading fact {code}/{}", bar.date))
+            })?;
+            if fact
+                .lifecycle()
+                .require()
+                .map_err(|error| fail(error.reason_code().into()))?
+                != &QualifiedListingStatus::Listed
+            {
+                return Err(fail(
+                    "daily trading status requires an explicitly listed instrument".into(),
+                )
+                .into());
+            }
+            let status = match fact
+                .suspension()
+                .require()
+                .map_err(|error| fail(error.reason_code().into()))?
+            {
+                QualifiedSuspensionStatus::Trading => "trading",
+                QualifiedSuspensionStatus::Suspended { .. } => "suspended",
+            };
+            let evidence = fact
+                .evidence()
+                .ok_or_else(|| fail("trading authority evidence missing".into()))?;
+            let source_at = evidence
+                .source_at
+                .as_deref()
+                .ok_or_else(|| fail("trading authority source time missing".into()))?;
+            let times = chrono::DateTime::parse_from_rfc3339(source_at)
+                .ok()
+                .zip(chrono::DateTime::parse_from_rfc3339(&evidence.observed_at).ok());
+            if evidence.source.trim().is_empty() || evidence.batch_id.trim().is_empty()
+                || fact.contract_version().trim().is_empty()
+                || fact.contract_version() == crate::data_gateway::qualified_trading_facts::QUALIFIED_TRADING_FACTS_CONTRACT_V1
+                || !times.is_some_and(|(source, observed)| source <= observed)
+            {
+                return Err(fail("daily trading authority evidence is incomplete".into()).into());
+            }
+            states.push((bar, *fact, status, evidence, source_at));
+        }
+        let mut conn = self.get_conn()?;
+        conn.immediate_transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
+            for (bar, fact, status, evidence, source_at) in &states {
+                Self::upsert_daily_record(conn, code, bar.date, Some(bar.open), Some(bar.high),
+                    Some(bar.low), Some(bar.close), Some(bar.volume), Some(bar.amount),
+                    Some(bar.pct_chg), None, None, None, None, Some(&batch.evidence().source))?;
+                diesel::sql_query("UPDATE stock_daily SET is_suspended=?1 WHERE code=?2 AND date=?3")
+                    .bind::<Integer,_>(i32::from(*status == "suspended"))
+                    .bind::<Text,_>(code).bind::<Text,_>(bar.date.to_string()).execute(conn)?;
+                diesel::sql_query("INSERT INTO qualified_daily_trading_status(code,date,status,contract_version,source,source_at,observed_at,batch_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
+                    .bind::<Text,_>(code).bind::<Text,_>(bar.date.to_string()).bind::<Text,_>(*status)
+                    .bind::<Text,_>(fact.contract_version()).bind::<Text,_>(&evidence.source)
+                    .bind::<Text,_>(*source_at).bind::<Text,_>(&evidence.observed_at)
+                    .bind::<Text,_>(&evidence.batch_id).execute(conn)?;
+            }
+            Ok(states.len())
+        })
     }
 
     /// 保存分析结果到数据库（使用 ON CONFLICT DO UPDATE，单条 SQL）

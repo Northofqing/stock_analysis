@@ -123,6 +123,14 @@ pub(crate) fn execute_checked_on(
         return outcome(signal.plan_id, receipt);
     }
     let view = ledger.read(binding).map_err(|error| error.to_string())?;
+    let price_qualification = ExecutionPriceQualification::acquire(
+        &signal.code,
+        quote
+            .observed_at
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .date_naive(),
+    )
+    .map_err(|error| error.to_string())?;
     if let Some(checkpoint) = checkpoint {
         if checkpoint.binding != *binding
             || checkpoint.version != view.version
@@ -177,6 +185,7 @@ pub(crate) fn execute_checked_on(
                 signal,
                 price_intent: PriceIntent::SignalQuoteMarketV1,
                 quote_price: Money::from_cny(quote.price).map_err(|error| error.to_string())?,
+                price_qualification,
                 marks,
             }),
             cancelled,

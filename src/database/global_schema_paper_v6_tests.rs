@@ -83,6 +83,7 @@ impl Fixture {
         ledger
             .apply(PaperCommand::Execute(
                 crate::trading::paper_ledger::ExecuteIntent {
+                    price_qualification: crate::trading::paper_ledger::ExecutionPriceQualification::for_test("TEST_CODE_000001", instant().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap()).date_naive()),
                     price_intent: crate::trading::paper_ledger::PriceIntent::FixedSignalPriceV1,
                     binding: binding.clone(),
                     command_id: "TEST_CODE_G6_BUY_V1".into(),

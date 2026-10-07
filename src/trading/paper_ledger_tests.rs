@@ -14,6 +14,11 @@ fn order(
 ) -> ExecuteIntent {
     let view = ledger.read(binding).unwrap();
     ExecuteIntent {
+        price_qualification: ExecutionPriceQualification::for_test(
+            "TEST_CODE_000001",
+            at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                .date_naive(),
+        ),
         price_intent: PriceIntent::FixedSignalPriceV1,
         binding: binding.clone(),
         command_id: id.into(),
@@ -77,6 +82,97 @@ fn mark_close(
 
 fn instant() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 14, 2, 0, 0).unwrap()
+}
+
+#[test]
+fn paper_ledger_independent_price_authority_rejects_equal_bad_quotes_without_financial_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db =
+        DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_independent_band.db"))
+            .unwrap();
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    let before = ledger.read(&binding).unwrap();
+    for (index, signal, quote) in [
+        (0, 0.073, 0.073),
+        (1, 10., 0.073),
+        (2, 12., 12.),
+        (3, 10.001, 10.001),
+    ] {
+        let mut intent = order(
+            &ledger,
+            &binding,
+            &format!("bad-band-{index}"),
+            Direction::Buy,
+            signal,
+            instant(),
+        );
+        intent.quote_price = Money::from_cny(quote).unwrap();
+        intent.price_qualification =
+            ExecutionPriceQualification::acquire("TEST_CODE_000001", day(instant())).unwrap();
+        assert!(matches!(
+            ledger.apply(PaperCommand::Execute(intent)),
+            Err(LedgerError::EvidenceUnavailable(_))
+        ));
+        assert_eq!(ledger.read(&binding).unwrap(), before);
+    }
+    let count = diesel::sql_query("SELECT count(*) AS value FROM paper_trades")
+        .get_result::<IntegerRow>(&mut db.get_conn().unwrap())
+        .unwrap()
+        .value;
+    assert_eq!(count, 0);
+    let mut valid = order(
+        &ledger,
+        &binding,
+        "valid-band",
+        Direction::Buy,
+        10.,
+        instant(),
+    );
+    valid.price_qualification =
+        ExecutionPriceQualification::acquire("TEST_CODE_000001", day(instant())).unwrap();
+    let original = ledger.apply(PaperCommand::Execute(valid.clone())).unwrap();
+    assert_eq!(original.status, LedgerStatus::Filled);
+    assert!(
+        ledger
+            .apply(PaperCommand::Execute(valid))
+            .unwrap()
+            .already_applied
+    );
+    assert!(ExecutionPriceQualification::acquire("002463", day(instant())).is_err());
+}
+
+#[test]
+fn paper_ledger_independent_price_authority_binds_instrument_and_execution_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_band_binding.db"))
+        .unwrap();
+    let ledger = PaperLedger::open(&db, &instant);
+    let seed = manifest();
+    let binding = seed.binding().unwrap();
+    ledger.apply(PaperCommand::Seed(seed)).unwrap();
+    let before = ledger.read(&binding).unwrap();
+    for (code, date) in [
+        ("TEST_CODE_other", day(instant())),
+        (
+            "TEST_CODE_000001",
+            day(instant()) - chrono::Duration::days(1),
+        ),
+    ] {
+        let mut intent = order(
+            &ledger,
+            &binding,
+            "wrong-band",
+            Direction::Buy,
+            10.,
+            instant(),
+        );
+        intent.price_qualification = ExecutionPriceQualification::for_test(code, date);
+        assert!(ledger.apply(PaperCommand::Execute(intent)).is_err());
+        assert_eq!(ledger.read(&binding).unwrap(), before);
+    }
 }
 
 #[test]

@@ -163,6 +163,27 @@ pub fn fetch_attribution_close_prices(
                             dates.join(",")
                         )
                     })?;
+                // A second ordinary bar write would erase status just bound
+                // by the outcome collector. Reacquire independent dated facts
+                // and use the same atomic writer when authority is available.
+                let facts = admitted
+                    .records()
+                    .iter()
+                    .map(|bar| qualified_trading_facts(code, bar.date))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let all_available = facts.iter().all(|fact| {
+                    fact.lifecycle().require()
+                        == Ok(&stock_analysis::data_gateway::QualifiedListingStatus::Listed)
+                        && fact.suspension().require().is_ok()
+                });
+                let db = stock_analysis::database::DatabaseManager::get();
+                if all_available {
+                    db.save_admitted_kline_with_trading_facts(&admitted, &facts)
+                } else {
+                    log::warn!("[attribution] {code} admitted bars have no complete independent daily authority; outcome windows remain unqualified");
+                    db.save_admitted_kline_data(&admitted)
+                }
+                .map_err(|error| format!("{code}: 已准入日线/资格落库失败: {error}"))?;
                 prices.insert(code.clone(), bar.close);
             }
             Err(primary_error) => match fetch_close_via_outcome_adaptive(code, today) {

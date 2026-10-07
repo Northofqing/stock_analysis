@@ -7457,6 +7457,11 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
     let mut ai_analysis_date: Option<chrono::NaiveDate> = None;
     // 2026-08-31: 每日复盘窗口内补推一次历史欠账 (calendar 日去重)。
     let mut backfill_date: Option<chrono::NaiveDate> = None;
+    // Observation collection has its own bounded cursor; a candidate's
+    // unavailable data cannot abort holdings valuation or review dispatch.
+    let mut outcome_refresh_day: Option<chrono::NaiveDate> = None;
+    let mut outcome_refresh_cursor: Option<String> = None;
+    let mut outcome_refresh_scanned = false;
 
     log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
 
@@ -7510,6 +7515,41 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
             stock_analysis::calendar::is_trading_day(now.date_naive()),
         ) {
             continue;
+        }
+
+        if outcome_refresh_day != Some(now.date_naive()) {
+            outcome_refresh_day = Some(now.date_naive());
+            outcome_refresh_cursor = None;
+            outcome_refresh_scanned = false;
+        }
+        if !outcome_refresh_scanned {
+            use stock_analysis::monitor::outcome_data::{refresh_outcome_data_page, OutcomeDataScope};
+            match prediction::completed_session_as_of_at(now.fixed_offset()) {
+                Ok(through) => match refresh_outcome_data_page(
+                    stock_analysis::database::DatabaseManager::get(),
+                    through,
+                    OutcomeDataScope::RecentSessions,
+                    outcome_refresh_cursor.as_deref(),
+                    10,
+                )
+                .await {
+                    Ok(page) => {
+                        // Exhaustion only ends this daily collection pass;
+                        // deferred authority/errors remain explicitly unresolved.
+                        outcome_refresh_scanned = page.requested_instruments == 0;
+                        if let Some(code) = &page.next_code {
+                            outcome_refresh_cursor = Some(code.clone());
+                        }
+                        if page.requested_instruments > 0 {
+                            log::info!("[outcome-data] daily collection pass: {page:?}");
+                        }
+                    }
+                    Err(error) => log::warn!(
+                        "[outcome-data] collection failed; same cursor retry eligible: {error}"
+                    ),
+                },
+                Err(error) => log::warn!("[outcome-data] completed session unavailable: {error}"),
+            }
         }
 
         if closing_valuation_runtime::eligible_after_close(now.fixed_offset()) {
