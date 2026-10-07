@@ -36,7 +36,7 @@
 
 ## 下一依赖
 
-1. 在同一活 reader 上追加 manifest 规范化哈希与身份校验；已关闭的局部 checked owner 不得重开 reader。
+1. Manifest 规范化哈希与身份子片的后继实现在 [清单内容接续](2026-10-07-v1-manifest-content-development.md)；沿同一活 reader，已关闭的局部 checked owner 不得重开 reader。最终验证与源码身份以该文档为准，不提升完整 Financial 资格。
 2. 完整历史经济重放与 Genesis/执行/裁定/投影相等，汇合 H01 原生 provider/SQL 资格。
 3. 真实资金 B、正向 F2 与 paper 生产接线；同版 SDK/RPC 和精确 activation 审阅仍分别执行。
 

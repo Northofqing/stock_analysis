@@ -5,7 +5,9 @@ use rusqlite::{params, Connection};
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 
-fn transformed(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> AdditiveStorageTransformed {
+pub(super) fn transformed(
+    original: rows::VerifiedUnapprovedOriginalRowsBackup,
+) -> AdditiveStorageTransformed {
     let copied =
         match AdditiveStorageCopied::create(original.into_additive_target_source().unwrap()) {
             Ok(owner) => owner,
@@ -16,7 +18,7 @@ fn transformed(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> Additive
         Err(held) => panic!("V1 content transform: {}", held.first_error()),
     }
 }
-fn prepared(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> V1ContentFrame {
+pub(super) fn prepared(original: rows::VerifiedUnapprovedOriginalRowsBackup) -> V1ContentFrame {
     let mut frame = V1ContentFrame::new(RawV1AuditLinksFrame::new(transformed(original).frame));
     assert!(
         frame.audit.raw.prepare(false)
@@ -159,7 +161,7 @@ fn task6_v1_content_same_owner_warm_and_cold() {
     );
 }
 
-fn fixed_connection() -> Connection {
+pub(super) fn fixed_connection() -> Connection {
     let c = Connection::open_in_memory().unwrap();
     c.execute_batch("CREATE TABLE paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes);
         CREATE TABLE paper_ledger_event(account_id,seq,command_id,previous_hash,event_hash,payload,business_plan_id,intent_hash,is_terminal,paper_trade_id,order_audit_id);
@@ -196,7 +198,7 @@ fn fixed_connection() -> Connection {
     }
     c
 }
-fn read_fields(c: &Connection, work: &mut target::TargetWork) -> V1AuditInputFields {
+pub(super) fn read_fields(c: &Connection, work: &mut target::TargetWork) -> V1AuditInputFields {
     let mut fields = V1AuditInputFields::default();
     for query in [
         V1AuditInputQuery::Accounts,

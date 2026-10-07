@@ -204,7 +204,8 @@ impl V1ContentFrame {
         self.audit.raw.phase = RawV1AuditLinksPhase::Complete;
         Ok(())
     }
-    fn finish(&mut self) -> bool {
+    // Keep the original second reader live for the next ordinary content check.
+    fn advance_content(&mut self) -> bool {
         if !self.begin() {
             return false;
         }
@@ -224,6 +225,12 @@ impl V1ContentFrame {
         if self.audit.raw.first() {
             return false;
         }
+        true
+    }
+    fn finish(&mut self) -> bool {
+        if !self.advance_content() {
+            return false;
+        }
         match self.close_and_tail() {
             Ok(()) => true,
             Err(first) => {
@@ -233,6 +240,9 @@ impl V1ContentFrame {
         }
     }
 }
+
+#[path = "global_schema_v1_manifest_content.rs"]
+mod manifest_content;
 
 fn digest_matches(hash: Sha256, expected: &str) -> StorageResult<bool> {
     let mut hex = [0; 64];
