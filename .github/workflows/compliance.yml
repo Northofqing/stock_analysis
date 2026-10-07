@@ -11,8 +11,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      # config/design_contracts.toml pins this same compiler for Gate C.
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@1.95.0
       - name: Install sqlite3 + python3
         run: |
           sudo apt-get update

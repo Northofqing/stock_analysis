@@ -103,3 +103,11 @@ Windows精确 `2b225b71148425d18c82a3dcc552f1444f3595cd` 的原CI `37564892679` 
 新增范围实际发现两类旧预期：桥接测试仍将刻意关闭的raw FuturesDelivery当成功、将已退役EconomicCalendar当invalid evidence；通道仍断言旧40项声明。按真实 `1cc28f425`/`419befbfa` 和 `df4202502` 合同变更修正既有断言，保持明确不可重试拒绝，并核当前41个唯一operation、MarketAnnouncements与BenchmarkBars必需声明。没有修改production Gateway、transport、准入或 fixture advertisement。
 
 当前三个目标合计18项通过（durable6、bridge2、channel10）；前两次各自真实失败及日志保留，只对后继修改的目标补验证。Cargo metadata确认workflow全部10个integration target存在、旧e2e缺失；YAML语法、两个测试文件rustfmt及diff-check通过。此为本机受控fixture/隔离owner证据，不是同版Windows真实业务RPC；原全部lib及其余原关键回归保持CI范围，新Linux完整step仍待实际运行。
+
+## 947c1ed2c 编译器漂移与后继一致性修复
+
+集成入口已提交并同步主目录及两远端：`947c1ed2c6ed6fd047dcfb08a6325d46791e6beb`，树 `ee611473de427b8fd117bc18e14f4e7aae24480a`。其原Linux compliance `37567506680` 的offline门仍通过，已进入正确测试范围的依赖编译；实际后继退出101是 `ethnum 1.5.2` 的E0512，原日志中 `TryFromIntError` 已为8bits，原transmute源为0bits，尚无test harness运行。
+
+完整原日志确认 `stable` action本轮安装Rust `1.99.0 b940084d7`；仓库BR-252合同、coverage原workflow和本机已验证Cargo均固定 `1.95.0 59807616e`。后继将Rust CI与compliance的compiler对齐现行固定合同，Rust CI显式安装rustfmt/clippy。没有改Cargo.lock、第三方源码、features、profile、覆盖阈值或strict检查范围。YAML语法和合同版本一致性另验；Linux依赖编译是否解除、完整测试与覆盖率仍由新HEAD原CI裁定。
+
+本机另外启动原 `cargo clippy --locked --offline --all-targets --all-features --message-format=json -- -D warnings`。首次全程尚无compiler JSON；进程采样固定在Cargo `PathSource`/`list_files_gix`/包输入fingerprint，而根目录有25GB未忽略的 `.replay-build-records` 生成原件。按完整PID/父进程/参数/cwd重验后只向本次Cargo发SIGINT，原driver退出255、两输出均空，记为主动中止、Clippy未执行，不是lint通过或lint失败。后继只把此生成目录加入.gitignore；原记录未移动/删除，源码、Cargo输入、合同及回执未改写。指纹阶段和真实严格诊断另据后继日志，不能仅由ignore声明声称性能或全部Clippy门已通过。
