@@ -42,19 +42,25 @@ pub struct ReasonWinrateReport {
 
 /// Shared calculation used by the DB-backed production loader and tests.
 pub fn summarize_verified_rows(rows: &[VerifiedOutcome]) -> WinrateSummary {
-    let verified: Vec<&VerifiedOutcome> = rows.iter().filter(|row| row.hit.is_some()).collect();
+    let verified: Vec<&VerifiedOutcome> = rows
+        .iter()
+        .filter(|row| {
+            row.hit.is_some()
+                && row
+                    .actual_change
+                    .is_some_and(|value| value.is_finite() && value >= -100.)
+                && row.special_case.as_deref() != Some("suspended")
+        })
+        .collect();
     let total = verified.len();
     let wins = verified.iter().filter(|row| row.hit == Some(true)).count();
     let losses = total - wins;
-    let returns: Vec<f64> = verified
-        .iter()
-        .filter_map(|row| row.actual_change)
-        .filter(|value| value.is_finite())
-        .collect();
+    let mean = verified.iter().enumerate().fold(0., |mean, (index, row)| {
+        mean + (row.actual_change.expect("complete verified outcome") - mean) / (index + 1) as f64
+    });
     WinrateSummary {
         winrate: (total > 0).then(|| wins as f64 / total as f64),
-        mean_return: (!returns.is_empty())
-            .then(|| returns.iter().sum::<f64>() / returns.len() as f64),
+        mean_return: (total > 0).then_some(mean),
         sufficient: total >= MIN_SAMPLES,
         total,
         wins,
@@ -103,7 +109,11 @@ pub fn load_reason_winrate(reason: Option<&str>) -> Result<ReasonWinrateReport, 
                   include_special: bool| {
         rows.iter()
             .map(|row| VerifiedOutcome {
-                hit: hit(row).map(|value| value != 0),
+                hit: hit(row).and_then(|value| match value {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                }),
                 actual_change: change(row),
                 special_case: include_special
                     .then(|| row.t1_special_case.clone())
@@ -120,4 +130,74 @@ pub fn load_reason_winrate(reason: Option<&str>) -> Result<ReasonWinrateReport, 
         t3: summarize_verified_rows(&t3),
         t5: summarize_verified_rows(&t5),
     })
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_nonfinite_impossible_or_suspended_returns_cannot_raise_sample_gate() {
+        let valid = VerifiedOutcome {
+            hit: Some(true),
+            actual_change: Some(1.),
+            special_case: None,
+        };
+        let mut rows = vec![valid; 199];
+        for value in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-100.01)] {
+            rows.push(VerifiedOutcome {
+                hit: Some(true),
+                actual_change: value,
+                special_case: None,
+            });
+        }
+        rows.push(VerifiedOutcome {
+            hit: Some(true),
+            actual_change: Some(0.),
+            special_case: Some("suspended".into()),
+        });
+        rows.push(VerifiedOutcome {
+            hit: None,
+            actual_change: Some(1.),
+            special_case: None,
+        });
+        let report = summarize_verified_rows(&rows);
+        assert_eq!((report.total, report.wins, report.losses), (199, 199, 0));
+        assert_eq!((report.mean_return, report.gated_score()), (Some(1.), None));
+    }
+
+    #[test]
+    fn complete_cost_unqualified_observations_preserve_statistics_and_finite_mean() {
+        let mut rows = vec![
+            VerifiedOutcome {
+                hit: Some(true),
+                actual_change: Some(2.),
+                special_case: None
+            };
+            150
+        ];
+        rows.extend(vec![
+            VerifiedOutcome {
+                hit: Some(false),
+                actual_change: Some(-1.),
+                special_case: None
+            };
+            50
+        ]);
+        let report = summarize_verified_rows(&rows);
+        assert_eq!(
+            (report.total, report.winrate, report.gated_score()),
+            (200, Some(0.75), Some(0.75))
+        );
+        assert!((report.mean_return.unwrap() - 1.25).abs() < 1e-12);
+        let max = VerifiedOutcome {
+            hit: Some(true),
+            actual_change: Some(f64::MAX),
+            special_case: None,
+        };
+        assert_eq!(
+            summarize_verified_rows(&[max.clone(), max]).mean_return,
+            Some(f64::MAX)
+        );
+    }
 }

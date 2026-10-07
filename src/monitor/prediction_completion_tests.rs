@@ -777,8 +777,16 @@ fn task2_due_scan_distinguishes_storage_read_error_from_missing_close() {
         (report.pending, report.verified, report.deferred),
         (1, 0, 0)
     );
-    assert_eq!(report.errors.len(), 1);
-    assert!(report.errors[0].contains("stock_daily"));
+    // The frozen target and horizon scan independently report storage failure;
+    // neither may turn it into a missing-price deferral or acknowledge a write.
+    assert_eq!(report.errors.len(), 2);
+    assert!(report
+        .errors
+        .iter()
+        .all(|error| error.contains("stock_daily")));
+    assert_eq!(report.windows.errors.len(), 1);
+    assert_eq!(report.windows.deferred_windows, 0);
+    assert_eq!(report.windows.verified_t1, 0);
 }
 
 #[tokio::test]

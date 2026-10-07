@@ -17,11 +17,17 @@ pub struct PredictionVerificationReport {
     pub deferred: usize,
     /// Another verifier won the CAS, or the DB declined the update: not our success.
     pub raced: usize,
+    /// Close-to-close observations, independently mature from the frozen target.
+    pub windows: super::horizons::PredictionWindowVerificationReport,
     pub errors: Vec<String>,
 }
 impl PredictionVerificationReport {
     pub fn log(&self) {
-        if self.errors.is_empty() && self.deferred == 0 && self.raced == 0 {
+        if self.errors.is_empty()
+            && self.deferred == 0
+            && self.raced == 0
+            && self.windows.deferred_windows == 0
+        {
             log::info!("[Prediction] 到期验证: {:?}", self);
         } else {
             log::warn!("[Prediction] 到期验证仍有未完成项: {:?}", self);
@@ -59,12 +65,20 @@ pub(super) fn recorded_direction_hit(value: &str, actual_change: f64) -> Result<
 }
 
 fn read_exact_close(db: &DatabaseManager, code: &str, date: &str) -> Result<Option<f64>, String> {
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    read_exact_close_on(&mut conn, code, date)
+}
+
+pub(super) fn read_exact_close_on(
+    conn: &mut diesel::SqliteConnection,
+    code: &str,
+    date: &str,
+) -> Result<Option<f64>, String> {
     #[derive(diesel::QueryableByName)]
     struct Close {
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
         close: Option<f64>,
     }
-    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     let row = diesel::sql_query(
         "SELECT daily.close FROM stock_daily AS daily \
          WHERE daily.code = ?1 AND daily.date = ?2 AND daily.is_suspended = 0 \
@@ -74,7 +88,7 @@ fn read_exact_close(db: &DatabaseManager, code: &str, date: &str) -> Result<Opti
     )
     .bind::<diesel::sql_types::Text, _>(code)
     .bind::<diesel::sql_types::Text, _>(date)
-    .get_result::<Close>(&mut conn)
+    .get_result::<Close>(conn)
     .optional()
     .map_err(|e| e.to_string())?;
     Ok(row.and_then(|r| r.close))
@@ -204,6 +218,15 @@ pub(super) fn verify_due_predictions_with_page_size(
                 Err(error) => report.errors.push(format!("id={} update: {error}", row.id)),
             }
         }
+    }
+    match super::horizons::verify_windows(db, as_of, high_water_id, page_size) {
+        Ok(windows) => {
+            report.errors.extend(windows.errors.iter().cloned());
+            report.windows = windows;
+        }
+        Err(error) => report
+            .errors
+            .push(format!("prediction-window scan: {error}")),
     }
     Ok(report)
 }

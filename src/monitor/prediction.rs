@@ -15,6 +15,10 @@ pub use verifier::{
     verify_due_predictions, verify_one, PredictionVerificationReport, VerifyOutcome,
 };
 
+#[path = "prediction_horizons.rs"]
+mod horizons;
+pub use horizons::PredictionWindowVerificationReport;
+
 #[path = "prediction_outcome_tracker.rs"]
 mod outcome_tracker;
 pub use outcome_tracker::{
