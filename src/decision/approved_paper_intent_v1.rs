@@ -2,7 +2,6 @@
 //! issuer can construct the distinct, non-serializable approval capability.
 //! Production approval/source contracts are not delivered and remain blocked.
 
-use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use crate::data_gateway::{
     QualifiedFact, QualifiedListingStatus, QualifiedSuspensionStatus, QualifiedTradingFacts,
     SecurityBoard,
@@ -13,6 +12,9 @@ use crate::trading::paper_book_v2_budget_v1::token;
 use crate::trading::paper_book_v2_execution::ActualExecutionBinding;
 use crate::trading::paper_book_v2_fill_model::{Side, WindowRecord, MODEL_VERSION};
 use crate::trading::paper_ledger::LedgerError;
+use crate::trading::paper_replay_financial_work_v1::{
+    self as fw, ClosedFinancialText as Txt, FinancialFailure, FinancialWork,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -53,8 +55,39 @@ impl IntentRecord {
     pub(crate) fn validate_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
         w.finish()?;
         self.source_window.validate_with_work(w)?;
-        if self.version != INTENT_VERSION || [ &self.account_id, &self.epoch_id, &self.parent_id, &self.investment_decision_id, &self.family_id, &self.chain_id, &self.instrument_code, &self.instrument_name, &self.approval_reference, ] .iter() .any(|v| !token(v)) || self.execution_manifest_hash.len() != 64 || !self .execution_manifest_hash .bytes() .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) || self.quantity == 0 || self.quantity % 100 != 0 || self.instrument_code != self.source_window.instrument_code || self.session_date != self.source_window.session_date || self.approved_at != self.source_window.observed_at || self.limit_micro_cny < self.source_window.lower_micro_cny || self.fee_price_cap_micro_cny < self.limit_micro_cny || self.fee_price_cap_micro_cny > self.source_window.upper_micro_cny || self.limit_micro_cny % self.source_window.tick_micro_cny != 0 || self.fee_price_cap_micro_cny % self.source_window.tick_micro_cny != 0 {
-            return Err(w.error(Txt::Intent(fw::IntentText::ClosedParentIntentBindingInvalid))?);
+        if self.version != INTENT_VERSION
+            || [
+                &self.account_id,
+                &self.epoch_id,
+                &self.parent_id,
+                &self.investment_decision_id,
+                &self.family_id,
+                &self.chain_id,
+                &self.instrument_code,
+                &self.instrument_name,
+                &self.approval_reference,
+            ]
+            .iter()
+            .any(|v| !token(v))
+            || self.execution_manifest_hash.len() != 64
+            || !self
+                .execution_manifest_hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || self.quantity == 0
+            || self.quantity % 100 != 0
+            || self.instrument_code != self.source_window.instrument_code
+            || self.session_date != self.source_window.session_date
+            || self.approved_at != self.source_window.observed_at
+            || self.limit_micro_cny < self.source_window.lower_micro_cny
+            || self.fee_price_cap_micro_cny < self.limit_micro_cny
+            || self.fee_price_cap_micro_cny > self.source_window.upper_micro_cny
+            || self.limit_micro_cny % self.source_window.tick_micro_cny != 0
+            || self.fee_price_cap_micro_cny % self.source_window.tick_micro_cny != 0
+        {
+            return Err(w.error(Txt::Intent(
+                fw::IntentText::ClosedParentIntentBindingInvalid,
+            ))?);
         }
         Ok(())
     }

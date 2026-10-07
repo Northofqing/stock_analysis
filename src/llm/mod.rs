@@ -156,17 +156,31 @@ impl ReceiptBearingJson {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn test_fixture_requested_model(
-        provider: &str, requested_model: &str, upstream_model: &str,
-        upstream_request_id: Option<&str>, upstream_response_id: &str,
-        system: &str, user: &str, raw_content: &str,
-        started_at: DateTime<Utc>, completed_at: DateTime<Utc>,
+        provider: &str,
+        requested_model: &str,
+        upstream_model: &str,
+        upstream_request_id: Option<&str>,
+        upstream_response_id: &str,
+        system: &str,
+        user: &str,
+        raw_content: &str,
+        started_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
     ) -> Self {
-        let mut completed = Self::test_fixture(provider, upstream_model, upstream_request_id,
-            upstream_response_id, system, user, raw_content, started_at, completed_at);
+        let mut completed = Self::test_fixture(
+            provider,
+            upstream_model,
+            upstream_request_id,
+            upstream_response_id,
+            system,
+            user,
+            raw_content,
+            started_at,
+            completed_at,
+        );
         completed.receipt.requested_model = Some(requested_model.to_owned());
         completed
     }
-
 }
 
 /// 统一 LLM 错误
@@ -437,58 +451,103 @@ mod tests {
         ));
     }
 
-
     #[tokio::test]
     async fn news_global_input_contract_http_requested_model_is_not_upstream_model() {
-        use tokio::io::{AsyncReadExt,AsyncWriteExt};
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address=listener.local_addr().unwrap();
-        let server=tokio::spawn(async move {
-            let (mut socket,_)=listener.accept().await.unwrap();
-            let mut bytes=Vec::new();
-            let header_end=loop {
-                let mut chunk=[0u8;4096];let n=socket.read(&mut chunk).await.unwrap();
-                assert!(n>0);bytes.extend_from_slice(&chunk[..n]);assert!(bytes.len()<=16384);
-                if let Some(i)=bytes.windows(4).position(|v|v==b"\r\n\r\n") {break i+4;}
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                assert!(bytes.len() <= 16384);
+                if let Some(i) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    break i + 4;
+                }
             };
-            let headers=std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
             assert!(headers.starts_with("POST /v1/chat/completions "));
-            let length=headers.lines().find_map(|line| {
-                let (name,value)=line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length").then(||value.trim().parse::<usize>().unwrap())
-            }).unwrap();assert!(header_end+length<=16384);
-            while bytes.len()<header_end+length {
-                let mut chunk=[0u8;4096];let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);
-                bytes.extend_from_slice(&chunk[..n]);assert!(bytes.len()<=16384);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(header_end + length <= 16384);
+            while bytes.len() < header_end + length {
+                let mut chunk = [0u8; 4096];
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                assert!(bytes.len() <= 16384);
             }
-            let wire:Value=serde_json::from_slice(&bytes[header_end..header_end+length]).unwrap();
-            assert_eq!(wire["model"],"TEST_CODE_CONFIGURED_REQUEST");
-            assert_eq!(wire["messages"][0]["content"],"TEST_CODE_SYSTEM");
-            assert_eq!(wire["messages"][1]["content"],"TEST_CODE_USER");
+            let wire: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            assert_eq!(wire["model"], "TEST_CODE_CONFIGURED_REQUEST");
+            assert_eq!(wire["messages"][0]["content"], "TEST_CODE_SYSTEM");
+            assert_eq!(wire["messages"][1]["content"], "TEST_CODE_USER");
             let body=serde_json::json!({"id":"TEST_CODE_HTTP_RESPONSE","choices":[{"index":0,
                 "message":{"content":"{\"importance\":80,\"uncertainty\":\"x\",\"core_logic\":\"x\"}",
                     "tool_calls":null,"role":"assistant","function_call":null},"finish_reason":"stop","logprobs":null}],
                 "created":1,"model":"TEST_CODE_UPSTREAM_ACTUAL","system_fingerprint":null,"object":"chat.completion","usage":null}).to_string();
             let response=format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",body.len(),body);
-            socket.write_all(response.as_bytes()).await.unwrap();socket.shutdown().await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
         });
-        let client=Client::with_config(OpenAIConfig::new().with_api_key("TEST_CODE_UNUSED_LOOPBACK_KEY")
-            .with_api_base(format!("http://{address}/v1"))).with_http_client(
-                reqwest_011::Client::builder().no_proxy().build().unwrap());
-        let completed=tokio::time::timeout(std::time::Duration::from_secs(5),
-            openai_compatible_chat_json_with_receipt(&client,"TEST_CODE_PROVIDER","TEST_CODE_CONFIGURED_REQUEST","TEST_CODE_SYSTEM","TEST_CODE_USER"))
-            .await.unwrap().unwrap();
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_key("TEST_CODE_UNUSED_LOOPBACK_KEY")
+                .with_api_base(format!("http://{address}/v1")),
+        )
+        .with_http_client(reqwest_011::Client::builder().no_proxy().build().unwrap());
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            openai_compatible_chat_json_with_receipt(
+                &client,
+                "TEST_CODE_PROVIDER",
+                "TEST_CODE_CONFIGURED_REQUEST",
+                "TEST_CODE_SYSTEM",
+                "TEST_CODE_USER",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         server.await.unwrap();
-        let receipt=completed.receipt();
-        assert_eq!(receipt.requested_model(),Some("TEST_CODE_CONFIGURED_REQUEST"));
-        assert_eq!(receipt.model(),"TEST_CODE_UPSTREAM_ACTUAL");
-        assert_eq!(receipt.provider(),"TEST_CODE_PROVIDER");
-        assert_eq!(receipt.system_sha256(),sha256_hex("TEST_CODE_SYSTEM"));
-        assert_eq!(receipt.user_sha256(),sha256_hex("TEST_CODE_USER"));
-        assert_eq!(receipt.response_sha256(),sha256_hex(completed.raw_content()));
-        let legacy=ReceiptBearingJson::test_fixture("TEST_CODE_PROVIDER","TEST_CODE_LEGACY",None,"TEST_CODE_RESPONSE",
-            "TEST_CODE_SYSTEM","TEST_CODE_USER","{}",Utc::now(),Utc::now());
-        assert_eq!(legacy.receipt().requested_model(),None);
-        assert!(serde_json::to_value(legacy.receipt()).unwrap().get("requested_model").is_none());
+        let receipt = completed.receipt();
+        assert_eq!(
+            receipt.requested_model(),
+            Some("TEST_CODE_CONFIGURED_REQUEST")
+        );
+        assert_eq!(receipt.model(), "TEST_CODE_UPSTREAM_ACTUAL");
+        assert_eq!(receipt.provider(), "TEST_CODE_PROVIDER");
+        assert_eq!(receipt.system_sha256(), sha256_hex("TEST_CODE_SYSTEM"));
+        assert_eq!(receipt.user_sha256(), sha256_hex("TEST_CODE_USER"));
+        assert_eq!(
+            receipt.response_sha256(),
+            sha256_hex(completed.raw_content())
+        );
+        let legacy = ReceiptBearingJson::test_fixture(
+            "TEST_CODE_PROVIDER",
+            "TEST_CODE_LEGACY",
+            None,
+            "TEST_CODE_RESPONSE",
+            "TEST_CODE_SYSTEM",
+            "TEST_CODE_USER",
+            "{}",
+            Utc::now(),
+            Utc::now(),
+        );
+        assert_eq!(legacy.receipt().requested_model(), None);
+        assert!(serde_json::to_value(legacy.receipt())
+            .unwrap()
+            .get("requested_model")
+            .is_none());
     }
 }

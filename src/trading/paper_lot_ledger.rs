@@ -2,38 +2,45 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
-use crate::performance::fee_evidence::{fill_adverse_cost, FillSide};
 use super::paper_replay_financial_work_v1::{
-    self as financial,
-    FinancialWork,
-    FinancialSink,
-    FinancialFailure,
-    HistoryChrono,
-    HistoryText,
-    HistoryTreeSlot
+    self as financial, FinancialFailure, FinancialSink, FinancialWork, HistoryChrono, HistoryText,
+    HistoryTreeSlot,
 };
+use crate::performance::fee_evidence::{fill_adverse_cost, FillSide};
 
 /// 解析持久化纸面成交的规范时间。禁止 SQLite/调用方把 `now`、仅日期或仅时间
 /// 补造成事实；执行账本与策略研究共用同一严格边界。
-pub(crate) fn parse_paper_fill_timestamp(fill_id: i64, raw: &str) -> Result<chrono::NaiveDateTime, String> {
-    financial::historical_text(parse_paper_fill_timestamp_body(fill_id, raw, &mut FinancialWork::Historical))
+pub(crate) fn parse_paper_fill_timestamp(
+    fill_id: i64,
+    raw: &str,
+) -> Result<chrono::NaiveDateTime, String> {
+    financial::historical_text(parse_paper_fill_timestamp_body(
+        fill_id,
+        raw,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn parse_paper_fill_timestamp_body(fill_id: i64, raw: &str, work: &mut FinancialWork<'_, '_>) -> financial::Result<chrono::NaiveDateTime> {
+pub(crate) fn parse_paper_fill_timestamp_body(
+    fill_id: i64,
+    raw: &str,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<chrono::NaiveDateTime> {
     work.history_begin()?;
     let parsed = match chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f") {
         Ok(value) => value,
-        Err(error) => return Err(fifo_error(work, FifoText::Timestamp {
-            fill_id, error
-        })?),
+        Err(error) => return Err(fifo_error(work, FifoText::Timestamp { fill_id, error })?),
     };
     let whole_seconds = work.history_time(HistoryChrono::Whole(parsed))?;
-    let canonical = raw == whole_seconds || raw.strip_prefix(&work.history_time(HistoryChrono::Dotted(&whole_seconds))?).is_some_and(|fraction| {
-        !fraction.is_empty() && fraction.len() <= 9 && fraction.bytes().all(|byte| byte.is_ascii_digit())
-    });
+    let canonical = raw == whole_seconds
+        || raw
+            .strip_prefix(&work.history_time(HistoryChrono::Dotted(&whole_seconds))?)
+            .is_some_and(|fraction| {
+                !fraction.is_empty()
+                    && fraction.len() <= 9
+                    && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            });
     if !canonical {
-        return Err(fifo_error(work, FifoText::Canonical {
-            fill_id, raw
-        })?);
+        return Err(fifo_error(work, FifoText::Canonical { fill_id, raw })?);
     }
     Ok(parsed)
 }
@@ -126,10 +133,21 @@ pub(crate) struct PositionState {
     source_fill_ids: Vec<i64>,
 }
 
-pub(crate) fn rebuild_paper_positions(fills: &[PaperFill], as_of_date: chrono::NaiveDate) -> Result<Vec<PaperPositionInventory>, String> {
-    financial::historical_text(rebuild_paper_positions_body(fills, as_of_date, &mut FinancialWork::Historical))
+pub(crate) fn rebuild_paper_positions(
+    fills: &[PaperFill],
+    as_of_date: chrono::NaiveDate,
+) -> Result<Vec<PaperPositionInventory>, String> {
+    financial::historical_text(rebuild_paper_positions_body(
+        fills,
+        as_of_date,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn rebuild_paper_positions_body(fills: &[PaperFill], as_of_date: chrono::NaiveDate, work: &mut FinancialWork<'_, '_>) -> financial::Result<Vec<PaperPositionInventory>> {
+pub(crate) fn rebuild_paper_positions_body(
+    fills: &[PaperFill],
+    as_of_date: chrono::NaiveDate,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<Vec<PaperPositionInventory>> {
     work.history_begin()?;
     let mut states = BTreeMap::<String, PositionState>::new();
     let mut seen_ids = HashSet::new();
@@ -147,15 +165,19 @@ pub(crate) fn rebuild_paper_positions_body(fills: &[PaperFill], as_of_date: chro
         }
         previous_order = Some(current_order);
         if fill.occurred_at.date() > as_of_date {
-            return Err(fifo_error(work, FifoText::Future {
-                fill, as_of_date
-            })?);
+            return Err(fifo_error(work, FifoText::Future { fill, as_of_date })?);
         }
-        let price = match fill.fill_price.filter(|value| value.is_finite() && *value > 0.0) {
+        let price = match fill
+            .fill_price
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
             Some(value) => value,
             None => return Err(fifo_error(work, FifoText::Price(fill.id))?),
         };
-        let quantity = match u32::try_from(fill.quantity).ok().filter(|value| *value > 0 && value.is_multiple_of(100)) {
+        let quantity = match u32::try_from(fill.quantity)
+            .ok()
+            .filter(|value| *value > 0 && value.is_multiple_of(100))
+        {
             Some(value) => value,
             None => return Err(fifo_error(work, FifoText::Quantity(fill))?),
         };
@@ -166,7 +188,7 @@ pub(crate) fn rebuild_paper_positions_body(fills: &[PaperFill], as_of_date: chro
                 let value = PositionState {
                     name: work.copy(&fill.name)?,
                     lots: VecDeque::new(),
-                    source_fill_ids: Vec::new()
+                    source_fill_ids: Vec::new(),
                 };
                 work.history_insert(entry, value)?
             }
@@ -174,22 +196,33 @@ pub(crate) fn rebuild_paper_positions_body(fills: &[PaperFill], as_of_date: chro
         work.history_name(&mut state.name, &fill.name)?;
         work.history_push(&mut state.source_fill_ids, fill.id)?;
         match fill.direction.as_str() {
-            "buy" => work.history_lot(&mut state.lots, OpenPaperLot {
-                buy_fill_id: fill.id, bought_at: fill.occurred_at, original_quantity: quantity, remaining_quantity: quantity, price,
-            })?,
+            "buy" => work.history_lot(
+                &mut state.lots,
+                OpenPaperLot {
+                    buy_fill_id: fill.id,
+                    bought_at: fill.occurred_at,
+                    original_quantity: quantity,
+                    remaining_quantity: quantity,
+                    price,
+                },
+            )?,
             "sell" => {
                 let mut remaining = quantity;
                 while remaining > 0 {
                     let lot = match state.lots.front_mut() {
                         Some(lot) => lot,
-                        None => return Err(fifo_error(work, FifoText::Oversell {
-                            fill, remaining
-                        })?),
+                        None => {
+                            return Err(fifo_error(work, FifoText::Oversell { fill, remaining })?)
+                        }
                     };
                     if lot.bought_at.date() >= fill.occurred_at.date() {
-                        return Err(fifo_error(work, FifoText::TPlusOne {
-                            fill, bought: lot.bought_at.date()
-                        })?);
+                        return Err(fifo_error(
+                            work,
+                            FifoText::TPlusOne {
+                                fill,
+                                bought: lot.bought_at.date(),
+                            },
+                        )?);
                     }
                     let consumed = remaining.min(lot.remaining_quantity);
                     lot.remaining_quantity -= consumed;
@@ -199,9 +232,12 @@ pub(crate) fn rebuild_paper_positions_body(fills: &[PaperFill], as_of_date: chro
                     }
                 }
             }
-            other => return Err(fifo_error(work, FifoText::Direction {
-                id: fill.id, other
-            })?),
+            other => {
+                return Err(fifo_error(
+                    work,
+                    FifoText::Direction { id: fill.id, other },
+                )?)
+            }
         }
     }
     let mut positions = Vec::new();
@@ -213,13 +249,17 @@ pub(crate) fn rebuild_paper_positions_body(fills: &[PaperFill], as_of_date: chro
     }
     Ok(positions)
 }
-fn inventory_from_state_body(code: String, state: PositionState, as_of_date: chrono::NaiveDate, work: &mut FinancialWork<'_, '_>) -> financial::Result<PaperPositionInventory> {
+fn inventory_from_state_body(
+    code: String,
+    state: PositionState,
+    as_of_date: chrono::NaiveDate,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<PaperPositionInventory> {
     let PositionState {
         name,
         lots,
-        source_fill_ids
-    }
-    = state;
+        source_fill_ids,
+    } = state;
     let mut total_quantity = 0_u32;
     let mut sellable_quantity = 0_u32;
     let mut locked_quantity = 0_u32;
@@ -230,70 +270,140 @@ fn inventory_from_state_body(code: String, state: PositionState, as_of_date: chr
     for lot in lots {
         total_quantity = match total_quantity.checked_add(lot.remaining_quantity) {
             Some(value) => value,
-            None => return Err(fifo_error(work, FifoText::Position {
-                code: &code, reason: PositionReason::Quantity
-            })?),
+            None => {
+                return Err(fifo_error(
+                    work,
+                    FifoText::Position {
+                        code: &code,
+                        reason: PositionReason::Quantity,
+                    },
+                )?)
+            }
         };
         let bought_date = lot.bought_at.date();
         if bought_date < as_of_date {
             sellable_quantity = match sellable_quantity.checked_add(lot.remaining_quantity) {
                 Some(value) => value,
-                None => return Err(fifo_error(work, FifoText::Position {
-                    code: &code, reason: PositionReason::SellableQuantity
-                })?),
+                None => {
+                    return Err(fifo_error(
+                        work,
+                        FifoText::Position {
+                            code: &code,
+                            reason: PositionReason::SellableQuantity,
+                        },
+                    )?)
+                }
             };
             sellable_cost += lot.price * f64::from(lot.remaining_quantity);
             if !sellable_cost.is_finite() {
-                return Err(fifo_error(work, FifoText::Position {
-                    code: &code, reason: PositionReason::SellableCost
-                })?);
+                return Err(fifo_error(
+                    work,
+                    FifoText::Position {
+                        code: &code,
+                        reason: PositionReason::SellableCost,
+                    },
+                )?);
             }
             let original_notional = lot.price * f64::from(lot.original_quantity);
             if !original_notional.is_finite() {
-                return Err(fifo_error(work, FifoText::Position {
-                    code: &code, reason: PositionReason::Notional
-                })?);
+                return Err(fifo_error(
+                    work,
+                    FifoText::Position {
+                        code: &code,
+                        reason: PositionReason::Notional,
+                    },
+                )?);
             }
-            sellable_buy_fee += fill_adverse_cost(FillSide::Buy, original_notional) * f64::from(lot.remaining_quantity) / f64::from(lot.original_quantity);
+            sellable_buy_fee += fill_adverse_cost(FillSide::Buy, original_notional)
+                * f64::from(lot.remaining_quantity)
+                / f64::from(lot.original_quantity);
             if !sellable_buy_fee.is_finite() {
-                return Err(fifo_error(work, FifoText::Position {
-                    code: &code, reason: PositionReason::Fee
-                })?);
+                return Err(fifo_error(
+                    work,
+                    FifoText::Position {
+                        code: &code,
+                        reason: PositionReason::Fee,
+                    },
+                )?);
             }
-            earliest_sellable_date = Some(earliest_sellable_date.map_or(bought_date, |current: chrono::NaiveDate| current.min(bought_date)));
-            work.history_push(&mut open_lots, PaperLotAuditEvidence {
-                buy_fill_id: lot.buy_fill_id, bought_at: lot.bought_at, original_quantity: lot.original_quantity, remaining_quantity: lot.remaining_quantity, price: lot.price, sellable: true
-            })?;
+            earliest_sellable_date = Some(
+                earliest_sellable_date.map_or(bought_date, |current: chrono::NaiveDate| {
+                    current.min(bought_date)
+                }),
+            );
+            work.history_push(
+                &mut open_lots,
+                PaperLotAuditEvidence {
+                    buy_fill_id: lot.buy_fill_id,
+                    bought_at: lot.bought_at,
+                    original_quantity: lot.original_quantity,
+                    remaining_quantity: lot.remaining_quantity,
+                    price: lot.price,
+                    sellable: true,
+                },
+            )?;
         } else if bought_date == as_of_date {
             locked_quantity = match locked_quantity.checked_add(lot.remaining_quantity) {
                 Some(value) => value,
-                None => return Err(fifo_error(work, FifoText::Position {
-                    code: &code, reason: PositionReason::LockedQuantity
-                })?),
+                None => {
+                    return Err(fifo_error(
+                        work,
+                        FifoText::Position {
+                            code: &code,
+                            reason: PositionReason::LockedQuantity,
+                        },
+                    )?)
+                }
             };
-            work.history_push(&mut open_lots, PaperLotAuditEvidence {
-                buy_fill_id: lot.buy_fill_id, bought_at: lot.bought_at, original_quantity: lot.original_quantity, remaining_quantity: lot.remaining_quantity, price: lot.price, sellable: false
-            })?;
+            work.history_push(
+                &mut open_lots,
+                PaperLotAuditEvidence {
+                    buy_fill_id: lot.buy_fill_id,
+                    bought_at: lot.bought_at,
+                    original_quantity: lot.original_quantity,
+                    remaining_quantity: lot.remaining_quantity,
+                    price: lot.price,
+                    sellable: false,
+                },
+            )?;
         } else {
-            return Err(fifo_error(work, FifoText::FutureLot {
-                code: &code, bought_date, as_of_date
-            })?);
+            return Err(fifo_error(
+                work,
+                FifoText::FutureLot {
+                    code: &code,
+                    bought_date,
+                    as_of_date,
+                },
+            )?);
         }
     }
     let sellable_avg_price = if sellable_quantity == 0 {
         None
-    }
-    else {
+    } else {
         let average = sellable_cost / f64::from(sellable_quantity);
         if !average.is_finite() || average <= 0.0 {
-            return Err(fifo_error(work, FifoText::Average {
-                code: &code, average
-            })?);
+            return Err(fifo_error(
+                work,
+                FifoText::Average {
+                    code: &code,
+                    average,
+                },
+            )?);
         }
         Some(average)
     };
     Ok(PaperPositionInventory {
-        code, name, total_quantity, sellable_quantity, locked_quantity, sellable_avg_price, sellable_buy_fee, earliest_sellable_date, as_of_date, source_fill_ids, open_lots
+        code,
+        name,
+        total_quantity,
+        sellable_quantity,
+        locked_quantity,
+        sellable_avg_price,
+        sellable_buy_fee,
+        earliest_sellable_date,
+        as_of_date,
+        source_fill_ids,
+        open_lots,
     })
 }
 #[derive(Clone, Copy)]
@@ -303,46 +413,50 @@ pub(crate) enum PositionReason {
     SellableCost,
     Notional,
     Fee,
-    LockedQuantity
+    LockedQuantity,
 }
 pub(crate) enum FifoText<'a> {
     Timestamp {
         fill_id: i64,
-        error: chrono::ParseError
+        error: chrono::ParseError,
     },
     Canonical {
         fill_id: i64,
-        raw: &'a str
+        raw: &'a str,
     },
-    Identity(&'a PaperFill), Duplicate(i64), Order(&'a PaperFill),
+    Identity(&'a PaperFill),
+    Duplicate(i64),
+    Order(&'a PaperFill),
     Future {
         fill: &'a PaperFill,
-        as_of_date: chrono::NaiveDate
+        as_of_date: chrono::NaiveDate,
     },
-    Price(i64), Quantity(&'a PaperFill), Oversell {
+    Price(i64),
+    Quantity(&'a PaperFill),
+    Oversell {
         fill: &'a PaperFill,
-        remaining: u32
+        remaining: u32,
     },
     TPlusOne {
         fill: &'a PaperFill,
-        bought: chrono::NaiveDate
+        bought: chrono::NaiveDate,
     },
     Direction {
         id: i64,
-        other: &'a str
+        other: &'a str,
     },
     Position {
         code: &'a str,
-        reason: PositionReason
+        reason: PositionReason,
     },
     FutureLot {
         code: &'a str,
         bought_date: chrono::NaiveDate,
-        as_of_date: chrono::NaiveDate
+        as_of_date: chrono::NaiveDate,
     },
     Average {
         code: &'a str,
-        average: f64
+        average: f64,
     },
 }
 impl FifoText<'_> {
@@ -397,7 +511,10 @@ impl FifoText<'_> {
         result.map_err(|_| ())
     }
 }
-fn fifo_error(work: &mut FinancialWork<'_, '_>, text: FifoText<'_>) -> financial::Result<FinancialFailure> {
+fn fifo_error(
+    work: &mut FinancialWork<'_, '_>,
+    text: FifoText<'_>,
+) -> financial::Result<FinancialFailure> {
     work.history_error(HistoryText::Fifo(text))
 }
 impl financial::history_sealed::Element for PaperFill {}
@@ -699,8 +816,10 @@ mod tests {
 pub(crate) fn history_boundary_open_lot() -> OpenPaperLot {
     OpenPaperLot {
         buy_fill_id: 1,
-        bought_at: chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap()
-            .and_hms_opt(10, 0, 0).unwrap(),
+        bought_at: chrono::NaiveDate::from_ymd_opt(2026, 9, 23)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap(),
         original_quantity: 100,
         remaining_quantity: 100,
         price: 10.0,

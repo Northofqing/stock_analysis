@@ -684,7 +684,8 @@ fn g5b_revision_mutation_non_g5b_and_legacy_without_head_do_not_adopt_the_day() 
 }
 
 #[test]
-fn g5b_revision_mutation_new_legacy_write_rejects_without_changing_unmatched_artifact_dirty_state() {
+fn g5b_revision_mutation_new_legacy_write_rejects_without_changing_unmatched_artifact_dirty_state()
+{
     let fixture = Fixture::new("REVISION_DIRTY");
     prospective_head(&fixture, DATE);
     let day = NaiveDate::parse_from_str(DATE, "%Y-%m-%d").unwrap();

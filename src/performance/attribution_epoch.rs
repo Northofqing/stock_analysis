@@ -11,16 +11,10 @@ use sha2::{Digest, Sha256};
 
 use super::economic_position::EconomicFillRow;
 use crate::trading::paper_lot_ledger::{
-    parse_paper_fill_timestamp,
-    parse_paper_fill_timestamp_body
+    parse_paper_fill_timestamp, parse_paper_fill_timestamp_body,
 };
 use crate::trading::paper_replay_financial_work_v1::{
-    self as financial,
-    FinancialWork,
-    FinancialFailure,
-    FinancialSink,
-    HistoryText,
-    HistoryTreeSlot
+    self as financial, FinancialFailure, FinancialSink, FinancialWork, HistoryText, HistoryTreeSlot,
 };
 
 const CARRY_MANIFEST_DOMAIN: &[u8] = b"BR255_ATTRIBUTION_CARRY_V1\0";
@@ -105,10 +99,21 @@ struct QuarantineState {
 /// Projects completed pre-boundary fills into the remaining per-code quantity.
 /// This validates all source facts, but intentionally does not enforce T+1:
 /// the output is an isolation quantity, not an economic position report.
-pub fn build_legacy_carry(rows: &[EconomicFillRow], completed_session: NaiveDate) -> Result<Vec<LegacyCarryPosition>, String> {
-    financial::historical_text(build_legacy_carry_body(rows, completed_session, &mut FinancialWork::Historical))
+pub fn build_legacy_carry(
+    rows: &[EconomicFillRow],
+    completed_session: NaiveDate,
+) -> Result<Vec<LegacyCarryPosition>, String> {
+    financial::historical_text(build_legacy_carry_body(
+        rows,
+        completed_session,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn build_legacy_carry_body(rows: &[EconomicFillRow], completed_session: NaiveDate, work: &mut FinancialWork<'_, '_>) -> financial::Result<Vec<LegacyCarryPosition>> {
+pub(crate) fn build_legacy_carry_body(
+    rows: &[EconomicFillRow],
+    completed_session: NaiveDate,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<Vec<LegacyCarryPosition>> {
     let validated = validate_rows_body(rows, None, work)?;
     let mut positions = BTreeMap::<String, u64>::new();
     for fill in validated {
@@ -138,9 +143,7 @@ pub(crate) fn build_legacy_carry_body(rows: &[EconomicFillRow], completed_sessio
     }
     let mut result = Vec::new();
     for (code, quantity) in positions {
-        if let Some(position) = (quantity > 0).then_some(LegacyCarryPosition {
-            code, quantity
-        }) {
+        if let Some(position) = (quantity > 0).then_some(LegacyCarryPosition { code, quantity }) {
             work.history_push(&mut result, position)?;
         }
     }
@@ -317,10 +320,21 @@ pub fn canonical_scoped_fill_manifest_hash(rows: &[EconomicFillRow]) -> Result<S
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn validate_rows<'a>(rows: &'a [EconomicFillRow], effective_date: Option<NaiveDate>) -> Result<Vec<ValidatedEpochFill<'a>>, String> {
-    financial::historical_text(validate_rows_body(rows, effective_date, &mut FinancialWork::Historical))
+fn validate_rows<'a>(
+    rows: &'a [EconomicFillRow],
+    effective_date: Option<NaiveDate>,
+) -> Result<Vec<ValidatedEpochFill<'a>>, String> {
+    financial::historical_text(validate_rows_body(
+        rows,
+        effective_date,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn validate_rows_body<'a>(rows: &'a [EconomicFillRow], effective_date: Option<NaiveDate>, work: &mut FinancialWork<'_, '_>) -> financial::Result<Vec<ValidatedEpochFill<'a>>> {
+fn validate_rows_body<'a>(
+    rows: &'a [EconomicFillRow],
+    effective_date: Option<NaiveDate>,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<Vec<ValidatedEpochFill<'a>>> {
     work.history_begin()?;
     let mut seen_ids = HashSet::new();
     let mut seen_plan_ids = HashSet::new();
@@ -337,9 +351,14 @@ fn validate_rows_body<'a>(rows: &'a [EconomicFillRow], effective_date: Option<Na
             return Err(carry_error(work, CarryText::BeforeEffective)?);
         }
         let quantity = validate_quantity_body(row, work)?;
-        work.history_push(&mut validated, ValidatedEpochFill {
-            row, occurred_at, quantity
-        })?;
+        work.history_push(
+            &mut validated,
+            ValidatedEpochFill {
+                row,
+                occurred_at,
+                quantity,
+            },
+        )?;
     }
     Ok(validated)
 }
@@ -361,18 +380,43 @@ fn canonical_source_fill_index(
 fn validate_quantity(row: &EconomicFillRow) -> Result<u64, String> {
     financial::historical_text(validate_quantity_body(row, &mut FinancialWork::Historical))
 }
-fn validate_quantity_body(row: &EconomicFillRow, work: &mut FinancialWork<'_, '_>) -> financial::Result<u64> {
-    match u64::try_from(row.quantity).ok().filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100)) {
+fn validate_quantity_body(
+    row: &EconomicFillRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<u64> {
+    match u64::try_from(row.quantity)
+        .ok()
+        .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
+    {
         Some(quantity) => Ok(quantity),
         None => Err(carry_error(work, CarryText::Quantity)?),
     }
 }
 
-fn validate_fill_facts<'a>(row: &'a EconomicFillRow, seen_ids: &mut HashSet<i64>, seen_plan_ids: &mut HashSet<&'a str>) -> Result<NaiveDateTime, String> {
-    financial::historical_text(validate_fill_facts_body(row, seen_ids, seen_plan_ids, &mut FinancialWork::Historical))
+fn validate_fill_facts<'a>(
+    row: &'a EconomicFillRow,
+    seen_ids: &mut HashSet<i64>,
+    seen_plan_ids: &mut HashSet<&'a str>,
+) -> Result<NaiveDateTime, String> {
+    financial::historical_text(validate_fill_facts_body(
+        row,
+        seen_ids,
+        seen_plan_ids,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn validate_fill_facts_body<'a>(row: &'a EconomicFillRow, seen_ids: &mut HashSet<i64>, seen_plan_ids: &mut HashSet<&'a str>, work: &mut FinancialWork<'_, '_>) -> financial::Result<NaiveDateTime> {
-    if row.id <= 0 || row.plan_id.trim().is_empty() || row.code.trim().is_empty() || row.name.trim().is_empty() || row.virtual_reason.trim().is_empty() {
+fn validate_fill_facts_body<'a>(
+    row: &'a EconomicFillRow,
+    seen_ids: &mut HashSet<i64>,
+    seen_plan_ids: &mut HashSet<&'a str>,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<NaiveDateTime> {
+    if row.id <= 0
+        || row.plan_id.trim().is_empty()
+        || row.code.trim().is_empty()
+        || row.name.trim().is_empty()
+        || row.virtual_reason.trim().is_empty()
+    {
         return Err(carry_error(work, CarryText::Identity)?);
     }
     if !work.history_seen(seen_ids, row.id)? {
@@ -386,7 +430,10 @@ fn validate_fill_facts_body<'a>(row: &'a EconomicFillRow, seen_ids: &mut HashSet
         Err(FinancialFailure::History(_)) => return Err(carry_error(work, CarryText::Timestamp)?),
         Err(error) => return Err(error),
     };
-    if !row.fill_price.is_some_and(|value| value.is_finite() && value > 0.0) {
+    if !row
+        .fill_price
+        .is_some_and(|value| value.is_finite() && value > 0.0)
+    {
         return Err(carry_error(work, CarryText::Price)?);
     }
     if !matches!(row.direction.as_str(), "buy" | "sell") {
@@ -1020,8 +1067,17 @@ mod tests {
 
 #[derive(Clone, Copy)]
 pub(crate) enum CarryText {
-    QuantityOverflow, Oversell, Direction, Order, BeforeEffective, Quantity,
-    Identity, DuplicateId, DuplicatePlan, Timestamp, Price,
+    QuantityOverflow,
+    Oversell,
+    Direction,
+    Order,
+    BeforeEffective,
+    Quantity,
+    Identity,
+    DuplicateId,
+    DuplicatePlan,
+    Timestamp,
+    Price,
 }
 impl CarryText {
     pub(crate) fn write(self, out: &mut FinancialSink<'_>) -> Result<(), ()> {
@@ -1040,7 +1096,10 @@ impl CarryText {
         })
     }
 }
-fn carry_error(work: &mut FinancialWork<'_, '_>, text: CarryText) -> financial::Result<FinancialFailure> {
+fn carry_error(
+    work: &mut FinancialWork<'_, '_>,
+    text: CarryText,
+) -> financial::Result<FinancialFailure> {
     work.history_error(HistoryText::Carry(text))
 }
 impl financial::history_sealed::Element for LegacyCarryPosition {}

@@ -1,13 +1,15 @@
 //! Deterministic modeled fills. Recorded inputs can be replayed, but cannot
 //! reconstruct a source-issued live execution window or an approved intent.
 
-use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use super::paper_book_v2_budget_v1::{checked, notional, token};
 use super::paper_ledger::LedgerError;
 use crate::performance::fee_evidence::FillSide;
 use crate::performance::fee_policy::{
     a_share_stock_fill_fee_with_policy_v2, AShareFeePolicyV2, FeeCoverageRequirement,
     StampTaxBracketV2,
+};
+use crate::trading::paper_replay_financial_work_v1::{
+    self as fw, ClosedFinancialText as Txt, FinancialFailure, FinancialWork,
 };
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -68,11 +70,43 @@ impl WindowRecord {
     }
     pub(crate) fn validate_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
         w.finish()?;
-        let local = w.option(self.observed_at.checked_add_signed(chrono::Duration::hours(8)), Txt::Fill(fw::FillText::ExecutionWindowShanghaiClockExceedsSupportedRange))?;
+        let local = w.option(
+            self.observed_at
+                .checked_add_signed(chrono::Duration::hours(8)),
+            Txt::Fill(fw::FillText::ExecutionWindowShanghaiClockExceedsSupportedRange),
+        )?;
         let day = local.date_naive();
         let seconds = local.time().num_seconds_from_midnight();
-        let session = (9 * 3600 + 30 * 60..=11 * 3600 + 30 * 60).contains(&seconds) || (13 * 3600..=15 * 3600).contains(&seconds);
-        if self.version != MODEL_VERSION || !token(&self.observation_id) || !token(&self.instrument_code) || !token(&self.source_reference) || !token(&self.facts_contract) || !token(&self.facts_batch_id) || !token(&self.facts_source) || !token(&self.regime_version) || !matches!(self.fee_segment.as_str(), "ShanghaiMainA" | "ShanghaiStarA") || chrono::DateTime::parse_from_rfc3339(&self.facts_source_at) .ok() .zip(chrono::DateTime::parse_from_rfc3339(&self.facts_observed_at).ok()) .is_none_or(|(a, b)| a > b || b.with_timezone(&Utc) > self.observed_at) || self.source_at > self.observed_at || self.observed_at > self.fresh_through || day != self.session_date || !session || !w.calendar_day(day)? || !self.listed || self.tick_micro_cny <= 0 || self.lower_micro_cny <= 0 || self.upper_micro_cny < self.lower_micro_cny || self.lower_micro_cny % self.tick_micro_cny != 0 || self.upper_micro_cny % self.tick_micro_cny != 0 || self.price_micro_cny < self.lower_micro_cny || self.price_micro_cny > self.upper_micro_cny || self.price_micro_cny % self.tick_micro_cny != 0 {
+        let session = (9 * 3600 + 30 * 60..=11 * 3600 + 30 * 60).contains(&seconds)
+            || (13 * 3600..=15 * 3600).contains(&seconds);
+        if self.version != MODEL_VERSION
+            || !token(&self.observation_id)
+            || !token(&self.instrument_code)
+            || !token(&self.source_reference)
+            || !token(&self.facts_contract)
+            || !token(&self.facts_batch_id)
+            || !token(&self.facts_source)
+            || !token(&self.regime_version)
+            || !matches!(self.fee_segment.as_str(), "ShanghaiMainA" | "ShanghaiStarA")
+            || chrono::DateTime::parse_from_rfc3339(&self.facts_source_at)
+                .ok()
+                .zip(chrono::DateTime::parse_from_rfc3339(&self.facts_observed_at).ok())
+                .is_none_or(|(a, b)| a > b || b.with_timezone(&Utc) > self.observed_at)
+            || self.source_at > self.observed_at
+            || self.observed_at > self.fresh_through
+            || day != self.session_date
+            || !session
+            || !w.calendar_day(day)?
+            || !self.listed
+            || self.tick_micro_cny <= 0
+            || self.lower_micro_cny <= 0
+            || self.upper_micro_cny < self.lower_micro_cny
+            || self.lower_micro_cny % self.tick_micro_cny != 0
+            || self.upper_micro_cny % self.tick_micro_cny != 0
+            || self.price_micro_cny < self.lower_micro_cny
+            || self.price_micro_cny > self.upper_micro_cny
+            || self.price_micro_cny % self.tick_micro_cny != 0
+        {
             return Err(w.error(Txt::Fill(fw::FillText::ExecutionWindowIsNotAdmissible))?);
         }
         Ok(())
@@ -104,19 +138,52 @@ pub(crate) enum ModelOutcome {
     Fill(ModeledFill),
 }
 
-pub(crate) fn model( side: Side, remaining: u32, limit: i64, fee_price_cap: i64, window: &WindowRecord, fee_policy: &AShareFeePolicyV2, ) -> Result<ModelOutcome, LedgerError> {
-    fw::historical(model_with_work(side, remaining, limit, fee_price_cap, window, fee_policy, &mut FinancialWork::Historical))
+pub(crate) fn model(
+    side: Side,
+    remaining: u32,
+    limit: i64,
+    fee_price_cap: i64,
+    window: &WindowRecord,
+    fee_policy: &AShareFeePolicyV2,
+) -> Result<ModelOutcome, LedgerError> {
+    fw::historical(model_with_work(
+        side,
+        remaining,
+        limit,
+        fee_price_cap,
+        window,
+        fee_policy,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn model_with_work( side: Side, remaining: u32, limit: i64, fee_price_cap: i64, window: &WindowRecord, fee_policy: &AShareFeePolicyV2, w: &mut FinancialWork<'_, '_>) -> fw::Result<ModelOutcome> {
+pub(crate) fn model_with_work(
+    side: Side,
+    remaining: u32,
+    limit: i64,
+    fee_price_cap: i64,
+    window: &WindowRecord,
+    fee_policy: &AShareFeePolicyV2,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<ModelOutcome> {
     w.finish()?;
     window.validate_with_work(w)?;
-    if remaining == 0 || remaining % 100 != 0 || limit <= 0 || fee_price_cap < limit || fee_price_cap > window.upper_micro_cny || limit < window.lower_micro_cny || limit % window.tick_micro_cny != 0 || fee_price_cap % window.tick_micro_cny != 0 {
+    if remaining == 0
+        || remaining % 100 != 0
+        || limit <= 0
+        || fee_price_cap < limit
+        || fee_price_cap > window.upper_micro_cny
+        || limit < window.lower_micro_cny
+        || limit % window.tick_micro_cny != 0
+        || fee_price_cap % window.tick_micro_cny != 0
+    {
         return Err(w.error(Txt::Fill(fw::FillText::ParentWholeLotBoundsInvalid))?);
     }
     if window.suspended {
         return Ok(ModelOutcome::NoFill(NoFillReason::Suspended));
     }
-    if (side == Side::Buy && window.price_micro_cny > limit) || (side == Side::Sell && window.price_micro_cny < limit) {
+    if (side == Side::Buy && window.price_micro_cny > limit)
+        || (side == Side::Sell && window.price_micro_cny < limit)
+    {
         return Ok(ModelOutcome::NoFill(NoFillReason::OutsideLimit));
     }
     if window.price_micro_cny > fee_price_cap {
@@ -126,8 +193,17 @@ pub(crate) fn model_with_work( side: Side, remaining: u32, limit: i64, fee_price
     if quantity == 0 {
         return Ok(ModelOutcome::NoFill(NoFillReason::LessThanWholeLot));
     }
-    let value = super::paper_book_v2_budget_v1::notional_with_work(window.price_micro_cny, quantity, w)?;
-    let fee = crate::performance::fee_policy::fill_fee_with_work( fee_policy, fee_policy.scope(), side.fee_side(), value, window.session_date, FeeCoverageRequirement::ModeledComponentsOnly, w, );
+    let value =
+        super::paper_book_v2_budget_v1::notional_with_work(window.price_micro_cny, quantity, w)?;
+    let fee = crate::performance::fee_policy::fill_fee_with_work(
+        fee_policy,
+        fee_policy.scope(),
+        side.fee_side(),
+        value,
+        window.session_date,
+        FeeCoverageRequirement::ModeledComponentsOnly,
+        w,
+    );
     let fee = fw::fee_evidence(fee, w)?;
     let sellable_from = w.calendar_next(window.session_date)?;
     Ok(ModelOutcome::Fill(ModeledFill {
@@ -148,10 +224,30 @@ pub(crate) fn model_with_work( side: Side, remaining: u32, limit: i64, fee_price
 /// commission minimum is also <= k times the original one-lot commission.
 /// Thus n times the one-lot component ceilings covers every partition and
 /// every price <= max_price. Actual fills still use the unchanged fee model.
-pub(crate) fn worst_case_fee( side: Side, remaining: u32, max_price: i64, day: NaiveDate, policy: &AShareFeePolicyV2, ) -> Result<i64, LedgerError> {
-    fw::historical(worst_case_fee_with_work(side, remaining, max_price, day, policy, &mut FinancialWork::Historical))
+pub(crate) fn worst_case_fee(
+    side: Side,
+    remaining: u32,
+    max_price: i64,
+    day: NaiveDate,
+    policy: &AShareFeePolicyV2,
+) -> Result<i64, LedgerError> {
+    fw::historical(worst_case_fee_with_work(
+        side,
+        remaining,
+        max_price,
+        day,
+        policy,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn worst_case_fee_with_work( side: Side, remaining: u32, max_price: i64, day: NaiveDate, policy: &AShareFeePolicyV2, w: &mut FinancialWork<'_, '_>) -> fw::Result<i64> {
+pub(crate) fn worst_case_fee_with_work(
+    side: Side,
+    remaining: u32,
+    max_price: i64,
+    day: NaiveDate,
+    policy: &AShareFeePolicyV2,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<i64> {
     w.finish()?;
     if remaining % 100 != 0 {
         return Err(w.error(Txt::Fill(fw::FillText::OddLotModelUnavailable))?);
@@ -159,23 +255,29 @@ pub(crate) fn worst_case_fee_with_work( side: Side, remaining: u32, max_price: i
     if remaining == 0 {
         return Ok(0);
     }
-    let fee = crate::performance::fee_policy::fill_fee_with_work( policy, policy.scope(), side.fee_side(), super::paper_book_v2_budget_v1::notional_with_work(max_price, 100, w)?, day, FeeCoverageRequirement::ModeledComponentsOnly, w, );
+    let fee = crate::performance::fee_policy::fill_fee_with_work(
+        policy,
+        policy.scope(),
+        side.fee_side(),
+        super::paper_book_v2_budget_v1::notional_with_work(max_price, 100, w)?,
+        day,
+        FeeCoverageRequirement::ModeledComponentsOnly,
+        w,
+    );
     let fee = fw::fee_evidence(fee, w)?;
     // This reads only the immutable canonical descriptor of the actual
     // policy value; it neither reconstructs a policy nor issues authority.
     let descriptor = w.fee_descriptor(policy)?;
     let text = match std::str::from_utf8(&descriptor) {
-        Ok(v)=>v,
-        Err(_)=>return Err(w.error(Txt::Fill(fw::FillText::FeeDescriptorUTF8Unavailable))?)
+        Ok(v) => v,
+        Err(_) => return Err(w.error(Txt::Fill(fw::FillText::FeeDescriptorUTF8Unavailable))?),
     };
     let numerator = fee_rate_integer(text, FeeRateField::Numerator, w)?;
     let denominator = fee_rate_integer(text, FeeRateField::Denominator, w)?;
     if numerator < 0 || denominator <= 0 {
         return Err(w.error(Txt::Fill(fw::FillText::FeeDescriptorRateInvalid))?);
     }
-    let ceiling = |numerator: i128,
-    denominator: i128| -> Result<i128,
-    LedgerError> {
+    let ceiling = |numerator: i128, denominator: i128| -> Result<i128, LedgerError> {
         let quotient = numerator / denominator;
         if numerator % denominator == 0 {
             Ok(quotient)
@@ -184,7 +286,11 @@ pub(crate) fn worst_case_fee_with_work( side: Side, remaining: u32, max_price: i
         }
     };
     let value = i128::from(fee.notional_micro_cny);
-    let commission = ceiling( value.checked_mul(numerator).ok_or(LedgerError::Overflow)?, denominator, )? .max(i128::from(fee.commission_micro_cny));
+    let commission = ceiling(
+        value.checked_mul(numerator).ok_or(LedgerError::Overflow)?,
+        denominator,
+    )?
+    .max(i128::from(fee.commission_micro_cny));
     let stamp = if side == Side::Buy {
         0
     } else {
@@ -195,18 +301,35 @@ pub(crate) fn worst_case_fee_with_work( side: Side, remaining: u32, max_price: i
         ceiling(value, denominator)?
     };
     let per_lot = commission.checked_add(stamp).ok_or(LedgerError::Overflow)?;
-    Ok(checked( per_lot .checked_mul(i128::from(remaining / 100)) .ok_or(LedgerError::Overflow)?, )?)
+    Ok(checked(
+        per_lot
+            .checked_mul(i128::from(remaining / 100))
+            .ok_or(LedgerError::Overflow)?,
+    )?)
 }
 
-#[derive(Clone,Copy)]
-enum FeeRateField { Numerator, Denominator }
-fn fee_rate_integer(text:&str, field:FeeRateField, w:&mut FinancialWork<'_, '_>)->fw::Result<i128>{
-    let prefix=match field{
-        FeeRateField::Numerator=>"commission_rate_num=",
-        FeeRateField::Denominator=>"commission_rate_den="
+#[derive(Clone, Copy)]
+enum FeeRateField {
+    Numerator,
+    Denominator,
+}
+fn fee_rate_integer(
+    text: &str,
+    field: FeeRateField,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<i128> {
+    let prefix = match field {
+        FeeRateField::Numerator => "commission_rate_num=",
+        FeeRateField::Denominator => "commission_rate_den=",
     };
-    let mut values=text.lines().filter_map(|line|line.strip_prefix(prefix));
-    let value=w.option(values.next().and_then(|v|v.parse::<i128>().ok()), Txt::Fill(fw::FillText::FeeDescriptorRateUnavailable))?;
-    w.require(values.next().is_none(), Txt::Fill(fw::FillText::FeeDescriptorRateDuplicated))?;
+    let mut values = text.lines().filter_map(|line| line.strip_prefix(prefix));
+    let value = w.option(
+        values.next().and_then(|v| v.parse::<i128>().ok()),
+        Txt::Fill(fw::FillText::FeeDescriptorRateUnavailable),
+    )?;
+    w.require(
+        values.next().is_none(),
+        Txt::Fill(fw::FillText::FeeDescriptorRateDuplicated),
+    )?;
     Ok(value)
 }

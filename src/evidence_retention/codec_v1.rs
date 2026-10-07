@@ -977,7 +977,11 @@ pub(super) fn canonical_preflighted_draft(
     // Failure stops before the serializer or any canonical comparison starts.
     // Work remains cumulative, including an attempted over-limit reservation.
     w.scan(b.len())?;
-    let mut c = Compare { b, p: 0, failed: false };
+    let mut c = Compare {
+        b,
+        p: 0,
+        failed: false,
+    };
     serde_json::to_writer(&mut c, d).map_err(|_| ValueError::InvalidScalar)?;
     if c.failed || c.p != b.len() {
         return Err(ValueError::NonCanonical);

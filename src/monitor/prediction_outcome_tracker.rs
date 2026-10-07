@@ -66,32 +66,74 @@ impl std::fmt::Debug for OutcomeItemFeedback {
 impl OutcomeItemFeedback {
     fn new(context: Arc<OutcomeFeedbackContext>, target: Option<&str>) -> Self {
         let selected = |row: &RecordedOutcomeRow| target.is_none_or(|date| row.target_date == date);
-        let total = context.snapshot.rows.iter().filter(|row| selected(row)).count();
-        let indices = context.snapshot.rows.iter().enumerate()
+        let total = context
+            .snapshot
+            .rows
+            .iter()
+            .filter(|row| selected(row))
+            .count();
+        let indices = context
+            .snapshot
+            .rows
+            .iter()
+            .enumerate()
             .filter(|(_, row)| selected(row))
-            .take(OUTCOME_FEEDBACK_DISPLAY_LIMIT).map(|(index, _)| index).collect();
-        Self { context, indices, total }
+            .take(OUTCOME_FEEDBACK_DISPLAY_LIMIT)
+            .map(|(index, _)| index)
+            .collect();
+        Self {
+            context,
+            indices,
+            total,
+        }
     }
 
-    pub fn total(&self) -> usize { self.total }
-    pub fn displayed(&self) -> usize { self.indices.len() }
+    pub fn total(&self) -> usize {
+        self.total
+    }
+    pub fn displayed(&self) -> usize {
+        self.indices.len()
+    }
 
     pub fn items(&self) -> impl ExactSizeIterator<Item = OutcomeItemFeedbackRow<'_>> + '_ {
-        self.indices.iter().map(move |&index| OutcomeItemFeedbackRow {
-            row: &self.context.snapshot.rows[index], context: &self.context,
-        })
+        self.indices
+            .iter()
+            .map(move |&index| OutcomeItemFeedbackRow {
+                row: &self.context.snapshot.rows[index],
+                context: &self.context,
+            })
     }
 
     /// Historical card fact only: no v1 receipt is attached to a row.
     pub fn unlinked_v1_cards(&self) -> Option<usize> {
-        self.context.linked.as_ref().ok().map(|linked| linked.cards.values().flatten()
-            .filter(|card| matches!(card.source_link(), crate::durable_delivery::CandidateBoardSourceLinkV1::UnlinkedV1)).count())
+        self.context.linked.as_ref().ok().map(|linked| {
+            linked
+                .cards
+                .values()
+                .flatten()
+                .filter(|card| {
+                    matches!(
+                        card.source_link(),
+                        crate::durable_delivery::CandidateBoardSourceLinkV1::UnlinkedV1
+                    )
+                })
+                .count()
+        })
     }
 
     /// Original NoStrong units have no target membership; no later row is adopted.
     pub fn no_strong_units(&self) -> Option<usize> {
-        self.context.linked.as_ref().ok().map(|linked| linked.units.iter()
-            .filter(|unit| unit.board.as_ref().is_some_and(|board| board.target_date.is_none())).count())
+        self.context.linked.as_ref().ok().map(|linked| {
+            linked
+                .units
+                .iter()
+                .filter(|unit| {
+                    unit.board
+                        .as_ref()
+                        .is_some_and(|board| board.target_date.is_none())
+                })
+                .count()
+        })
     }
 }
 
@@ -102,14 +144,26 @@ pub struct OutcomeItemFeedbackRow<'a> {
 }
 
 impl<'a> OutcomeItemFeedbackRow<'a> {
-    pub fn prediction_row_id(&self) -> i64 { self.row.id }
-    pub fn code(&self) -> Option<&'a str> { self.row.code.as_deref() }
-    pub fn target_date(&self) -> &'a str { &self.row.target_date }
-    pub fn recorded_hit(&self) -> Option<bool> { self.row.hit.map(|hit| hit == 1) }
+    pub fn prediction_row_id(&self) -> i64 {
+        self.row.id
+    }
+    pub fn code(&self) -> Option<&'a str> {
+        self.row.code.as_deref()
+    }
+    pub fn target_date(&self) -> &'a str {
+        &self.row.target_date
+    }
+    pub fn recorded_hit(&self) -> Option<bool> {
+        self.row.hit.map(|hit| hit == 1)
+    }
 
     fn freeze(&self) -> Option<&'a crate::database::p05_prediction_freeze::FrozenCandidateBoardV2> {
-        self.context.snapshot.freezes.iter().find(|freeze| freeze.ordered_rows().iter()
-            .any(|member| member.prediction_row_id() == self.row.id))
+        self.context.snapshot.freezes.iter().find(|freeze| {
+            freeze
+                .ordered_rows()
+                .iter()
+                .any(|member| member.prediction_row_id() == self.row.id)
+        })
     }
 
     pub fn frozen_occurrence_identity(&self) -> Option<&'a str> {
@@ -120,15 +174,22 @@ impl<'a> OutcomeItemFeedbackRow<'a> {
         self.freeze().map(|freeze| freeze.source_sha256())
     }
 
-    pub fn original_card(&self) -> Option<&'a crate::durable_delivery::CandidateBoardCardObservationV1> {
+    pub fn original_card(
+        &self,
+    ) -> Option<&'a crate::durable_delivery::CandidateBoardCardObservationV1> {
         let linked = self.context.linked.as_ref().ok()?;
         let freeze = self.freeze()?;
-        linked.cards.values().flatten().find(|observation| {
-            observation.card().occurrence_identity() == freeze.occurrence_identity()
-                && matches!(observation.source_link(),
+        linked
+            .cards
+            .values()
+            .flatten()
+            .find(|observation| {
+                observation.card().occurrence_identity() == freeze.occurrence_identity()
+                    && matches!(observation.source_link(),
                     crate::durable_delivery::CandidateBoardSourceLinkV1::DeclaredV2 { ordered_rows }
                     if ordered_rows.iter().any(|member| member.prediction_row_id() == self.row.id))
-        }).map(|observation| observation.card())
+            })
+            .map(|observation| observation.card())
     }
 
     pub fn delivery_status(&self) -> OutcomeItemDeliveryStatus {
@@ -138,8 +199,11 @@ impl<'a> OutcomeItemFeedbackRow<'a> {
             Err(reason) => return OutcomeItemDeliveryStatus::Unavailable { reason },
         };
         if let Some(member) = linked.members.get(&self.row.id) {
-            return if member.awaiting { OutcomeItemDeliveryStatus::AcceptedAwaitingDrain }
-                else { OutcomeItemDeliveryStatus::PhysicallyAccepted };
+            return if member.awaiting {
+                OutcomeItemDeliveryStatus::AcceptedAwaitingDrain
+            } else {
+                OutcomeItemDeliveryStatus::PhysicallyAccepted
+            };
         }
         if let Some(card) = self.original_card() {
             return match card.terminal() {
@@ -154,7 +218,10 @@ impl<'a> OutcomeItemFeedbackRow<'a> {
         if let Some(freeze) = self.freeze() {
             if linked.cards.values().flatten().any(|card| {
                 card.card().occurrence_identity() == freeze.occurrence_identity()
-                    && matches!(card.source_link(), crate::durable_delivery::CandidateBoardSourceLinkV1::UnlinkedV1)
+                    && matches!(
+                        card.source_link(),
+                        crate::durable_delivery::CandidateBoardSourceLinkV1::UnlinkedV1
+                    )
             }) {
                 // Same occurrence is not row membership. original_card() stays None.
                 return OutcomeItemDeliveryStatus::UnlinkedV1;
@@ -178,12 +245,16 @@ fn feedback_extent_preflight(context: &OutcomeFeedbackContext) -> Result<(), &'s
     let limit = crate::database::p05_prediction_freeze::OUTCOME_REPORT_MAX_BYTES as usize;
     let mut bytes = 1024usize;
     for row in rows {
-        bytes = bytes.checked_add(1024).ok_or("outcome_feedback_extent_exceeded")?;
+        bytes = bytes
+            .checked_add(1024)
+            .ok_or("outcome_feedback_extent_exceeded")?;
         let item = OutcomeItemFeedbackRow { row, context };
         let card = item.original_card();
         for field in [
-            item.code(), Some(item.target_date()),
-            item.frozen_occurrence_identity(), item.frozen_source_sha256(),
+            item.code(),
+            Some(item.target_date()),
+            item.frozen_occurrence_identity(),
+            item.frozen_source_sha256(),
             card.map(|value| value.occurrence_identity()),
             card.map(|value| value.decision_identity()),
             card.map(|value| value.envelope_sha256()),
@@ -192,19 +263,31 @@ fn feedback_extent_preflight(context: &OutcomeFeedbackContext) -> Result<(), &'s
             card.and_then(|value| value.disposition_identity()),
             card.and_then(|value| value.terminal_evidence_sha256()),
             card.and_then(|value| value.accepted_channel()),
-        ].into_iter().flatten() {
+        ]
+        .into_iter()
+        .flatten()
+        {
             // Rust Debug escaping needs at most six ASCII bytes per input byte.
-            bytes = bytes.checked_add(field.len().checked_mul(6)
-                .ok_or("outcome_feedback_extent_exceeded")?)
+            bytes = bytes
+                .checked_add(
+                    field
+                        .len()
+                        .checked_mul(6)
+                        .ok_or("outcome_feedback_extent_exceeded")?,
+                )
                 .ok_or("outcome_feedback_extent_exceeded")?;
         }
-        if bytes > limit { return Err("outcome_feedback_extent_exceeded"); }
+        if bytes > limit {
+            return Err("outcome_feedback_extent_exceeded");
+        }
     }
     Ok(())
 }
 
 impl OutcomePeriodObservation {
-    pub fn item_feedback(&self) -> &OutcomeItemFeedback { &self.item_feedback }
+    pub fn item_feedback(&self) -> &OutcomeItemFeedback {
+        &self.item_feedback
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,12 +356,17 @@ impl OutcomeDailyWeeklyObservation {
         let label = "周窗";
         let feedback = self.weekly.item_feedback();
         let card_context = match (feedback.unlinked_v1_cards(), feedback.no_strong_units()) {
-            (Some(v1), Some(no_strong)) =>
-                format!("UnlinkedV1卡{v1}不关联行 / NoStrong无目标成员单元{no_strong}"),
+            (Some(v1), Some(no_strong)) => {
+                format!("UnlinkedV1卡{v1}不关联行 / NoStrong无目标成员单元{no_strong}")
+            }
             _ => "原卡/Unit上下文不可用；UnlinkedV1/NoStrong数量未知".into(),
         };
-        lines.push(format!("[OutcomeTracker][{label}逐项] 显示{}/总{}（原row ID顺序）；{}",
-            feedback.displayed(), feedback.total(), card_context));
+        lines.push(format!(
+            "[OutcomeTracker][{label}逐项] 显示{}/总{}（原row ID顺序）；{}",
+            feedback.displayed(),
+            feedback.total(),
+            card_context
+        ));
         for item in feedback.items() {
             let result = match item.recorded_hit() {
                 Some(true) => "hit",
@@ -542,7 +630,11 @@ impl<'a> OutcomeTracker<'a> {
             .validate_outcome_report_tail(&units, &flat, &drains)
             .map_err(|_| "outcome_sql_binding_changed_at_tail")?;
         drop(flat);
-        Ok(LinkedOutcomeContext { members, cards, units })
+        Ok(LinkedOutcomeContext {
+            members,
+            cards,
+            units,
+        })
     }
 }
 

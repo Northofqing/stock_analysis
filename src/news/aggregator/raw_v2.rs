@@ -726,7 +726,9 @@ fn qualify_news_publication_at(
         let registration = attempt.registration();
         let RawGlobalNewsTerminal::Available { records, evidence } = &attempt.terminal else {
             let reason = match &attempt.terminal {
-                RawGlobalNewsTerminal::VerifiedEmpty { .. } => "verified_empty_not_content_freshness",
+                RawGlobalNewsTerminal::VerifiedEmpty { .. } => {
+                    "verified_empty_not_content_freshness"
+                }
                 RawGlobalNewsTerminal::Unavailable(_) => "unavailable_not_content_freshness",
                 RawGlobalNewsTerminal::Available { .. } => "non_available_branch",
             };
@@ -758,24 +760,36 @@ fn qualify_news_publication_at(
                 "available_record_limit_exceeded"
             } else if registration.source_contract != registration.provider.source() {
                 "provider_source_contract_mismatch"
-            } else if validate_global_news_batch_evidence(registration.provider, evidence).is_err() {
+            } else if validate_global_news_batch_evidence(registration.provider, evidence).is_err()
+            {
                 "batch_evidence_invalid"
-            } else if !news_flash_identity_allowed_for_env(env, &[
-                registration.provider.wire_name(), evidence.source.as_str(), evidence.batch_id.as_str(),
-            ]) {
+            } else if !news_flash_identity_allowed_for_env(
+                env,
+                &[
+                    registration.provider.wire_name(),
+                    evidence.source.as_str(),
+                    evidence.batch_id.as_str(),
+                ],
+            ) {
                 "batch_identity_rejected_for_environment"
             } else {
-                records.iter().take(REGISTERED_GLOBAL_NEWS_LIMIT as usize).find_map(|record| {
-                    if let Err(reason) = validate_news_flash_record(registration.provider, record, evidence, env) {
-                        Some(reason)
-                    } else if record.published_at > record.observed_at {
-                        Some("record_publication_after_observation")
-                    } else if record.observed_at > wall {
-                        Some("record_observation_future")
-                    } else {
-                        None
-                    }
-                }).unwrap_or("provider_atomic_guard_rejected")
+                records
+                    .iter()
+                    .take(REGISTERED_GLOBAL_NEWS_LIMIT as usize)
+                    .find_map(|record| {
+                        if let Err(reason) =
+                            validate_news_flash_record(registration.provider, record, evidence, env)
+                        {
+                            Some(reason)
+                        } else if record.published_at > record.observed_at {
+                            Some("record_publication_after_observation")
+                        } else if record.observed_at > wall {
+                            Some("record_observation_future")
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or("provider_atomic_guard_rejected")
             };
             log_news_health_feed_observation(attempt, batch, wall, freshest, reason, 0);
             continue;
@@ -783,22 +797,33 @@ fn qualify_news_publication_at(
         // Admission is provider-atomic. Stale but valid siblings remain raw facts.
         let mut diagnostic_fresh_records = 0;
         for record in records {
-            let Ok(publication_age) = wall.signed_duration_since(record.published_at).to_std() else {
+            let Ok(publication_age) = wall.signed_duration_since(record.published_at).to_std()
+            else {
                 continue;
             };
-            let Ok(observation_age) = wall.signed_duration_since(record.observed_at).to_std() else {
+            let Ok(observation_age) = wall.signed_duration_since(record.observed_at).to_std()
+            else {
                 continue;
             };
             if publication_age <= budget && observation_age <= budget {
-                freshest = Some(freshest.map_or(record.published_at, |prior| {
-                    prior.max(record.published_at)
-                }));
+                freshest = Some(
+                    freshest.map_or(record.published_at, |prior| prior.max(record.published_at)),
+                );
                 diagnostic_fresh_records += 1;
             }
         }
-        log_news_health_feed_observation(attempt, batch, wall, freshest,
-            if diagnostic_fresh_records > 0 { "fresh_available_content" }
-            else { "no_publication_and_observation_within_age_budget" }, diagnostic_fresh_records);
+        log_news_health_feed_observation(
+            attempt,
+            batch,
+            wall,
+            freshest,
+            if diagnostic_fresh_records > 0 {
+                "fresh_available_content"
+            } else {
+                "no_publication_and_observation_within_age_budget"
+            },
+            diagnostic_fresh_records,
+        );
     }
     freshest.map(|published_at| QualifiedNewsPublication {
         published_at,
@@ -814,7 +839,12 @@ pub fn refresh_news_health_from_raw_batch(
 ) -> Result<NewsHealthRefresh, String> {
     let wall = Utc::now();
     let monotonic = std::time::Instant::now();
-    match qualify_news_publication_at(batch, crate::risk::env_guard::current_env(), wall, monotonic) {
+    match qualify_news_publication_at(
+        batch,
+        crate::risk::env_guard::current_env(),
+        wall,
+        monotonic,
+    ) {
         Some(qualified) => crate::monitor::data_mode::mark_qualified_news_success(&qualified),
         None => Ok(NewsHealthRefresh::NotFresh),
     }
@@ -2588,10 +2618,14 @@ mod tests {
         let mut item = record(provider);
         item.published_at = published_at;
         item.observed_at = observed_at;
-        item.evidence = SourceEvidence::new(provider.provider_id(), observed_wire.as_str(), batch_id.as_str())
-            .expect("typed TEST_CODE record evidence")
-            .with_source_at(source_wire.as_str())
-            .expect("typed TEST_CODE source time");
+        item.evidence = SourceEvidence::new(
+            provider.provider_id(),
+            observed_wire.as_str(),
+            batch_id.as_str(),
+        )
+        .expect("typed TEST_CODE record evidence")
+        .with_source_at(source_wire.as_str())
+        .expect("typed TEST_CODE source time");
         RawGlobalNewsTerminal::Available {
             records: vec![item],
             evidence: BatchEvidence {
@@ -2677,7 +2711,10 @@ mod tests {
         let original = batch.clone();
         let qualified = qualify_news_publication_at(&batch, TradingEnv::Test, wall, monotonic)
             .expect("one complete fresh Jin10 provider");
-        assert_eq!(qualified.published_at(), wall - chrono::Duration::seconds(120));
+        assert_eq!(
+            qualified.published_at(),
+            wall - chrono::Duration::seconds(120)
+        );
         let successes = std::sync::RwLock::new(CapabilitySuccesses::default());
         assert_eq!(
             mark_qualified_news_success_on(&successes, &qualified).unwrap(),
@@ -2687,7 +2724,10 @@ mod tests {
         assert_eq!(batch, original);
         assert!(qualify_news_publication_at(&batch, TradingEnv::Prod, wall, monotonic).is_none());
         let input = successes.read().unwrap().input_at(monotonic, 120, 600);
-        assert!(input.capabilities.iter().filter(|s| s.cap != crate::monitor::data_mode::Capability::News)
+        assert!(input
+            .capabilities
+            .iter()
+            .filter(|s| s.cap != crate::monitor::data_mode::Capability::News)
             .all(|s| s.staleness_secs.is_none()));
         // A malformed sibling invalidates its entire provider, not merely that row.
         if let RawGlobalNewsTerminal::Available { records, .. } = &mut batch.attempts[2].terminal {
@@ -2705,20 +2745,33 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let monotonic = std::time::Instant::now();
-        for cut in ["old", "empty", "unavailable", "future_pub", "future_obs", "batch", "registry", "outer_future"] {
+        for cut in [
+            "old",
+            "empty",
+            "unavailable",
+            "future_pub",
+            "future_obs",
+            "batch",
+            "registry",
+            "outer_future",
+        ] {
             let mut batch = news_health_batch(
                 wall - chrono::Duration::seconds(2),
                 wall - chrono::Duration::seconds(1),
             );
             match cut {
-                "old" => batch.attempts[2].terminal = news_health_available(
-                    GlobalNewsProvider::Jin10,
-                    wall - chrono::Duration::seconds(301),
-                    wall - chrono::Duration::seconds(1),
-                ),
-                "empty" => batch.attempts[2].terminal = RawGlobalNewsTerminal::VerifiedEmpty {
-                    evidence: evidence(GlobalNewsProvider::Jin10, "jin10_global_news"),
-                },
+                "old" => {
+                    batch.attempts[2].terminal = news_health_available(
+                        GlobalNewsProvider::Jin10,
+                        wall - chrono::Duration::seconds(301),
+                        wall - chrono::Duration::seconds(1),
+                    )
+                }
+                "empty" => {
+                    batch.attempts[2].terminal = RawGlobalNewsTerminal::VerifiedEmpty {
+                        evidence: evidence(GlobalNewsProvider::Jin10, "jin10_global_news"),
+                    }
+                }
                 "unavailable" => {
                     for attempt in &mut batch.attempts {
                         attempt.terminal = RawGlobalNewsTerminal::Unavailable(FeedUnavailable {
@@ -2731,18 +2784,24 @@ mod tests {
                         });
                     }
                 }
-                "future_pub" => batch.attempts[2].terminal = news_health_available(
-                    GlobalNewsProvider::Jin10,
-                    wall + chrono::Duration::seconds(1),
-                    wall - chrono::Duration::seconds(1),
-                ),
-                "future_obs" => batch.attempts[2].terminal = news_health_available(
-                    GlobalNewsProvider::Jin10,
-                    wall - chrono::Duration::seconds(2),
-                    wall + chrono::Duration::seconds(1),
-                ),
+                "future_pub" => {
+                    batch.attempts[2].terminal = news_health_available(
+                        GlobalNewsProvider::Jin10,
+                        wall + chrono::Duration::seconds(1),
+                        wall - chrono::Duration::seconds(1),
+                    )
+                }
+                "future_obs" => {
+                    batch.attempts[2].terminal = news_health_available(
+                        GlobalNewsProvider::Jin10,
+                        wall - chrono::Duration::seconds(2),
+                        wall + chrono::Duration::seconds(1),
+                    )
+                }
                 "batch" => {
-                    if let RawGlobalNewsTerminal::Available { evidence, .. } = &mut batch.attempts[2].terminal {
+                    if let RawGlobalNewsTerminal::Available { evidence, .. } =
+                        &mut batch.attempts[2].terminal
+                    {
                         evidence.batch_id = "TEST_CODE_other_batch".to_owned();
                     }
                 }
@@ -2751,17 +2810,24 @@ mod tests {
                 _ => unreachable!(),
             }
             let original = batch.clone();
-            assert!(qualify_news_publication_at(&batch, TradingEnv::Test, wall, monotonic).is_none(), "{cut}");
+            assert!(
+                qualify_news_publication_at(&batch, TradingEnv::Test, wall, monotonic).is_none(),
+                "{cut}"
+            );
             assert_eq!(batch, original, "raw ownership remains intact: {cut}");
         }
         let boundary = news_health_batch(
             wall - chrono::Duration::seconds(300),
             wall - chrono::Duration::seconds(299),
         );
-        assert!(qualify_news_publication_at(&boundary, TradingEnv::Test, wall, monotonic).is_some());
+        assert!(
+            qualify_news_publication_at(&boundary, TradingEnv::Test, wall, monotonic).is_some()
+        );
         assert!(crate::monitor::data_mode::mark_capability_success(
             crate::monitor::data_mode::Capability::News
-        ).unwrap_err().contains("admitted fresh publication"));
+        )
+        .unwrap_err()
+        .contains("admitted fresh publication"));
     }
 
     #[test]
@@ -2775,42 +2841,84 @@ mod tests {
         let batch = news_health_batch(wall - chrono::Duration::seconds(10), wall);
         let first = qualify_news_publication_at(&batch, TradingEnv::Test, wall, monotonic).unwrap();
         let successes = std::sync::RwLock::new(CapabilitySuccesses::default());
-        assert_eq!(mark_qualified_news_success_on(&successes, &first).unwrap(), NewsHealthRefresh::Updated);
+        assert_eq!(
+            mark_qualified_news_success_on(&successes, &first).unwrap(),
+            NewsHealthRefresh::Updated
+        );
         let later_wall = wall + chrono::Duration::seconds(100);
         let later_monotonic = monotonic + std::time::Duration::from_secs(100);
-        let repeated = qualify_news_publication_at(&batch, TradingEnv::Test, later_wall, later_monotonic).unwrap();
-        assert_eq!(mark_qualified_news_success_on(&successes, &repeated).unwrap(), NewsHealthRefresh::Retained);
+        let repeated =
+            qualify_news_publication_at(&batch, TradingEnv::Test, later_wall, later_monotonic)
+                .unwrap();
+        assert_eq!(
+            mark_qualified_news_success_on(&successes, &repeated).unwrap(),
+            NewsHealthRefresh::Retained
+        );
         assert_eq!(news_health_age(&successes, later_monotonic), Some(110));
         let expired = monotonic + std::time::Duration::from_secs(301);
-        assert!(qualify_news_publication_at(&batch, TradingEnv::Test,
-            wall + chrono::Duration::seconds(301), expired).is_none());
+        assert!(qualify_news_publication_at(
+            &batch,
+            TradingEnv::Test,
+            wall + chrono::Duration::seconds(301),
+            expired
+        )
+        .is_none());
         assert_eq!(news_health_age(&successes, expired), Some(311));
-        let newer_batch = news_health_batch(
-            wall + chrono::Duration::seconds(90), later_wall,
+        let newer_batch = news_health_batch(wall + chrono::Duration::seconds(90), later_wall);
+        let newer = qualify_news_publication_at(
+            &newer_batch,
+            TradingEnv::Test,
+            later_wall,
+            later_monotonic,
+        )
+        .unwrap();
+        assert_eq!(
+            mark_qualified_news_success_on(&successes, &newer).unwrap(),
+            NewsHealthRefresh::Updated
         );
-        let newer = qualify_news_publication_at(&newer_batch, TradingEnv::Test,
-            later_wall, later_monotonic).unwrap();
-        assert_eq!(mark_qualified_news_success_on(&successes, &newer).unwrap(), NewsHealthRefresh::Updated);
         assert_eq!(news_health_age(&successes, later_monotonic), Some(10));
-        let backwards = qualify_news_publication_at(&newer_batch, TradingEnv::Test,
-            later_wall, monotonic + std::time::Duration::from_secs(99)).unwrap();
-        assert!(mark_qualified_news_success_on(&successes, &backwards).unwrap_err().contains("backwards"));
+        let backwards = qualify_news_publication_at(
+            &newer_batch,
+            TradingEnv::Test,
+            later_wall,
+            monotonic + std::time::Duration::from_secs(99),
+        )
+        .unwrap();
+        assert!(mark_qualified_news_success_on(&successes, &backwards)
+            .unwrap_err()
+            .contains("backwards"));
         assert_eq!(news_health_age(&successes, later_monotonic), Some(10));
-        let wall_backwards_batch = news_health_batch(wall + chrono::Duration::seconds(90),
-            wall + chrono::Duration::seconds(99));
-        let wall_backwards = qualify_news_publication_at(&wall_backwards_batch, TradingEnv::Test,
-            wall + chrono::Duration::seconds(99), later_monotonic).unwrap();
-        assert!(mark_qualified_news_success_on(&successes, &wall_backwards).unwrap_err().contains("backwards"));
+        let wall_backwards_batch = news_health_batch(
+            wall + chrono::Duration::seconds(90),
+            wall + chrono::Duration::seconds(99),
+        );
+        let wall_backwards = qualify_news_publication_at(
+            &wall_backwards_batch,
+            TradingEnv::Test,
+            wall + chrono::Duration::seconds(99),
+            later_monotonic,
+        )
+        .unwrap();
+        assert!(mark_qualified_news_success_on(&successes, &wall_backwards)
+            .unwrap_err()
+            .contains("backwards"));
         assert_eq!(news_health_age(&successes, later_monotonic), Some(10));
         let poisoned = std::sync::Arc::new(std::sync::RwLock::new(CapabilitySuccesses::default()));
         let worker = std::sync::Arc::clone(&poisoned);
         assert!(std::thread::spawn(move || {
             let _held = worker.write().unwrap();
             panic!("TEST_CODE deliberate isolated lock poison");
-        }).join().is_err());
-        assert!(mark_qualified_news_success_on(&poisoned, &newer).unwrap_err().contains("poisoned"));
+        })
+        .join()
+        .is_err());
+        assert!(mark_qualified_news_success_on(&poisoned, &newer)
+            .unwrap_err()
+            .contains("poisoned"));
         let state = poisoned.read().unwrap_or_else(|error| error.into_inner());
-        assert!(state.input_at(later_monotonic, 120, 600).capabilities.iter()
+        assert!(state
+            .input_at(later_monotonic, 120, 600)
+            .capabilities
+            .iter()
             .all(|status| status.staleness_secs.is_none()));
     }
 
@@ -2823,19 +2931,33 @@ mod tests {
 
 impl NewsFlashSourceIdentity {
     /// Only a fresh immutable scored capability can supply this source identity.
-    pub fn from_audited_critical(score: &crate::monitor::news_ai::AuditedCriticalNews) -> Result<Self,String> {
-        let value = score.evidence().source().map_err(|e|e.to_string())?;
-        Ok(Self { event_id:value.event_id, provider:value.provider, source:value.source,
-            published_at:value.published_at.with_timezone(&Utc), observed_at:value.observed_at.with_timezone(&Utc),
-            batch_id:value.batch_id })
+    pub fn from_audited_critical(
+        score: &crate::monitor::news_ai::AuditedCriticalNews,
+    ) -> Result<Self, String> {
+        let value = score.evidence().source().map_err(|e| e.to_string())?;
+        Ok(Self {
+            event_id: value.event_id,
+            provider: value.provider,
+            source: value.source,
+            published_at: value.published_at.with_timezone(&Utc),
+            observed_at: value.observed_at.with_timezone(&Utc),
+            batch_id: value.batch_id,
+        })
     }
 }
 
 impl NewsFlashSourceIdentity {
-    pub fn from_audited_global_critical(score: &crate::monitor::news_ai::AuditedGlobalCriticalNews) -> Result<Self,String> {
-        let value = score.evidence().source().map_err(|e|e.to_string())?;
-        Ok(Self { event_id:value.event_id, provider:value.provider, source:value.source,
-            published_at:value.published_at.with_timezone(&Utc), observed_at:value.observed_at.with_timezone(&Utc),
-            batch_id:value.batch_id })
+    pub fn from_audited_global_critical(
+        score: &crate::monitor::news_ai::AuditedGlobalCriticalNews,
+    ) -> Result<Self, String> {
+        let value = score.evidence().source().map_err(|e| e.to_string())?;
+        Ok(Self {
+            event_id: value.event_id,
+            provider: value.provider,
+            source: value.source,
+            published_at: value.published_at.with_timezone(&Utc),
+            observed_at: value.observed_at.with_timezone(&Utc),
+            batch_id: value.batch_id,
+        })
     }
 }

@@ -265,8 +265,12 @@ fn verify_manifest_row_on(
         return Err(StagedPaperBookV2Error::ManifestMismatch);
     }
     let row = &rows[0];
-    verify_fee_manifest_fields(&row.schema_id, &row.policy_instance_id,
-        &row.descriptor_sha256, &row.descriptor_bytes)
+    verify_fee_manifest_fields(
+        &row.schema_id,
+        &row.policy_instance_id,
+        &row.descriptor_sha256,
+        &row.descriptor_bytes,
+    )
 }
 
 // The original ordinary predicate is shared by the retained fixed read. This
@@ -276,7 +280,9 @@ pub(super) fn fee_manifest_validation_owned_bytes() -> usize {
     64 + A_SHARE_FEE_SCHEDULE_V2.len() + ":sha256:".len() + 64
 }
 pub(super) fn verify_fee_manifest_fields(
-    schema_id: &str, policy_instance_id: &str, descriptor_sha256: &str,
+    schema_id: &str,
+    policy_instance_id: &str,
+    descriptor_sha256: &str,
     descriptor_bytes: &[u8],
 ) -> Result<(), StagedPaperBookV2Error> {
     if schema_id != STAGED_SCHEMA {

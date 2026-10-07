@@ -2644,34 +2644,55 @@ fn paper_v2_execution_actual_global_readonly_hook_stays_query_only_and_returns_e
     assert_eq!(actual_rows(&f.original.db), before);
 }
 
-
 // Heap buffers belong to the original nonClone command, not to the movable
 // outer frame's address. These observations create no authorization object.
 fn retained_fixed_command_buffers(command: &PaperV2Command) -> (usize, usize, usize) {
     match command {
-        PaperV2Command::Cancel { command_id, expected, parent_id } =>
-            (command_id.as_ptr() as usize, parent_id.as_ptr() as usize,
-                expected.event_hash.as_ptr() as usize),
+        PaperV2Command::Cancel {
+            command_id,
+            expected,
+            parent_id,
+        } => (
+            command_id.as_ptr() as usize,
+            parent_id.as_ptr() as usize,
+            expected.event_hash.as_ptr() as usize,
+        ),
         _ => panic!("this slice uses an actual fixed Cancel command"),
     }
 }
-fn retained_fixed_return_buffers(value: &RetainedExecutionAcquired) -> (usize, usize, usize, usize, usize) {
+fn retained_fixed_return_buffers(
+    value: &RetainedExecutionAcquired,
+) -> (usize, usize, usize, usize, usize) {
     let request_buffer = match value.fresh_request.as_ref() {
         Some(CommandRecord::Cancel { parent_id, .. }) => parent_id.as_ptr() as usize,
         None => 0,
         _ => panic!("this fixed return must preserve its actual Cancel record"),
     };
-    (value.receipt.command_id.as_ptr() as usize, value.receipt.account_id.as_ptr() as usize,
-        value.receipt.head.event_hash.as_ptr() as usize, value.binding.rows.events.as_ptr() as usize,
-        request_buffer)
+    (
+        value.receipt.command_id.as_ptr() as usize,
+        value.receipt.account_id.as_ptr() as usize,
+        value.receipt.head.event_hash.as_ptr() as usize,
+        value.binding.rows.events.as_ptr() as usize,
+        request_buffer,
+    )
 }
 // Re-entry is a resource-retention check, never an SQL retry or reconstruction.
 fn retained_fixed_assert_no_retry<'db, 'a>(
     frame: crate::database::global_schema_v1::paper_v6::RetainedPaperWrite<
-        'db, RetainedExecutionInput<'a>, RetainedExecutionAcquired, LedgerError>,
+        'db,
+        RetainedExecutionInput<'a>,
+        RetainedExecutionAcquired,
+        LedgerError,
+    >,
 ) -> crate::database::global_schema_v1::paper_v6::RetainedPaperWrite<
-    'db, RetainedExecutionInput<'a>, RetainedExecutionAcquired, LedgerError> {
-    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWriteOutcome, RetainedPaperWritePhase};
+    'db,
+    RetainedExecutionInput<'a>,
+    RetainedExecutionAcquired,
+    LedgerError,
+> {
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWriteOutcome, RetainedPaperWritePhase,
+    };
     let frame = Box::new(frame);
     let phase = frame.phase();
     let (input, value, work, error, faults) = frame.observe_fixed_execution_for_test();
@@ -2692,39 +2713,58 @@ fn retained_fixed_assert_no_retry<'db, 'a>(
     );
     let frame = match (phase, outcome) {
         (RetainedPaperWritePhase::Complete, RetainedPaperWriteOutcome::Complete(frame)) => frame,
-        (RetainedPaperWritePhase::WriterStopped | RetainedPaperWritePhase::Unopened,
-            RetainedPaperWriteOutcome::Held(frame)) => frame,
-        (RetainedPaperWritePhase::CommittedReadbackPending | RetainedPaperWritePhase::CommitUnknown,
-            RetainedPaperWriteOutcome::Pending(frame)) => frame,
+        (
+            RetainedPaperWritePhase::WriterStopped | RetainedPaperWritePhase::Unopened,
+            RetainedPaperWriteOutcome::Held(frame),
+        ) => frame,
+        (
+            RetainedPaperWritePhase::CommittedReadbackPending
+            | RetainedPaperWritePhase::CommitUnknown,
+            RetainedPaperWriteOutcome::Pending(frame),
+        ) => frame,
         _ => panic!("repeat must preserve the actual fixed owner's classification"),
     };
     let (input, value, work, error, after_faults) = frame.observe_fixed_execution_for_test();
     assert_eq!(frame.phase(), phase);
-    assert_eq!(retained_fixed_command_buffers(&input.command), input_buffers);
+    assert_eq!(
+        retained_fixed_command_buffers(&input.command),
+        input_buffers
+    );
     assert_eq!(value.map(retained_fixed_return_buffers), value_buffers);
     assert_eq!(work.map(|(_, remaining)| remaining), remaining);
     assert_eq!(after_faults, faults);
     assert_eq!(error.map(std::mem::discriminant), error_kind);
-    assert_eq!(match error {
-        Some(LedgerError::IntegrityFailure(reason)) => Some(reason.as_ptr() as usize),
-        _ => None,
-    }, error_buffer);
+    assert_eq!(
+        match error {
+            Some(LedgerError::IntegrityFailure(reason)) => Some(reason.as_ptr() as usize),
+            _ => None,
+        },
+        error_buffer
+    );
     frame
 }
 
 #[test]
 fn paper_retained_fixed_actual_commit_and_readback_keep_owned_return() {
-    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWriteOutcome, RetainedPaperWritePhase};
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWriteOutcome, RetainedPaperWritePhase,
+    };
     let f = actual_v6_fixture();
     actual_submit(&f, "TEST_CODE_RETAINED_COMPLETE_PARENT", Side::Sell, 100, 2);
     let expected = actual_view(&f).head;
     let before = actual_rows(&f.original.db);
     let command = PaperV2Command::Cancel {
         command_id: "TEST_CODE_RETAINED_COMPLETE_COMMAND".into(),
-        expected: expected.clone(), parent_id: "TEST_CODE_RETAINED_COMPLETE_PARENT".into(),
+        expected: expected.clone(),
+        parent_id: "TEST_CODE_RETAINED_COMPLETE_PARENT".into(),
     };
     let original = retained_fixed_command_buffers(&command);
-    let frame = match apply_retained_for_isolated_test(&f.original.db, &f.manifest.account_id, command, at(7)) {
+    let frame = match apply_retained_for_isolated_test(
+        &f.original.db,
+        &f.manifest.account_id,
+        command,
+        at(7),
+    ) {
         RetainedPaperWriteOutcome::Complete(frame) => frame,
         _ => panic!("true fixed COMMIT and independent read-back must complete"),
     };
@@ -2739,13 +2779,18 @@ fn paper_retained_fixed_actual_commit_and_readback_keep_owned_return() {
     let value = value.expect("actual acquired return belongs to the complete frame");
     assert!(!value.receipt.replayed && !value.binding.rows.events.is_empty());
     assert_eq!(value.receipt.head.version, expected.version + 1);
-    assert!(matches!(value.fresh_request.as_ref(), Some(CommandRecord::Cancel { parent_id, .. })
-        if parent_id == "TEST_CODE_RETAINED_COMPLETE_PARENT"));
+    assert!(
+        matches!(value.fresh_request.as_ref(), Some(CommandRecord::Cancel { parent_id, .. })
+        if parent_id == "TEST_CODE_RETAINED_COMPLETE_PARENT")
+    );
     let acquired_buffers = retained_fixed_return_buffers(value);
     let after = actual_rows(&f.original.db);
     assert_eq!(after.events.len(), before.events.len() + 1);
     assert_eq!(after, value.binding.rows);
-    assert_eq!(actual_view(&f).projection.parents["TEST_CODE_RETAINED_COMPLETE_PARENT"].status, ParentStatus::Cancelled);
+    assert_eq!(
+        actual_view(&f).projection.parents["TEST_CODE_RETAINED_COMPLETE_PARENT"].status,
+        ParentStatus::Cancelled
+    );
     let frame = retained_fixed_assert_no_retry(frame);
     assert_eq!(actual_rows(&f.original.db), after);
     let (input, value) = match frame.finish_complete() {
@@ -2755,16 +2800,29 @@ fn paper_retained_fixed_actual_commit_and_readback_keep_owned_return() {
     assert_eq!(retained_fixed_command_buffers(&input.command), original);
     assert_eq!(retained_fixed_return_buffers(&value), acquired_buffers);
     assert_eq!(value.binding.rows, after);
-    assert_eq!(original_payloads(&f.original.db, &f.manifest.account_id), f.original.old_payloads);
+    assert_eq!(
+        original_payloads(&f.original.db, &f.manifest.account_id),
+        f.original.old_payloads
+    );
     drop((input, value));
 
     // A real schema change after the true COMMIT/checkpoint rejects the fresh
     // reader. It is not a callback-supplied error pretending to be COMMIT Err.
     let pending = actual_v6_fixture();
-    actual_submit(&pending, "TEST_CODE_RETAINED_PENDING_PARENT", Side::Sell, 100, 2);
+    actual_submit(
+        &pending,
+        "TEST_CODE_RETAINED_PENDING_PARENT",
+        Side::Sell,
+        100,
+        2,
+    );
     let expected = actual_view(&pending).head;
     let before = actual_rows(&pending.original.db);
-    let path = pending.original.directory.path().join("TEST_CODE_paper_v5.db");
+    let path = pending
+        .original
+        .directory
+        .path()
+        .join("TEST_CODE_paper_v5.db");
     let hook_path = path.clone();
     let hits = std::rc::Rc::new(std::cell::Cell::new(0));
     let hit = hits.clone();
@@ -2772,20 +2830,30 @@ fn paper_retained_fixed_actual_commit_and_readback_keep_owned_return() {
         hit.set(hit.get() + 1);
         let mut conn = SqliteConnection::establish(hook_path.to_str().unwrap()).unwrap();
         diesel::sql_query("CREATE TABLE TEST_CODE_retained_postcommit_cut(value INTEGER)")
-            .execute(&mut conn).unwrap();
+            .execute(&mut conn)
+            .unwrap();
     });
     let command = PaperV2Command::Cancel {
         command_id: "TEST_CODE_RETAINED_PENDING_COMMAND".into(),
-        expected: expected.clone(), parent_id: "TEST_CODE_RETAINED_PENDING_PARENT".into(),
+        expected: expected.clone(),
+        parent_id: "TEST_CODE_RETAINED_PENDING_PARENT".into(),
     };
     let original = retained_fixed_command_buffers(&command);
-    let frame = match apply_retained_for_isolated_test(&pending.original.db, &pending.manifest.account_id, command, at(7)) {
+    let frame = match apply_retained_for_isolated_test(
+        &pending.original.db,
+        &pending.manifest.account_id,
+        command,
+        at(7),
+    ) {
         RetainedPaperWriteOutcome::Pending(frame) => frame,
         _ => panic!("post-COMMIT catalog refusal must retain the actual acquired return"),
     };
     drop(guard);
     assert_eq!(hits.get(), 1);
-    assert_eq!(frame.phase(), RetainedPaperWritePhase::CommittedReadbackPending);
+    assert_eq!(
+        frame.phase(),
+        RetainedPaperWritePhase::CommittedReadbackPending
+    );
     let (input, value, work, error, faults) = frame.observe_fixed_execution_for_test();
     assert_eq!(retained_fixed_command_buffers(&input.command), original);
     assert!(input.actual.is_some() && input.sampled_at == Some(at(7)));
@@ -2806,20 +2874,36 @@ fn paper_retained_fixed_actual_commit_and_readback_keep_owned_return() {
         Err(owner) => owner,
         Ok(_) => panic!("catalog refusal cannot release a success return"),
     };
-    assert_eq!(frame.phase(), RetainedPaperWritePhase::CommittedReadbackPending);
+    assert_eq!(
+        frame.phase(),
+        RetainedPaperWritePhase::CommittedReadbackPending
+    );
     drop(frame); // Explicit fixture teardown, not recovery or automatic retry.
 }
 
 #[test]
 fn paper_retained_fixed_stale_head_and_writer_tail_keep_first_fault() {
-    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWriteOutcome, RetainedPaperWritePhase};
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWriteOutcome, RetainedPaperWritePhase,
+    };
     {
         // The original idempotent singleton init does not install an isolated manager.
         DatabaseManager::init(None).unwrap();
-        let command = PaperV2Command::Cancel { command_id: "TEST_CODE_BRIDGE_REFUSED".into(),
-            expected: HeadIdentity { version: 1, event_hash: "a".repeat(64) }, parent_id: "TEST_CODE_BRIDGE_PARENT".into() };
+        let command = PaperV2Command::Cancel {
+            command_id: "TEST_CODE_BRIDGE_REFUSED".into(),
+            expected: HeadIdentity {
+                version: 1,
+                event_hash: "a".repeat(64),
+            },
+            parent_id: "TEST_CODE_BRIDGE_PARENT".into(),
+        };
         let original = retained_fixed_command_buffers(&command);
-        let frame = match apply_retained_for_isolated_test(DatabaseManager::get(), "TEST_CODE_BRIDGE_ACCOUNT", command, at(7)) {
+        let frame = match apply_retained_for_isolated_test(
+            DatabaseManager::get(),
+            "TEST_CODE_BRIDGE_ACCOUNT",
+            command,
+            at(7),
+        ) {
             RetainedPaperWriteOutcome::Held(frame) => frame,
             _ => panic!("ordinary manager has no constructor-issued isolated origin"),
         };
@@ -2835,10 +2919,18 @@ fn paper_retained_fixed_stale_head_and_writer_tail_keep_first_fault() {
     actual_submit(&f, "TEST_CODE_RETAINED_WRITER_PARENT", Side::Sell, 100, 2);
     actual_submit(&f, "TEST_CODE_RETAINED_EXTRA_PARENT", Side::Sell, 100, 3);
     let before = actual_rows(&f.original.db);
-    let command = PaperV2Command::Cancel { command_id: "TEST_CODE_RETAINED_STALE".into(),
-        expected: stale, parent_id: "TEST_CODE_RETAINED_WRITER_PARENT".into() };
+    let command = PaperV2Command::Cancel {
+        command_id: "TEST_CODE_RETAINED_STALE".into(),
+        expected: stale,
+        parent_id: "TEST_CODE_RETAINED_WRITER_PARENT".into(),
+    };
     let original = retained_fixed_command_buffers(&command);
-    let frame = match apply_retained_for_isolated_test(&f.original.db, &f.manifest.account_id, command, at(7)) {
+    let frame = match apply_retained_for_isolated_test(
+        &f.original.db,
+        &f.manifest.account_id,
+        command,
+        at(7),
+    ) {
         RetainedPaperWriteOutcome::Held(frame) => frame,
         _ => panic!("actual stale head must stop before a commit-ready return"),
     };
@@ -2860,12 +2952,25 @@ fn paper_retained_fixed_stale_head_and_writer_tail_keep_first_fault() {
     let hit = hits.clone();
     let guard = install_test_hook(TestPhase::LastSqlBeforeCommit, move |conn| {
         hit.set(hit.get() + 1);
-        append_hook_cancel(conn, &account, "TEST_CODE_RETAINED_EXTRA_PARENT", "TEST_CODE_RETAINED_EXTRA_EVENT");
+        append_hook_cancel(
+            conn,
+            &account,
+            "TEST_CODE_RETAINED_EXTRA_PARENT",
+            "TEST_CODE_RETAINED_EXTRA_EVENT",
+        );
     });
-    let command = PaperV2Command::Cancel { command_id: "TEST_CODE_RETAINED_WRITER_TAIL".into(),
-        expected: expected.clone(), parent_id: "TEST_CODE_RETAINED_WRITER_PARENT".into() };
+    let command = PaperV2Command::Cancel {
+        command_id: "TEST_CODE_RETAINED_WRITER_TAIL".into(),
+        expected: expected.clone(),
+        parent_id: "TEST_CODE_RETAINED_WRITER_PARENT".into(),
+    };
     let original = retained_fixed_command_buffers(&command);
-    let frame = match apply_retained_for_isolated_test(&f.original.db, &f.manifest.account_id, command, at(7)) {
+    let frame = match apply_retained_for_isolated_test(
+        &f.original.db,
+        &f.manifest.account_id,
+        command,
+        at(7),
+    ) {
         RetainedPaperWriteOutcome::Held(frame) => frame,
         _ => panic!("real legal writer mutation must stop at the fixed SQL-binding tail"),
     };
@@ -2890,13 +2995,18 @@ fn paper_retained_fixed_stale_head_and_writer_tail_keep_first_fault() {
         Ok(_) => panic!("writer-tail refusal cannot release a success return"),
     };
     assert!(frame.observe_fixed_execution_for_test().1.is_some());
-    assert_eq!(original_payloads(&f.original.db, &f.manifest.account_id), f.original.old_payloads);
+    assert_eq!(
+        original_payloads(&f.original.db, &f.manifest.account_id),
+        f.original.old_payloads
+    );
     drop(frame);
 }
 
 #[test]
 fn paper_retained_fixed_checkpoint_child_readback_keeps_both_commands() {
-    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWriteOutcome, RetainedPaperWritePhase};
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWriteOutcome, RetainedPaperWritePhase,
+    };
     let f = actual_v6_fixture();
     actual_submit(&f, "TEST_CODE_RETAINED_PARENT_CANCEL", Side::Sell, 100, 2);
     actual_submit(&f, "TEST_CODE_RETAINED_CHILD_CANCEL", Side::Sell, 100, 3);
@@ -2906,30 +3016,48 @@ fn paper_retained_fixed_checkpoint_child_readback_keeps_both_commands() {
     let hit = hits.clone();
     let guard = crate::database::install_retained_readback_after_checkpoint_hook(move || {
         hit.set(hit.get() + 1);
-        let name = "trading::paper_book_v2_execution::tests::TEST_CODE_paper_v2_execution_global_child";
+        let name =
+            "trading::paper_book_v2_execution::tests::TEST_CODE_paper_v2_execution_global_child";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", name, "--nocapture"])
             .env(PAPER_CHILD_PATH, directory.join("TEST_CODE_paper_v5.db"))
             .env(PAPER_CHILD_ACTION, "TEST_CODE_RETAINED_CHILD_CANCEL")
             .env(PAPER_CHILD_COMMAND, "TEST_CODE_RETAINED_COMMITTED_CHILD")
-            .output().unwrap();
+            .output()
+            .unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
-        assert!(output.status.success(), "actual retained child failed: {stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "actual retained child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(stdout.contains("running 1 test"));
-        assert!(stdout.contains("TEST_CODE_PAPER_CHILD_COMMITTED TEST_CODE_RETAINED_COMMITTED_CHILD"));
+        assert!(
+            stdout.contains("TEST_CODE_PAPER_CHILD_COMMITTED TEST_CODE_RETAINED_COMMITTED_CHILD")
+        );
     });
-    let command = PaperV2Command::Cancel { command_id: "TEST_CODE_RETAINED_COMMITTED_PARENT".into(),
-        expected: expected.clone(), parent_id: "TEST_CODE_RETAINED_PARENT_CANCEL".into() };
+    let command = PaperV2Command::Cancel {
+        command_id: "TEST_CODE_RETAINED_COMMITTED_PARENT".into(),
+        expected: expected.clone(),
+        parent_id: "TEST_CODE_RETAINED_PARENT_CANCEL".into(),
+    };
     let original = retained_fixed_command_buffers(&command);
-    let frame = match apply_retained_for_isolated_test(&f.original.db, &f.manifest.account_id, command, at(7)) {
+    let frame = match apply_retained_for_isolated_test(
+        &f.original.db,
+        &f.manifest.account_id,
+        command,
+        at(7),
+    ) {
         RetainedPaperWriteOutcome::Pending(frame) => frame,
         _ => panic!("child COMMIT before fresh read-back must retain the original parent return"),
     };
     drop(guard);
     assert_eq!(hits.get(), 1);
     let (input, value, work, error, faults) = frame.observe_fixed_execution_for_test();
-    assert_eq!(frame.phase(), RetainedPaperWritePhase::CommittedReadbackPending);
+    assert_eq!(
+        frame.phase(),
+        RetainedPaperWritePhase::CommittedReadbackPending
+    );
     assert_eq!(retained_fixed_command_buffers(&input.command), original);
     assert!(input.actual.is_some() && input.sampled_at == Some(at(7)));
     let value = value.expect("parent's actual receipt/binding remain owned");
@@ -2942,15 +3070,30 @@ fn paper_retained_fixed_checkpoint_child_readback_keeps_both_commands() {
     let current = actual_view(&f);
     assert_eq!(current.head.version, expected.version + 2);
     for (parent, command, version) in [
-        ("TEST_CODE_RETAINED_PARENT_CANCEL", "TEST_CODE_RETAINED_COMMITTED_PARENT", expected.version + 1),
-        ("TEST_CODE_RETAINED_CHILD_CANCEL", "TEST_CODE_RETAINED_COMMITTED_CHILD", expected.version + 2),
+        (
+            "TEST_CODE_RETAINED_PARENT_CANCEL",
+            "TEST_CODE_RETAINED_COMMITTED_PARENT",
+            expected.version + 1,
+        ),
+        (
+            "TEST_CODE_RETAINED_CHILD_CANCEL",
+            "TEST_CODE_RETAINED_COMMITTED_CHILD",
+            expected.version + 2,
+        ),
     ] {
-        assert_eq!(current.projection.parents[parent].status, ParentStatus::Cancelled);
-        let observed = recover_command_for_isolated_test(&f.original.db, &f.manifest.account_id, command)
-            .unwrap().unwrap();
+        assert_eq!(
+            current.projection.parents[parent].status,
+            ParentStatus::Cancelled
+        );
+        let observed =
+            recover_command_for_isolated_test(&f.original.db, &f.manifest.account_id, command)
+                .unwrap()
+                .unwrap();
         assert_eq!(observed.receipt().head.version, version);
         assert_eq!(observed.observed_head(), &current.head);
-        assert!(matches!(observed.request(), CommandRecord::Cancel { parent_id, .. } if parent_id == parent));
+        assert!(
+            matches!(observed.request(), CommandRecord::Cancel { parent_id, .. } if parent_id == parent)
+        );
     }
     let before_repeat = actual_rows(&f.original.db);
     assert_ne!(value.binding.rows, before_repeat); // The original T is not reminted from the new head.
@@ -2960,9 +3103,15 @@ fn paper_retained_fixed_checkpoint_child_readback_keeps_both_commands() {
         Err(owner) => owner,
         Ok(_) => panic!("pending read-back cannot release a success return"),
     };
-    assert_eq!(frame.phase(), RetainedPaperWritePhase::CommittedReadbackPending);
+    assert_eq!(
+        frame.phase(),
+        RetainedPaperWritePhase::CommittedReadbackPending
+    );
     assert!(frame.observe_fixed_execution_for_test().1.is_some());
-    assert_eq!(original_payloads(&f.original.db, &f.manifest.account_id), f.original.old_payloads);
+    assert_eq!(
+        original_payloads(&f.original.db, &f.manifest.account_id),
+        f.original.old_payloads
+    );
     drop(frame); // Explicit fixture teardown; no automatic replay/recovery.
 }
 

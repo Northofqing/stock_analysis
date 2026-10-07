@@ -9,8 +9,8 @@
 //! only its own exact WAL/SHM pair under BR-189; it never writes either global
 //! identity field or substitutes an unattested path.
 
-use fs2::FileExt;
 use crate::selection::audit::financial_original as financial_audit;
+use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
@@ -36,6 +36,8 @@ use crate::selection::audit::{
     SelectionAuditWriter, ValidatedAuditChainSnapshot,
 };
 
+#[path = "global_schema_additive_target_v1.rs"]
+mod additive_target;
 #[path = "global_schema_backup_v1.rs"]
 mod backup;
 #[path = "global_schema_candidate_v7.rs"]
@@ -46,14 +48,12 @@ pub(crate) mod investment_v8;
 pub(crate) mod paper_v6;
 #[path = "global_schema_prospective_v1.rs"]
 mod prospective;
-#[path = "global_schema_rows_v1.rs"]
-mod rows;
 #[path = "global_schema_replay_work_v1.rs"]
 pub(crate) mod replay_work;
+#[path = "global_schema_rows_v1.rs"]
+mod rows;
 #[path = "global_schema_target_v1.rs"]
 mod target;
-#[path = "global_schema_additive_target_v1.rs"]
-mod additive_target;
 
 pub(crate) const STOCK_ANALYSIS_SQLITE_APPLICATION_ID: i64 = 1_398_035_265;
 pub(crate) const STOCK_ANALYSIS_DB_SCHEMA_GENERATION: i64 = 1;
@@ -425,7 +425,8 @@ struct FinancialRetainedStartDecision {
 #[allow(dead_code)]
 impl FinancialStartDecision {
     fn fixed_production() -> Self {
-        match decide_financial_mode_pair(BoundMode::Production, GlobalSchemaCatalogMode::Production) {
+        match decide_financial_mode_pair(BoundMode::Production, GlobalSchemaCatalogMode::Production)
+        {
             Ok(FinancialModeDecision::Production) => Self {
                 purpose: FinancialStartPurpose::FinancialTargetRowsBackup,
                 bound: BoundMode::Production,
@@ -436,8 +437,16 @@ impl FinancialStartDecision {
     }
 
     fn into_retained(self) -> FinancialRetainedStartDecision {
-        let Self { purpose, bound, catalog } = self;
-        FinancialRetainedStartDecision { purpose, bound, catalog }
+        let Self {
+            purpose,
+            bound,
+            catalog,
+        } = self;
+        FinancialRetainedStartDecision {
+            purpose,
+            bound,
+            catalog,
+        }
     }
 }
 
@@ -477,30 +486,77 @@ struct FinancialCompleteSidecars {
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum FinancialSidecarPhase {
-    BeforeA00, WalOpening, WalOpened, WalPinned, ShmOpening, ShmOpened,
-    PairLocal, BuiltLocal, ValidatedLocal, AbandonedResult, Returned, LocalDrained,
+    BeforeA00,
+    WalOpening,
+    WalOpened,
+    WalPinned,
+    ShmOpening,
+    ShmOpened,
+    PairLocal,
+    BuiltLocal,
+    ValidatedLocal,
+    AbandonedResult,
+    Returned,
+    LocalDrained,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum FinancialSidecarCut { WalPin, ShmPin, Journal, PairValidation }
+enum FinancialSidecarCut {
+    WalPin,
+    ShmPin,
+    Journal,
+    PairValidation,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum FinancialSidecarFault { UnexpectedCut, Terminal, ResourceMissing }
+enum FinancialSidecarFault {
+    UnexpectedCut,
+    Terminal,
+    ResourceMissing,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum FinancialSidecarDrop { CurrentPin, Shm, Wal, BuiltPair, NoLocalPayload }
+enum FinancialSidecarDrop {
+    CurrentPin,
+    Shm,
+    Wal,
+    BuiltPair,
+    NoLocalPayload,
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum FinancialAuditPhase { NotStarted, Acquiring, Records, Ready, Failed, Draining, Released }
+enum FinancialAuditPhase {
+    NotStarted,
+    Acquiring,
+    Records,
+    Ready,
+    Failed,
+    Draining,
+    Released,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum FinancialAuditFault { UnexpectedCut, Terminal }
+enum FinancialAuditFault {
+    UnexpectedCut,
+    Terminal,
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum FinancialAuditPinPhase { None, LocalParent, LocalComplete, CompleteRetained }
+enum FinancialAuditPinPhase {
+    None,
+    LocalParent,
+    LocalComplete,
+    CompleteRetained,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-enum FinancialAuditRelease { Session(financial_audit::Action), LocalFile, LocalParent, LocalRecords, Finished }
+enum FinancialAuditRelease {
+    Session(financial_audit::Action),
+    LocalFile,
+    LocalParent,
+    LocalRecords,
+    Finished,
+}
 #[allow(dead_code)]
 struct FinancialAuditState<'writer> {
     resources: financial_audit::Resources<'writer>,
@@ -512,7 +568,16 @@ struct FinancialAuditState<'writer> {
 }
 #[allow(dead_code)]
 impl FinancialAuditState<'_> {
-    fn empty() -> Self { Self { resources: financial_audit::Resources::empty(), records: None, pin_phase: FinancialAuditPinPhase::None, parent: None, leaf: None, file: None } }
+    fn empty() -> Self {
+        Self {
+            resources: financial_audit::Resources::empty(),
+            records: None,
+            pin_phase: FinancialAuditPinPhase::None,
+            parent: None,
+            leaf: None,
+            file: None,
+        }
+    }
 }
 #[allow(dead_code)]
 struct FinancialPhysical {
@@ -533,19 +598,44 @@ struct FinancialPhysical {
 #[allow(dead_code)]
 impl FinancialPhysical {
     fn empty() -> Self {
-        Self { phase: FinancialSidecarPhase::BeforeA00, audit_phase: FinancialAuditPhase::NotStarted, opened: None,
-            wal: None, shm: None, complete: None, returned: None, abandoned: None, failed_cut: None,
-            primary: None, context: None }
+        Self {
+            phase: FinancialSidecarPhase::BeforeA00,
+            audit_phase: FinancialAuditPhase::NotStarted,
+            opened: None,
+            wal: None,
+            shm: None,
+            complete: None,
+            returned: None,
+            abandoned: None,
+            failed_cut: None,
+            primary: None,
+            context: None,
+        }
     }
-    fn post_a00_started(&self) -> bool { self.phase != FinancialSidecarPhase::BeforeA00 }
-    fn audit_pending(&self) -> bool { !matches!(self.audit_phase, FinancialAuditPhase::NotStarted | FinancialAuditPhase::Released) }
-    fn blocks_original_close(&self) -> bool { self.audit_pending() || self.sidecar_locals_pending() }
+    fn post_a00_started(&self) -> bool {
+        self.phase != FinancialSidecarPhase::BeforeA00
+    }
+    fn audit_pending(&self) -> bool {
+        !matches!(
+            self.audit_phase,
+            FinancialAuditPhase::NotStarted | FinancialAuditPhase::Released
+        )
+    }
+    fn blocks_original_close(&self) -> bool {
+        self.audit_pending() || self.sidecar_locals_pending()
+    }
     fn sidecar_locals_pending(&self) -> bool {
-        !matches!(self.phase, FinancialSidecarPhase::BeforeA00
-            | FinancialSidecarPhase::Returned | FinancialSidecarPhase::LocalDrained)
+        !matches!(
+            self.phase,
+            FinancialSidecarPhase::BeforeA00
+                | FinancialSidecarPhase::Returned
+                | FinancialSidecarPhase::LocalDrained
+        )
     }
     fn begin_after_a00(&mut self) -> Result<(), FinancialSidecarFault> {
-        if self.post_a00_started() { return Err(FinancialSidecarFault::UnexpectedCut); }
+        if self.post_a00_started() {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
         self.phase = FinancialSidecarPhase::WalOpening;
         Ok(())
     }
@@ -562,28 +652,52 @@ struct FinancialSidecarLoan<'a> {
 }
 #[allow(dead_code)]
 impl<'a> FinancialSidecarLoan<'a> {
-    fn require_normal_cut(&self, phase: FinancialSidecarPhase) -> Result<(), FinancialSidecarFault> {
-        if self.work.terminal().is_some() { return Err(FinancialSidecarFault::Terminal); }
+    fn require_normal_cut(
+        &self,
+        phase: FinancialSidecarPhase,
+    ) -> Result<(), FinancialSidecarFault> {
+        if self.work.terminal().is_some() {
+            return Err(FinancialSidecarFault::Terminal);
+        }
         if self.physical.phase != phase || self.physical.failed_cut.is_some() {
             return Err(FinancialSidecarFault::UnexpectedCut);
         }
         Ok(())
     }
-    fn retain_context(&mut self, context: FinancialPhysicalContext) -> Result<(), FinancialPhysicalContext> {
-        if self.work.terminal().is_some() || self.physical.post_a00_started()
-            || self.physical.context.is_some() { return Err(context); }
+    fn retain_context(
+        &mut self,
+        context: FinancialPhysicalContext,
+    ) -> Result<(), FinancialPhysicalContext> {
+        if self.work.terminal().is_some()
+            || self.physical.post_a00_started()
+            || self.physical.context.is_some()
+        {
+            return Err(context);
+        }
         self.physical.context = Some(context);
         Ok(())
     }
-    fn retain_opened_wal(&mut self, opened: FinancialOpenedSidecar) -> Result<(), FinancialOpenedSidecar> {
-        if self.require_normal_cut(FinancialSidecarPhase::WalOpening).is_err() { return Err(opened); }
+    fn retain_opened_wal(
+        &mut self,
+        opened: FinancialOpenedSidecar,
+    ) -> Result<(), FinancialOpenedSidecar> {
+        if self
+            .require_normal_cut(FinancialSidecarPhase::WalOpening)
+            .is_err()
+        {
+            return Err(opened);
+        }
         self.physical.opened = Some(opened);
         self.physical.phase = FinancialSidecarPhase::WalOpened;
         Ok(())
     }
     fn finish_wal_pin(&mut self, identity: FileIdentity) -> Result<(), FinancialSidecarFault> {
         self.require_normal_cut(FinancialSidecarPhase::WalOpened)?;
-        let opened = self.physical.opened.take().ok_or(FinancialSidecarFault::ResourceMissing)?;
+        let opened = self
+            .physical
+            .opened
+            .take()
+            .ok_or(FinancialSidecarFault::ResourceMissing)?;
         self.physical.wal = Some(opened.into_pin(identity));
         self.physical.phase = FinancialSidecarPhase::WalPinned;
         Ok(())
@@ -593,15 +707,27 @@ impl<'a> FinancialSidecarLoan<'a> {
         self.physical.phase = FinancialSidecarPhase::ShmOpening;
         Ok(())
     }
-    fn retain_opened_shm(&mut self, opened: FinancialOpenedSidecar) -> Result<(), FinancialOpenedSidecar> {
-        if self.require_normal_cut(FinancialSidecarPhase::ShmOpening).is_err() { return Err(opened); }
+    fn retain_opened_shm(
+        &mut self,
+        opened: FinancialOpenedSidecar,
+    ) -> Result<(), FinancialOpenedSidecar> {
+        if self
+            .require_normal_cut(FinancialSidecarPhase::ShmOpening)
+            .is_err()
+        {
+            return Err(opened);
+        }
         self.physical.opened = Some(opened);
         self.physical.phase = FinancialSidecarPhase::ShmOpened;
         Ok(())
     }
     fn finish_shm_pin(&mut self, identity: FileIdentity) -> Result<(), FinancialSidecarFault> {
         self.require_normal_cut(FinancialSidecarPhase::ShmOpened)?;
-        let opened = self.physical.opened.take().ok_or(FinancialSidecarFault::ResourceMissing)?;
+        let opened = self
+            .physical
+            .opened
+            .take()
+            .ok_or(FinancialSidecarFault::ResourceMissing)?;
         self.physical.shm = Some(opened.into_pin(identity));
         self.physical.phase = FinancialSidecarPhase::PairLocal;
         Ok(())
@@ -610,67 +736,114 @@ impl<'a> FinancialSidecarLoan<'a> {
     // This does not perform that operation or issue its FS/provider facts.
     fn finish_journal_absence(&mut self) -> Result<(), FinancialSidecarFault> {
         self.require_normal_cut(FinancialSidecarPhase::PairLocal)?;
-        if self.physical.wal.is_none() || self.physical.shm.is_none() { return Err(FinancialSidecarFault::ResourceMissing); }
+        if self.physical.wal.is_none() || self.physical.shm.is_none() {
+            return Err(FinancialSidecarFault::ResourceMissing);
+        }
         let wal = self.physical.wal.take().expect("PairLocal owns wal");
         let shm = self.physical.shm.take().expect("PairLocal owns shm");
-        let FinancialPinnedSidecar { pin: wal, pin_nul: wal_name, #[cfg(test)] trace: wal_trace } = wal;
-        let FinancialPinnedSidecar { pin: shm, pin_nul: shm_name, #[cfg(test)] trace: shm_trace } = shm;
+        let FinancialPinnedSidecar {
+            pin: wal,
+            pin_nul: wal_name,
+            #[cfg(test)]
+                trace: wal_trace,
+        } = wal;
+        let FinancialPinnedSidecar {
+            pin: shm,
+            pin_nul: shm_name,
+            #[cfg(test)]
+                trace: shm_trace,
+        } = shm;
         self.physical.complete = Some(FinancialCompleteSidecars {
             sidecars: OwnerCreatedSqliteSidecars { wal, shm },
             pin_names: [wal_name, shm_name],
-            #[cfg(test)] traces: [wal_trace, shm_trace],
+            #[cfg(test)]
+            traces: [wal_trace, shm_trace],
         });
         self.physical.phase = FinancialSidecarPhase::BuiltLocal;
         Ok(())
     }
     // The validated callee result owns the actual pair. Its return alone has
     // not yet placed that result in the parent's distinct retained slot.
-    fn finish_pair_validation(self) -> Result<FinancialSidecarReturn<'a>, (Self, FinancialSidecarFault)> {
-        if let Err(fault) = self.require_normal_cut(FinancialSidecarPhase::BuiltLocal) { return Err((self, fault)); }
+    fn finish_pair_validation(
+        self,
+    ) -> Result<FinancialSidecarReturn<'a>, (Self, FinancialSidecarFault)> {
+        if let Err(fault) = self.require_normal_cut(FinancialSidecarPhase::BuiltLocal) {
+            return Err((self, fault));
+        }
         // The exclusive physical borrow then keeps both destination slots
         // empty until this one carrier is consumed or forwarded by its Drop.
         if self.physical.returned.is_some() || self.physical.abandoned.is_some() {
             return Err((self, FinancialSidecarFault::UnexpectedCut));
         }
-        let Some(sidecars) = self.physical.complete.take() else { return Err((self, FinancialSidecarFault::ResourceMissing)); };
+        let Some(sidecars) = self.physical.complete.take() else {
+            return Err((self, FinancialSidecarFault::ResourceMissing));
+        };
         self.physical.phase = FinancialSidecarPhase::ValidatedLocal;
         let Self { physical, work } = self;
-        Ok(FinancialSidecarReturn { physical, work, sidecars: Some(sidecars) })
+        Ok(FinancialSidecarReturn {
+            physical,
+            work,
+            sidecars: Some(sidecars),
+        })
     }
     fn failed_wal_pin(&mut self) -> Result<(), FinancialSidecarFault> {
-        if !matches!(self.physical.phase, FinancialSidecarPhase::WalOpening | FinancialSidecarPhase::WalOpened) {
+        if !matches!(
+            self.physical.phase,
+            FinancialSidecarPhase::WalOpening | FinancialSidecarPhase::WalOpened
+        ) {
             return Err(FinancialSidecarFault::UnexpectedCut);
         }
         self.retain_failure_cut(FinancialSidecarCut::WalPin)
     }
     fn failed_shm_pin(&mut self) -> Result<(), FinancialSidecarFault> {
-        if !matches!(self.physical.phase, FinancialSidecarPhase::ShmOpening | FinancialSidecarPhase::ShmOpened) {
+        if !matches!(
+            self.physical.phase,
+            FinancialSidecarPhase::ShmOpening | FinancialSidecarPhase::ShmOpened
+        ) {
             return Err(FinancialSidecarFault::UnexpectedCut);
         }
         self.retain_failure_cut(FinancialSidecarCut::ShmPin)
     }
     fn failed_journal_absence(&mut self) -> Result<(), FinancialSidecarFault> {
-        if self.physical.phase != FinancialSidecarPhase::PairLocal { return Err(FinancialSidecarFault::UnexpectedCut); }
+        if self.physical.phase != FinancialSidecarPhase::PairLocal {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
         self.retain_failure_cut(FinancialSidecarCut::Journal)
     }
     fn failed_pair_validation(&mut self) -> Result<(), FinancialSidecarFault> {
-        if self.physical.phase != FinancialSidecarPhase::BuiltLocal { return Err(FinancialSidecarFault::UnexpectedCut); }
+        if self.physical.phase != FinancialSidecarPhase::BuiltLocal {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
         self.retain_failure_cut(FinancialSidecarCut::PairValidation)
     }
-    fn retain_failure_cut(&mut self, cut: FinancialSidecarCut) -> Result<(), FinancialSidecarFault> {
-        if self.work.terminal().is_some() { return Err(FinancialSidecarFault::Terminal); }
-        if self.physical.failed_cut.is_some() || self.physical.primary.is_some() { return Err(FinancialSidecarFault::UnexpectedCut); }
+    fn retain_failure_cut(
+        &mut self,
+        cut: FinancialSidecarCut,
+    ) -> Result<(), FinancialSidecarFault> {
+        if self.work.terminal().is_some() {
+            return Err(FinancialSidecarFault::Terminal);
+        }
+        if self.physical.failed_cut.is_some() || self.physical.primary.is_some() {
+            return Err(FinancialSidecarFault::UnexpectedCut);
+        }
         self.physical.failed_cut = Some(cut);
         Ok(())
     }
-    fn retain_paid_primary(&mut self, error: rows::original_source::SourceOperationError)
-        -> Result<(), rows::original_source::SourceOperationError> {
+    fn retain_paid_primary(
+        &mut self,
+        error: rows::original_source::SourceOperationError,
+    ) -> Result<(), rows::original_source::SourceOperationError> {
         // Abandonment is a mechanism obligation, not an invented FS failure
         // or proof of diagnostic payment. Only an already-owned error moves.
         let required = self.physical.failed_cut.is_some()
             || self.physical.phase == FinancialSidecarPhase::AbandonedResult;
-        if self.work.terminal().is_some() || !required
-            || self.physical.primary.is_some() || !self.physical.sidecar_locals_pending() { return Err(error); }
+        if self.work.terminal().is_some()
+            || !required
+            || self.physical.primary.is_some()
+            || !self.physical.sidecar_locals_pending()
+        {
+            return Err(error);
+        }
         self.physical.primary = Some(error);
         Ok(())
     }
@@ -681,23 +854,34 @@ impl<'a> FinancialSidecarLoan<'a> {
         // physical slots (for example after a safe forget of its carrier).
         if self.physical.phase == FinancialSidecarPhase::ValidatedLocal
             || !self.physical.sidecar_locals_pending()
-            || (self.work.terminal().is_none() && self.physical.primary.is_none()) {
+            || (self.work.terminal().is_none() && self.physical.primary.is_none())
+        {
             return Err(FinancialSidecarFault::UnexpectedCut);
         }
         let action = if let Some(opened) = self.physical.opened.take() {
-            opened.drop_owned(); FinancialSidecarDrop::CurrentPin
+            opened.drop_owned();
+            FinancialSidecarDrop::CurrentPin
         } else if let Some(complete) = self.physical.complete.take() {
-            complete.drop_built_local(); FinancialSidecarDrop::BuiltPair
+            complete.drop_built_local();
+            FinancialSidecarDrop::BuiltPair
         } else if let Some(abandoned) = self.physical.abandoned.take() {
-            abandoned.drop_built_local(); FinancialSidecarDrop::BuiltPair
+            abandoned.drop_built_local();
+            FinancialSidecarDrop::BuiltPair
         } else if let Some(shm) = self.physical.shm.take() {
-            shm.drop_owned(FinancialSidecarDrop::Shm); FinancialSidecarDrop::Shm
+            shm.drop_owned(FinancialSidecarDrop::Shm);
+            FinancialSidecarDrop::Shm
         } else if let Some(wal) = self.physical.wal.take() {
-            wal.drop_owned(FinancialSidecarDrop::Wal); FinancialSidecarDrop::Wal
-        } else { FinancialSidecarDrop::NoLocalPayload };
-        if self.physical.opened.is_none() && self.physical.complete.is_none()
+            wal.drop_owned(FinancialSidecarDrop::Wal);
+            FinancialSidecarDrop::Wal
+        } else {
+            FinancialSidecarDrop::NoLocalPayload
+        };
+        if self.physical.opened.is_none()
+            && self.physical.complete.is_none()
             && self.physical.abandoned.is_none()
-            && self.physical.shm.is_none() && self.physical.wal.is_none() {
+            && self.physical.shm.is_none()
+            && self.physical.wal.is_none()
+        {
             self.physical.phase = FinancialSidecarPhase::LocalDrained;
         }
         Ok(action)
@@ -715,8 +899,14 @@ struct FinancialSidecarReturn<'a> {
 #[allow(dead_code)]
 impl FinancialSidecarReturn<'_> {
     fn finish_sidecar_acquisition(mut self) -> Result<(), Self> {
-        if self.work.terminal().is_some() || self.physical.phase != FinancialSidecarPhase::ValidatedLocal
-            || self.sidecars.is_none() || self.physical.returned.is_some() || self.physical.abandoned.is_some() { return Err(self); }
+        if self.work.terminal().is_some()
+            || self.physical.phase != FinancialSidecarPhase::ValidatedLocal
+            || self.sidecars.is_none()
+            || self.physical.returned.is_some()
+            || self.physical.abandoned.is_some()
+        {
+            return Err(self);
+        }
         self.physical.returned = self.sidecars.take();
         self.physical.phase = FinancialSidecarPhase::Returned;
         Ok(()) // Drop sees an empty carrier and ends only the same borrow.
@@ -735,34 +925,76 @@ impl Drop for FinancialSidecarReturn<'_> {
 #[allow(dead_code)]
 impl FinancialOpenedSidecar {
     fn into_pin(self, identity: FileIdentity) -> FinancialPinnedSidecar {
-        let Self { file, leaf, path, pin_nul, #[cfg(test)] trace } = self;
-        FinancialPinnedSidecar { pin: PinnedOwnerSqliteSidecar { file, identity, leaf, path }, pin_nul,
-            #[cfg(test)] trace }
+        let Self {
+            file,
+            leaf,
+            path,
+            pin_nul,
+            #[cfg(test)]
+            trace,
+        } = self;
+        FinancialPinnedSidecar {
+            pin: PinnedOwnerSqliteSidecar {
+                file,
+                identity,
+                leaf,
+                path,
+            },
+            pin_nul,
+            #[cfg(test)]
+            trace,
+        }
     }
     fn drop_owned(self) {
-        let Self { file, leaf, path, pin_nul, #[cfg(test)] trace } = self;
-        drop(file); drop(leaf); drop(path); drop(pin_nul);
-        #[cfg(test)] trace.record(FinancialSidecarDrop::CurrentPin);
+        let Self {
+            file,
+            leaf,
+            path,
+            pin_nul,
+            #[cfg(test)]
+            trace,
+        } = self;
+        drop(file);
+        drop(leaf);
+        drop(path);
+        drop(pin_nul);
+        #[cfg(test)]
+        trace.record(FinancialSidecarDrop::CurrentPin);
     }
 }
 #[allow(dead_code)]
 impl FinancialPinnedSidecar {
     fn drop_owned(self, action: FinancialSidecarDrop) {
-        let Self { pin, pin_nul, #[cfg(test)] trace } = self;
-        drop(pin); drop(pin_nul);
-        #[cfg(test)] trace.record(action);
-        #[cfg(not(test))] let _ = action;
+        let Self {
+            pin,
+            pin_nul,
+            #[cfg(test)]
+            trace,
+        } = self;
+        drop(pin);
+        drop(pin_nul);
+        #[cfg(test)]
+        trace.record(action);
+        #[cfg(not(test))]
+        let _ = action;
     }
 }
 #[allow(dead_code)]
 impl FinancialCompleteSidecars {
     fn drop_built_local(self) {
-        let Self { sidecars, pin_names, #[cfg(test)] traces } = self;
+        let Self {
+            sidecars,
+            pin_names,
+            #[cfg(test)]
+            traces,
+        } = self;
         let OwnerCreatedSqliteSidecars { wal, shm } = sidecars;
         drop(wal);
-        #[cfg(test)] traces[0].record(FinancialSidecarDrop::Wal);
+        #[cfg(test)]
+        traces[0].record(FinancialSidecarDrop::Wal);
         drop(shm);
-        #[cfg(test)] traces[1].record(FinancialSidecarDrop::Shm);
+        #[cfg(test)]
+        traces[1].record(FinancialSidecarDrop::Shm);
         drop(pin_names);
     }
 }
@@ -779,80 +1011,158 @@ struct FinancialAuditFields<'a, 'writer> {
 #[allow(dead_code)]
 impl<'writer> FinancialAuditFields<'_, 'writer> {
     fn begin(&mut self, writer: &'writer SelectionAuditWriter) -> Result<(), FinancialAuditFault> {
-        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
-        if !self.native.audit_acquisition_ready() || !self.physical.parent_sidecars_retained() || self.physical.primary.is_some()
-            || self.physical.audit_phase != FinancialAuditPhase::NotStarted { return Err(FinancialAuditFault::UnexpectedCut); }
-        self.audit.resources.bind(writer).map_err(|_| FinancialAuditFault::UnexpectedCut)?;
-        self.physical.audit_phase = FinancialAuditPhase::Acquiring; Ok(())
+        if self.work.terminal().is_some() {
+            return Err(FinancialAuditFault::Terminal);
+        }
+        if !self.native.audit_acquisition_ready()
+            || !self.physical.parent_sidecars_retained()
+            || self.physical.primary.is_some()
+            || self.physical.audit_phase != FinancialAuditPhase::NotStarted
+        {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
+        self.audit
+            .resources
+            .bind(writer)
+            .map_err(|_| FinancialAuditFault::UnexpectedCut)?;
+        self.physical.audit_phase = FinancialAuditPhase::Acquiring;
+        Ok(())
     }
     // Preflight precedes each producer operation. The resulting short port
     // has no work access or owning result: its single consume always retains
     // acquired payload directly, with no second post-acquisition refusal.
-    fn records_port(&mut self) -> Result<FinancialAuditRecordsPort<'_, 'writer>, FinancialAuditFault> {
-        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+    fn records_port(
+        &mut self,
+    ) -> Result<FinancialAuditRecordsPort<'_, 'writer>, FinancialAuditFault> {
+        if self.work.terminal().is_some() {
+            return Err(FinancialAuditFault::Terminal);
+        }
         if self.physical.audit_phase != FinancialAuditPhase::Acquiring
-            || !self.audit.resources.ready() || self.audit.records.is_some() { return Err(FinancialAuditFault::UnexpectedCut); }
-        Ok(FinancialAuditRecordsPort { audit: self.audit, physical: self.physical })
+            || !self.audit.resources.ready()
+            || self.audit.records.is_some()
+        {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
+        Ok(FinancialAuditRecordsPort {
+            audit: self.audit,
+            physical: self.physical,
+        })
     }
-    fn parent_port(&mut self) -> Result<FinancialAuditParentPort<'_, 'writer>, FinancialAuditFault> {
-        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+    fn parent_port(
+        &mut self,
+    ) -> Result<FinancialAuditParentPort<'_, 'writer>, FinancialAuditFault> {
+        if self.work.terminal().is_some() {
+            return Err(FinancialAuditFault::Terminal);
+        }
         if self.physical.audit_phase != FinancialAuditPhase::Records
-            || self.audit.pin_phase != FinancialAuditPinPhase::None { return Err(FinancialAuditFault::UnexpectedCut); }
+            || self.audit.pin_phase != FinancialAuditPinPhase::None
+        {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
         Ok(FinancialAuditParentPort { audit: self.audit })
     }
     fn file_port(&mut self) -> Result<FinancialAuditFilePort<'_, 'writer>, FinancialAuditFault> {
-        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if self.work.terminal().is_some() {
+            return Err(FinancialAuditFault::Terminal);
+        }
         if self.physical.audit_phase != FinancialAuditPhase::Records
-            || self.audit.pin_phase != FinancialAuditPinPhase::LocalParent { return Err(FinancialAuditFault::UnexpectedCut); }
+            || self.audit.pin_phase != FinancialAuditPinPhase::LocalParent
+        {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
         Ok(FinancialAuditFilePort { audit: self.audit })
     }
     fn finish_pins(&mut self) -> Result<(), FinancialAuditFault> {
-        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
+        if self.work.terminal().is_some() {
+            return Err(FinancialAuditFault::Terminal);
+        }
         if self.physical.audit_phase != FinancialAuditPhase::Records
-            || self.audit.pin_phase != FinancialAuditPinPhase::LocalComplete { return Err(FinancialAuditFault::UnexpectedCut); }
-        // Logical parent retention only; no validation/FS permission is issued.
-        self.audit.pin_phase = FinancialAuditPinPhase::CompleteRetained;
-        self.physical.audit_phase = FinancialAuditPhase::Ready; Ok(())
-    }
-    fn note_normal_failure(&mut self) -> Result<(), FinancialAuditFault> {
-        if self.work.terminal().is_some() { return Err(FinancialAuditFault::Terminal); }
-        if !matches!(self.physical.audit_phase, FinancialAuditPhase::Acquiring | FinancialAuditPhase::Records | FinancialAuditPhase::Ready) {
+            || self.audit.pin_phase != FinancialAuditPinPhase::LocalComplete
+        {
             return Err(FinancialAuditFault::UnexpectedCut);
         }
-        self.physical.audit_phase = FinancialAuditPhase::Failed; Ok(())
+        // Logical parent retention only; no validation/FS permission is issued.
+        self.audit.pin_phase = FinancialAuditPinPhase::CompleteRetained;
+        self.physical.audit_phase = FinancialAuditPhase::Ready;
+        Ok(())
     }
-    fn retain_paid_primary(&mut self, error: rows::original_source::SourceOperationError)
-        -> Result<(), rows::original_source::SourceOperationError> {
-        if self.work.terminal().is_some() || self.physical.audit_phase != FinancialAuditPhase::Failed
-            || self.physical.primary.is_some() { return Err(error); }
-        self.physical.primary = Some(error); Ok(())
+    fn note_normal_failure(&mut self) -> Result<(), FinancialAuditFault> {
+        if self.work.terminal().is_some() {
+            return Err(FinancialAuditFault::Terminal);
+        }
+        if !matches!(
+            self.physical.audit_phase,
+            FinancialAuditPhase::Acquiring
+                | FinancialAuditPhase::Records
+                | FinancialAuditPhase::Ready
+        ) {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
+        self.physical.audit_phase = FinancialAuditPhase::Failed;
+        Ok(())
+    }
+    fn retain_paid_primary(
+        &mut self,
+        error: rows::original_source::SourceOperationError,
+    ) -> Result<(), rows::original_source::SourceOperationError> {
+        if self.work.terminal().is_some()
+            || self.physical.audit_phase != FinancialAuditPhase::Failed
+            || self.physical.primary.is_some()
+        {
+            return Err(error);
+        }
+        self.physical.primary = Some(error);
+        Ok(())
     }
     fn begin_release(&mut self) -> Result<(), FinancialAuditFault> {
-        if !self.native.transaction_release_ready(&self.work, self.physical) || !self.physical.audit_pending() || self.physical.audit_phase == FinancialAuditPhase::Draining
-            || (self.work.terminal().is_none() && (self.physical.audit_phase != FinancialAuditPhase::Failed
-                || self.physical.primary.is_none())) { return Err(FinancialAuditFault::UnexpectedCut); }
-        self.audit.resources.loan().begin_release().map_err(|_| FinancialAuditFault::UnexpectedCut)?;
-        self.physical.audit_phase = FinancialAuditPhase::Draining; Ok(())
+        if !self
+            .native
+            .transaction_release_ready(&self.work, self.physical)
+            || !self.physical.audit_pending()
+            || self.physical.audit_phase == FinancialAuditPhase::Draining
+            || (self.work.terminal().is_none()
+                && (self.physical.audit_phase != FinancialAuditPhase::Failed
+                    || self.physical.primary.is_none()))
+        {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
+        self.audit
+            .resources
+            .loan()
+            .begin_release()
+            .map_err(|_| FinancialAuditFault::UnexpectedCut)?;
+        self.physical.audit_phase = FinancialAuditPhase::Draining;
+        Ok(())
     }
     fn release_one(&mut self) -> Result<FinancialAuditRelease, FinancialAuditFault> {
-        if self.physical.audit_phase != FinancialAuditPhase::Draining { return Err(FinancialAuditFault::UnexpectedCut); }
+        if self.physical.audit_phase != FinancialAuditPhase::Draining {
+            return Err(FinancialAuditFault::UnexpectedCut);
+        }
         if !self.audit.resources.released() {
-            let action = self.audit.resources.loan().release_one().map_err(|_| FinancialAuditFault::UnexpectedCut)?;
+            let action = self
+                .audit
+                .resources
+                .loan()
+                .release_one()
+                .map_err(|_| FinancialAuditFault::UnexpectedCut)?;
             // Session Finished cannot discharge G's still-local pin payload.
             return Ok(FinancialAuditRelease::Session(action));
         }
         if self.audit.pin_phase != FinancialAuditPinPhase::CompleteRetained {
             if self.audit.file.is_some() {
-                drop(self.audit.file.take()); self.audit.pin_phase = FinancialAuditPinPhase::LocalParent;
+                drop(self.audit.file.take());
+                self.audit.pin_phase = FinancialAuditPinPhase::LocalParent;
                 return Ok(FinancialAuditRelease::LocalFile);
             }
             if self.audit.parent.is_some() {
-                drop(self.audit.parent.take()); drop(self.audit.leaf.take());
+                drop(self.audit.parent.take());
+                drop(self.audit.leaf.take());
                 self.audit.pin_phase = FinancialAuditPinPhase::None;
                 return Ok(FinancialAuditRelease::LocalParent);
             }
             if self.audit.records.is_some() {
-                drop(self.audit.records.take()); return Ok(FinancialAuditRelease::LocalRecords);
+                drop(self.audit.records.take());
+                return Ok(FinancialAuditRelease::LocalRecords);
             }
         }
         self.physical.audit_phase = FinancialAuditPhase::Released;
@@ -862,27 +1172,38 @@ impl<'writer> FinancialAuditFields<'_, 'writer> {
 // No public constructors/raw access/closure factory. Each producer port is a
 // non-owning short borrow, issued only after terminal/phase preflight.
 #[allow(dead_code)]
-struct FinancialAuditRecordsPort<'a, 'writer> { audit: &'a mut FinancialAuditState<'writer>, physical: &'a mut FinancialPhysical }
+struct FinancialAuditRecordsPort<'a, 'writer> {
+    audit: &'a mut FinancialAuditState<'writer>,
+    physical: &'a mut FinancialPhysical,
+}
 #[allow(dead_code)]
 impl FinancialAuditRecordsPort<'_, '_> {
     fn retain(self, records: ValidatedAuditChainSnapshot) {
-        self.audit.records = Some(records); self.physical.audit_phase = FinancialAuditPhase::Records;
+        self.audit.records = Some(records);
+        self.physical.audit_phase = FinancialAuditPhase::Records;
     }
 }
 #[allow(dead_code)]
-struct FinancialAuditParentPort<'a, 'writer> { audit: &'a mut FinancialAuditState<'writer> }
+struct FinancialAuditParentPort<'a, 'writer> {
+    audit: &'a mut FinancialAuditState<'writer>,
+}
 #[allow(dead_code)]
 impl FinancialAuditParentPort<'_, '_> {
     fn retain(self, parent: PinnedDirectory, leaf: OsString) {
-        self.audit.parent = Some(parent); self.audit.leaf = Some(leaf); self.audit.pin_phase = FinancialAuditPinPhase::LocalParent;
+        self.audit.parent = Some(parent);
+        self.audit.leaf = Some(leaf);
+        self.audit.pin_phase = FinancialAuditPinPhase::LocalParent;
     }
 }
 #[allow(dead_code)]
-struct FinancialAuditFilePort<'a, 'writer> { audit: &'a mut FinancialAuditState<'writer> }
+struct FinancialAuditFilePort<'a, 'writer> {
+    audit: &'a mut FinancialAuditState<'writer>,
+}
 #[allow(dead_code)]
 impl FinancialAuditFilePort<'_, '_> {
     fn retain(self, file: PinnedSelectionAuditFile) {
-        self.audit.file = Some(file); self.audit.pin_phase = FinancialAuditPinPhase::LocalComplete;
+        self.audit.file = Some(file);
+        self.audit.pin_phase = FinancialAuditPinPhase::LocalComplete;
     }
 }
 
@@ -924,17 +1245,36 @@ impl<'writer> FinancialSourceStart<'writer> {
     }
 
     fn begin_original_transaction(&mut self) -> bool {
-        if !self.audit.resources.ready() || self.audit.pin_phase != FinancialAuditPinPhase::CompleteRetained
-            || self.audit.records.is_none() || self.audit.parent.is_none() || self.audit.leaf.is_none() || self.audit.file.is_none() { return false; }
+        if !self.audit.resources.ready()
+            || self.audit.pin_phase != FinancialAuditPinPhase::CompleteRetained
+            || self.audit.records.is_none()
+            || self.audit.parent.is_none()
+            || self.audit.leaf.is_none()
+            || self.audit.file.is_none()
+        {
+            return false;
+        }
         self.fields().original_transaction().begin()
     }
 
     fn audit_fields(&mut self) -> FinancialAuditFields<'_, 'writer> {
-        FinancialAuditFields { native: &self.native, audit: &mut self.audit, physical: &mut self.physical, work: self.staged.source_loan() }
+        FinancialAuditFields {
+            native: &self.native,
+            audit: &mut self.audit,
+            physical: &mut self.physical,
+            work: self.staged.source_loan(),
+        }
     }
 
     fn enter_rows(self) -> FinancialRowsConstruction<'writer> {
-        let Self { decision, native, staged, release, physical, audit } = self;
+        let Self {
+            decision,
+            native,
+            staged,
+            release,
+            physical,
+            audit,
+        } = self;
         FinancialRowsConstruction {
             decision,
             native,
@@ -958,49 +1298,120 @@ impl<'writer> FinancialRowsConstruction<'writer> {
     }
 
     fn begin_original_transaction(&mut self) -> bool {
-        if !self.audit.resources.ready() || self.audit.pin_phase != FinancialAuditPinPhase::CompleteRetained
-            || self.audit.records.is_none() || self.audit.parent.is_none() || self.audit.leaf.is_none() || self.audit.file.is_none() { return false; }
+        if !self.audit.resources.ready()
+            || self.audit.pin_phase != FinancialAuditPinPhase::CompleteRetained
+            || self.audit.records.is_none()
+            || self.audit.parent.is_none()
+            || self.audit.leaf.is_none()
+            || self.audit.file.is_none()
+        {
+            return false;
+        }
         self.fields().original_transaction().begin()
     }
 
     fn audit_fields(&mut self) -> FinancialAuditFields<'_, 'writer> {
-        FinancialAuditFields { native: &self.native, audit: &mut self.audit, physical: &mut self.physical, work: self.construction.source_loan() }
+        FinancialAuditFields {
+            native: &self.native,
+            audit: &mut self.audit,
+            physical: &mut self.physical,
+            work: self.construction.source_loan(),
+        }
     }
 
-    fn reject(self, failure: rows::original_source::SourceFailure) -> FinancialRejectedConstruction<'writer> {
-        FinancialRejectedConstruction { construction: self, failure }
+    fn reject(
+        self,
+        failure: rows::original_source::SourceFailure,
+    ) -> FinancialRejectedConstruction<'writer> {
+        FinancialRejectedConstruction {
+            construction: self,
+            failure,
+        }
     }
 }
 
 // A01/A02 retain the actual outer purpose, never cloned hooks or a second
 // work pool. This fixed wrapper owns the existing frame and its new sibling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinancialInitialReadFault { Purpose, Modes, AlreadyBound }
+enum FinancialInitialReadFault {
+    Purpose,
+    Modes,
+    AlreadyBound,
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FinancialExtentSchema { Main, Temp }
+enum FinancialExtentSchema {
+    Main,
+    Temp,
+}
 #[derive(Clone, Copy)]
-enum FinancialInitialPragma { ApplicationId, UserVersion, ForeignKeys, JournalMode, Synchronous }
+enum FinancialInitialPragma {
+    ApplicationId,
+    UserVersion,
+    ForeignKeys,
+    JournalMode,
+    Synchronous,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinancialExtentFault { ObjectNegative, ObjectOverflow, ByteNegative, ByteOverflow, TotalCap }
+enum FinancialExtentFault {
+    ObjectNegative,
+    ObjectOverflow,
+    ByteNegative,
+    ByteOverflow,
+    TotalCap,
+}
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum FinancialInitialReadCase { NegativeCount, NegativeExtent, ExcessCap, MaximumSum, WrongInteger, JournalWrongType, JournalInvalidUtf8, SynchronousWrongType, StepError, NoRows, NoRowsResetError }
+enum FinancialInitialReadCase {
+    NegativeCount,
+    NegativeExtent,
+    ExcessCap,
+    MaximumSum,
+    WrongInteger,
+    JournalWrongType,
+    JournalInvalidUtf8,
+    SynchronousWrongType,
+    StepError,
+    NoRows,
+    NoRowsResetError,
+}
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum FinancialInitialTerminalCut { BeforePrepare, FirstColumn, QueryReturnUnknown, JournalBeforeReset, OwnedIgnoredReset, RawDriverBeforeReturn, RawDriverAfterReturn }
+enum FinancialInitialTerminalCut {
+    BeforePrepare,
+    FirstColumn,
+    QueryReturnUnknown,
+    JournalBeforeReset,
+    OwnedIgnoredReset,
+    RawDriverBeforeReturn,
+    RawDriverAfterReturn,
+}
 // These fixed outer wrapping cuts are reached only through Q's unissued
 // wrap port, after query_row scope cleanup and its independent Error return.
 // C's allocated diagnostic must already be owned/paid by the future formatter.
 fn retain_initial_extent_diagnostic(detail: String) -> rows::original_source::SourceOperationError {
     rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
-        source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure { stage: "prospective-catalog-extent", ddl_id: None, detail },
+        source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure {
+            stage: "prospective-catalog-extent",
+            ddl_id: None,
+            detail,
+        },
     })
 }
-fn retain_initial_pragma_driver_error(kind: FinancialInitialPragma, source: rusqlite::Error) -> rows::original_source::SourceOperationError {
-    let operation = match kind { FinancialInitialPragma::ApplicationId => "capture PRAGMA application_id",
-        FinancialInitialPragma::UserVersion => "capture PRAGMA user_version", FinancialInitialPragma::ForeignKeys => "capture PRAGMA foreign_keys",
-        FinancialInitialPragma::JournalMode => "capture PRAGMA journal_mode", FinancialInitialPragma::Synchronous => "capture PRAGMA synchronous" };
-    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })
+fn retain_initial_pragma_driver_error(
+    kind: FinancialInitialPragma,
+    source: rusqlite::Error,
+) -> rows::original_source::SourceOperationError {
+    let operation = match kind {
+        FinancialInitialPragma::ApplicationId => "capture PRAGMA application_id",
+        FinancialInitialPragma::UserVersion => "capture PRAGMA user_version",
+        FinancialInitialPragma::ForeignKeys => "capture PRAGMA foreign_keys",
+        FinancialInitialPragma::JournalMode => "capture PRAGMA journal_mode",
+        FinancialInitialPragma::Synchronous => "capture PRAGMA synchronous",
+    };
+    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite {
+        operation,
+        source,
+    })
 }
 struct FinancialInitialReadState<'purpose> {
     purpose: &'purpose SelectionSnapshotPurpose,
@@ -1019,13 +1430,31 @@ struct FinancialInitialReadState<'purpose> {
     synchronous: Option<i64>,
 }
 impl<'purpose> FinancialInitialReadState<'purpose> {
-    fn from_purpose(purpose: &'purpose SelectionSnapshotPurpose, decision: &FinancialRetainedStartDecision)
-        -> Result<Self, FinancialInitialReadFault> {
-        if !matches!(purpose, SelectionSnapshotPurpose::RowsBackup(_)) { return Err(FinancialInitialReadFault::Purpose); }
-        decide_financial_mode_pair(decision.bound, decision.catalog).map_err(|_| FinancialInitialReadFault::Modes)?;
-        Ok(Self { purpose, bound: decision.bound, catalog: decision.catalog, objects: 0, bytes: 0,
-            count: None, extent: None, main: None, temp: None, application_id: None, user_version: None,
-            foreign_keys: None, journal_mode: None, synchronous: None })
+    fn from_purpose(
+        purpose: &'purpose SelectionSnapshotPurpose,
+        decision: &FinancialRetainedStartDecision,
+    ) -> Result<Self, FinancialInitialReadFault> {
+        if !matches!(purpose, SelectionSnapshotPurpose::RowsBackup(_)) {
+            return Err(FinancialInitialReadFault::Purpose);
+        }
+        decide_financial_mode_pair(decision.bound, decision.catalog)
+            .map_err(|_| FinancialInitialReadFault::Modes)?;
+        Ok(Self {
+            purpose,
+            bound: decision.bound,
+            catalog: decision.catalog,
+            objects: 0,
+            bytes: 0,
+            count: None,
+            extent: None,
+            main: None,
+            temp: None,
+            application_id: None,
+            user_version: None,
+            foreign_keys: None,
+            journal_mode: None,
+            synchronous: None,
+        })
     }
     // Called only after the independent completed query_row return, in the
     // source's count -> extent order. Both-schema cap follows temp conversion.
@@ -1033,18 +1462,32 @@ impl<'purpose> FinancialInitialReadState<'purpose> {
         let count = self.count.expect("typed extent first column retained");
         let extent = self.extent.expect("typed extent second column retained");
         let objects = u64::try_from(count).map_err(|_| FinancialExtentFault::ObjectNegative)?;
-        self.objects = self.objects.checked_add(objects).ok_or(FinancialExtentFault::ObjectOverflow)?;
+        self.objects = self
+            .objects
+            .checked_add(objects)
+            .ok_or(FinancialExtentFault::ObjectOverflow)?;
         let bytes = u64::try_from(extent).map_err(|_| FinancialExtentFault::ByteNegative)?;
-        self.bytes = self.bytes.checked_add(bytes).ok_or(FinancialExtentFault::ByteOverflow)?;
-        match schema { FinancialExtentSchema::Main => self.main = Some((count, extent)),
-            FinancialExtentSchema::Temp => self.temp = Some((count, extent)) }
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(FinancialExtentFault::ByteOverflow)?;
+        match schema {
+            FinancialExtentSchema::Main => self.main = Some((count, extent)),
+            FinancialExtentSchema::Temp => self.temp = Some((count, extent)),
+        }
         if schema == FinancialExtentSchema::Temp {
-            let options = self.purpose.options().expect("validated RowsBackup has real source options");
-            if self.objects > options.max_catalog_objects || self.bytes > options.max_catalog_bytes {
+            let options = self
+                .purpose
+                .options()
+                .expect("validated RowsBackup has real source options");
+            if self.objects > options.max_catalog_objects || self.bytes > options.max_catalog_bytes
+            {
                 return Err(FinancialExtentFault::TotalCap);
             }
         }
-        self.count = None; self.extent = None; Ok(())
+        self.count = None;
+        self.extent = None;
+        Ok(())
     }
 }
 struct FinancialInitialReadFrame<'purpose, 'writer> {
@@ -1056,23 +1499,37 @@ struct FinancialInitialReadConstruction<'purpose, 'writer> {
     initial: FinancialInitialReadState<'purpose>,
 }
 impl<'writer> FinancialSourceStart<'writer> {
-    fn bind_initial_read<'purpose>(mut self, purpose: &'purpose SelectionSnapshotPurpose)
-        -> Result<FinancialInitialReadFrame<'purpose, 'writer>, (Self, FinancialInitialReadFault)> {
+    fn bind_initial_read<'purpose>(
+        mut self,
+        purpose: &'purpose SelectionSnapshotPurpose,
+    ) -> Result<FinancialInitialReadFrame<'purpose, 'writer>, (Self, FinancialInitialReadFault)>
+    {
         let initial = match FinancialInitialReadState::from_purpose(purpose, &self.decision) {
-            Ok(initial) => initial, Err(fault) => return Err((self, fault)),
+            Ok(initial) => initial,
+            Err(fault) => return Err((self, fault)),
         };
-        if !self.fields().bind_initial_read_context() { return Err((self, FinancialInitialReadFault::AlreadyBound)); }
-        Ok(FinancialInitialReadFrame { source: self, initial })
+        if !self.fields().bind_initial_read_context() {
+            return Err((self, FinancialInitialReadFault::AlreadyBound));
+        }
+        Ok(FinancialInitialReadFrame {
+            source: self,
+            initial,
+        })
     }
 }
 impl<'purpose, 'writer> FinancialInitialReadFrame<'purpose, 'writer> {
     fn read_loan(&mut self) -> replay_work::OriginalInitialReadLoan<'_, 'purpose> {
         self.source.fields().initial_read(&mut self.initial)
     }
-    fn begin(&mut self) -> bool { self.source.begin_original_transaction() }
+    fn begin(&mut self) -> bool {
+        self.source.begin_original_transaction()
+    }
     fn enter_rows(self) -> FinancialInitialReadConstruction<'purpose, 'writer> {
         let Self { source, initial } = self;
-        FinancialInitialReadConstruction { source: source.enter_rows(), initial }
+        FinancialInitialReadConstruction {
+            source: source.enter_rows(),
+            initial,
+        }
     }
 }
 impl<'purpose> FinancialInitialReadConstruction<'purpose, '_> {
@@ -1081,15 +1538,25 @@ impl<'purpose> FinancialInitialReadConstruction<'purpose, '_> {
     }
 }
 
-
 // A03/A04 retained owning frame. This introduces no collect implementation,
 // allocator, native executor or Original selected-rules issuer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinancialIntegrityQuery { Check, Foreign }
+enum FinancialIntegrityQuery {
+    Check,
+    Foreign,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinancialIntegrityErrorCut { Prepare, Query, Read }
+enum FinancialIntegrityErrorCut {
+    Prepare,
+    Query,
+    Read,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinancialIntegrityFault { IntegrityRows, ForeignNonzero, ForeignOverflow }
+enum FinancialIntegrityFault {
+    IntegrityRows,
+    ForeignNonzero,
+    ForeignOverflow,
+}
 struct FinancialIntegrityReadState {
     integrity_rows: Option<Vec<String>>,
     partial_row: Option<String>,
@@ -1099,8 +1566,16 @@ struct FinancialIntegrityReadState {
     fault: Option<FinancialIntegrityFault>,
 }
 impl FinancialIntegrityReadState {
-    fn empty() -> Self { Self { integrity_rows: None, partial_row: None, partial_rows: None, paid_detail: None,
-        foreign_key_violations: 0, fault: None } }
+    fn empty() -> Self {
+        Self {
+            integrity_rows: None,
+            partial_row: None,
+            partial_rows: None,
+            paid_detail: None,
+            foreign_key_violations: 0,
+            fault: None,
+        }
+    }
 }
 struct FinancialIntegrityReadFrame<'purpose, 'writer> {
     prefix: FinancialInitialReadFrame<'purpose, 'writer>,
@@ -1110,13 +1585,21 @@ impl<'purpose, 'writer> FinancialInitialReadFrame<'purpose, 'writer> {
     fn begin_integrity(mut self) -> Result<FinancialIntegrityReadFrame<'purpose, 'writer>, Self> {
         // Same borrowed purpose/modes and the complete retained A01/A02
         // prefix, never a new configured context or meter from scalar labels.
-        if !self.source.fields().begin_integrity_read() { return Err(self); }
-        Ok(FinancialIntegrityReadFrame { prefix: self, integrity: FinancialIntegrityReadState::empty() })
+        if !self.source.fields().begin_integrity_read() {
+            return Err(self);
+        }
+        Ok(FinancialIntegrityReadFrame {
+            prefix: self,
+            integrity: FinancialIntegrityReadState::empty(),
+        })
     }
 }
 impl FinancialIntegrityReadFrame<'_, '_> {
     fn integrity_loan(&mut self) -> replay_work::OriginalIntegrityReadLoan<'_> {
-        self.prefix.source.fields().integrity_read(&mut self.integrity)
+        self.prefix
+            .source
+            .fields()
+            .integrity_read(&mut self.integrity)
     }
 }
 // Fixed C capture prefix; it preserves the complete successful A03 frame.
@@ -1128,33 +1611,77 @@ struct FinancialCapturePrefixState {
     catalog_error: Option<GlobalSchemaCatalogError>,
 }
 impl FinancialCapturePrefixState {
-    fn empty() -> Self { Self { identity: [None; 2], source_id: None, detail: None, catalog_error: None } }
+    fn empty() -> Self {
+        Self {
+            identity: [None; 2],
+            source_id: None,
+            detail: None,
+            catalog_error: None,
+        }
+    }
 }
 struct FinancialCapturePrefixFrame<'purpose, 'writer> {
     integrity: FinancialIntegrityReadFrame<'purpose, 'writer>,
     capture: FinancialCapturePrefixState,
 }
 impl<'purpose, 'writer> FinancialIntegrityReadFrame<'purpose, 'writer> {
-    fn begin_catalog_prefix(mut self) -> Result<FinancialCapturePrefixFrame<'purpose, 'writer>, Self> {
-        if self.integrity.integrity_rows.as_ref().is_none_or(|rows| rows.as_slice() != ["ok"])
+    fn begin_catalog_prefix(
+        mut self,
+    ) -> Result<FinancialCapturePrefixFrame<'purpose, 'writer>, Self> {
+        if self
+            .integrity
+            .integrity_rows
+            .as_ref()
+            .is_none_or(|rows| rows.as_slice() != ["ok"])
             || self.integrity.foreign_key_violations != 0
-            || !self.prefix.source.fields().begin_catalog_prefix() { return Err(self); }
-        Ok(FinancialCapturePrefixFrame { integrity: self, capture: FinancialCapturePrefixState::empty() })
+            || !self.prefix.source.fields().begin_catalog_prefix()
+        {
+            return Err(self);
+        }
+        Ok(FinancialCapturePrefixFrame {
+            integrity: self,
+            capture: FinancialCapturePrefixState::empty(),
+        })
     }
 }
 impl FinancialCapturePrefixFrame<'_, '_> {
     fn capture_loan(&mut self) -> replay_work::OriginalCapturePrefixLoan<'_> {
-        self.integrity.prefix.source.fields().capture_prefix(&mut self.capture)
+        self.integrity
+            .prefix
+            .source
+            .fields()
+            .capture_prefix(&mut self.capture)
     }
 }
 // Pure move from the actual already-returned C error. The fixed formatting
 // port must first retain its actual String; this function does no formatting.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FinancialCompileErrorCase { Prepare, Query, Step, Type, Utf8, DoneReset }
+enum FinancialCompileErrorCase {
+    Prepare,
+    Query,
+    Step,
+    Type,
+    Utf8,
+    DoneReset,
+}
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FinancialCompileTerminalCut { BeforePrepare, PreparePending, QueryPending, StepPending, DoneBeforeReset, MapperPending, RawPending, CollectPending, VectorPending, VectorOwned, DetailPending, CatalogOwned, StatementDropPending }
+enum FinancialCompileTerminalCut {
+    BeforePrepare,
+    PreparePending,
+    QueryPending,
+    StepPending,
+    DoneBeforeReset,
+    MapperPending,
+    RawPending,
+    CollectPending,
+    VectorPending,
+    VectorOwned,
+    DetailPending,
+    CatalogOwned,
+    StatementDropPending,
+}
 struct FinancialCompileOptionsState {
     rows: Option<Vec<String>>,
     detail: Option<String>,
@@ -1165,17 +1692,38 @@ struct FinancialCompileOptionsFrame<'purpose, 'writer> {
     options: FinancialCompileOptionsState,
 }
 impl<'purpose, 'writer> FinancialCapturePrefixFrame<'purpose, 'writer> {
-    fn begin_compile_options(mut self) -> Result<FinancialCompileOptionsFrame<'purpose, 'writer>, Self> {
-        if self.capture.identity.iter().any(Option::is_none) || self.capture.source_id.is_none()
-            || !self.integrity.prefix.source.fields().begin_compile_options() { return Err(self); }
-        Ok(FinancialCompileOptionsFrame { prefix: self, options: FinancialCompileOptionsState {
-            rows: None, detail: None, catalog_error: None,
-        } })
+    fn begin_compile_options(
+        mut self,
+    ) -> Result<FinancialCompileOptionsFrame<'purpose, 'writer>, Self> {
+        if self.capture.identity.iter().any(Option::is_none)
+            || self.capture.source_id.is_none()
+            || !self
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .begin_compile_options()
+        {
+            return Err(self);
+        }
+        Ok(FinancialCompileOptionsFrame {
+            prefix: self,
+            options: FinancialCompileOptionsState {
+                rows: None,
+                detail: None,
+                catalog_error: None,
+            },
+        })
     }
 }
 impl FinancialCompileOptionsFrame<'_, '_> {
     fn compile_options_loan(&mut self) -> replay_work::OriginalCompileOptionsLoan<'_> {
-        self.prefix.integrity.prefix.source.fields().compile_options(&mut self.options, &mut self.prefix.capture.source_id)
+        self.prefix
+            .integrity
+            .prefix
+            .source
+            .fields()
+            .compile_options(&mut self.options, &mut self.prefix.capture.source_id)
     }
 }
 // This carrier moves the entire completed collector frame once. Its Vec,
@@ -1184,16 +1732,36 @@ struct FinancialCompileSortFrame<'purpose, 'writer> {
     compile: FinancialCompileOptionsFrame<'purpose, 'writer>,
 }
 impl<'purpose, 'writer> FinancialCompileOptionsFrame<'purpose, 'writer> {
-    fn begin_sort_duplicate(mut self) -> Result<FinancialCompileSortFrame<'purpose, 'writer>, Self> {
-        if self.options.rows.is_none() || self.prefix.capture.source_id.is_none()
-            || !self.prefix.integrity.prefix.source.fields().begin_compile_sort_duplicate() { return Err(self); }
+    fn begin_sort_duplicate(
+        mut self,
+    ) -> Result<FinancialCompileSortFrame<'purpose, 'writer>, Self> {
+        if self.options.rows.is_none()
+            || self.prefix.capture.source_id.is_none()
+            || !self
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .begin_compile_sort_duplicate()
+        {
+            return Err(self);
+        }
         Ok(FinancialCompileSortFrame { compile: self })
     }
 }
 impl FinancialCompileSortFrame<'_, '_> {
     fn sort_duplicate_loan(&mut self) -> replay_work::OriginalCompileSortLoan<'_> {
-        self.compile.prefix.integrity.prefix.source.fields().compile_sort_duplicate(
-            &mut self.compile.options, &mut self.compile.prefix.capture.source_id)
+        self.compile
+            .prefix
+            .integrity
+            .prefix
+            .source
+            .fields()
+            .compile_sort_duplicate(
+                &mut self.compile.options,
+                &mut self.compile.prefix.capture.source_id,
+            )
     }
 }
 // One whole-frame move transfers the returned, sorted unique Vec into its
@@ -1208,18 +1776,48 @@ struct FinancialCompileIteratorFrame<'purpose, 'writer> {
 }
 impl<'purpose, 'writer> FinancialCompileSortFrame<'purpose, 'writer> {
     fn begin_iteration(mut self) -> Result<FinancialCompileIteratorFrame<'purpose, 'writer>, Self> {
-        if self.compile.options.rows.is_none() || self.compile.prefix.capture.source_id.is_none()
-            || !self.compile.prefix.integrity.prefix.source.fields().begin_compile_iterator() { return Err(self); }
-        let rows = self.compile.options.rows.take().expect("same exclusive preflight owns the Vec");
-        Ok(FinancialCompileIteratorFrame { sort: self, iteration: FinancialCompileIteratorState {
-            iterator: Some(rows.into_iter()), pending: None,
-        } })
+        if self.compile.options.rows.is_none()
+            || self.compile.prefix.capture.source_id.is_none()
+            || !self
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .begin_compile_iterator()
+        {
+            return Err(self);
+        }
+        let rows = self
+            .compile
+            .options
+            .rows
+            .take()
+            .expect("same exclusive preflight owns the Vec");
+        Ok(FinancialCompileIteratorFrame {
+            sort: self,
+            iteration: FinancialCompileIteratorState {
+                iterator: Some(rows.into_iter()),
+                pending: None,
+            },
+        })
     }
 }
 impl FinancialCompileIteratorFrame<'_, '_> {
     fn iteration_loan(&mut self) -> replay_work::OriginalCompileIteratorLoan<'_> {
-        self.sort.compile.prefix.integrity.prefix.source.fields().compile_iterator(
-            &mut self.sort.compile.options, &mut self.sort.compile.prefix.capture.source_id, &mut self.iteration)
+        self.sort
+            .compile
+            .prefix
+            .integrity
+            .prefix
+            .source
+            .fields()
+            .compile_iterator(
+                &mut self.sort.compile.options,
+                &mut self.sort.compile.prefix.capture.source_id,
+                &mut self.iteration,
+            )
     }
 }
 // Fixed data continuation: every value remains with the original whole frame.
@@ -1232,11 +1830,23 @@ struct FinancialCompileDigestState {
     encoded: Option<String>,
     identity: Option<super::global_schema_catalog_v1::SqliteRuntimeIdentity>,
     validation: Option<Result<(), GlobalSchemaCatalogError>>,
-    pending_runtime: Option<Result<super::global_schema_catalog_v1::SqliteRuntimeIdentity, GlobalSchemaCatalogError>>,
+    pending_runtime: Option<
+        Result<super::global_schema_catalog_v1::SqliteRuntimeIdentity, GlobalSchemaCatalogError>,
+    >,
 }
 impl FinancialCompileDigestState {
-    fn empty() -> Self { Self { hasher: None, output: None, version: None, source_part: None,
-        encoded: None, identity: None, validation: None, pending_runtime: None } }
+    fn empty() -> Self {
+        Self {
+            hasher: None,
+            output: None,
+            version: None,
+            source_part: None,
+            encoded: None,
+            identity: None,
+            validation: None,
+            pending_runtime: None,
+        }
+    }
 }
 struct FinancialCompileDigestFrame<'purpose, 'writer> {
     sort: FinancialCompileSortFrame<'purpose, 'writer>,
@@ -1245,35 +1855,84 @@ struct FinancialCompileDigestFrame<'purpose, 'writer> {
 }
 impl<'purpose, 'writer> FinancialCompileSortFrame<'purpose, 'writer> {
     fn begin_digest(mut self) -> Result<FinancialCompileDigestFrame<'purpose, 'writer>, Self> {
-        if self.compile.options.rows.is_none() || self.compile.prefix.capture.source_id.is_none()
-            || !self.compile.prefix.integrity.prefix.source.fields().begin_compile_digest() { return Err(self); }
-        Ok(FinancialCompileDigestFrame { sort: self, iteration: FinancialCompileIteratorState { iterator: None, pending: None },
-            digest: FinancialCompileDigestState::empty() })
+        if self.compile.options.rows.is_none()
+            || self.compile.prefix.capture.source_id.is_none()
+            || !self
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .begin_compile_digest()
+        {
+            return Err(self);
+        }
+        Ok(FinancialCompileDigestFrame {
+            sort: self,
+            iteration: FinancialCompileIteratorState {
+                iterator: None,
+                pending: None,
+            },
+            digest: FinancialCompileDigestState::empty(),
+        })
     }
 }
 impl FinancialCompileDigestFrame<'_, '_> {
     fn digest_loan(&mut self) -> replay_work::OriginalCompileDigestLoan<'_> {
-        self.sort.compile.prefix.integrity.prefix.source.fields().compile_digest(
-            &mut self.sort.compile.options, &mut self.sort.compile.prefix.capture.source_id, &mut self.iteration, &mut self.digest)
+        self.sort
+            .compile
+            .prefix
+            .integrity
+            .prefix
+            .source
+            .fields()
+            .compile_digest(
+                &mut self.sort.compile.options,
+                &mut self.sort.compile.prefix.capture.source_id,
+                &mut self.iteration,
+                &mut self.digest,
+            )
     }
 }
-fn retain_capture_catalog_error(error: GlobalSchemaCatalogError) -> rows::original_source::SourceOperationError {
-    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source: error })
+fn retain_capture_catalog_error(
+    error: GlobalSchemaCatalogError,
+) -> rows::original_source::SourceOperationError {
+    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
+        source: error,
+    })
 }
 
-fn retain_integrity_driver_error(query: FinancialIntegrityQuery, cut: FinancialIntegrityErrorCut,
-    source: rusqlite::Error) -> rows::original_source::SourceOperationError {
+fn retain_integrity_driver_error(
+    query: FinancialIntegrityQuery,
+    cut: FinancialIntegrityErrorCut,
+    source: rusqlite::Error,
+) -> rows::original_source::SourceOperationError {
     let operation = match (query, cut) {
-        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Prepare) => "prepare PRAGMA integrity_check",
-        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Query) => "query PRAGMA integrity_check",
-        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Read) => "read PRAGMA integrity_check",
-        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Prepare) => "prepare PRAGMA foreign_key_check",
-        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Query) => "query PRAGMA foreign_key_check",
-        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Read) => "read PRAGMA foreign_key_check",
+        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Prepare) => {
+            "prepare PRAGMA integrity_check"
+        }
+        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Query) => {
+            "query PRAGMA integrity_check"
+        }
+        (FinancialIntegrityQuery::Check, FinancialIntegrityErrorCut::Read) => {
+            "read PRAGMA integrity_check"
+        }
+        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Prepare) => {
+            "prepare PRAGMA foreign_key_check"
+        }
+        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Query) => {
+            "query PRAGMA foreign_key_check"
+        }
+        (FinancialIntegrityQuery::Foreign, FinancialIntegrityErrorCut::Read) => {
+            "read PRAGMA foreign_key_check"
+        }
     };
-    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })
+    rows::original_source::SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite {
+        operation,
+        source,
+    })
 }
-
 
 /// Non-forgeable permission to capture the selection catalog from the
 /// database connection retained by the global owner.
@@ -1304,8 +1963,8 @@ fn new_global_schema_version_owner() -> GlobalSchemaVersionOwner {
 mod financial_source_start_tests {
     use super::*;
     use rows::original_source::{
-        OwnerStartProbe, SourceFailure, SourceOperationError, SourceResourceCause,
-        SourceSite, SourceTerminal,
+        OwnerStartProbe, SourceFailure, SourceOperationError, SourceResourceCause, SourceSite,
+        SourceTerminal,
     };
 
     // Pure connected representation tests: no files, SQLite, source spec/tail,
@@ -1314,7 +1973,10 @@ mod financial_source_start_tests {
     fn history_original_owner_start_fixed_origin_move_and_nested_loan_keep_terminal() {
         let owner = GlobalSchemaVersionOwner::for_test_code();
         let mut start = owner.start_fixed_financial_source_work();
-        assert_eq!(start.decision.purpose, FinancialStartPurpose::FinancialTargetRowsBackup);
+        assert_eq!(
+            start.decision.purpose,
+            FinancialStartPurpose::FinancialTargetRowsBackup
+        );
         assert_eq!(start.decision.bound, BoundMode::Production);
         assert_eq!(start.decision.catalog, GlobalSchemaCatalogMode::Production);
         {
@@ -1322,7 +1984,10 @@ mod financial_source_start_tests {
             assert!(fields.test_code_unreached());
             let mut work = fields.source_work();
             let initial = work.test_code_observation();
-            assert_eq!((initial.limit, initial.used, initial.terminal), (16 * 1024 * 1024, 0, None));
+            assert_eq!(
+                (initial.limit, initial.used, initial.terminal),
+                (16 * 1024 * 1024, 0, None)
+            );
             work.test_code_probe(OwnerStartProbe::FundEarly).unwrap();
         }
         let mut construction = start.enter_rows();
@@ -1333,25 +1998,38 @@ mod financial_source_start_tests {
             let mut work = nested.source_work();
             work.test_code_probe(OwnerStartProbe::FundRows).unwrap();
             let funded = work.test_code_observation();
-            assert_eq!((funded.used, funded.rows, funded.bytes, funded.streams), (8, 2, 11, 1));
+            assert_eq!(
+                (funded.used, funded.rows, funded.bytes, funded.streams),
+                (8, 2, 11, 1)
+            );
         }
         let first = {
             let mut fields = construction.fields();
             let mut work = fields.source_work();
-            work.test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()
+            work.test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err()
         };
-        assert_eq!(first, SourceTerminal::Resource {
-            site: SourceSite::RawCatalog,
-            cause: SourceResourceCause::Exceeded,
-            attempted_used: 16 * 1024 * 1024 + 8,
-        });
+        assert_eq!(
+            first,
+            SourceTerminal::Resource {
+                site: SourceSite::RawCatalog,
+                cause: SourceResourceCause::Exceeded,
+                attempted_used: 16 * 1024 * 1024 + 8,
+            }
+        );
         let mut fields = construction.fields();
         assert!(fields.test_code_unreached());
         let mut nested = fields.reborrow();
         let mut work = nested.source_work();
-        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+        assert_eq!(
+            work.test_code_probe(OwnerStartProbe::TryAfterTerminal),
+            Err(first)
+        );
         let retained = work.test_code_observation();
-        assert_eq!((retained.used, retained.terminal), (16 * 1024 * 1024 + 8, Some(first)));
+        assert_eq!(
+            (retained.used, retained.terminal),
+            (16 * 1024 * 1024 + 8, Some(first))
+        );
     }
 
     #[test]
@@ -1380,7 +2058,11 @@ mod financial_source_start_tests {
     fn history_original_owner_start_rejection_keeps_whole_carrier_and_failure_category() {
         let owner = GlobalSchemaVersionOwner::for_test_code();
         let mut start = owner.start_fixed_financial_source_work();
-        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        start
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         let construction = start.enter_rows();
         let mut paid = construction.reject(SourceFailure::Paid(SourceOperationError::Global(
             GlobalSchemaV1Error::ExclusiveProcessMaintenanceLeaseUnavailable,
@@ -1389,7 +2071,10 @@ mod financial_source_start_tests {
             panic!("fixed paid owner error must retain its category");
         };
         assert_eq!(error.code(), "global_schema_exclusive_process_lease_busy");
-        assert_eq!(paid.construction.decision.catalog, GlobalSchemaCatalogMode::Production);
+        assert_eq!(
+            paid.construction.decision.catalog,
+            GlobalSchemaCatalogMode::Production
+        );
         {
             let mut fields = paid.construction.fields();
             assert!(fields.test_code_unreached());
@@ -1400,19 +2085,39 @@ mod financial_source_start_tests {
         // A separate fixed fixture covers terminal rejection; it never creates
         // a replacement pool inside either source capture.
         let mut terminal_start = owner.start_fixed_financial_source_work();
-        terminal_start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        terminal_start
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         let mut terminal_construction = terminal_start.enter_rows();
-        let first = terminal_construction.fields().source_work()
-            .test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+        let first = terminal_construction
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::ExceedProduction)
+            .unwrap_err();
         let mut rejected = terminal_construction.reject(SourceFailure::Terminal(first));
-        assert!(matches!(&rejected.failure, SourceFailure::Terminal(terminal) if *terminal == first));
+        assert!(
+            matches!(&rejected.failure, SourceFailure::Terminal(terminal) if *terminal == first)
+        );
         let mut fields = rejected.construction.fields();
         assert!(fields.test_code_unreached());
         let mut work = fields.source_work();
-        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+        assert_eq!(
+            work.test_code_probe(OwnerStartProbe::TryAfterTerminal),
+            Err(first)
+        );
         let retained = work.test_code_observation();
-        assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
-            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(first)));
+        assert_eq!(
+            (
+                retained.used,
+                retained.rows,
+                retained.bytes,
+                retained.streams,
+                retained.terminal
+            ),
+            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(first))
+        );
     }
 }
 
@@ -1426,28 +2131,60 @@ mod financial_original_sql_lifecycle_tests {
     // create no SQLite pointer, source qualification, rules or paid request.
     #[test]
     fn history_original_sql_lifecycle_constructor_failure_keeps_primary_and_single_close() {
-        for case in [LifecycleConstructorCase::NoHandle,
+        for case in [
+            LifecycleConstructorCase::NoHandle,
             LifecycleConstructorCase::OpenErrorWithResource,
-            LifecycleConstructorCase::BusyTimeoutError] {
+            LifecycleConstructorCase::BusyTimeoutError,
+        ] {
             let owner = GlobalSchemaVersionOwner::for_test_code();
             let mut start = owner.start_fixed_financial_source_work();
-            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
             start.fields().test_code_constructor_cut(case);
             let after = start.fields().source_work().test_code_observation();
-            assert_eq!((after.limit, after.used, after.rows, after.bytes, after.streams, after.terminal),
-                (16 * 1024 * 1024, 3, 2, 11, 1, None));
+            assert_eq!(
+                (
+                    after.limit,
+                    after.used,
+                    after.rows,
+                    after.bytes,
+                    after.streams,
+                    after.terminal
+                ),
+                (16 * 1024 * 1024, 3, 2, 11, 1, None)
+            );
         }
     }
 
     #[test]
     fn history_original_sql_lifecycle_a00_first_row_no_row_and_paid_cleanup_order() {
-        for case in [LifecycleA00Case::FirstRow, LifecycleA00Case::NoRow, LifecycleA00Case::StepError] {
+        for case in [
+            LifecycleA00Case::FirstRow,
+            LifecycleA00Case::NoRow,
+            LifecycleA00Case::StepError,
+        ] {
             let owner = GlobalSchemaVersionOwner::for_test_code();
             let mut start = owner.start_fixed_financial_source_work();
-            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
             start.fields().test_code_a00_cut(case);
             let after = start.fields().source_work().test_code_observation();
-            assert_eq!((after.used, after.rows, after.bytes, after.streams, after.terminal), (3, 2, 11, 1, None));
+            assert_eq!(
+                (
+                    after.used,
+                    after.rows,
+                    after.bytes,
+                    after.streams,
+                    after.terminal
+                ),
+                (3, 2, 11, 1, None)
+            );
         }
     }
 
@@ -1455,13 +2192,25 @@ mod financial_original_sql_lifecycle_tests {
     fn history_original_sql_lifecycle_terminal_move_and_unreleased_borrow_keep_fields() {
         let owner = GlobalSchemaVersionOwner::for_test_code();
         let mut start = owner.start_fixed_financial_source_work();
-        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        start
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         start.fields().test_code_seed_live_a00();
-        let terminal = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-        assert_eq!(terminal, SourceTerminal::Resource {
-            site: SourceSite::RawCatalog, cause: SourceResourceCause::Exceeded,
-            attempted_used: 16 * 1024 * 1024 + 3,
-        });
+        let terminal = start
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::ExceedProduction)
+            .unwrap_err();
+        assert_eq!(
+            terminal,
+            SourceTerminal::Resource {
+                site: SourceSite::RawCatalog,
+                cause: SourceResourceCause::Exceeded,
+                attempted_used: 16 * 1024 * 1024 + 3,
+            }
+        );
         // This consumes the whole existing frame exactly once, including its
         // retained protocol resource slots and the already-terminal RowsWork.
         let mut construction = start.enter_rows();
@@ -1470,15 +2219,29 @@ mod financial_original_sql_lifecycle_tests {
             fields.reborrow().test_code_terminal_drain();
             assert!(fields.test_code_unreleased_a00());
             let mut work = fields.source_work();
-            assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(terminal));
+            assert_eq!(
+                work.test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                Err(terminal)
+            );
             let retained = work.test_code_observation();
-            assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
-                (16 * 1024 * 1024 + 3, 2, 11, 1, Some(terminal)));
+            assert_eq!(
+                (
+                    retained.used,
+                    retained.rows,
+                    retained.bytes,
+                    retained.streams,
+                    retained.terminal
+                ),
+                (16 * 1024 * 1024 + 3, 2, 11, 1, Some(terminal))
+            );
         }
         // Ending the failed-close loan does not release a slot or refund work.
         let mut fields = construction.fields();
         assert!(fields.test_code_unreleased_a00());
-        assert_eq!(fields.source_work().test_code_observation().terminal, Some(terminal));
+        assert_eq!(
+            fields.source_work().test_code_observation().terminal,
+            Some(terminal)
+        );
     }
 }
 
@@ -1487,11 +2250,19 @@ mod financial_original_sql_lifecycle_tests {
 #[derive(Clone)]
 struct FinancialSidecarTrace(std::rc::Rc<std::cell::RefCell<FinancialSidecarTraceState>>);
 #[cfg(test)]
-struct FinancialSidecarTraceState { events: [Option<FinancialSidecarDrop>; 4], used: usize }
+struct FinancialSidecarTraceState {
+    events: [Option<FinancialSidecarDrop>; 4],
+    used: usize,
+}
 #[cfg(test)]
 impl FinancialSidecarTrace {
     fn new() -> Self {
-        Self(std::rc::Rc::new(std::cell::RefCell::new(FinancialSidecarTraceState { events: [None; 4], used: 0 })))
+        Self(std::rc::Rc::new(std::cell::RefCell::new(
+            FinancialSidecarTraceState {
+                events: [None; 4],
+                used: 0,
+            },
+        )))
     }
     fn record(&self, action: FinancialSidecarDrop) {
         let mut trace = self.0.borrow_mut();
@@ -1500,7 +2271,9 @@ impl FinancialSidecarTrace {
         trace.events[index] = Some(action);
         trace.used += 1;
     }
-    fn snapshot(&self) -> [Option<FinancialSidecarDrop>; 4] { self.0.borrow().events }
+    fn snapshot(&self) -> [Option<FinancialSidecarDrop>; 4] {
+        self.0.borrow().events
+    }
 }
 
 #[cfg(test)]
@@ -1514,22 +2287,44 @@ mod financial_original_sidecar_acquisition_tests {
     fn fixed_opened_wal(trace: &FinancialSidecarTrace) -> (FinancialOpenedSidecar, FileIdentity) {
         let file = File::open("/dev/null").unwrap();
         let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
-        (FinancialOpenedSidecar { file, leaf: OsString::from("TEST_CODE-wal"),
-            path: PathBuf::from("/TEST_CODE/wal"), pin_nul: CString::new("TEST_CODE-wal").unwrap(), trace: trace.clone() }, identity)
+        (
+            FinancialOpenedSidecar {
+                file,
+                leaf: OsString::from("TEST_CODE-wal"),
+                path: PathBuf::from("/TEST_CODE/wal"),
+                pin_nul: CString::new("TEST_CODE-wal").unwrap(),
+                trace: trace.clone(),
+            },
+            identity,
+        )
     }
     fn fixed_opened_shm(trace: &FinancialSidecarTrace) -> (FinancialOpenedSidecar, FileIdentity) {
         let file = File::open("/dev/null").unwrap();
         let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
-        (FinancialOpenedSidecar { file, leaf: OsString::from("TEST_CODE-shm"),
-            path: PathBuf::from("/TEST_CODE/shm"), pin_nul: CString::new("TEST_CODE-shm").unwrap(), trace: trace.clone() }, identity)
+        (
+            FinancialOpenedSidecar {
+                file,
+                leaf: OsString::from("TEST_CODE-shm"),
+                path: PathBuf::from("/TEST_CODE/shm"),
+                pin_nul: CString::new("TEST_CODE-shm").unwrap(),
+                trace: trace.clone(),
+            },
+            identity,
+        )
     }
     fn fixed_supplied_primary() -> (SourceOperationError, usize) {
         let detail = String::from("TEST_CODE supplied E04 primary");
         let allocation = detail.as_ptr() as usize;
-        (SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }), allocation)
+        (
+            SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }),
+            allocation,
+        )
     }
     fn assert_primary_retained(physical: &FinancialPhysical, allocation: usize) {
-        let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &physical.primary else {
+        let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged {
+            detail,
+        })) = &physical.primary
+        else {
             panic!("the once-moved primary category must survive");
         };
         assert_eq!(detail.as_ptr() as usize, allocation);
@@ -1540,22 +2335,35 @@ mod financial_original_sidecar_acquisition_tests {
         let (shm, shm_identity) = fixed_opened_shm(trace);
         let mut fields = start.fields();
         let mut sidecars = fields.sidecar_loan();
-        sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+        sidecars
+            .retain_opened_wal(wal)
+            .unwrap_or_else(|_| panic!("fixed wal cut"));
         sidecars.finish_wal_pin(wal_identity).unwrap();
         sidecars.begin_shm_pin().unwrap();
-        sidecars.retain_opened_shm(shm).unwrap_or_else(|_| panic!("fixed shm cut"));
+        sidecars
+            .retain_opened_shm(shm)
+            .unwrap_or_else(|_| panic!("fixed shm cut"));
         sidecars.finish_shm_pin(shm_identity).unwrap();
     }
 
     #[test]
     fn history_original_sidecar_acquisition_partial_cuts_drain_before_close_keep_primary() {
-        for cut in [FinancialSidecarCut::WalPin, FinancialSidecarCut::ShmPin,
-            FinancialSidecarCut::Journal, FinancialSidecarCut::PairValidation] {
-            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        for cut in [
+            FinancialSidecarCut::WalPin,
+            FinancialSidecarCut::ShmPin,
+            FinancialSidecarCut::Journal,
+            FinancialSidecarCut::PairValidation,
+        ] {
+            let mut start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
             let trace = FinancialSidecarTrace::new();
             let (error, allocation) = fixed_supplied_primary();
             let (spare, spare_allocation) = fixed_supplied_primary(); // Pre-existing fixture value, for overwrite refusal only.
-            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+            start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
             let before = start.fields().source_work().test_code_observation();
             start.fields().test_code_enter_sidecars();
             match cut {
@@ -1563,7 +2371,9 @@ mod financial_original_sidecar_acquisition_tests {
                     let (wal, _) = fixed_opened_wal(&trace);
                     let mut fields = start.fields();
                     let mut sidecars = fields.sidecar_loan();
-                    sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+                    sidecars
+                        .retain_opened_wal(wal)
+                        .unwrap_or_else(|_| panic!("fixed wal cut"));
                     sidecars.failed_wal_pin().unwrap();
                 }
                 FinancialSidecarCut::ShmPin => {
@@ -1571,15 +2381,23 @@ mod financial_original_sidecar_acquisition_tests {
                     let (shm, _) = fixed_opened_shm(&trace);
                     let mut fields = start.fields();
                     let mut sidecars = fields.sidecar_loan();
-                    sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+                    sidecars
+                        .retain_opened_wal(wal)
+                        .unwrap_or_else(|_| panic!("fixed wal cut"));
                     sidecars.finish_wal_pin(wal_identity).unwrap();
                     sidecars.begin_shm_pin().unwrap();
-                    sidecars.retain_opened_shm(shm).unwrap_or_else(|_| panic!("fixed shm cut"));
+                    sidecars
+                        .retain_opened_shm(shm)
+                        .unwrap_or_else(|_| panic!("fixed shm cut"));
                     sidecars.failed_shm_pin().unwrap();
                 }
                 FinancialSidecarCut::Journal => {
                     fixed_pair_local(&mut start, &trace);
-                    start.fields().sidecar_loan().failed_journal_absence().unwrap();
+                    start
+                        .fields()
+                        .sidecar_loan()
+                        .failed_journal_absence()
+                        .unwrap();
                 }
                 FinancialSidecarCut::PairValidation => {
                     fixed_pair_local(&mut start, &trace);
@@ -1590,31 +2408,72 @@ mod financial_original_sidecar_acquisition_tests {
                 }
             }
             assert!(!start.physical.parent_sidecars_retained());
-            assert_eq!(start.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
+            assert_eq!(
+                start.fields().sidecar_loan().drain_one_local(),
+                Err(FinancialSidecarFault::UnexpectedCut)
+            );
             start.fields().test_code_sidecar_blocks_close(); // Missing paid primary cannot be bypassed.
             assert_eq!(trace.snapshot(), [None; 4]);
-            start.fields().sidecar_loan().retain_paid_primary(error).unwrap_or_else(|_| panic!("supplied primary must move once"));
+            start
+                .fields()
+                .sidecar_loan()
+                .retain_paid_primary(error)
+                .unwrap_or_else(|_| panic!("supplied primary must move once"));
             assert_primary_retained(&start.physical, allocation);
-            let Err(spare) = start.fields().sidecar_loan().retain_paid_primary(spare) else { panic!("a second primary must be returned untouched"); };
-            let SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = spare else { panic!("same rejected category"); };
+            let Err(spare) = start.fields().sidecar_loan().retain_paid_primary(spare) else {
+                panic!("a second primary must be returned untouched");
+            };
+            let SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged {
+                detail,
+            }) = spare
+            else {
+                panic!("same rejected category");
+            };
             assert_eq!(detail.as_ptr() as usize, spare_allocation);
             assert_primary_retained(&start.physical, allocation);
             start.fields().test_code_sidecar_blocks_close(); // Paid primary alone cannot bypass local files.
             let expected_actions = match cut {
                 FinancialSidecarCut::WalPin => [Some(FinancialSidecarDrop::CurrentPin), None],
-                FinancialSidecarCut::ShmPin => [Some(FinancialSidecarDrop::CurrentPin), Some(FinancialSidecarDrop::Wal)],
-                FinancialSidecarCut::Journal => [Some(FinancialSidecarDrop::Shm), Some(FinancialSidecarDrop::Wal)],
-                FinancialSidecarCut::PairValidation => [Some(FinancialSidecarDrop::BuiltPair), None],
+                FinancialSidecarCut::ShmPin => [
+                    Some(FinancialSidecarDrop::CurrentPin),
+                    Some(FinancialSidecarDrop::Wal),
+                ],
+                FinancialSidecarCut::Journal => [
+                    Some(FinancialSidecarDrop::Shm),
+                    Some(FinancialSidecarDrop::Wal),
+                ],
+                FinancialSidecarCut::PairValidation => {
+                    [Some(FinancialSidecarDrop::BuiltPair), None]
+                }
             };
             for action in expected_actions.into_iter().flatten() {
                 assert_eq!(start.fields().sidecar_loan().drain_one_local(), Ok(action));
-                if start.physical.blocks_original_close() { start.fields().test_code_sidecar_blocks_close(); }
+                if start.physical.blocks_original_close() {
+                    start.fields().test_code_sidecar_blocks_close();
+                }
             }
             let expected_drops = match cut {
-                FinancialSidecarCut::WalPin => [Some(FinancialSidecarDrop::CurrentPin), None, None, None],
-                FinancialSidecarCut::ShmPin => [Some(FinancialSidecarDrop::CurrentPin), Some(FinancialSidecarDrop::Wal), None, None],
-                FinancialSidecarCut::Journal => [Some(FinancialSidecarDrop::Shm), Some(FinancialSidecarDrop::Wal), None, None],
-                FinancialSidecarCut::PairValidation => [Some(FinancialSidecarDrop::Wal), Some(FinancialSidecarDrop::Shm), None, None],
+                FinancialSidecarCut::WalPin => {
+                    [Some(FinancialSidecarDrop::CurrentPin), None, None, None]
+                }
+                FinancialSidecarCut::ShmPin => [
+                    Some(FinancialSidecarDrop::CurrentPin),
+                    Some(FinancialSidecarDrop::Wal),
+                    None,
+                    None,
+                ],
+                FinancialSidecarCut::Journal => [
+                    Some(FinancialSidecarDrop::Shm),
+                    Some(FinancialSidecarDrop::Wal),
+                    None,
+                    None,
+                ],
+                FinancialSidecarCut::PairValidation => [
+                    Some(FinancialSidecarDrop::Wal),
+                    Some(FinancialSidecarDrop::Shm),
+                    None,
+                    None,
+                ],
             };
             assert_eq!(trace.snapshot(), expected_drops); // PairLocal and BuiltLocal have different real drop order.
             assert_primary_retained(&start.physical, allocation);
@@ -1624,7 +2483,10 @@ mod financial_original_sidecar_acquisition_tests {
                 frame.fields().test_code_sidecar_close_busy();
                 assert!(frame.fields().test_code_unreleased_a00());
                 assert_primary_retained(&frame.physical, allocation);
-                { let mut fields = frame.fields(); let _short = fields.sidecar_loan(); }
+                {
+                    let mut fields = frame.fields();
+                    let _short = fields.sidecar_loan();
+                }
                 assert_eq!(trace.snapshot(), expected_drops);
                 assert_primary_retained(&frame.physical, allocation);
                 assert_eq!(frame.fields().source_work().test_code_observation(), before);
@@ -1638,29 +2500,49 @@ mod financial_original_sidecar_acquisition_tests {
 
     #[test]
     fn history_original_sidecar_acquisition_returned_boundary_and_failed_close_hold_files() {
-        let mut failed_a00 = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let mut failed_a00 =
+            GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
         failed_a00.fields().test_code_a00_primary_refuses_sidecars();
         assert!(!failed_a00.physical.post_a00_started());
-        let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let mut start =
+            GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
         let trace = FinancialSidecarTrace::new();
-        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        start
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         let before = start.fields().source_work().test_code_observation();
         start.fields().test_code_enter_sidecars();
         fixed_pair_local(&mut start, &trace);
-        start.fields().sidecar_loan().finish_journal_absence().unwrap();
+        start
+            .fields()
+            .sidecar_loan()
+            .finish_journal_absence()
+            .unwrap();
         assert!(!start.physical.parent_sidecars_retained());
         start.fields().test_code_sidecar_blocks_close(); // BuiltLocal is not the parent's returned object.
         {
             let mut fields = start.fields();
             let sidecars = fields.sidecar_loan();
-            let returned = sidecars.finish_pair_validation().unwrap_or_else(|_| panic!("fixed validated callee result"));
+            let returned = sidecars
+                .finish_pair_validation()
+                .unwrap_or_else(|_| panic!("fixed validated callee result"));
             assert!(!returned.physical.parent_sidecars_retained());
             assert!(returned.physical.complete.is_none());
-            returned.finish_sidecar_acquisition().unwrap_or_else(|_| panic!("fixed normal parent return")); // Consume into the parent's different slot.
+            returned
+                .finish_sidecar_acquisition()
+                .unwrap_or_else(|_| panic!("fixed normal parent return")); // Consume into the parent's different slot.
         }
         assert!(start.physical.parent_sidecars_retained());
-        assert_eq!(start.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
-        { let mut fields = start.fields(); let _short = fields.sidecar_loan(); }
+        assert_eq!(
+            start.fields().sidecar_loan().drain_one_local(),
+            Err(FinancialSidecarFault::UnexpectedCut)
+        );
+        {
+            let mut fields = start.fields();
+            let _short = fields.sidecar_loan();
+        }
         assert_eq!(trace.snapshot(), [None; 4]);
         let mut frame = start.enter_rows(); // The same Work and both real Files move once.
         frame.fields().test_code_sidecar_close_busy();
@@ -1674,18 +2556,29 @@ mod financial_original_sidecar_acquisition_tests {
         assert_eq!(frame.fields().source_work().test_code_observation(), before);
 
         // An unconsumed normal callee result stays in the same owning frame.
-        let mut abandoned = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let mut abandoned =
+            GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
         let abandoned_trace = FinancialSidecarTrace::new();
         let (error, allocation) = fixed_supplied_primary();
-        abandoned.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        abandoned
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         let before_abandonment = abandoned.fields().source_work().test_code_observation();
         abandoned.fields().test_code_enter_sidecars();
         fixed_pair_local(&mut abandoned, &abandoned_trace);
-        abandoned.fields().sidecar_loan().finish_journal_absence().unwrap();
+        abandoned
+            .fields()
+            .sidecar_loan()
+            .finish_journal_absence()
+            .unwrap();
         {
             let mut fields = abandoned.fields();
             let sidecars = fields.sidecar_loan();
-            let returned = sidecars.finish_pair_validation().unwrap_or_else(|_| panic!("fixed callee result"));
+            let returned = sidecars
+                .finish_pair_validation()
+                .unwrap_or_else(|_| panic!("fixed callee result"));
             drop(returned); // Only forward the actual pair, never implicitly release it.
         }
         let retained = &abandoned.physical.abandoned.as_ref().unwrap().sidecars;
@@ -1696,84 +2589,195 @@ mod financial_original_sidecar_acquisition_tests {
         assert!(!abandoned.physical.parent_sidecars_retained());
         assert!(abandoned.physical.complete.is_none() && abandoned.physical.returned.is_none());
         abandoned.fields().test_code_sidecar_blocks_close();
-        assert_eq!(abandoned.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
-        abandoned.fields().sidecar_loan().retain_paid_primary(error).unwrap_or_else(|_| panic!("once-owned supplied primary"));
+        assert_eq!(
+            abandoned.fields().sidecar_loan().drain_one_local(),
+            Err(FinancialSidecarFault::UnexpectedCut)
+        );
+        abandoned
+            .fields()
+            .sidecar_loan()
+            .retain_paid_primary(error)
+            .unwrap_or_else(|_| panic!("once-owned supplied primary"));
         assert_primary_retained(&abandoned.physical, allocation);
         abandoned.fields().test_code_sidecar_blocks_close();
-        { let mut fields = abandoned.fields(); let _short = fields.sidecar_loan(); }
+        {
+            let mut fields = abandoned.fields();
+            let _short = fields.sidecar_loan();
+        }
         assert_primary_retained(&abandoned.physical, allocation);
         assert_eq!(abandoned_trace.snapshot(), [None; 4]);
         let mut frame = abandoned.enter_rows();
         assert_primary_retained(&frame.physical, allocation);
-        assert_eq!(frame.fields().source_work().test_code_observation(), before_abandonment);
-        assert_eq!(frame.fields().sidecar_loan().drain_one_local(), Ok(FinancialSidecarDrop::BuiltPair));
-        assert_eq!(abandoned_trace.snapshot(), [Some(FinancialSidecarDrop::Wal), Some(FinancialSidecarDrop::Shm), None, None]);
+        assert_eq!(
+            frame.fields().source_work().test_code_observation(),
+            before_abandonment
+        );
+        assert_eq!(
+            frame.fields().sidecar_loan().drain_one_local(),
+            Ok(FinancialSidecarDrop::BuiltPair)
+        );
+        assert_eq!(
+            abandoned_trace.snapshot(),
+            [
+                Some(FinancialSidecarDrop::Wal),
+                Some(FinancialSidecarDrop::Shm),
+                None,
+                None
+            ]
+        );
         assert!(!frame.physical.parent_sidecars_retained());
         frame.fields().test_code_sidecar_close_busy();
         assert!(frame.fields().test_code_unreleased_a00());
         assert_primary_retained(&frame.physical, allocation);
-        { let mut fields = frame.fields(); let _short = fields.sidecar_loan(); }
-        assert_eq!(frame.fields().source_work().test_code_observation(), before_abandonment);
+        {
+            let mut fields = frame.fields();
+            let _short = fields.sidecar_loan();
+        }
+        assert_eq!(
+            frame.fields().source_work().test_code_observation(),
+            before_abandonment
+        );
         assert_primary_retained(&frame.physical, allocation);
     }
 
     #[test]
     fn history_original_sidecar_acquisition_terminal_short_loan_move_and_local_drain_keep_work() {
-        let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let mut start =
+            GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
         let trace = FinancialSidecarTrace::new();
         let (wal, wal_identity) = fixed_opened_wal(&trace);
         let (shm, shm_identity) = fixed_opened_shm(&trace);
-        start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        start
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         start.fields().test_code_enter_sidecars();
         {
             let mut fields = start.fields();
             let mut sidecars = fields.sidecar_loan();
-            sidecars.retain_opened_wal(wal).unwrap_or_else(|_| panic!("fixed wal cut"));
+            sidecars
+                .retain_opened_wal(wal)
+                .unwrap_or_else(|_| panic!("fixed wal cut"));
             sidecars.finish_wal_pin(wal_identity).unwrap();
             sidecars.begin_shm_pin().unwrap();
-            sidecars.retain_opened_shm(shm).unwrap_or_else(|_| panic!("fixed shm cut"));
+            sidecars
+                .retain_opened_shm(shm)
+                .unwrap_or_else(|_| panic!("fixed shm cut"));
         }
-        let terminal = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+        let terminal = start
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::ExceedProduction)
+            .unwrap_err();
         start.fields().test_code_sidecar_blocks_close();
-        { let mut fields = start.fields(); let _short = fields.sidecar_loan(); }
+        {
+            let mut fields = start.fields();
+            let _short = fields.sidecar_loan();
+        }
         assert_eq!(trace.snapshot(), [None; 4]); // Loan drop releases no acquired File.
-        start.physical.opened.as_ref().unwrap().file.metadata().unwrap();
-        start.physical.wal.as_ref().unwrap().pin.file.metadata().unwrap();
+        start
+            .physical
+            .opened
+            .as_ref()
+            .unwrap()
+            .file
+            .metadata()
+            .unwrap();
+        start
+            .physical
+            .wal
+            .as_ref()
+            .unwrap()
+            .pin
+            .file
+            .metadata()
+            .unwrap();
         let mut frame = start.enter_rows();
         {
             let mut fields = frame.fields();
             let mut sidecars = fields.sidecar_loan();
-            assert_eq!(sidecars.finish_shm_pin(shm_identity), Err(FinancialSidecarFault::Terminal));
-            assert_eq!(sidecars.finish_journal_absence(), Err(FinancialSidecarFault::Terminal));
-            assert_eq!(sidecars.failed_shm_pin(), Err(FinancialSidecarFault::Terminal));
-            assert_eq!(sidecars.drain_one_local(), Ok(FinancialSidecarDrop::CurrentPin));
+            assert_eq!(
+                sidecars.finish_shm_pin(shm_identity),
+                Err(FinancialSidecarFault::Terminal)
+            );
+            assert_eq!(
+                sidecars.finish_journal_absence(),
+                Err(FinancialSidecarFault::Terminal)
+            );
+            assert_eq!(
+                sidecars.failed_shm_pin(),
+                Err(FinancialSidecarFault::Terminal)
+            );
+            assert_eq!(
+                sidecars.drain_one_local(),
+                Ok(FinancialSidecarDrop::CurrentPin)
+            );
         }
         frame.fields().test_code_sidecar_blocks_close(); // Wal is still owned, so even terminal cannot close early.
-        assert_eq!(frame.fields().sidecar_loan().drain_one_local(), Ok(FinancialSidecarDrop::Wal));
-        assert_eq!(trace.snapshot(), [Some(FinancialSidecarDrop::CurrentPin), Some(FinancialSidecarDrop::Wal), None, None]);
+        assert_eq!(
+            frame.fields().sidecar_loan().drain_one_local(),
+            Ok(FinancialSidecarDrop::Wal)
+        );
+        assert_eq!(
+            trace.snapshot(),
+            [
+                Some(FinancialSidecarDrop::CurrentPin),
+                Some(FinancialSidecarDrop::Wal),
+                None,
+                None
+            ]
+        );
         assert!(frame.physical.primary.is_none()); // Terminal never requests a new diagnostic error.
         frame.fields().test_code_sidecar_close_busy();
         assert!(frame.fields().test_code_unreleased_a00());
         let mut fields = frame.fields();
         let mut work = fields.source_work();
-        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(terminal));
+        assert_eq!(
+            work.test_code_probe(OwnerStartProbe::TryAfterTerminal),
+            Err(terminal)
+        );
         let retained = work.test_code_observation();
-        assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
-            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(terminal)));
+        assert_eq!(
+            (
+                retained.used,
+                retained.rows,
+                retained.bytes,
+                retained.streams,
+                retained.terminal
+            ),
+            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(terminal))
+        );
 
-        let mut abandoned = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        let mut abandoned =
+            GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
         let abandoned_trace = FinancialSidecarTrace::new();
-        abandoned.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        abandoned
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         abandoned.fields().test_code_enter_sidecars();
         fixed_pair_local(&mut abandoned, &abandoned_trace);
-        abandoned.fields().sidecar_loan().finish_journal_absence().unwrap();
+        abandoned
+            .fields()
+            .sidecar_loan()
+            .finish_journal_absence()
+            .unwrap();
         let first;
         {
             let mut fields = abandoned.fields();
             let sidecars = fields.sidecar_loan();
-            let mut returned = sidecars.finish_pair_validation().unwrap_or_else(|_| panic!("fixed callee result"));
-            first = returned.work.test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-            let Err(returned) = returned.finish_sidecar_acquisition() else { panic!("terminal must refuse parent return and retain the same carrier"); };
+            let mut returned = sidecars
+                .finish_pair_validation()
+                .unwrap_or_else(|_| panic!("fixed callee result"));
+            first = returned
+                .work
+                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err();
+            let Err(returned) = returned.finish_sidecar_acquisition() else {
+                panic!("terminal must refuse parent return and retain the same carrier");
+            };
             let still_owned = &returned.sidecars.as_ref().unwrap().sidecars;
             still_owned.wal.file.metadata().unwrap();
             still_owned.shm.file.metadata().unwrap();
@@ -1788,34 +2792,81 @@ mod financial_original_sidecar_acquisition_tests {
         assert!(!abandoned.physical.parent_sidecars_retained());
         assert!(abandoned.physical.primary.is_none() && abandoned.physical.failed_cut.is_none());
         abandoned.fields().test_code_sidecar_blocks_close();
-        { let mut fields = abandoned.fields(); let _short = fields.sidecar_loan(); }
+        {
+            let mut fields = abandoned.fields();
+            let _short = fields.sidecar_loan();
+        }
         assert_eq!(abandoned_trace.snapshot(), [None; 4]);
         let mut frame = abandoned.enter_rows();
         frame.fields().test_code_sidecar_blocks_close();
-        assert_eq!(frame.fields().sidecar_loan().drain_one_local(), Ok(FinancialSidecarDrop::BuiltPair));
-        assert_eq!(abandoned_trace.snapshot(), [Some(FinancialSidecarDrop::Wal), Some(FinancialSidecarDrop::Shm), None, None]);
+        assert_eq!(
+            frame.fields().sidecar_loan().drain_one_local(),
+            Ok(FinancialSidecarDrop::BuiltPair)
+        );
+        assert_eq!(
+            abandoned_trace.snapshot(),
+            [
+                Some(FinancialSidecarDrop::Wal),
+                Some(FinancialSidecarDrop::Shm),
+                None,
+                None
+            ]
+        );
         assert!(frame.physical.primary.is_none());
         frame.fields().test_code_sidecar_close_busy();
         assert!(frame.fields().test_code_unreleased_a00());
         let mut fields = frame.fields();
         let mut work = fields.source_work();
-        assert_eq!(work.test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+        assert_eq!(
+            work.test_code_probe(OwnerStartProbe::TryAfterTerminal),
+            Err(first)
+        );
         let retained = work.test_code_observation();
-        assert_eq!((retained.used, retained.rows, retained.bytes, retained.streams, retained.terminal),
-            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(first)));
+        assert_eq!(
+            (
+                retained.used,
+                retained.rows,
+                retained.bytes,
+                retained.streams,
+                retained.terminal
+            ),
+            (16 * 1024 * 1024 + 3, 2, 11, 1, Some(first))
+        );
 
         // A fixed state-only probe models unresolved/forgotten result residue;
         // no File is created or leaked and no owned result is asserted drained.
-        let mut unresolved = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-        unresolved.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        let mut unresolved =
+            GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        unresolved
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::FundEarly)
+            .unwrap();
         unresolved.fields().test_code_enter_sidecars();
         unresolved.physical.phase = FinancialSidecarPhase::ValidatedLocal;
-        assert_eq!(unresolved.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
-        let first = unresolved.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+        assert_eq!(
+            unresolved.fields().sidecar_loan().drain_one_local(),
+            Err(FinancialSidecarFault::UnexpectedCut)
+        );
+        let first = unresolved
+            .fields()
+            .source_work()
+            .test_code_probe(OwnerStartProbe::ExceedProduction)
+            .unwrap_err();
         unresolved.fields().test_code_sidecar_blocks_close();
-        assert_eq!(unresolved.fields().sidecar_loan().drain_one_local(), Err(FinancialSidecarFault::UnexpectedCut));
+        assert_eq!(
+            unresolved.fields().sidecar_loan().drain_one_local(),
+            Err(FinancialSidecarFault::UnexpectedCut)
+        );
         assert!(unresolved.physical.blocks_original_close());
-        assert_eq!(unresolved.fields().source_work().test_code_observation().terminal, Some(first));
+        assert_eq!(
+            unresolved
+                .fields()
+                .source_work()
+                .test_code_observation()
+                .terminal,
+            Some(first)
+        );
     }
 }
 
@@ -2227,21 +3278,50 @@ impl Drop for TestCodeSelectionRehearsal {
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum FinancialBeginFailureCase { Prepare, Step, Tail }
+enum FinancialBeginFailureCase {
+    Prepare,
+    Step,
+    Tail,
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum FinancialIntegrityErrorCase { Prepare, Query, Step, DoneReset, WrongType, WrongNull, WrongReal, WrongBlob, InvalidUtf8, ForeignPrepare, ForeignQuery, ForeignStep }
+enum FinancialIntegrityErrorCase {
+    Prepare,
+    Query,
+    Step,
+    DoneReset,
+    WrongType,
+    WrongNull,
+    WrongReal,
+    WrongBlob,
+    InvalidUtf8,
+    ForeignPrepare,
+    ForeignQuery,
+    ForeignStep,
+}
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum FinancialIntegrityTerminalCut { BeforePrepare, CompletedBeforeWhole, ForeignEofPending, SemanticDetail, PaidDetailPending, OwnedPaidDetail, AfterVector, ForeignRow, RowWithPartialOwner, OwnedRaw, OwnedIgnoredReset }
+enum FinancialIntegrityTerminalCut {
+    BeforePrepare,
+    CompletedBeforeWhole,
+    ForeignEofPending,
+    SemanticDetail,
+    PaidDetailPending,
+    OwnedPaidDetail,
+    AfterVector,
+    ForeignRow,
+    RowWithPartialOwner,
+    OwnedRaw,
+    OwnedIgnoredReset,
+}
 
 #[allow(dead_code)]
 #[cfg(test)]
 mod financial_original_audit_acquisition_tests {
     use super::*;
-    use rows::original_source::{OwnerStartProbe, SourceOperationError};
     use financial_audit::{Action, Case, Trace};
+    use rows::original_source::{OwnerStartProbe, SourceOperationError};
     // Fixed protocols own descriptors/guards. /dev/null, an unvalidated owned
     // tail and ProtocolHeld confer no FS lock, validated audit, native/SQL,
     // paid request or Source success qualification.
@@ -2251,422 +3331,1112 @@ mod financial_original_audit_acquisition_tests {
         for (index, name) in ["TEST_CODE-wal", "TEST_CODE-shm"].into_iter().enumerate() {
             let file = File::open("/dev/null").unwrap();
             let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
-            let opened = FinancialOpenedSidecar { file, leaf: OsString::from(name),
-                path: PathBuf::from(name), pin_nul: CString::new(name).unwrap(), trace: trace.clone() };
-            let mut fields = start.fields(); let mut loan = fields.sidecar_loan();
+            let opened = FinancialOpenedSidecar {
+                file,
+                leaf: OsString::from(name),
+                path: PathBuf::from(name),
+                pin_nul: CString::new(name).unwrap(),
+                trace: trace.clone(),
+            };
+            let mut fields = start.fields();
+            let mut loan = fields.sidecar_loan();
             if index == 0 {
-                loan.retain_opened_wal(opened).unwrap_or_else(|_| panic!("fixed wal"));
-                loan.finish_wal_pin(identity).unwrap(); loan.begin_shm_pin().unwrap();
+                loan.retain_opened_wal(opened)
+                    .unwrap_or_else(|_| panic!("fixed wal"));
+                loan.finish_wal_pin(identity).unwrap();
+                loan.begin_shm_pin().unwrap();
             } else {
-                loan.retain_opened_shm(opened).unwrap_or_else(|_| panic!("fixed shm"));
-                loan.finish_shm_pin(identity).unwrap(); loan.finish_journal_absence().unwrap();
-                loan.finish_pair_validation().unwrap_or_else(|_| panic!("fixed pair"))
-                    .finish_sidecar_acquisition().unwrap_or_else(|_| panic!("fixed return"));
+                loan.retain_opened_shm(opened)
+                    .unwrap_or_else(|_| panic!("fixed shm"));
+                loan.finish_shm_pin(identity).unwrap();
+                loan.finish_journal_absence().unwrap();
+                loan.finish_pair_validation()
+                    .unwrap_or_else(|_| panic!("fixed pair"))
+                    .finish_sidecar_acquisition()
+                    .unwrap_or_else(|_| panic!("fixed return"));
             }
         }
     }
     fn fixed_primary() -> (SourceOperationError, usize) {
-        let detail = String::from("TEST_CODE supplied E05 primary"); let allocation = detail.as_ptr() as usize;
-        (SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }), allocation)
+        let detail = String::from("TEST_CODE supplied E05 primary");
+        let allocation = detail.as_ptr() as usize;
+        (
+            SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }),
+            allocation,
+        )
     }
     fn assert_primary(physical: &FinancialPhysical, allocation: usize) {
-        let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &physical.primary else { panic!("same primary"); };
-        assert_eq!(detail.as_ptr() as usize, allocation); assert_eq!(detail, "TEST_CODE supplied E05 primary");
+        let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged {
+            detail,
+        })) = &physical.primary
+        else {
+            panic!("same primary");
+        };
+        assert_eq!(detail.as_ptr() as usize, allocation);
+        assert_eq!(detail, "TEST_CODE supplied E05 primary");
     }
     fn fixed_parent() -> PinnedDirectory {
-        let file = File::open("/dev/null").unwrap(); let identity = DirectoryIdentity::from_metadata(&file.metadata().unwrap());
-        PinnedDirectory { path: PathBuf::from("/TEST_CODE/audit"), root: File::open("/dev/null").unwrap(),
-            relative_components: Vec::new(), file, identity }
+        let file = File::open("/dev/null").unwrap();
+        let identity = DirectoryIdentity::from_metadata(&file.metadata().unwrap());
+        PinnedDirectory {
+            path: PathBuf::from("/TEST_CODE/audit"),
+            root: File::open("/dev/null").unwrap(),
+            relative_components: Vec::new(),
+            file,
+            identity,
+        }
     }
     fn fixed_file() -> PinnedSelectionAuditFile {
-        let file = File::open("/dev/null").unwrap(); let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
+        let file = File::open("/dev/null").unwrap();
+        let identity = FileIdentity::from_metadata(&file.metadata().unwrap());
         PinnedSelectionAuditFile::Present { file, identity }
     }
     fn assert_owned_pin(audit: &FinancialAuditState<'_>) {
-        if let Some(parent) = &audit.parent { parent.file.metadata().unwrap(); parent.root.metadata().unwrap(); }
-        if let Some(PinnedSelectionAuditFile::Present { file, .. }) = &audit.file { file.metadata().unwrap(); }
+        if let Some(parent) = &audit.parent {
+            parent.file.metadata().unwrap();
+            parent.root.metadata().unwrap();
+        }
+        if let Some(PinnedSelectionAuditFile::Present { file, .. }) = &audit.file {
+            file.metadata().unwrap();
+        }
     }
     mod transaction_begin_tests {
         use super::*;
-        fn fixed_ready<'writer>(start: &mut FinancialSourceStart<'writer>, writer: &'writer SelectionAuditWriter, trace: &Trace) {
-            fixed_returned_sidecars(start); start.audit_fields().begin(writer).unwrap();
-            start.audit.resources.loan().seed_fixed_case(Case::Ready, trace);
-            start.audit_fields().records_port().unwrap().retain(financial_audit::fixed_snapshot());
-            start.audit_fields().parent_port().unwrap().retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
-            start.audit_fields().file_port().unwrap().retain(fixed_file()); start.audit_fields().finish_pins().unwrap();
+        fn fixed_ready<'writer>(
+            start: &mut FinancialSourceStart<'writer>,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+        ) {
+            fixed_returned_sidecars(start);
+            start.audit_fields().begin(writer).unwrap();
+            start
+                .audit
+                .resources
+                .loan()
+                .seed_fixed_case(Case::Ready, trace);
+            start
+                .audit_fields()
+                .records_port()
+                .unwrap()
+                .retain(financial_audit::fixed_snapshot());
+            start
+                .audit_fields()
+                .parent_port()
+                .unwrap()
+                .retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
+            start
+                .audit_fields()
+                .file_port()
+                .unwrap()
+                .retain(fixed_file());
+            start.audit_fields().finish_pins().unwrap();
         }
         fn drain_audit(frame: &mut FinancialRowsConstruction<'_>, trace: &Trace) {
             frame.audit_fields().begin_release().unwrap();
-            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(Action::Unlock)));
+            assert_eq!(
+                frame.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Session(Action::Unlock))
+            );
             frame.audit.resources.loan().observe_fixed_unlock_ok();
-            for action in [Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished] {
-                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+            for action in [
+                Action::LockFile,
+                Action::Guard,
+                Action::Parent,
+                Action::Data,
+                Action::Finished,
+            ] {
+                assert_eq!(
+                    frame.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::Session(action))
+                );
                 frame.fields().test_code_audit_blocks_close();
             }
-            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
-            assert_ne!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.audit);
+            assert_eq!(
+                frame.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Finished)
+            );
+            assert_ne!(trace.snapshot(), [None; 8]);
+            assert_owned_pin(&frame.audit);
         }
         #[test]
         fn history_original_transaction_begin_failures_retain_primary_without_rollback() {
-            for case in [FinancialBeginFailureCase::Prepare, FinancialBeginFailureCase::Step, FinancialBeginFailureCase::Tail] {
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let (primary, allocation) = fixed_primary(); let (spare, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
-                let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-                start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_ready(&mut start, &writer, &trace);
-                let before = start.fields().source_work().test_code_observation(); assert!(start.begin_original_transaction());
-                start.fields().original_transaction().test_code_failure_cut(case);
-                assert_eq!(start.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&start.audit);
-                start.fields().original_transaction().test_code_retain_failure_primary(primary, spare);
+            for case in [
+                FinancialBeginFailureCase::Prepare,
+                FinancialBeginFailureCase::Step,
+                FinancialBeginFailureCase::Tail,
+            ] {
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let (primary, allocation) = fixed_primary();
+                let (spare, _) = fixed_primary();
+                let (cleanup, _) = fixed_primary();
+                let mut start =
+                    GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+                start
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::FundEarly)
+                    .unwrap();
+                fixed_ready(&mut start, &writer, &trace);
+                let before = start.fields().source_work().test_code_observation();
+                assert!(start.begin_original_transaction());
+                start
+                    .fields()
+                    .original_transaction()
+                    .test_code_failure_cut(case);
+                assert_eq!(
+                    start.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_owned_pin(&start.audit);
+                start
+                    .fields()
+                    .original_transaction()
+                    .test_code_retain_failure_primary(primary, spare);
                 assert_primary(&start.physical, allocation);
-                start.fields().original_transaction().test_code_finish_failed_begin(cleanup);
-                let mut frame = start.enter_rows(); assert_primary(&frame.physical, allocation);
+                start
+                    .fields()
+                    .original_transaction()
+                    .test_code_finish_failed_begin(cleanup);
+                let mut frame = start.enter_rows();
+                assert_primary(&frame.physical, allocation);
                 assert_eq!(frame.fields().source_work().test_code_observation(), before);
-                drain_audit(&mut frame, &trace); frame.fields().test_code_sidecar_close_busy();
-                assert_primary(&frame.physical, allocation); assert_owned_pin(&frame.audit);
+                drain_audit(&mut frame, &trace);
+                frame.fields().test_code_sidecar_close_busy();
+                assert_primary(&frame.physical, allocation);
+                assert_owned_pin(&frame.audit);
                 assert_eq!(frame.fields().source_work().test_code_observation(), before);
             }
         }
         #[test]
         fn history_original_transaction_begin_independent_return_and_early_exit_hold_same_frame() {
             for rollback in [false, true] {
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let (primary, allocation) = fixed_primary(); let (spare, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
-                let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-                start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_ready(&mut start, &writer, &trace);
-                assert!(start.begin_original_transaction()); assert!(!start.begin_original_transaction());
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let (primary, allocation) = fixed_primary();
+                let (spare, _) = fixed_primary();
+                let (cleanup, _) = fixed_primary();
+                let mut start =
+                    GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+                start
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::FundEarly)
+                    .unwrap();
+                fixed_ready(&mut start, &writer, &trace);
+                assert!(start.begin_original_transaction());
+                assert!(!start.begin_original_transaction());
                 start.fields().original_transaction().test_code_done_batch();
-                assert_eq!(start.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                start.fields().original_transaction().test_code_paid_finalize_then_wait(cleanup);
-                assert_eq!(start.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(trace.snapshot(), [None; 8]); start.audit.resources.loan().assert_fixed_owned();
-                start.fields().original_transaction().test_code_observe_fixed_return_ok();
-                let before = start.fields().source_work().test_code_observation(); let mut frame = start.enter_rows();
-                { let _short = frame.fields().original_transaction(); }
-                assert_owned_pin(&frame.audit); assert_eq!(trace.snapshot(), [None; 8]);
-                frame.fields().original_transaction().test_code_normal_early_primary(primary, spare);
+                assert_eq!(
+                    start.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                start
+                    .fields()
+                    .original_transaction()
+                    .test_code_paid_finalize_then_wait(cleanup);
+                assert_eq!(
+                    start.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                assert_eq!(trace.snapshot(), [None; 8]);
+                start.audit.resources.loan().assert_fixed_owned();
+                start
+                    .fields()
+                    .original_transaction()
+                    .test_code_observe_fixed_return_ok();
+                let before = start.fields().source_work().test_code_observation();
+                let mut frame = start.enter_rows();
+                {
+                    let _short = frame.fields().original_transaction();
+                }
+                assert_owned_pin(&frame.audit);
+                assert_eq!(trace.snapshot(), [None; 8]);
+                frame
+                    .fields()
+                    .original_transaction()
+                    .test_code_normal_early_primary(primary, spare);
                 assert_primary(&frame.physical, allocation);
-                assert_eq!(frame.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(
+                    frame.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
                 if rollback {
-                    let (ignored, _) = fixed_primary(); let (finalize, _) = fixed_primary();
-                    frame.fields().original_transaction().test_code_normal_rollback_error(ignored, finalize);
-                } else { frame.fields().original_transaction().test_code_autocommit_one(); }
-                assert_eq!(trace.snapshot(), [None; 8]); assert_primary(&frame.physical, allocation);
-                drain_audit(&mut frame, &trace); frame.fields().test_code_sidecar_close_busy();
-                assert_owned_pin(&frame.audit); assert_primary(&frame.physical, allocation);
-                assert!(frame.physical.parent_sidecars_retained()); assert_eq!(frame.fields().source_work().test_code_observation(), before);
+                    let (ignored, _) = fixed_primary();
+                    let (finalize, _) = fixed_primary();
+                    frame
+                        .fields()
+                        .original_transaction()
+                        .test_code_normal_rollback_error(ignored, finalize);
+                } else {
+                    frame
+                        .fields()
+                        .original_transaction()
+                        .test_code_autocommit_one();
+                }
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_primary(&frame.physical, allocation);
+                drain_audit(&mut frame, &trace);
+                frame.fields().test_code_sidecar_close_busy();
+                assert_owned_pin(&frame.audit);
+                assert_primary(&frame.physical, allocation);
+                assert!(frame.physical.parent_sidecars_retained());
+                assert_eq!(frame.fields().source_work().test_code_observation(), before);
             }
         }
         #[test]
-        fn history_original_transaction_begin_terminal_waits_for_fact_and_preserves_first_terminal() {
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_ready(&mut start, &writer, &trace);
-            assert!(start.begin_original_transaction()); start.fields().original_transaction().test_code_done_batch();
+        fn history_original_transaction_begin_terminal_waits_for_fact_and_preserves_first_terminal()
+        {
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
+            let mut start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
+            fixed_ready(&mut start, &writer, &trace);
+            assert!(start.begin_original_transaction());
+            start.fields().original_transaction().test_code_done_batch();
             // Normal ignored finalize diagnostic is still unpaid. Terminal
             // requests no new owned error; its consumed VM remains consumed.
-            let first = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-            let before = start.fields().source_work().test_code_observation(); let mut frame = start.enter_rows();
-            frame.fields().original_transaction().test_code_assert_transaction_barrier();
-            assert_eq!(frame.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-            assert!(!frame.begin_original_transaction()); assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.audit);
-            { let _short = frame.fields().original_transaction(); }
+            let first = start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err();
+            let before = start.fields().source_work().test_code_observation();
+            let mut frame = start.enter_rows();
+            frame
+                .fields()
+                .original_transaction()
+                .test_code_assert_transaction_barrier();
+            assert_eq!(
+                frame.audit_fields().begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
+            assert!(!frame.begin_original_transaction());
+            assert_eq!(trace.snapshot(), [None; 8]);
+            assert_owned_pin(&frame.audit);
+            {
+                let _short = frame.fields().original_transaction();
+            }
             assert_eq!(frame.fields().source_work().test_code_observation(), before);
             // This separate fixed protocol observation represents an existing
             // completed driver call, not a new SQL call or a status inference.
-            frame.fields().original_transaction().test_code_observe_fixed_return_ok();
-            frame.fields().original_transaction().test_code_terminal_exit();
-            assert_eq!(trace.snapshot(), [None; 8]); assert!(frame.physical.primary.is_none());
-            drain_audit(&mut frame, &trace); frame.fields().test_code_sidecar_close_busy();
-            assert_owned_pin(&frame.audit); assert!(frame.physical.primary.is_none());
-            assert_eq!(frame.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+            frame
+                .fields()
+                .original_transaction()
+                .test_code_observe_fixed_return_ok();
+            frame
+                .fields()
+                .original_transaction()
+                .test_code_terminal_exit();
+            assert_eq!(trace.snapshot(), [None; 8]);
+            assert!(frame.physical.primary.is_none());
+            drain_audit(&mut frame, &trace);
+            frame.fields().test_code_sidecar_close_busy();
+            assert_owned_pin(&frame.audit);
+            assert!(frame.physical.primary.is_none());
+            assert_eq!(
+                frame
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                Err(first)
+            );
             assert_eq!(frame.fields().source_work().test_code_observation(), before);
             // Already-retained Error differs from unknown return: terminal
             // consumes its pending unpaid phase without re-observing the call.
             for rollback_tail in [false, true] {
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-                start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_ready(&mut start, &writer, &trace);
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let mut start =
+                    GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+                start
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::FundEarly)
+                    .unwrap();
+                fixed_ready(&mut start, &writer, &trace);
                 assert!(start.begin_original_transaction());
                 let mut primary_allocation = None;
                 if rollback_tail {
-                    let (cleanup, _) = fixed_primary(); let (primary, allocation) = fixed_primary(); let (spare, _) = fixed_primary();
+                    let (cleanup, _) = fixed_primary();
+                    let (primary, allocation) = fixed_primary();
+                    let (spare, _) = fixed_primary();
                     start.fields().original_transaction().test_code_done_batch();
-                    start.fields().original_transaction().test_code_paid_finalize_then_wait(cleanup);
-                    start.fields().original_transaction().test_code_observe_fixed_return_ok();
-                    start.fields().original_transaction().test_code_normal_early_primary(primary, spare);
+                    start
+                        .fields()
+                        .original_transaction()
+                        .test_code_paid_finalize_then_wait(cleanup);
+                    start
+                        .fields()
+                        .original_transaction()
+                        .test_code_observe_fixed_return_ok();
+                    start
+                        .fields()
+                        .original_transaction()
+                        .test_code_normal_early_primary(primary, spare);
                     primary_allocation = Some(allocation);
-                    start.fields().original_transaction().test_code_rollback_tail_error();
-                } else { start.fields().original_transaction().test_code_failure_cut(FinancialBeginFailureCase::Tail); }
-                assert_eq!(start.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                let first = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-                let before = start.fields().source_work().test_code_observation(); let mut frame = start.enter_rows();
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.audit);
-                assert_eq!(frame.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                frame.fields().original_transaction().test_code_consume_known_error_at_terminal();
+                    start
+                        .fields()
+                        .original_transaction()
+                        .test_code_rollback_tail_error();
+                } else {
+                    start
+                        .fields()
+                        .original_transaction()
+                        .test_code_failure_cut(FinancialBeginFailureCase::Tail);
+                }
+                assert_eq!(
+                    start.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                let first = start
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                    .unwrap_err();
+                let before = start.fields().source_work().test_code_observation();
+                let mut frame = start.enter_rows();
                 assert_eq!(trace.snapshot(), [None; 8]);
-                if let Some(allocation) = primary_allocation { assert_primary(&frame.physical, allocation); }
-                else { assert!(frame.physical.primary.is_none()); }
-                drain_audit(&mut frame, &trace); frame.fields().test_code_sidecar_close_busy(); assert_owned_pin(&frame.audit);
-                if let Some(allocation) = primary_allocation { assert_primary(&frame.physical, allocation); }
-                else { assert!(frame.physical.primary.is_none()); }
-                assert_eq!(frame.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+                assert_owned_pin(&frame.audit);
+                assert_eq!(
+                    frame.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                frame
+                    .fields()
+                    .original_transaction()
+                    .test_code_consume_known_error_at_terminal();
+                assert_eq!(trace.snapshot(), [None; 8]);
+                if let Some(allocation) = primary_allocation {
+                    assert_primary(&frame.physical, allocation);
+                } else {
+                    assert!(frame.physical.primary.is_none());
+                }
+                drain_audit(&mut frame, &trace);
+                frame.fields().test_code_sidecar_close_busy();
+                assert_owned_pin(&frame.audit);
+                if let Some(allocation) = primary_allocation {
+                    assert_primary(&frame.physical, allocation);
+                } else {
+                    assert!(frame.physical.primary.is_none());
+                }
+                assert_eq!(
+                    frame
+                        .fields()
+                        .source_work()
+                        .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                    Err(first)
+                );
                 assert_eq!(frame.fields().source_work().test_code_observation(), before);
             }
         }
         fn fixed_initial_raw_error() -> (rusqlite::Error, usize) {
-            let name = String::from("TEST_CODE raw driver error"); let allocation = name.as_ptr() as usize;
+            let name = String::from("TEST_CODE raw driver error");
+            let allocation = name.as_ptr() as usize;
             (rusqlite::Error::InvalidColumnName(name), allocation)
         }
-        fn assert_initial_primary(physical: &FinancialPhysical, raw: usize, catalog: usize, original: usize) {
+        fn assert_initial_primary(
+            physical: &FinancialPhysical,
+            raw: usize,
+            catalog: usize,
+            original: usize,
+        ) {
             match physical.primary.as_ref().expect("one retained primary") {
-                SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { source: rusqlite::Error::InvalidColumnName(name), .. }) => assert_eq!(name.as_ptr() as usize, raw),
-                SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure { detail, .. } }) => assert_eq!(detail.as_ptr() as usize, catalog),
+                SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite {
+                    source: rusqlite::Error::InvalidColumnName(name),
+                    ..
+                }) => assert_eq!(name.as_ptr() as usize, raw),
+                SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
+                    source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure { detail, .. },
+                }) => assert_eq!(detail.as_ptr() as usize, catalog),
                 _ => assert_primary(physical, original),
             }
         }
-        fn fixed_initial_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
-            writer: &'writer SelectionAuditWriter, trace: &Trace) -> FinancialInitialReadFrame<'purpose, 'writer> {
-            let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-            let mut frame = start.bind_initial_read(purpose).unwrap_or_else(|_| panic!("genuine fixed purpose borrow"));
-            frame.read_loan().test_code_validation_unknown_blocks_begin();
+        fn fixed_initial_frame<'purpose, 'writer>(
+            purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+        ) -> FinancialInitialReadFrame<'purpose, 'writer> {
+            let start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            let mut frame = start
+                .bind_initial_read(purpose)
+                .unwrap_or_else(|_| panic!("genuine fixed purpose borrow"));
+            frame
+                .read_loan()
+                .test_code_validation_unknown_blocks_begin();
             assert!(frame.read_loan().test_code_validate_genuine_rows_options());
-            frame.source.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
-            fixed_ready(&mut frame.source, writer, trace); assert!(frame.begin());
-            frame.source.fields().original_transaction().test_code_done_batch();
-            let (cleanup, _) = fixed_primary(); frame.source.fields().original_transaction().test_code_paid_finalize_then_wait(cleanup);
-            frame.source.fields().original_transaction().test_code_observe_fixed_return_ok();
-            frame.read_loan().test_code_fixed_prerequisites(); frame
+            frame
+                .source
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
+            fixed_ready(&mut frame.source, writer, trace);
+            assert!(frame.begin());
+            frame
+                .source
+                .fields()
+                .original_transaction()
+                .test_code_done_batch();
+            let (cleanup, _) = fixed_primary();
+            frame
+                .source
+                .fields()
+                .original_transaction()
+                .test_code_paid_finalize_then_wait(cleanup);
+            frame
+                .source
+                .fields()
+                .original_transaction()
+                .test_code_observe_fixed_return_ok();
+            frame.read_loan().test_code_fixed_prerequisites();
+            frame
         }
         #[test]
         fn history_original_initial_read_prefix_genuine_context_and_exact_typed_caps() {
-            for purpose in [SelectionSnapshotPurpose::Diagnostic, SelectionSnapshotPurpose::Prospective(prospective::Options::production()),
-                SelectionSnapshotPurpose::Backup(backup::Options::production())] {
-                let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-                let Err((mut start, fault)) = start.bind_initial_read(&purpose) else { panic!("non-financial purpose refuses before validation/SQL"); };
-                assert_eq!(fault, FinancialInitialReadFault::Purpose); assert!(start.fields().test_code_unreached());
+            for purpose in [
+                SelectionSnapshotPurpose::Diagnostic,
+                SelectionSnapshotPurpose::Prospective(prospective::Options::production()),
+                SelectionSnapshotPurpose::Backup(backup::Options::production()),
+            ] {
+                let start =
+                    GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+                let Err((mut start, fault)) = start.bind_initial_read(&purpose) else {
+                    panic!("non-financial purpose refuses before validation/SQL");
+                };
+                assert_eq!(fault, FinancialInitialReadFault::Purpose);
+                assert!(start.fields().test_code_unreached());
                 assert_eq!(start.fields().source_work().test_code_observation().used, 0);
             }
-            let mut bad_options = rows::Options::production(); bad_options.limits.metadata_bytes -= 1;
+            let mut bad_options = rows::Options::production();
+            bad_options.limits.metadata_bytes -= 1;
             let bad = SelectionSnapshotPurpose::RowsBackup(bad_options);
-            let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-            let mut rejected = start.bind_initial_read(&bad).unwrap_or_else(|_| panic!("real purpose is still validation Unknown"));
-            rejected.read_loan().test_code_validation_unknown_blocks_begin();
-            assert!(!rejected.read_loan().test_code_validate_genuine_rows_options()); assert!(!rejected.begin());
-            assert!(rejected.source.physical.primary.is_some()); assert!(rejected.source.fields().test_code_unreached());
+            let start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            let mut rejected = start
+                .bind_initial_read(&bad)
+                .unwrap_or_else(|_| panic!("real purpose is still validation Unknown"));
+            rejected
+                .read_loan()
+                .test_code_validation_unknown_blocks_begin();
+            assert!(!rejected
+                .read_loan()
+                .test_code_validate_genuine_rows_options());
+            assert!(!rejected.begin());
+            assert!(rejected.source.physical.primary.is_some());
+            assert!(rejected.source.fields().test_code_unreached());
             let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
+            let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
             let before = frame.source.fields().source_work().test_code_observation();
-            let journal = String::from("wal"); let allocation = journal.as_ptr() as usize;
+            let journal = String::from("wal");
+            let allocation = journal.as_ptr() as usize;
             frame.read_loan().test_code_exact_prefix(journal);
-            assert_eq!((frame.initial.objects, frame.initial.bytes), (4096, 16 * 1024 * 1024));
-            assert_eq!(frame.initial.main, Some((4095, 16 * 1024 * 1024 - 1))); assert_eq!(frame.initial.temp, Some((1, 1)));
-            assert_eq!((frame.initial.application_id, frame.initial.user_version, frame.initial.foreign_keys, frame.initial.synchronous),
-                (Some(1398035265), Some(1), Some(1), Some(2)));
-            assert_eq!(frame.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
-            assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.source.audit);
-            { let _short = frame.read_loan(); }
-            let mut moved = frame.enter_rows(); assert!(std::ptr::eq(moved.initial.purpose, &purpose));
-            assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
-            assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+            assert_eq!(
+                (frame.initial.objects, frame.initial.bytes),
+                (4096, 16 * 1024 * 1024)
+            );
+            assert_eq!(frame.initial.main, Some((4095, 16 * 1024 * 1024 - 1)));
+            assert_eq!(frame.initial.temp, Some((1, 1)));
+            assert_eq!(
+                (
+                    frame.initial.application_id,
+                    frame.initial.user_version,
+                    frame.initial.foreign_keys,
+                    frame.initial.synchronous
+                ),
+                (Some(1398035265), Some(1), Some(1), Some(2))
+            );
+            assert_eq!(
+                frame.initial.journal_mode.as_ref().unwrap().as_ptr() as usize,
+                allocation
+            );
+            assert_eq!(
+                frame.source.audit_fields().begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
+            assert_eq!(trace.snapshot(), [None; 8]);
+            assert_owned_pin(&frame.source.audit);
+            {
+                let _short = frame.read_loan();
+            }
+            let mut moved = frame.enter_rows();
+            assert!(std::ptr::eq(moved.initial.purpose, &purpose));
+            assert_eq!(
+                moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize,
+                allocation
+            );
+            assert_eq!(
+                moved.source.fields().source_work().test_code_observation(),
+                before
+            );
             // This prefix cannot publish capture/Tail/COMMIT. Only a terminal
             // fixed cleanup is selected here, with the partial owned prefix kept.
-            moved.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-            moved.read_loan().test_code_terminal_drain_prefix(); moved.source.fields().original_transaction().test_code_terminal_exit();
-            drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_ok();
-            assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
+            moved
+                .source
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err();
+            moved.read_loan().test_code_terminal_drain_prefix();
+            moved
+                .source
+                .fields()
+                .original_transaction()
+                .test_code_terminal_exit();
+            drain_audit(&mut moved.source, &trace);
+            moved.source.fields().test_code_sidecar_close_ok();
+            assert_eq!(
+                moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize,
+                allocation
+            );
         }
         #[test]
         fn history_original_initial_read_prefix_errors_keep_partial_heap_and_first_primary() {
-            for case in [FinancialInitialReadCase::NegativeCount, FinancialInitialReadCase::NegativeExtent,
-                FinancialInitialReadCase::ExcessCap, FinancialInitialReadCase::MaximumSum,
-                FinancialInitialReadCase::WrongInteger, FinancialInitialReadCase::JournalWrongType,
-                FinancialInitialReadCase::JournalInvalidUtf8, FinancialInitialReadCase::SynchronousWrongType,
-                FinancialInitialReadCase::StepError, FinancialInitialReadCase::NoRows, FinancialInitialReadCase::NoRowsResetError] {
+            for case in [
+                FinancialInitialReadCase::NegativeCount,
+                FinancialInitialReadCase::NegativeExtent,
+                FinancialInitialReadCase::ExcessCap,
+                FinancialInitialReadCase::MaximumSum,
+                FinancialInitialReadCase::WrongInteger,
+                FinancialInitialReadCase::JournalWrongType,
+                FinancialInitialReadCase::JournalInvalidUtf8,
+                FinancialInitialReadCase::SynchronousWrongType,
+                FinancialInitialReadCase::StepError,
+                FinancialInitialReadCase::NoRows,
+                FinancialInitialReadCase::NoRowsResetError,
+            ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
                 let before = frame.source.fields().source_work().test_code_observation();
-                let journal = String::from("wal"); let journal_allocation = journal.as_ptr() as usize;
+                let journal = String::from("wal");
+                let journal_allocation = journal.as_ptr() as usize;
                 frame.read_loan().test_code_fault_cut(case, journal);
-                assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                let (primary, allocation) = fixed_primary(); let (raw, raw_allocation) = fixed_initial_raw_error();
-                frame.read_loan().test_code_retain_first_error(primary, raw); { let _short = frame.read_loan(); }
-                let (cleanup, _) = fixed_initial_raw_error(); let detail_allocation = frame.read_loan().test_code_finish_normal_error(cleanup);
-                let mut moved = frame.enter_rows(); assert_initial_primary(&moved.source.physical, raw_allocation, detail_allocation, allocation);
-                if matches!(case, FinancialInitialReadCase::SynchronousWrongType) {
-                    assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, journal_allocation);
+                assert_eq!(
+                    frame.source.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                let (primary, allocation) = fixed_primary();
+                let (raw, raw_allocation) = fixed_initial_raw_error();
+                frame.read_loan().test_code_retain_first_error(primary, raw);
+                {
+                    let _short = frame.read_loan();
                 }
-                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
-                moved.source.fields().original_transaction().test_code_existing_read_primary_exit();
-                drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_busy();
-                assert_initial_primary(&moved.source.physical, raw_allocation, detail_allocation, allocation); assert_owned_pin(&moved.source.audit);
-                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+                let (cleanup, _) = fixed_initial_raw_error();
+                let detail_allocation = frame.read_loan().test_code_finish_normal_error(cleanup);
+                let mut moved = frame.enter_rows();
+                assert_initial_primary(
+                    &moved.source.physical,
+                    raw_allocation,
+                    detail_allocation,
+                    allocation,
+                );
+                if matches!(case, FinancialInitialReadCase::SynchronousWrongType) {
+                    assert_eq!(
+                        moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize,
+                        journal_allocation
+                    );
+                }
+                assert_eq!(
+                    moved.source.fields().source_work().test_code_observation(),
+                    before
+                );
+                moved
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_existing_read_primary_exit();
+                drain_audit(&mut moved.source, &trace);
+                moved.source.fields().test_code_sidecar_close_busy();
+                assert_initial_primary(
+                    &moved.source.physical,
+                    raw_allocation,
+                    detail_allocation,
+                    allocation,
+                );
+                assert_owned_pin(&moved.source.audit);
+                assert_eq!(
+                    moved.source.fields().source_work().test_code_observation(),
+                    before
+                );
             }
             #[derive(Clone, Copy)]
-            enum PrimaryCut { BeforePrepare, BetweenQueries, AcquiredRow }
-            for cut in [PrimaryCut::BeforePrepare, PrimaryCut::BetweenQueries, PrimaryCut::AcquiredRow] {
+            enum PrimaryCut {
+                BeforePrepare,
+                BetweenQueries,
+                AcquiredRow,
+            }
+            for cut in [
+                PrimaryCut::BeforePrepare,
+                PrimaryCut::BetweenQueries,
+                PrimaryCut::AcquiredRow,
+            ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
                 let before = frame.source.fields().source_work().test_code_observation();
                 match cut {
-                    PrimaryCut::BeforePrepare => frame.read_loan().test_code_primary_before_prepare_cut(),
-                    PrimaryCut::BetweenQueries => frame.read_loan().test_code_primary_between_queries_cut(),
-                    PrimaryCut::AcquiredRow => frame.read_loan().test_code_primary_acquired_row_cut(),
+                    PrimaryCut::BeforePrepare => {
+                        frame.read_loan().test_code_primary_before_prepare_cut()
+                    }
+                    PrimaryCut::BetweenQueries => {
+                        frame.read_loan().test_code_primary_between_queries_cut()
+                    }
+                    PrimaryCut::AcquiredRow => {
+                        frame.read_loan().test_code_primary_acquired_row_cut()
+                    }
                 }
                 let (primary, allocation) = fixed_primary();
                 if matches!(cut, PrimaryCut::AcquiredRow) {
                     // Actual G audit producer can retain the first owned error
                     // while Q holds a ROW; the shared selector must stop reads.
                     frame.source.audit_fields().note_normal_failure().unwrap();
-                    frame.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("same first audit primary"));
-                } else { frame.read_loan().test_code_retain_before_read_primary(primary); }
-                assert_primary(&frame.source.physical, allocation); assert_owned_pin(&frame.source.audit);
-                assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                let (raw, _) = fixed_initial_raw_error(); let (cleanup, _) = fixed_initial_raw_error();
-                frame.read_loan().test_code_primary_drains_existing_read(raw, cleanup);
-                assert_eq!(frame.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                { let _short = frame.read_loan(); }
-                assert_eq!(trace.snapshot(), [None; 8]); assert_primary(&frame.source.physical, allocation);
-                let mut moved = frame.enter_rows(); assert!(std::ptr::eq(moved.initial.purpose, &purpose));
+                    frame
+                        .source
+                        .audit_fields()
+                        .retain_paid_primary(primary)
+                        .unwrap_or_else(|_| panic!("same first audit primary"));
+                } else {
+                    frame
+                        .read_loan()
+                        .test_code_retain_before_read_primary(primary);
+                }
+                assert_primary(&frame.source.physical, allocation);
+                assert_owned_pin(&frame.source.audit);
+                assert_eq!(
+                    frame.source.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                let (raw, _) = fixed_initial_raw_error();
+                let (cleanup, _) = fixed_initial_raw_error();
+                frame
+                    .read_loan()
+                    .test_code_primary_drains_existing_read(raw, cleanup);
+                assert_eq!(
+                    frame.source.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                {
+                    let _short = frame.read_loan();
+                }
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_primary(&frame.source.physical, allocation);
+                let mut moved = frame.enter_rows();
+                assert!(std::ptr::eq(moved.initial.purpose, &purpose));
                 if matches!(cut, PrimaryCut::BetweenQueries) {
-                    assert_eq!(moved.initial.main, Some((3, 17))); assert!(moved.initial.temp.is_none());
+                    assert_eq!(moved.initial.main, Some((3, 17)));
+                    assert!(moved.initial.temp.is_none());
                 } else if matches!(cut, PrimaryCut::AcquiredRow) {
-                    assert_eq!(moved.initial.count, Some(3)); assert!(moved.initial.extent.is_none()); assert!(moved.initial.main.is_none());
+                    assert_eq!(moved.initial.count, Some(3));
+                    assert!(moved.initial.extent.is_none());
+                    assert!(moved.initial.main.is_none());
                 }
                 if matches!(cut, PrimaryCut::AcquiredRow) {
-                    let (ignored, _) = fixed_primary(); let (finalize, _) = fixed_primary();
-                    moved.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, finalize);
-                } else { moved.source.fields().original_transaction().test_code_existing_read_primary_exit(); }
-                assert_eq!(trace.snapshot(), [None; 8]); assert_primary(&moved.source.physical, allocation);
-                drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_busy();
-                assert_owned_pin(&moved.source.audit); assert_primary(&moved.source.physical, allocation);
-                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+                    let (ignored, _) = fixed_primary();
+                    let (finalize, _) = fixed_primary();
+                    moved
+                        .source
+                        .fields()
+                        .original_transaction()
+                        .test_code_read_primary_rollback_once(ignored, finalize);
+                } else {
+                    moved
+                        .source
+                        .fields()
+                        .original_transaction()
+                        .test_code_existing_read_primary_exit();
+                }
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_primary(&moved.source.physical, allocation);
+                drain_audit(&mut moved.source, &trace);
+                moved.source.fields().test_code_sidecar_close_busy();
+                assert_owned_pin(&moved.source.audit);
+                assert_primary(&moved.source.physical, allocation);
+                assert_eq!(
+                    moved.source.fields().source_work().test_code_observation(),
+                    before
+                );
             }
         }
         #[test]
         fn history_original_initial_read_prefix_terminal_drains_only_reached_owned_resources() {
             let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-            let start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-            let mut unknown = start.bind_initial_read(&purpose).unwrap_or_else(|_| panic!("real purpose Unknown"));
-            unknown.source.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
-            let first = unknown.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-            unknown.read_loan().test_code_terminal_drain_prefix(); assert!(!unknown.begin());
-            assert_eq!(unknown.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+            let start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            let mut unknown = start
+                .bind_initial_read(&purpose)
+                .unwrap_or_else(|_| panic!("real purpose Unknown"));
+            unknown
+                .source
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
+            let first = unknown
+                .source
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err();
+            unknown.read_loan().test_code_terminal_drain_prefix();
+            assert!(!unknown.begin());
+            assert_eq!(
+                unknown
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                Err(first)
+            );
             assert!(unknown.source.fields().test_code_unreached());
-            for cut in [FinancialInitialTerminalCut::BeforePrepare, FinancialInitialTerminalCut::FirstColumn,
-                FinancialInitialTerminalCut::QueryReturnUnknown, FinancialInitialTerminalCut::JournalBeforeReset,
-                FinancialInitialTerminalCut::OwnedIgnoredReset, FinancialInitialTerminalCut::RawDriverBeforeReturn, FinancialInitialTerminalCut::RawDriverAfterReturn] {
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
-                let journal = String::from("wal"); let allocation = journal.as_ptr() as usize; let (cleanup, _) = fixed_initial_raw_error();
-                frame.read_loan().test_code_terminal_cut(cut, journal, cleanup); { let _short = frame.read_loan(); }
+            for cut in [
+                FinancialInitialTerminalCut::BeforePrepare,
+                FinancialInitialTerminalCut::FirstColumn,
+                FinancialInitialTerminalCut::QueryReturnUnknown,
+                FinancialInitialTerminalCut::JournalBeforeReset,
+                FinancialInitialTerminalCut::OwnedIgnoredReset,
+                FinancialInitialTerminalCut::RawDriverBeforeReturn,
+                FinancialInitialTerminalCut::RawDriverAfterReturn,
+            ] {
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let mut frame = fixed_initial_frame(&purpose, &writer, &trace);
+                let journal = String::from("wal");
+                let allocation = journal.as_ptr() as usize;
+                let (cleanup, _) = fixed_initial_raw_error();
+                frame
+                    .read_loan()
+                    .test_code_terminal_cut(cut, journal, cleanup);
+                {
+                    let _short = frame.read_loan();
+                }
                 let mut moved = frame.enter_rows();
-                if matches!(cut, FinancialInitialTerminalCut::FirstColumn | FinancialInitialTerminalCut::QueryReturnUnknown) {
-                    assert_eq!(moved.initial.count, Some(3)); assert_eq!(moved.initial.objects, 0); assert!(moved.initial.main.is_none());
+                if matches!(
+                    cut,
+                    FinancialInitialTerminalCut::FirstColumn
+                        | FinancialInitialTerminalCut::QueryReturnUnknown
+                ) {
+                    assert_eq!(moved.initial.count, Some(3));
+                    assert_eq!(moved.initial.objects, 0);
+                    assert!(moved.initial.main.is_none());
                 }
-                let first = moved.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
+                let first = moved
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                    .unwrap_err();
                 let before = moved.source.fields().source_work().test_code_observation();
-                assert_eq!(moved.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+                assert_eq!(
+                    moved.source.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
                 moved.read_loan().test_code_terminal_drain_prefix();
-                if matches!(cut, FinancialInitialTerminalCut::JournalBeforeReset | FinancialInitialTerminalCut::OwnedIgnoredReset) {
-                    assert_eq!(moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize, allocation);
+                if matches!(
+                    cut,
+                    FinancialInitialTerminalCut::JournalBeforeReset
+                        | FinancialInitialTerminalCut::OwnedIgnoredReset
+                ) {
+                    assert_eq!(
+                        moved.initial.journal_mode.as_ref().unwrap().as_ptr() as usize,
+                        allocation
+                    );
                 }
-                moved.source.fields().original_transaction().test_code_terminal_exit();
-                drain_audit(&mut moved.source, &trace); moved.source.fields().test_code_sidecar_close_busy();
-                assert!(moved.source.physical.primary.is_none()); assert_owned_pin(&moved.source.audit);
-                assert_eq!(moved.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-                assert_eq!(moved.source.fields().source_work().test_code_observation(), before);
+                moved
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_terminal_exit();
+                drain_audit(&mut moved.source, &trace);
+                moved.source.fields().test_code_sidecar_close_busy();
+                assert!(moved.source.physical.primary.is_none());
+                assert_owned_pin(&moved.source.audit);
+                assert_eq!(
+                    moved
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                    Err(first)
+                );
+                assert_eq!(
+                    moved.source.fields().source_work().test_code_observation(),
+                    before
+                );
             }
         }
-        fn fixed_integrity_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
-            writer: &'writer SelectionAuditWriter, trace: &Trace) -> FinancialIntegrityReadFrame<'purpose, 'writer> {
+        fn fixed_integrity_frame<'purpose, 'writer>(
+            purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+        ) -> FinancialIntegrityReadFrame<'purpose, 'writer> {
             let prefix = fixed_initial_frame(purpose, writer, trace);
             // Seven independent A01/A02 whole returns, not a scalar label,
             // must precede selecting the two fixed integrity queries.
-            let Err(mut prefix) = prefix.begin_integrity() else { panic!("unreached prefix refuses A03"); };
-            prefix.read_loan().test_code_exact_prefix(String::from("wal"));
-            prefix.begin_integrity().unwrap_or_else(|_| panic!("complete same-frame prefix"))
+            let Err(mut prefix) = prefix.begin_integrity() else {
+                panic!("unreached prefix refuses A03");
+            };
+            prefix
+                .read_loan()
+                .test_code_exact_prefix(String::from("wal"));
+            prefix
+                .begin_integrity()
+                .unwrap_or_else(|_| panic!("complete same-frame prefix"))
         }
         fn drain_integrity_source_audit(frame: &mut FinancialSourceStart<'_>, trace: &Trace) {
             frame.audit_fields().begin_release().unwrap();
-            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(Action::Unlock)));
+            assert_eq!(
+                frame.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Session(Action::Unlock))
+            );
             frame.audit.resources.loan().observe_fixed_unlock_ok();
-            for action in [Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished] {
-                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+            for action in [
+                Action::LockFile,
+                Action::Guard,
+                Action::Parent,
+                Action::Data,
+                Action::Finished,
+            ] {
+                assert_eq!(
+                    frame.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::Session(action))
+                );
                 frame.fields().test_code_audit_blocks_close();
             }
-            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
-            assert_ne!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.audit);
+            assert_eq!(
+                frame.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Finished)
+            );
+            assert_ne!(trace.snapshot(), [None; 8]);
+            assert_owned_pin(&frame.audit);
         }
         // Fixed protocol scripts only: supplied Sqlite/String/Vec carriers and
         // /dev/null resources do not establish real SQL, FS, capacity or payment.
-        fn fixed_capture_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
-            writer: &'writer SelectionAuditWriter, trace: &Trace) -> FinancialCapturePrefixFrame<'purpose, 'writer> {
+        fn fixed_capture_frame<'purpose, 'writer>(
+            purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+        ) -> FinancialCapturePrefixFrame<'purpose, 'writer> {
             let mut integrity = fixed_integrity_frame(purpose, writer, trace);
-            let Err(mut integrity) = integrity.begin_catalog_prefix() else { panic!("unreached A03 refuses capture"); };
-            assert!(integrity.integrity_loan().test_code_whole_check(vec![String::from("ok")]));
-            integrity.integrity_loan().test_code_foreign_rows(0, false); integrity.integrity_loan().test_code_finish_success();
-            integrity.begin_catalog_prefix().unwrap_or_else(|_| panic!("actual two whole results/VM scopes and capture Ok"))
+            let Err(mut integrity) = integrity.begin_catalog_prefix() else {
+                panic!("unreached A03 refuses capture");
+            };
+            assert!(integrity
+                .integrity_loan()
+                .test_code_whole_check(vec![String::from("ok")]));
+            integrity.integrity_loan().test_code_foreign_rows(0, false);
+            integrity.integrity_loan().test_code_finish_success();
+            integrity
+                .begin_catalog_prefix()
+                .unwrap_or_else(|_| panic!("actual two whole results/VM scopes and capture Ok"))
         }
         fn fixed_capture_raw(case: replay_work::CaptureErrorCase) -> rusqlite::Error {
             use replay_work::CaptureErrorCase as Case;
             match case {
                 Case::NoRows => rusqlite::Error::QueryReturnedNoRows,
-                Case::Type => rusqlite::Error::InvalidColumnType(0, String::from("TEST_CODE actual column0"), rusqlite::types::Type::Blob),
+                Case::Type => rusqlite::Error::InvalidColumnType(
+                    0,
+                    String::from("TEST_CODE actual column0"),
+                    rusqlite::types::Type::Blob,
+                ),
                 Case::Utf8 => {
-                    let invalid = [0xff]; let child = std::str::from_utf8(&invalid).unwrap_err();
-                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(child))
-                },
-                _ => rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR), Some(String::from("TEST_CODE owned raw driver detail"))),
+                    let invalid = [0xff];
+                    let child = std::str::from_utf8(&invalid).unwrap_err();
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(child),
+                    )
+                }
+                _ => rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(String::from("TEST_CODE owned raw driver detail")),
+                ),
             }
         }
         fn capture_advance_to(frame: &mut FinancialCapturePrefixFrame<'_, '_>, query: usize) {
-            if query >= 1 { frame.capture_loan().test_code_integer_query(i64::MIN); }
-            if query == 2 { frame.capture_loan().test_code_integer_query(i64::MAX); }
+            if query >= 1 {
+                frame.capture_loan().test_code_integer_query(i64::MIN);
+            }
+            if query == 2 {
+                frame.capture_loan().test_code_integer_query(i64::MAX);
+            }
         }
-        fn assert_capture_primary(frame: &FinancialCapturePrefixFrame<'_, '_>, query: usize, allocation: usize) {
+        fn assert_capture_primary(
+            frame: &FinancialCapturePrefixFrame<'_, '_>,
+            query: usize,
+            allocation: usize,
+        ) {
             let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
-                source: GlobalSchemaCatalogError::SqliteReferenceBuildFailure { stage, ddl_id, detail },
-            })) = &frame.integrity.prefix.source.physical.primary else { panic!("same fixed C error through G enum move"); };
-            assert_eq!(*stage, ["capture-application-id", "capture-user-version", "capture-source-id"][query]);
-            assert!(ddl_id.is_none()); assert_eq!(detail.as_ptr() as usize, allocation); assert!(!detail.is_empty());
+                source:
+                    GlobalSchemaCatalogError::SqliteReferenceBuildFailure {
+                        stage,
+                        ddl_id,
+                        detail,
+                    },
+            })) = &frame.integrity.prefix.source.physical.primary
+            else {
+                panic!("same fixed C error through G enum move");
+            };
+            assert_eq!(
+                *stage,
+                [
+                    "capture-application-id",
+                    "capture-user-version",
+                    "capture-source-id"
+                ][query]
+            );
+            assert!(ddl_id.is_none());
+            assert_eq!(detail.as_ptr() as usize, allocation);
+            assert!(!detail.is_empty());
         }
         #[test]
         fn history_original_capture_prefix_fixed_order_full_i64_and_actual_owned_source() {
             for text in ["TEST_CODE unvalidated source-id", ""] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
                 let mut frame = fixed_capture_frame(&purpose, &writer, &trace);
-                let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
+                let vector = frame
+                    .integrity
+                    .integrity
+                    .integrity_rows
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr();
                 let row = frame.integrity.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr();
-                let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
-                frame.capture_loan().test_code_barrier(); frame.capture_loan().test_code_integer_query(i64::MIN);
+                let before = frame
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                frame.capture_loan().test_code_barrier();
+                frame.capture_loan().test_code_integer_query(i64::MIN);
                 assert_eq!(frame.capture.identity, [Some(i64::MIN), None]);
                 frame.capture_loan().test_code_integer_query(i64::MAX);
-                let source = String::from(text); let pointer = source.as_ptr(); frame.capture_loan().test_code_source_query(source);
-                { let _short = frame.capture_loan(); } let mut moved = frame;
+                let source = String::from(text);
+                let pointer = source.as_ptr();
+                frame.capture_loan().test_code_source_query(source);
+                {
+                    let _short = frame.capture_loan();
+                }
+                let mut moved = frame;
                 assert_eq!(moved.capture.identity, [Some(i64::MIN), Some(i64::MAX)]);
                 assert_eq!(moved.capture.source_id.as_ref().unwrap().as_ptr(), pointer);
                 assert_eq!(moved.capture.source_id.as_deref(), Some(text));
-                assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
-                assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr(), row);
-                assert!(std::ptr::eq(moved.integrity.prefix.initial.purpose, &purpose));
-                assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                moved.capture_loan().test_code_barrier(); assert_eq!(trace.snapshot(), [None; 8]);
-                assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                assert_eq!(
+                    moved
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    vector
+                );
+                assert_eq!(
+                    moved.integrity.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr(),
+                    row
+                );
+                assert!(std::ptr::eq(
+                    moved.integrity.prefix.initial.purpose,
+                    &purpose
+                ));
+                assert_eq!(
+                    moved.integrity.prefix.source.audit_fields().begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                moved.capture_loan().test_code_barrier();
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_eq!(
+                    moved
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
                 // The prefix is retained before compile_options, never a
                 // CatalogSnapshot/COMMIT/settled FinancialPending success.
                 let spare = fixed_capture_raw(replay_work::CaptureErrorCase::Step);
-                let first = moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-                let terminal = moved.integrity.prefix.source.fields().source_work().test_code_observation();
-                moved.capture_loan().test_code_drain_interrupted(None, spare);
-                moved.integrity.integrity_loan().test_code_drain_interrupted();
-                moved.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                let first = moved
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                    .unwrap_err();
+                let terminal = moved
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                moved
+                    .capture_loan()
+                    .test_code_drain_interrupted(None, spare);
+                moved
+                    .integrity
+                    .integrity_loan()
+                    .test_code_drain_interrupted();
+                moved
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_terminal_exit();
                 drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
-                moved.integrity.prefix.source.fields().test_code_sidecar_close_busy(); assert_owned_pin(&moved.integrity.prefix.source.audit);
-                assert!(moved.integrity.prefix.source.physical.parent_sidecars_retained());
-                assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-                assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), terminal);
+                moved
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .test_code_sidecar_close_busy();
+                assert_owned_pin(&moved.integrity.prefix.source.audit);
+                assert!(moved
+                    .integrity
+                    .prefix
+                    .source
+                    .physical
+                    .parent_sidecars_retained());
+                assert_eq!(
+                    moved
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                    Err(first)
+                );
+                assert_eq!(
+                    moved
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    terminal
+                );
             }
         }
         #[test]
@@ -2676,42 +4446,148 @@ mod financial_original_audit_acquisition_tests {
             // ignored cleanup Errors; those children cannot become a primary.
             {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
                 let mut frame = fixed_capture_frame(&purpose, &writer, &trace);
-                frame.capture_loan().test_code_success_with_ignored_children(fixed_capture_raw(Case::Step), fixed_capture_raw(Case::Step));
+                frame
+                    .capture_loan()
+                    .test_code_success_with_ignored_children(
+                        fixed_capture_raw(Case::Step),
+                        fixed_capture_raw(Case::Step),
+                    );
                 frame.capture_loan().test_code_integer_query(i64::MAX);
-                frame.capture_loan().test_code_source_query(String::from("TEST_CODE successful ignored children"));
+                frame
+                    .capture_loan()
+                    .test_code_source_query(String::from("TEST_CODE successful ignored children"));
                 assert!(frame.integrity.prefix.source.physical.primary.is_none());
                 let spare = fixed_capture_raw(Case::Step);
-                frame.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-                frame.capture_loan().test_code_drain_interrupted(None, spare);
-                frame.integrity.integrity_loan().test_code_drain_interrupted();
-                frame.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                frame
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                    .unwrap_err();
+                frame
+                    .capture_loan()
+                    .test_code_drain_interrupted(None, spare);
+                frame
+                    .integrity
+                    .integrity_loan()
+                    .test_code_drain_interrupted();
+                frame
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_terminal_exit();
                 drain_integrity_source_audit(&mut frame.integrity.prefix.source, &trace);
-                frame.integrity.prefix.source.fields().test_code_sidecar_close_busy();
+                frame
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .test_code_sidecar_close_busy();
                 assert!(frame.integrity.prefix.source.physical.primary.is_none());
             }
             for query in 0..3 {
-                for case in [Case::Prepare, Case::Tail, Case::Bind, Case::Step, Case::NoRows, Case::DoneReset, Case::Type, Case::Utf8] {
-                    if matches!(case, Case::Utf8) && query != 2 { continue; }
+                for case in [
+                    Case::Prepare,
+                    Case::Tail,
+                    Case::Bind,
+                    Case::Step,
+                    Case::NoRows,
+                    Case::DoneReset,
+                    Case::Type,
+                    Case::Utf8,
+                ] {
+                    if matches!(case, Case::Utf8) && query != 2 {
+                        continue;
+                    }
                     let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                    let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                    let mut frame = fixed_capture_frame(&purpose, &writer, &trace); capture_advance_to(&mut frame, query);
-                    let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                    let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
-                    let allocation = frame.capture_loan().test_code_error(case, fixed_capture_raw(case), fixed_capture_raw(Case::Step), fixed_capture_raw(Case::Step));
-                    { let _short = frame.capture_loan(); } let mut moved = frame;
+                    let writer = financial_audit::fixed_writer();
+                    let trace = Trace::new();
+                    let mut frame = fixed_capture_frame(&purpose, &writer, &trace);
+                    capture_advance_to(&mut frame, query);
+                    let vector = frame
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr();
+                    let before = frame
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation();
+                    let allocation = frame.capture_loan().test_code_error(
+                        case,
+                        fixed_capture_raw(case),
+                        fixed_capture_raw(Case::Step),
+                        fixed_capture_raw(Case::Step),
+                    );
+                    {
+                        let _short = frame.capture_loan();
+                    }
+                    let mut moved = frame;
                     assert_capture_primary(&moved, query, allocation);
-                    assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
-                    assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                    moved.integrity.integrity_loan().test_code_drain_interrupted();
-                    let (ignored, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
-                    moved.integrity.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, cleanup);
+                    assert_eq!(
+                        moved
+                            .integrity
+                            .integrity
+                            .integrity_rows
+                            .as_ref()
+                            .unwrap()
+                            .as_ptr(),
+                        vector
+                    );
+                    assert_eq!(
+                        moved.integrity.prefix.source.audit_fields().begin_release(),
+                        Err(FinancialAuditFault::UnexpectedCut)
+                    );
+                    moved
+                        .integrity
+                        .integrity_loan()
+                        .test_code_drain_interrupted();
+                    let (ignored, _) = fixed_primary();
+                    let (cleanup, _) = fixed_primary();
+                    moved
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .original_transaction()
+                        .test_code_read_primary_rollback_once(ignored, cleanup);
                     drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
-                    moved.integrity.prefix.source.fields().test_code_sidecar_close_busy();
-                    assert_capture_primary(&moved, query, allocation); assert_owned_pin(&moved.integrity.prefix.source.audit);
-                    assert!(moved.integrity.prefix.source.physical.parent_sidecars_retained());
-                    assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                    moved
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .test_code_sidecar_close_busy();
+                    assert_capture_primary(&moved, query, allocation);
+                    assert_owned_pin(&moved.integrity.prefix.source.audit);
+                    assert!(moved
+                        .integrity
+                        .prefix
+                        .source
+                        .physical
+                        .parent_sidecars_retained());
+                    assert_eq!(
+                        moved
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation(),
+                        before
+                    );
                 }
             }
         }
@@ -2721,461 +4597,1858 @@ mod financial_original_audit_acquisition_tests {
             for query in 0..3 {
                 for case in [ErrorCase::NoRows, ErrorCase::DoneReset] {
                     let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                    let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                    let mut frame = fixed_capture_frame(&purpose, &writer, &trace); capture_advance_to(&mut frame, query);
-                    let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                    let raw = fixed_capture_raw(case); let duplicate = fixed_capture_raw(case); let spare = fixed_capture_raw(ErrorCase::Step);
+                    let writer = financial_audit::fixed_writer();
+                    let trace = Trace::new();
+                    let mut frame = fixed_capture_frame(&purpose, &writer, &trace);
+                    capture_advance_to(&mut frame, query);
+                    let vector = frame
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr();
+                    let raw = fixed_capture_raw(case);
+                    let duplicate = fixed_capture_raw(case);
+                    let spare = fixed_capture_raw(ErrorCase::Step);
                     frame.capture_loan().test_code_reached_done();
-                    let first = frame.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-                    let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
-                    { let _short = frame.capture_loan(); } let mut moved = frame;
-                    assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
-                    assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                    assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.integrity.prefix.source.audit);
-                    moved.capture_loan().test_code_done_result_after_terminal(case, raw, duplicate);
-                    moved.capture_loan().test_code_drain_interrupted(None, spare);
-                    assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
-                    moved.integrity.integrity_loan().test_code_drain_interrupted();
-                    moved.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                    let first = frame
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_probe(OwnerStartProbe::ExceedProduction)
+                        .unwrap_err();
+                    let before = frame
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation();
+                    {
+                        let _short = frame.capture_loan();
+                    }
+                    let mut moved = frame;
+                    assert_eq!(
+                        moved
+                            .integrity
+                            .integrity
+                            .integrity_rows
+                            .as_ref()
+                            .unwrap()
+                            .as_ptr(),
+                        vector
+                    );
+                    assert_eq!(
+                        moved.integrity.prefix.source.audit_fields().begin_release(),
+                        Err(FinancialAuditFault::UnexpectedCut)
+                    );
+                    assert_eq!(trace.snapshot(), [None; 8]);
+                    assert_owned_pin(&moved.integrity.prefix.source.audit);
+                    moved
+                        .capture_loan()
+                        .test_code_done_result_after_terminal(case, raw, duplicate);
+                    moved
+                        .capture_loan()
+                        .test_code_drain_interrupted(None, spare);
+                    assert_eq!(
+                        moved
+                            .integrity
+                            .integrity
+                            .integrity_rows
+                            .as_ref()
+                            .unwrap()
+                            .as_ptr(),
+                        vector
+                    );
+                    moved
+                        .integrity
+                        .integrity_loan()
+                        .test_code_drain_interrupted();
+                    moved
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .original_transaction()
+                        .test_code_terminal_exit();
                     drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
-                    moved.integrity.prefix.source.fields().test_code_sidecar_close_busy(); assert_owned_pin(&moved.integrity.prefix.source.audit);
+                    moved
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .test_code_sidecar_close_busy();
+                    assert_owned_pin(&moved.integrity.prefix.source.audit);
                     assert!(moved.integrity.prefix.source.physical.primary.is_none());
-                    assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-                    assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                    assert_eq!(
+                        moved
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                        Err(first)
+                    );
+                    assert_eq!(
+                        moved
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation(),
+                        before
+                    );
                 }
             }
             for query in 0..3 {
-                for cut in [Cut::BeforeQuery, Cut::Prepared, Cut::Row, Cut::OwnedString, Cut::StringPending,
-                    Cut::WholePending, Cut::PragmaScopePending, Cut::OwnedRaw, Cut::CleanupOwed, Cut::DetailPending, Cut::CatalogPending] {
-                    if matches!(cut, Cut::OwnedString | Cut::StringPending) && query != 2 { continue; }
-                    if matches!(cut, Cut::PragmaScopePending) && query == 2 { continue; }
+                for cut in [
+                    Cut::BeforeQuery,
+                    Cut::Prepared,
+                    Cut::Row,
+                    Cut::OwnedString,
+                    Cut::StringPending,
+                    Cut::WholePending,
+                    Cut::PragmaScopePending,
+                    Cut::OwnedRaw,
+                    Cut::CleanupOwed,
+                    Cut::DetailPending,
+                    Cut::CatalogPending,
+                ] {
+                    if matches!(cut, Cut::OwnedString | Cut::StringPending) && query != 2 {
+                        continue;
+                    }
+                    if matches!(cut, Cut::PragmaScopePending) && query == 2 {
+                        continue;
+                    }
                     for terminal in [false, true] {
-                        let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                        let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                        let mut frame = fixed_capture_frame(&purpose, &writer, &trace); capture_advance_to(&mut frame, query);
-                        let vector = frame.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                        let pending = frame.capture_loan().test_code_interruption_cut(cut, fixed_capture_raw(ErrorCase::Step), fixed_capture_raw(ErrorCase::Step));
+                        let purpose =
+                            SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                        let writer = financial_audit::fixed_writer();
+                        let trace = Trace::new();
+                        let mut frame = fixed_capture_frame(&purpose, &writer, &trace);
+                        capture_advance_to(&mut frame, query);
+                        let vector = frame
+                            .integrity
+                            .integrity
+                            .integrity_rows
+                            .as_ref()
+                            .unwrap()
+                            .as_ptr();
+                        let pending = frame.capture_loan().test_code_interruption_cut(
+                            cut,
+                            fixed_capture_raw(ErrorCase::Step),
+                            fixed_capture_raw(ErrorCase::Step),
+                        );
                         let source = frame.capture.source_id.as_ref().map(|s| s.as_ptr());
                         let pending_pointer = pending.as_ref().map(|s| s.as_ptr());
                         let (primary, allocation) = fixed_primary();
                         let reset_child = fixed_capture_raw(ErrorCase::Step);
-                        let first = if terminal { drop(primary); Some(frame.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
-                            else { frame.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
-                                frame.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first actual supplied primary")); None };
-                        let before = frame.integrity.prefix.source.fields().source_work().test_code_observation();
-                        { let _short = frame.capture_loan(); } let mut moved = frame;
+                        let first = if terminal {
+                            drop(primary);
+                            Some(
+                                frame
+                                    .integrity
+                                    .prefix
+                                    .source
+                                    .fields()
+                                    .source_work()
+                                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                                    .unwrap_err(),
+                            )
+                        } else {
+                            frame
+                                .integrity
+                                .prefix
+                                .source
+                                .audit_fields()
+                                .note_normal_failure()
+                                .unwrap();
+                            frame
+                                .integrity
+                                .prefix
+                                .source
+                                .audit_fields()
+                                .retain_paid_primary(primary)
+                                .unwrap_or_else(|_| panic!("first actual supplied primary"));
+                            None
+                        };
+                        let before = frame
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation();
+                        {
+                            let _short = frame.capture_loan();
+                        }
+                        let mut moved = frame;
                         assert_eq!(moved.capture.source_id.as_ref().map(|s| s.as_ptr()), source);
                         assert_eq!(pending.as_ref().map(|s| s.as_ptr()), pending_pointer);
-                        assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
-                        assert_eq!(moved.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                        assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.integrity.prefix.source.audit);
-                        moved.capture_loan().test_code_drain_interrupted(pending, reset_child);
-                        assert_eq!(moved.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
-                        moved.integrity.integrity_loan().test_code_drain_interrupted();
-                        if terminal { moved.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit(); }
-                        else { assert_primary(&moved.integrity.prefix.source.physical, allocation);
-                            let (ignored, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
-                            moved.integrity.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, cleanup); }
+                        assert_eq!(
+                            moved
+                                .integrity
+                                .integrity
+                                .integrity_rows
+                                .as_ref()
+                                .unwrap()
+                                .as_ptr(),
+                            vector
+                        );
+                        assert_eq!(
+                            moved.integrity.prefix.source.audit_fields().begin_release(),
+                            Err(FinancialAuditFault::UnexpectedCut)
+                        );
+                        assert_eq!(trace.snapshot(), [None; 8]);
+                        assert_owned_pin(&moved.integrity.prefix.source.audit);
+                        moved
+                            .capture_loan()
+                            .test_code_drain_interrupted(pending, reset_child);
+                        assert_eq!(
+                            moved
+                                .integrity
+                                .integrity
+                                .integrity_rows
+                                .as_ref()
+                                .unwrap()
+                                .as_ptr(),
+                            vector
+                        );
+                        moved
+                            .integrity
+                            .integrity_loan()
+                            .test_code_drain_interrupted();
+                        if terminal {
+                            moved
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .original_transaction()
+                                .test_code_terminal_exit();
+                        } else {
+                            assert_primary(&moved.integrity.prefix.source.physical, allocation);
+                            let (ignored, _) = fixed_primary();
+                            let (cleanup, _) = fixed_primary();
+                            moved
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .original_transaction()
+                                .test_code_read_primary_rollback_once(ignored, cleanup);
+                        }
                         drain_integrity_source_audit(&mut moved.integrity.prefix.source, &trace);
-                        moved.integrity.prefix.source.fields().test_code_sidecar_close_busy(); assert_owned_pin(&moved.integrity.prefix.source.audit);
-                        if let Some(first) = first { assert!(moved.integrity.prefix.source.physical.primary.is_none());
-                            assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
-                        else { assert_primary(&moved.integrity.prefix.source.physical, allocation); }
-                        assert_eq!(moved.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                        moved
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .test_code_sidecar_close_busy();
+                        assert_owned_pin(&moved.integrity.prefix.source.audit);
+                        if let Some(first) = first {
+                            assert!(moved.integrity.prefix.source.physical.primary.is_none());
+                            assert_eq!(
+                                moved
+                                    .integrity
+                                    .prefix
+                                    .source
+                                    .fields()
+                                    .source_work()
+                                    .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                                Err(first)
+                            );
+                        } else {
+                            assert_primary(&moved.integrity.prefix.source.physical, allocation);
+                        }
+                        assert_eq!(
+                            moved
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_observation(),
+                            before
+                        );
                     }
                 }
             }
         }
 
-        fn fixed_compile_options_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
-            writer: &'writer SelectionAuditWriter, trace: &Trace) -> FinancialCompileOptionsFrame<'purpose, 'writer> {
+        fn fixed_compile_options_frame<'purpose, 'writer>(
+            purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+        ) -> FinancialCompileOptionsFrame<'purpose, 'writer> {
             let capture = fixed_capture_frame(purpose, writer, trace);
-            let Err(mut capture) = capture.begin_compile_options() else { panic!("unreached capture refuses local compile-options VM"); };
-            capture.capture_loan().test_code_integer_query(i64::MIN); capture.capture_loan().test_code_integer_query(i64::MAX);
-            capture.capture_loan().test_code_source_query(String::from("TEST_CODE actual returned source-id"));
-            capture.begin_compile_options().unwrap_or_else(|_| panic!("complete prefix moves once, retains histories"))
+            let Err(mut capture) = capture.begin_compile_options() else {
+                panic!("unreached capture refuses local compile-options VM");
+            };
+            capture.capture_loan().test_code_integer_query(i64::MIN);
+            capture.capture_loan().test_code_integer_query(i64::MAX);
+            capture
+                .capture_loan()
+                .test_code_source_query(String::from("TEST_CODE actual returned source-id"));
+            capture
+                .begin_compile_options()
+                .unwrap_or_else(|_| panic!("complete prefix moves once, retains histories"))
         }
         fn compile_options_raw(case: FinancialCompileErrorCase) -> rusqlite::Error {
             match case {
-                FinancialCompileErrorCase::Type => fixed_capture_raw(replay_work::CaptureErrorCase::Type),
-                FinancialCompileErrorCase::Utf8 => fixed_capture_raw(replay_work::CaptureErrorCase::Utf8),
+                FinancialCompileErrorCase::Type => {
+                    fixed_capture_raw(replay_work::CaptureErrorCase::Type)
+                }
+                FinancialCompileErrorCase::Utf8 => {
+                    fixed_capture_raw(replay_work::CaptureErrorCase::Utf8)
+                }
                 FinancialCompileErrorCase::Query => rusqlite::Error::InvalidParameterCount(1, 0),
                 _ => fixed_capture_raw(replay_work::CaptureErrorCase::Step),
             }
         }
-        fn finish_compile_options_failure(frame: &mut FinancialCompileOptionsFrame<'_, '_>, trace: &Trace, terminal: bool) {
-            frame.prefix.integrity.integrity_loan().test_code_drain_interrupted();
-            if terminal { frame.prefix.integrity.prefix.source.fields().original_transaction().test_code_terminal_exit(); }
-            else {
-                let (ignored, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
-                frame.prefix.integrity.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, cleanup);
+        fn finish_compile_options_failure(
+            frame: &mut FinancialCompileOptionsFrame<'_, '_>,
+            trace: &Trace,
+            terminal: bool,
+        ) {
+            frame
+                .prefix
+                .integrity
+                .integrity_loan()
+                .test_code_drain_interrupted();
+            if terminal {
+                frame
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_terminal_exit();
+            } else {
+                let (ignored, _) = fixed_primary();
+                let (cleanup, _) = fixed_primary();
+                frame
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_read_primary_rollback_once(ignored, cleanup);
             }
             drain_integrity_source_audit(&mut frame.prefix.integrity.prefix.source, trace);
-            frame.prefix.integrity.prefix.source.fields().test_code_sidecar_close_busy(); assert_owned_pin(&frame.prefix.integrity.prefix.source.audit);
+            frame
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .test_code_sidecar_close_busy();
+            assert_owned_pin(&frame.prefix.integrity.prefix.source.audit);
         }
         #[test]
         fn history_original_compile_options_collect_owns_vec_and_live_statement() {
             // Supplied returned Vec is real owned data. These fixed scripts do
             // not own the driver's private partial collector or qualify SQL.
-            for rows in [Vec::new(), vec![String::from("TEST_CODE option Z"), String::from("TEST_CODE option A")]] {
+            for rows in [
+                Vec::new(),
+                vec![
+                    String::from("TEST_CODE option Z"),
+                    String::from("TEST_CODE option A"),
+                ],
+            ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
                 let mut frame = fixed_compile_options_frame(&purpose, &writer, &trace);
                 let source = frame.prefix.capture.source_id.as_ref().unwrap().as_ptr();
-                let integrity = frame.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                let vector = rows.as_ptr(); let first = rows.first().map(|row| row.as_ptr()); let capacity = rows.capacity();
-                let before = frame.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                let integrity = frame
+                    .prefix
+                    .integrity
+                    .integrity
+                    .integrity_rows
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr();
+                let vector = rows.as_ptr();
+                let first = rows.first().map(|row| row.as_ptr());
+                let capacity = rows.capacity();
+                let before = frame
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
                 frame.compile_options_loan().test_code_collect_success(rows);
-                { let _short = frame.compile_options_loan(); } let mut moved = frame;
+                {
+                    let _short = frame.compile_options_loan();
+                }
+                let mut moved = frame;
                 assert_eq!(moved.options.rows.as_ref().unwrap().as_ptr(), vector);
                 assert_eq!(moved.options.rows.as_ref().unwrap().capacity(), capacity);
-                assert_eq!(moved.options.rows.as_ref().unwrap().first().map(|row| row.as_ptr()), first);
-                if first.is_some() { assert_eq!(moved.options.rows.as_ref().unwrap()[0], "TEST_CODE option Z"); }
-                assert_eq!(moved.prefix.capture.identity, [Some(i64::MIN), Some(i64::MAX)]);
-                assert_eq!(moved.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
-                assert_eq!(moved.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
-                assert!(std::ptr::eq(moved.prefix.integrity.prefix.initial.purpose, &purpose));
-                assert_eq!(moved.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(trace.snapshot(), [None; 8]); moved.compile_options_loan().test_code_barrier();
-                assert_eq!(moved.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
-                let first_terminal = moved.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-                let stopped = moved.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                moved.compile_options_loan().test_code_drain_interrupted(None, None, None);
-                assert_eq!(moved.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
+                assert_eq!(
+                    moved
+                        .options
+                        .rows
+                        .as_ref()
+                        .unwrap()
+                        .first()
+                        .map(|row| row.as_ptr()),
+                    first
+                );
+                if first.is_some() {
+                    assert_eq!(
+                        moved.options.rows.as_ref().unwrap()[0],
+                        "TEST_CODE option Z"
+                    );
+                }
+                assert_eq!(
+                    moved.prefix.capture.identity,
+                    [Some(i64::MIN), Some(i64::MAX)]
+                );
+                assert_eq!(
+                    moved.prefix.capture.source_id.as_ref().unwrap().as_ptr(),
+                    source
+                );
+                assert_eq!(
+                    moved
+                        .prefix
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    integrity
+                );
+                assert!(std::ptr::eq(
+                    moved.prefix.integrity.prefix.initial.purpose,
+                    &purpose
+                ));
+                assert_eq!(
+                    moved
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .audit_fields()
+                        .begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                assert_eq!(trace.snapshot(), [None; 8]);
+                moved.compile_options_loan().test_code_barrier();
+                assert_eq!(
+                    moved
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
+                let first_terminal = moved
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                    .unwrap_err();
+                let stopped = moved
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                moved
+                    .compile_options_loan()
+                    .test_code_drain_interrupted(None, None, None);
+                assert_eq!(
+                    moved
+                        .prefix
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    integrity
+                );
                 finish_compile_options_failure(&mut moved, &trace, true);
-                assert_eq!(moved.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first_terminal));
-                assert_eq!(moved.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), stopped);
+                assert_eq!(
+                    moved
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                    Err(first_terminal)
+                );
+                assert_eq!(
+                    moved
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    stopped
+                );
             }
         }
         #[test]
         fn history_original_compile_options_errors_wrap_before_statement_exit() {
-            for case in [FinancialCompileErrorCase::Prepare, FinancialCompileErrorCase::Query, FinancialCompileErrorCase::Step,
-                FinancialCompileErrorCase::Type, FinancialCompileErrorCase::Utf8, FinancialCompileErrorCase::DoneReset] {
+            for case in [
+                FinancialCompileErrorCase::Prepare,
+                FinancialCompileErrorCase::Query,
+                FinancialCompileErrorCase::Step,
+                FinancialCompileErrorCase::Type,
+                FinancialCompileErrorCase::Utf8,
+                FinancialCompileErrorCase::DoneReset,
+            ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
                 let mut frame = fixed_compile_options_frame(&purpose, &writer, &trace);
-                let integrity = frame.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                let before = frame.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                frame.compile_options_loan().test_code_error(case, compile_options_raw(case));
-                let detail_pointer = frame.compile_options_loan().test_code_wrap_before_statement_exit();
-                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source:
-                    GlobalSchemaCatalogError::SqliteReferenceBuildFailure { stage, ddl_id, detail },
-                })) = &frame.prefix.integrity.prefix.source.physical.primary else { panic!("actual detail through C then G pure moves"); };
-                let expected = match case { FinancialCompileErrorCase::Prepare => "prepare-compile-options",
-                    FinancialCompileErrorCase::Query => "query-compile-options", _ => "read-compile-options" };
-                assert_eq!(*stage, expected); assert!(ddl_id.is_none()); assert!(!detail.is_empty());
+                let integrity = frame
+                    .prefix
+                    .integrity
+                    .integrity
+                    .integrity_rows
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr();
+                let before = frame
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                frame
+                    .compile_options_loan()
+                    .test_code_error(case, compile_options_raw(case));
+                let detail_pointer = frame
+                    .compile_options_loan()
+                    .test_code_wrap_before_statement_exit();
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
+                    source:
+                        GlobalSchemaCatalogError::SqliteReferenceBuildFailure {
+                            stage,
+                            ddl_id,
+                            detail,
+                        },
+                })) = &frame.prefix.integrity.prefix.source.physical.primary
+                else {
+                    panic!("actual detail through C then G pure moves");
+                };
+                let expected = match case {
+                    FinancialCompileErrorCase::Prepare => "prepare-compile-options",
+                    FinancialCompileErrorCase::Query => "query-compile-options",
+                    _ => "read-compile-options",
+                };
+                assert_eq!(*stage, expected);
+                assert!(ddl_id.is_none());
+                assert!(!detail.is_empty());
                 assert_eq!(detail.as_ptr() as usize, detail_pointer);
-                assert!(frame.prefix.capture.source_id.is_none()); assert_eq!(trace.snapshot(), [None; 8]);
-                assert_eq!(frame.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
+                assert!(frame.prefix.capture.source_id.is_none());
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_eq!(
+                    frame
+                        .prefix
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    integrity
+                );
                 finish_compile_options_failure(&mut frame, &trace, false);
-                assert_eq!(frame.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                assert_eq!(
+                    frame
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
             }
         }
         #[test]
         fn history_original_compile_options_primary_terminal_wait_for_owned_callee_returns() {
-            for cut in [FinancialCompileTerminalCut::BeforePrepare, FinancialCompileTerminalCut::PreparePending,
-                FinancialCompileTerminalCut::QueryPending, FinancialCompileTerminalCut::StepPending,
-                FinancialCompileTerminalCut::DoneBeforeReset, FinancialCompileTerminalCut::MapperPending,
-                FinancialCompileTerminalCut::RawPending, FinancialCompileTerminalCut::CollectPending,
-                FinancialCompileTerminalCut::VectorPending, FinancialCompileTerminalCut::VectorOwned,
-                FinancialCompileTerminalCut::DetailPending, FinancialCompileTerminalCut::CatalogOwned,
-                FinancialCompileTerminalCut::StatementDropPending] {
+            for cut in [
+                FinancialCompileTerminalCut::BeforePrepare,
+                FinancialCompileTerminalCut::PreparePending,
+                FinancialCompileTerminalCut::QueryPending,
+                FinancialCompileTerminalCut::StepPending,
+                FinancialCompileTerminalCut::DoneBeforeReset,
+                FinancialCompileTerminalCut::MapperPending,
+                FinancialCompileTerminalCut::RawPending,
+                FinancialCompileTerminalCut::CollectPending,
+                FinancialCompileTerminalCut::VectorPending,
+                FinancialCompileTerminalCut::VectorOwned,
+                FinancialCompileTerminalCut::DetailPending,
+                FinancialCompileTerminalCut::CatalogOwned,
+                FinancialCompileTerminalCut::StatementDropPending,
+            ] {
                 for terminal in [false, true] {
                     let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                    let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                    let writer = financial_audit::fixed_writer();
+                    let trace = Trace::new();
                     let mut frame = fixed_compile_options_frame(&purpose, &writer, &trace);
-                    let integrity = frame.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                    let pending = frame.compile_options_loan().test_code_interruption_cut(cut, compile_options_raw(FinancialCompileErrorCase::Step));
+                    let integrity = frame
+                        .prefix
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr();
+                    let pending = frame.compile_options_loan().test_code_interruption_cut(
+                        cut,
+                        compile_options_raw(FinancialCompileErrorCase::Step),
+                    );
                     let (primary, allocation) = fixed_primary();
-                    let first = if terminal { drop(primary); Some(frame.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
-                        else { frame.prefix.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
-                            frame.prefix.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first actual supplied primary")); None };
-                    let before = frame.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                    { let _short = frame.compile_options_loan(); } let mut moved = frame;
+                    let first = if terminal {
+                        drop(primary);
+                        Some(
+                            frame
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                                .unwrap_err(),
+                        )
+                    } else {
+                        frame
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .note_normal_failure()
+                            .unwrap();
+                        frame
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .retain_paid_primary(primary)
+                            .unwrap_or_else(|_| panic!("first actual supplied primary"));
+                        None
+                    };
+                    let before = frame
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation();
+                    {
+                        let _short = frame.compile_options_loan();
+                    }
+                    let mut moved = frame;
                     moved.compile_options_loan().test_code_barrier();
-                    assert_eq!(moved.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                    assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.prefix.integrity.prefix.source.audit);
-                    moved.compile_options_loan().test_code_drain_interrupted(pending.0, pending.1, pending.2);
-                    assert_eq!(moved.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
+                    assert_eq!(
+                        moved
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .begin_release(),
+                        Err(FinancialAuditFault::UnexpectedCut)
+                    );
+                    assert_eq!(trace.snapshot(), [None; 8]);
+                    assert_owned_pin(&moved.prefix.integrity.prefix.source.audit);
+                    moved
+                        .compile_options_loan()
+                        .test_code_drain_interrupted(pending.0, pending.1, pending.2);
+                    assert_eq!(
+                        moved
+                            .prefix
+                            .integrity
+                            .integrity
+                            .integrity_rows
+                            .as_ref()
+                            .unwrap()
+                            .as_ptr(),
+                        integrity
+                    );
                     finish_compile_options_failure(&mut moved, &trace, terminal);
-                    if let Some(first) = first { assert!(moved.prefix.integrity.prefix.source.physical.primary.is_none());
-                        assert_eq!(moved.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
-                    else { assert_primary(&moved.prefix.integrity.prefix.source.physical, allocation); }
-                    assert_eq!(moved.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                    if let Some(first) = first {
+                        assert!(moved
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .physical
+                            .primary
+                            .is_none());
+                        assert_eq!(
+                            moved
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                            Err(first)
+                        );
+                    } else {
+                        assert_primary(&moved.prefix.integrity.prefix.source.physical, allocation);
+                    }
+                    assert_eq!(
+                        moved
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation(),
+                        before
+                    );
                 }
             }
         }
 
-        fn fixed_compile_sort_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
-            writer: &'writer SelectionAuditWriter, trace: &Trace, values: Vec<String>) -> FinancialCompileSortFrame<'purpose, 'writer> {
+        fn fixed_compile_sort_frame<'purpose, 'writer>(
+            purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+            values: Vec<String>,
+        ) -> FinancialCompileSortFrame<'purpose, 'writer> {
             let compile = fixed_compile_options_frame(purpose, writer, trace);
-            let Err(mut compile) = compile.begin_sort_duplicate() else { panic!("no returned Vec refuses sort entry"); };
-            compile.compile_options_loan().test_code_collect_success(values);
-            compile.begin_sort_duplicate().unwrap_or_else(|_| panic!("actual returned Vec moves whole collector frame once"))
+            let Err(mut compile) = compile.begin_sort_duplicate() else {
+                panic!("no returned Vec refuses sort entry");
+            };
+            compile
+                .compile_options_loan()
+                .test_code_collect_success(values);
+            compile
+                .begin_sort_duplicate()
+                .unwrap_or_else(|_| panic!("actual returned Vec moves whole collector frame once"))
         }
         fn actual_duplicate_error() -> GlobalSchemaCatalogError {
-            GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail: String::from("SQLite reports duplicate compile options") }
+            GlobalSchemaCatalogError::InvalidRuntimeIdentity {
+                detail: String::from("SQLite reports duplicate compile options"),
+            }
         }
         fn duplicate_detail_pointer(error: &GlobalSchemaCatalogError) -> *const u8 {
-            let GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail } = error else { panic!("fixed actual duplicate C error"); };
+            let GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail } = error else {
+                panic!("fixed actual duplicate C error");
+            };
             detail.as_ptr()
         }
         #[test]
         fn history_original_compile_sort_duplicate_unique_vec_and_held_digest() {
             // cfg-only actual Vec.sort() checks mechanics, not private scratch,
             // allocation fit, formatter payment or SQL/provider qualification.
-            for values in [Vec::new(), vec![String::from("A")], vec![String::from("Z"), String::from("A"), String::from("M")]] {
+            for values in [
+                Vec::new(),
+                vec![String::from("A")],
+                vec![String::from("Z"), String::from("A"), String::from("M")],
+            ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let vector = values.as_ptr(); let capacity = values.capacity();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let vector = values.as_ptr();
+                let capacity = values.capacity();
                 let children: Vec<_> = values.iter().map(|s| s.as_ptr()).collect();
                 let mut frame = fixed_compile_sort_frame(&purpose, &writer, &trace, values);
-                let source = frame.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
-                let integrity = frame.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                let before = frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+                let source = frame
+                    .compile
+                    .prefix
+                    .capture
+                    .source_id
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr();
+                let integrity = frame
+                    .compile
+                    .prefix
+                    .integrity
+                    .integrity
+                    .integrity_rows
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr();
+                let before = frame
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
                 frame.sort_duplicate_loan().test_code_sort_body();
-                { let _short = frame.sort_duplicate_loan(); } let mut moved = frame;
-                assert_eq!(moved.compile.options.rows.as_ref().unwrap().as_ptr(), vector);
-                assert_eq!(moved.compile.options.rows.as_ref().unwrap().capacity(), capacity);
-                for pointer in children { assert!(moved.compile.options.rows.as_ref().unwrap().iter().any(|s| s.as_ptr() == pointer)); }
-                moved.sort_duplicate_loan().test_code_sort_return(); moved.sort_duplicate_loan().test_code_check_unique();
-                assert!(moved.compile.options.rows.as_ref().unwrap().windows(2).all(|pair| pair[0] < pair[1]));
-                assert_eq!(moved.compile.prefix.capture.identity, [Some(i64::MIN), Some(i64::MAX)]);
-                assert_eq!(moved.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
-                assert_eq!(moved.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
-                assert!(std::ptr::eq(moved.compile.prefix.integrity.prefix.initial.purpose, &purpose));
+                {
+                    let _short = frame.sort_duplicate_loan();
+                }
+                let mut moved = frame;
+                assert_eq!(
+                    moved.compile.options.rows.as_ref().unwrap().as_ptr(),
+                    vector
+                );
+                assert_eq!(
+                    moved.compile.options.rows.as_ref().unwrap().capacity(),
+                    capacity
+                );
+                for pointer in children {
+                    assert!(moved
+                        .compile
+                        .options
+                        .rows
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|s| s.as_ptr() == pointer));
+                }
+                moved.sort_duplicate_loan().test_code_sort_return();
+                moved.sort_duplicate_loan().test_code_check_unique();
+                assert!(moved
+                    .compile
+                    .options
+                    .rows
+                    .as_ref()
+                    .unwrap()
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1]));
+                assert_eq!(
+                    moved.compile.prefix.capture.identity,
+                    [Some(i64::MIN), Some(i64::MAX)]
+                );
+                assert_eq!(
+                    moved
+                        .compile
+                        .prefix
+                        .capture
+                        .source_id
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    source
+                );
+                assert_eq!(
+                    moved
+                        .compile
+                        .prefix
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    integrity
+                );
+                assert!(std::ptr::eq(
+                    moved.compile.prefix.integrity.prefix.initial.purpose,
+                    &purpose
+                ));
                 assert_eq!(trace.snapshot(), [None; 8]);
-                assert_eq!(moved.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
-                let first = moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-                let stopped = moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                moved.sort_duplicate_loan().test_code_vector_before_statement(); moved.sort_duplicate_loan().test_code_statement_before_source_id();
-                moved.sort_duplicate_loan().test_code_finish_error_returns(); finish_compile_options_failure(&mut moved.compile, &trace, true);
-                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), stopped);
+                assert_eq!(
+                    moved
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .audit_fields()
+                        .begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                assert_eq!(
+                    moved
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
+                let first = moved
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                    .unwrap_err();
+                let stopped = moved
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                moved
+                    .sort_duplicate_loan()
+                    .test_code_vector_before_statement();
+                moved
+                    .sort_duplicate_loan()
+                    .test_code_statement_before_source_id();
+                moved.sort_duplicate_loan().test_code_finish_error_returns();
+                finish_compile_options_failure(&mut moved.compile, &trace, true);
+                assert_eq!(
+                    moved
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                    Err(first)
+                );
+                assert_eq!(
+                    moved
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    stopped
+                );
             }
         }
         #[test]
         fn history_original_compile_sort_duplicate_error_before_lexical_cleanup() {
             let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-            let mut frame = fixed_compile_sort_frame(&purpose, &writer, &trace,
-                vec![String::from("Z"), String::from("A"), String::from("Z")]);
-            let before = frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-            frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
+            let mut frame = fixed_compile_sort_frame(
+                &purpose,
+                &writer,
+                &trace,
+                vec![String::from("Z"), String::from("A"), String::from("Z")],
+            );
+            let before = frame
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_observation();
+            frame.sort_duplicate_loan().test_code_sort_body();
+            frame.sort_duplicate_loan().test_code_sort_return();
             frame.sort_duplicate_loan().test_code_check_duplicate();
-            let error = actual_duplicate_error(); let detail = duplicate_detail_pointer(&error);
-            frame.sort_duplicate_loan().test_code_retain_duplicate(error);
-            assert_eq!(duplicate_detail_pointer(frame.compile.options.catalog_error.as_ref().unwrap()), detail);
-            { let _short = frame.sort_duplicate_loan(); } let mut moved = frame;
-            assert!(moved.compile.options.rows.is_some()); assert!(moved.compile.prefix.capture.source_id.is_some());
-            assert_eq!(moved.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-            moved.sort_duplicate_loan().test_code_duplicate_return(); moved.sort_duplicate_loan().test_code_vector_before_statement();
-            assert_eq!(duplicate_detail_pointer(moved.compile.options.catalog_error.as_ref().unwrap()), detail);
-            moved.sort_duplicate_loan().test_code_statement_before_source_id();
-            assert!(moved.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+            let error = actual_duplicate_error();
+            let detail = duplicate_detail_pointer(&error);
+            frame
+                .sort_duplicate_loan()
+                .test_code_retain_duplicate(error);
+            assert_eq!(
+                duplicate_detail_pointer(frame.compile.options.catalog_error.as_ref().unwrap()),
+                detail
+            );
+            {
+                let _short = frame.sort_duplicate_loan();
+            }
+            let mut moved = frame;
+            assert!(moved.compile.options.rows.is_some());
+            assert!(moved.compile.prefix.capture.source_id.is_some());
+            assert_eq!(
+                moved
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .audit_fields()
+                    .begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
+            moved.sort_duplicate_loan().test_code_duplicate_return();
+            moved
+                .sort_duplicate_loan()
+                .test_code_vector_before_statement();
+            assert_eq!(
+                duplicate_detail_pointer(moved.compile.options.catalog_error.as_ref().unwrap()),
+                detail
+            );
+            moved
+                .sort_duplicate_loan()
+                .test_code_statement_before_source_id();
+            assert!(moved
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .physical
+                .primary
+                .is_none());
             moved.sort_duplicate_loan().test_code_finish_error_returns();
-            let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog { source })) = &moved.compile.prefix.integrity.prefix.source.physical.primary
-                else { panic!("same actual duplicate C error reaches G only after scope returns"); };
+            let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionCatalog {
+                source,
+            })) = &moved
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .physical
+                .primary
+            else {
+                panic!("same actual duplicate C error reaches G only after scope returns");
+            };
             assert_eq!(duplicate_detail_pointer(source), detail);
             finish_compile_options_failure(&mut moved.compile, &trace, false);
-            assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            assert_eq!(
+                moved
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation(),
+                before
+            );
         }
         #[test]
         fn history_original_compile_sort_duplicate_primary_terminal_keep_owed_returns() {
             // Fixed connected cuts: before sort, started/unknown body, actual
             // body returned/lexical pending, duplicate owner pending/owned,
             // and unique digest not started. No cfg allocation is payment.
-            for cut in 0..6 { for terminal in [false, true] {
-                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let values = if cut == 5 { vec![String::from("B"), String::from("A")] }
-                    else { vec![String::from("B"), String::from("A"), String::from("B")] };
-                let mut frame = fixed_compile_sort_frame(&purpose, &writer, &trace, values);
-                let mut pending = None;
-                match cut {
-                    1 => frame.sort_duplicate_loan().test_code_drop_body_unknown(),
-                    2 => frame.sort_duplicate_loan().test_code_sort_body(),
-                    3 | 4 | 5 => {
-                        frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
-                        if cut == 5 { frame.sort_duplicate_loan().test_code_check_unique(); }
-                        else {
-                            frame.sort_duplicate_loan().test_code_check_duplicate();
-                            let error = actual_duplicate_error();
-                            if cut == 3 { frame.sort_duplicate_loan().test_code_begin_duplicate_unknown(); pending = Some(error); }
-                            else { frame.sort_duplicate_loan().test_code_retain_duplicate(error); }
+            for cut in 0..6 {
+                for terminal in [false, true] {
+                    let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                    let writer = financial_audit::fixed_writer();
+                    let trace = Trace::new();
+                    let values = if cut == 5 {
+                        vec![String::from("B"), String::from("A")]
+                    } else {
+                        vec![String::from("B"), String::from("A"), String::from("B")]
+                    };
+                    let mut frame = fixed_compile_sort_frame(&purpose, &writer, &trace, values);
+                    let mut pending = None;
+                    match cut {
+                        1 => frame.sort_duplicate_loan().test_code_drop_body_unknown(),
+                        2 => frame.sort_duplicate_loan().test_code_sort_body(),
+                        3 | 4 | 5 => {
+                            frame.sort_duplicate_loan().test_code_sort_body();
+                            frame.sort_duplicate_loan().test_code_sort_return();
+                            if cut == 5 {
+                                frame.sort_duplicate_loan().test_code_check_unique();
+                            } else {
+                                frame.sort_duplicate_loan().test_code_check_duplicate();
+                                let error = actual_duplicate_error();
+                                if cut == 3 {
+                                    frame
+                                        .sort_duplicate_loan()
+                                        .test_code_begin_duplicate_unknown();
+                                    pending = Some(error);
+                                } else {
+                                    frame
+                                        .sort_duplicate_loan()
+                                        .test_code_retain_duplicate(error);
+                                }
+                            }
                         }
-                    },
-                    _ => {},
+                        _ => {}
+                    }
+                    let (primary, allocation) = fixed_primary();
+                    let first = if terminal {
+                        drop(primary);
+                        Some(
+                            frame
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                                .unwrap_err(),
+                        )
+                    } else {
+                        frame
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .note_normal_failure()
+                            .unwrap();
+                        frame
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .retain_paid_primary(primary)
+                            .unwrap_or_else(|_| panic!("actual first supplied primary"));
+                        None
+                    };
+                    let before = frame
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation();
+                    {
+                        let _short = frame.sort_duplicate_loan();
+                    }
+                    let mut moved = frame;
+                    moved.sort_duplicate_loan().test_code_barrier();
+                    assert_eq!(
+                        moved
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .begin_release(),
+                        Err(FinancialAuditFault::UnexpectedCut)
+                    );
+                    assert_eq!(trace.snapshot(), [None; 8]);
+                    assert_owned_pin(&moved.compile.prefix.integrity.prefix.source.audit);
+                    if cut == 1 {
+                        // No actual body return exists. T/primary cannot infer it
+                        // or start a sort to make cleanup possible: remains Held.
+                        moved
+                            .sort_duplicate_loan()
+                            .test_code_no_successor_after_stop();
+                    } else {
+                        if cut == 2 {
+                            moved.sort_duplicate_loan().test_code_sort_return();
+                        }
+                        if cut == 3 {
+                            let error = pending.take().unwrap();
+                            let pointer = duplicate_detail_pointer(&error);
+                            moved.sort_duplicate_loan().test_code_late_duplicate(error);
+                            assert_eq!(
+                                duplicate_detail_pointer(
+                                    moved.compile.options.catalog_error.as_ref().unwrap()
+                                ),
+                                pointer
+                            );
+                        }
+                        if cut == 3 || cut == 4 {
+                            moved.sort_duplicate_loan().test_code_duplicate_return();
+                        }
+                        moved
+                            .sort_duplicate_loan()
+                            .test_code_vector_before_statement();
+                        moved
+                            .sort_duplicate_loan()
+                            .test_code_statement_before_source_id();
+                        moved.sort_duplicate_loan().test_code_finish_error_returns();
+                        finish_compile_options_failure(&mut moved.compile, &trace, terminal);
+                    }
+                    assert!(pending.is_none());
+                    if let Some(first) = first {
+                        assert!(moved
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .physical
+                            .primary
+                            .is_none());
+                        assert_eq!(
+                            moved
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                            Err(first)
+                        );
+                    } else {
+                        assert_primary(
+                            &moved.compile.prefix.integrity.prefix.source.physical,
+                            allocation,
+                        );
+                    }
+                    assert_eq!(
+                        moved
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation(),
+                        before
+                    );
                 }
-                let (primary, allocation) = fixed_primary();
-                let first = if terminal { drop(primary); Some(frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
-                    else { frame.compile.prefix.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
-                        frame.compile.prefix.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("actual first supplied primary")); None };
-                let before = frame.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                { let _short = frame.sort_duplicate_loan(); } let mut moved = frame;
-                moved.sort_duplicate_loan().test_code_barrier();
-                assert_eq!(moved.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.compile.prefix.integrity.prefix.source.audit);
-                if cut == 1 {
-                    // No actual body return exists. T/primary cannot infer it
-                    // or start a sort to make cleanup possible: remains Held.
-                    moved.sort_duplicate_loan().test_code_no_successor_after_stop();
-                } else {
-                    if cut == 2 { moved.sort_duplicate_loan().test_code_sort_return(); }
-                    if cut == 3 { let error = pending.take().unwrap(); let pointer = duplicate_detail_pointer(&error);
-                        moved.sort_duplicate_loan().test_code_late_duplicate(error);
-                        assert_eq!(duplicate_detail_pointer(moved.compile.options.catalog_error.as_ref().unwrap()), pointer); }
-                    if cut == 3 || cut == 4 { moved.sort_duplicate_loan().test_code_duplicate_return(); }
-                    moved.sort_duplicate_loan().test_code_vector_before_statement(); moved.sort_duplicate_loan().test_code_statement_before_source_id();
-                    moved.sort_duplicate_loan().test_code_finish_error_returns(); finish_compile_options_failure(&mut moved.compile, &trace, terminal);
-                }
-                assert!(pending.is_none());
-                if let Some(first) = first { assert!(moved.compile.prefix.integrity.prefix.source.physical.primary.is_none());
-                    assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
-                else { assert_primary(&moved.compile.prefix.integrity.prefix.source.physical, allocation); }
-                assert_eq!(moved.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
-            } }
+            }
         }
 
-        fn fixed_compile_iterator_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
-            writer: &'writer SelectionAuditWriter, trace: &Trace, values: Vec<String>) -> FinancialCompileIteratorFrame<'purpose, 'writer> {
+        fn fixed_compile_iterator_frame<'purpose, 'writer>(
+            purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+            values: Vec<String>,
+        ) -> FinancialCompileIteratorFrame<'purpose, 'writer> {
             let frame = fixed_compile_sort_frame(purpose, writer, trace, values);
-            let Err(mut frame) = frame.begin_iteration() else { panic!("unreturned sort refuses the whole-frame move"); };
-            frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
+            let Err(mut frame) = frame.begin_iteration() else {
+                panic!("unreturned sort refuses the whole-frame move");
+            };
+            frame.sort_duplicate_loan().test_code_sort_body();
+            frame.sort_duplicate_loan().test_code_sort_return();
             frame.sort_duplicate_loan().test_code_check_unique();
-            frame.begin_iteration().unwrap_or_else(|_| panic!("actual unique Vec enters its consuming iterator once"))
+            frame
+                .begin_iteration()
+                .unwrap_or_else(|_| panic!("actual unique Vec enters its consuming iterator once"))
         }
-        fn finish_compile_iterator_failure(frame: &mut FinancialCompileIteratorFrame<'_, '_>, trace: &Trace, terminal: bool) {
+        fn finish_compile_iterator_failure(
+            frame: &mut FinancialCompileIteratorFrame<'_, '_>,
+            trace: &Trace,
+            terminal: bool,
+        ) {
             frame.iteration_loan().test_code_interrupted_drain();
             finish_compile_options_failure(&mut frame.sort.compile, trace, terminal);
         }
         #[test]
         fn history_original_compile_iterator_moves_vec_and_real_next() {
             let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
             let values = vec![String::from("Z"), String::from("A"), String::from("M")];
-            let vector = values.as_ptr(); let capacity = values.capacity(); let first_string = values[1].as_ptr();
+            let vector = values.as_ptr();
+            let capacity = values.capacity();
+            let first_string = values[1].as_ptr();
             let mut frame = fixed_compile_iterator_frame(&purpose, &writer, &trace, values);
-            assert!(frame.sort.compile.options.rows.is_none()); assert!(frame.iteration.pending.is_none());
-            assert_eq!(frame.iteration.iterator.as_ref().unwrap().as_slice().as_ptr(), vector);
-            assert_eq!(frame.iteration.iterator.as_ref().unwrap().as_slice(), ["A", "M", "Z"]);
+            assert!(frame.sort.compile.options.rows.is_none());
+            assert!(frame.iteration.pending.is_none());
+            assert_eq!(
+                frame
+                    .iteration
+                    .iterator
+                    .as_ref()
+                    .unwrap()
+                    .as_slice()
+                    .as_ptr(),
+                vector
+            );
+            assert_eq!(
+                frame.iteration.iterator.as_ref().unwrap().as_slice(),
+                ["A", "M", "Z"]
+            );
             assert!(capacity >= frame.iteration.iterator.as_ref().unwrap().len());
-            assert!(!frame.sort.compile.prefix.integrity.prefix.source.fields().begin_compile_iterator());
-            let source = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
-            let integrity = frame.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-            let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+            assert!(!frame
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .begin_compile_iterator());
+            let source = frame
+                .sort
+                .compile
+                .prefix
+                .capture
+                .source_id
+                .as_ref()
+                .unwrap()
+                .as_ptr();
+            let integrity = frame
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .integrity
+                .integrity_rows
+                .as_ref()
+                .unwrap()
+                .as_ptr();
+            let before = frame
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_observation();
             frame.iteration_loan().test_code_next_body();
             assert_eq!(frame.iteration.pending.as_deref(), Some("A"));
-            assert_eq!(frame.iteration.pending.as_ref().unwrap().as_ptr(), first_string);
-            assert_eq!(frame.iteration.iterator.as_ref().unwrap().as_slice(), ["M", "Z"]);
-            { let _short = frame.iteration_loan(); } let mut moved = frame;
-            moved.iteration_loan().test_code_next_return(); moved.iteration_loan().test_code_pending_held();
-            assert_eq!(moved.iteration.pending.as_ref().unwrap().as_ptr(), first_string);
-            assert_eq!(moved.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
-            assert_eq!(moved.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
-            assert!(std::ptr::eq(moved.sort.compile.prefix.integrity.prefix.initial.purpose, &purpose));
-            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
-            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
-            let first = moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-            let stopped = moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
+            assert_eq!(
+                frame.iteration.pending.as_ref().unwrap().as_ptr(),
+                first_string
+            );
+            assert_eq!(
+                frame.iteration.iterator.as_ref().unwrap().as_slice(),
+                ["M", "Z"]
+            );
+            {
+                let _short = frame.iteration_loan();
+            }
+            let mut moved = frame;
+            moved.iteration_loan().test_code_next_return();
+            moved.iteration_loan().test_code_pending_held();
+            assert_eq!(
+                moved.iteration.pending.as_ref().unwrap().as_ptr(),
+                first_string
+            );
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .capture
+                    .source_id
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr(),
+                source
+            );
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .integrity
+                    .integrity_rows
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr(),
+                integrity
+            );
+            assert!(std::ptr::eq(
+                moved.sort.compile.prefix.integrity.prefix.initial.purpose,
+                &purpose
+            ));
+            assert_eq!(trace.snapshot(), [None; 8]);
+            assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .audit_fields()
+                    .begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation(),
+                before
+            );
+            let first = moved
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err();
+            let stopped = moved
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_observation();
             // Hash was never entered. Actual pending String and remaining
             // iterator may drain once, before the old Stmt/source-id cleanup.
             finish_compile_iterator_failure(&mut moved, &trace, true);
-            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), stopped);
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                Err(first)
+            );
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation(),
+                stopped
+            );
         }
         #[test]
         fn history_original_compile_iterator_eof_and_interrupted_drain() {
             // A real empty iterator reaches EOF; nonempty cleanup cuts are
             // before hash. No supplied boolean claims a hash call returned.
-            for cut in 0..3 { for terminal in [false, true] {
-                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let values = if cut == 2 { Vec::new() } else { vec![String::from("A"), String::from("B")] };
-                let mut frame = fixed_compile_iterator_frame(&purpose, &writer, &trace, values);
-                let source = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
-                if cut != 0 { frame.iteration_loan().test_code_next_body(); }
-                if cut == 2 { frame.iteration_loan().test_code_next_return(); frame.iteration_loan().test_code_empty_eof(); }
-                let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
-                let (primary, allocation) = fixed_primary();
-                let first = if terminal { drop(primary); Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
-                    else { frame.sort.compile.prefix.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
-                        frame.sort.compile.prefix.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first actual supplied error owner")); None };
-                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                { let _short = frame.iteration_loan(); } let mut moved = frame;
-                // Late failure cannot discard the acquired String or skip the
-                // independently reached next() return observation.
-                if cut == 1 { assert_eq!(moved.iteration.pending.as_ref().map(|s| s.as_ptr()), pending);
-                    moved.iteration_loan().test_code_barrier(); moved.iteration_loan().test_code_next_return(); }
-                assert_eq!(moved.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                finish_compile_iterator_failure(&mut moved, &trace, terminal);
-                if let Some(first) = first { assert!(moved.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
-                    assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
-                else { assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
-            } }
+            for cut in 0..3 {
+                for terminal in [false, true] {
+                    let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                    let writer = financial_audit::fixed_writer();
+                    let trace = Trace::new();
+                    let values = if cut == 2 {
+                        Vec::new()
+                    } else {
+                        vec![String::from("A"), String::from("B")]
+                    };
+                    let mut frame = fixed_compile_iterator_frame(&purpose, &writer, &trace, values);
+                    let source = frame
+                        .sort
+                        .compile
+                        .prefix
+                        .capture
+                        .source_id
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr();
+                    if cut != 0 {
+                        frame.iteration_loan().test_code_next_body();
+                    }
+                    if cut == 2 {
+                        frame.iteration_loan().test_code_next_return();
+                        frame.iteration_loan().test_code_empty_eof();
+                    }
+                    let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
+                    let (primary, allocation) = fixed_primary();
+                    let first = if terminal {
+                        drop(primary);
+                        Some(
+                            frame
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                                .unwrap_err(),
+                        )
+                    } else {
+                        frame
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .note_normal_failure()
+                            .unwrap();
+                        frame
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .retain_paid_primary(primary)
+                            .unwrap_or_else(|_| panic!("first actual supplied error owner"));
+                        None
+                    };
+                    let before = frame
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation();
+                    {
+                        let _short = frame.iteration_loan();
+                    }
+                    let mut moved = frame;
+                    // Late failure cannot discard the acquired String or skip the
+                    // independently reached next() return observation.
+                    if cut == 1 {
+                        assert_eq!(
+                            moved.iteration.pending.as_ref().map(|s| s.as_ptr()),
+                            pending
+                        );
+                        moved.iteration_loan().test_code_barrier();
+                        moved.iteration_loan().test_code_next_return();
+                    }
+                    assert_eq!(
+                        moved
+                            .sort
+                            .compile
+                            .prefix
+                            .capture
+                            .source_id
+                            .as_ref()
+                            .unwrap()
+                            .as_ptr(),
+                        source
+                    );
+                    assert_eq!(trace.snapshot(), [None; 8]);
+                    assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                    assert_eq!(
+                        moved
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .begin_release(),
+                        Err(FinancialAuditFault::UnexpectedCut)
+                    );
+                    finish_compile_iterator_failure(&mut moved, &trace, terminal);
+                    if let Some(first) = first {
+                        assert!(moved
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .physical
+                            .primary
+                            .is_none());
+                        assert_eq!(
+                            moved
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                            Err(first)
+                        );
+                    } else {
+                        assert_primary(
+                            &moved.sort.compile.prefix.integrity.prefix.source.physical,
+                            allocation,
+                        );
+                    }
+                    assert_eq!(
+                        moved
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation(),
+                        before
+                    );
+                }
+            }
         }
         #[test]
         fn history_original_compile_iterator_unknown_hash_holds_first_failure() {
-            for cut in 0..3 { for terminal in [false, true] {
-                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let mut frame = fixed_compile_iterator_frame(&purpose, &writer, &trace,
-                    vec![String::from("A"), String::from("B")]);
-                let source = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
-                if cut == 0 { frame.iteration_loan().test_code_next_unknown(); }
-                else { frame.iteration_loan().test_code_next_body(); frame.iteration_loan().test_code_next_return();
-                    frame.iteration_loan().test_code_hash_unknown(cut == 2); }
-                let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
-                let remaining = frame.iteration.iterator.as_ref().unwrap().as_slice().as_ptr();
-                let count = frame.iteration.iterator.as_ref().unwrap().len();
-                let (primary, allocation) = fixed_primary();
-                let first = if terminal { drop(primary); Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err()) }
-                    else { frame.sort.compile.prefix.integrity.prefix.source.audit_fields().note_normal_failure().unwrap();
-                        frame.sort.compile.prefix.integrity.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("actual first supplied diagnostic")); None };
-                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                { let _short = frame.iteration_loan(); } let mut moved = frame;
-                moved.iteration_loan().test_code_no_drain();
-                assert_eq!(moved.iteration.pending.as_ref().map(|s| s.as_ptr()), pending);
-                assert_eq!(moved.iteration.iterator.as_ref().unwrap().as_slice().as_ptr(), remaining);
-                assert_eq!(moved.iteration.iterator.as_ref().unwrap().len(), count);
-                assert_eq!(moved.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr(), source);
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
-                if let Some(first) = first { assert!(moved.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
-                    assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first)); }
-                else { assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
-            } }
+            for cut in 0..3 {
+                for terminal in [false, true] {
+                    let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                    let writer = financial_audit::fixed_writer();
+                    let trace = Trace::new();
+                    let mut frame = fixed_compile_iterator_frame(
+                        &purpose,
+                        &writer,
+                        &trace,
+                        vec![String::from("A"), String::from("B")],
+                    );
+                    let source = frame
+                        .sort
+                        .compile
+                        .prefix
+                        .capture
+                        .source_id
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr();
+                    if cut == 0 {
+                        frame.iteration_loan().test_code_next_unknown();
+                    } else {
+                        frame.iteration_loan().test_code_next_body();
+                        frame.iteration_loan().test_code_next_return();
+                        frame.iteration_loan().test_code_hash_unknown(cut == 2);
+                    }
+                    let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
+                    let remaining = frame
+                        .iteration
+                        .iterator
+                        .as_ref()
+                        .unwrap()
+                        .as_slice()
+                        .as_ptr();
+                    let count = frame.iteration.iterator.as_ref().unwrap().len();
+                    let (primary, allocation) = fixed_primary();
+                    let first = if terminal {
+                        drop(primary);
+                        Some(
+                            frame
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                                .unwrap_err(),
+                        )
+                    } else {
+                        frame
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .note_normal_failure()
+                            .unwrap();
+                        frame
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .retain_paid_primary(primary)
+                            .unwrap_or_else(|_| panic!("actual first supplied diagnostic"));
+                        None
+                    };
+                    let before = frame
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation();
+                    {
+                        let _short = frame.iteration_loan();
+                    }
+                    let mut moved = frame;
+                    moved.iteration_loan().test_code_no_drain();
+                    assert_eq!(
+                        moved.iteration.pending.as_ref().map(|s| s.as_ptr()),
+                        pending
+                    );
+                    assert_eq!(
+                        moved
+                            .iteration
+                            .iterator
+                            .as_ref()
+                            .unwrap()
+                            .as_slice()
+                            .as_ptr(),
+                        remaining
+                    );
+                    assert_eq!(moved.iteration.iterator.as_ref().unwrap().len(), count);
+                    assert_eq!(
+                        moved
+                            .sort
+                            .compile
+                            .prefix
+                            .capture
+                            .source_id
+                            .as_ref()
+                            .unwrap()
+                            .as_ptr(),
+                        source
+                    );
+                    assert_eq!(
+                        moved
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .begin_release(),
+                        Err(FinancialAuditFault::UnexpectedCut)
+                    );
+                    assert_eq!(trace.snapshot(), [None; 8]);
+                    assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                    if let Some(first) = first {
+                        assert!(moved
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .physical
+                            .primary
+                            .is_none());
+                        assert_eq!(
+                            moved
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                            Err(first)
+                        );
+                    } else {
+                        assert_primary(
+                            &moved.sort.compile.prefix.integrity.prefix.source.physical,
+                            allocation,
+                        );
+                    }
+                    assert_eq!(
+                        moved
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation(),
+                        before
+                    );
+                }
+            }
         }
 
         // Fixed ordinary library execution through the production protocol
         // cores. These fixtures retain existing native/SQL debts; they issue no
         // rules, allocation payment, layout or Financial completion witness.
-        fn fixed_compile_digest_frame<'purpose, 'writer>(purpose: &'purpose SelectionSnapshotPurpose,
-            writer: &'writer SelectionAuditWriter, trace: &Trace, values: Vec<String>) -> FinancialCompileDigestFrame<'purpose, 'writer> {
+        fn fixed_compile_digest_frame<'purpose, 'writer>(
+            purpose: &'purpose SelectionSnapshotPurpose,
+            writer: &'writer SelectionAuditWriter,
+            trace: &Trace,
+            values: Vec<String>,
+        ) -> FinancialCompileDigestFrame<'purpose, 'writer> {
             let mut frame = fixed_compile_sort_frame(purpose, writer, trace, values);
-            frame.sort_duplicate_loan().test_code_sort_body(); frame.sort_duplicate_loan().test_code_sort_return();
+            frame.sort_duplicate_loan().test_code_sort_body();
+            frame.sort_duplicate_loan().test_code_sort_return();
             frame.sort_duplicate_loan().test_code_check_unique();
-            frame.begin_digest().unwrap_or_else(|_| panic!("actual sorted unique returned Vec enters fixed digest"))
+            frame
+                .begin_digest()
+                .unwrap_or_else(|_| panic!("actual sorted unique returned Vec enters fixed digest"))
         }
-        fn advance_compile_digest_to_call(frame: &mut FinancialCompileDigestFrame<'_, '_>, step: u8) {
-            if step == 0 { return; }
-            frame.digest_loan().test_code_call(0, 3); frame.digest_loan().test_code_move_iterator();
+        fn advance_compile_digest_to_call(
+            frame: &mut FinancialCompileDigestFrame<'_, '_>,
+            step: u8,
+        ) {
+            if step == 0 {
+                return;
+            }
+            frame.digest_loan().test_code_call(0, 3);
+            frame.digest_loan().test_code_move_iterator();
             loop {
                 frame.digest_loan().test_code_next();
-                if frame.iteration.pending.is_none() { break; }
-                if step == 1 { return; }
-                frame.digest_loan().test_code_call(1, 3); frame.digest_loan().test_code_consume_field();
+                if frame.iteration.pending.is_none() {
+                    break;
+                }
+                if step == 1 {
+                    return;
+                }
+                frame.digest_loan().test_code_call(1, 3);
+                frame.digest_loan().test_code_consume_field();
             }
-            frame.digest_loan().test_code_finish_iterator(); if step == 2 { return; }
-            frame.digest_loan().test_code_call(2, 3); frame.digest_loan().test_code_move_source(); if step == 3 { return; }
-            frame.digest_loan().test_code_call(3, 3); if step == 4 { return; }
-            frame.digest_loan().test_code_call(4, 3); frame.digest_loan().test_code_build_identity();
+            frame.digest_loan().test_code_finish_iterator();
+            if step == 2 {
+                return;
+            }
+            frame.digest_loan().test_code_call(2, 3);
+            frame.digest_loan().test_code_move_source();
+            if step == 3 {
+                return;
+            }
+            frame.digest_loan().test_code_call(3, 3);
+            if step == 4 {
+                return;
+            }
+            frame.digest_loan().test_code_call(4, 3);
+            frame.digest_loan().test_code_build_identity();
             assert_eq!(step, 5);
         }
         #[test]
@@ -3183,374 +6456,1108 @@ mod financial_original_audit_acquisition_tests {
             // Root's independently frozen known answers, not recomputation of
             // the candidate's domain/length encoding or formatter.
             for (values, expected) in [
-                (Vec::new(), "145c4a8741a57b51d094fc06ccf9736ac86a5fa0a780060c99dc4c57de465552"),
-                (vec![String::from("AB"), String::from("C")], "ea00837041ee515aee37d5696f8f342c8b384913a59a51366314a67c5fcb1253"),
-                (vec![String::from("A"), String::from("BC")], "705aceba8dfbcdd880e0a55ae2b15d6d75c20f576840327b864e7986c6ab26be"),
-                (vec![String::from("A"), String::from("é"), String::from("λ")], "471e2f0ed6c07de21406a8a3c8ad5fa78b8856eaf8d29b7dc630ef963ad9f307"),
+                (
+                    Vec::new(),
+                    "145c4a8741a57b51d094fc06ccf9736ac86a5fa0a780060c99dc4c57de465552",
+                ),
+                (
+                    vec![String::from("AB"), String::from("C")],
+                    "ea00837041ee515aee37d5696f8f342c8b384913a59a51366314a67c5fcb1253",
+                ),
+                (
+                    vec![String::from("A"), String::from("BC")],
+                    "705aceba8dfbcdd880e0a55ae2b15d6d75c20f576840327b864e7986c6ab26be",
+                ),
+                (
+                    vec![String::from("A"), String::from("é"), String::from("λ")],
+                    "471e2f0ed6c07de21406a8a3c8ad5fa78b8856eaf8d29b7dc630ef963ad9f307",
+                ),
             ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let vector = values.as_ptr(); let children: Vec<_> = values.iter().map(|s| s.as_ptr()).collect();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
+                let vector = values.as_ptr();
+                let children: Vec<_> = values.iter().map(|s| s.as_ptr()).collect();
                 let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, values);
-                let source_id = frame.sort.compile.prefix.capture.source_id.as_ref().unwrap().as_ptr();
-                let integrity = frame.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr();
-                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                assert_eq!(frame.sort.compile.options.rows.as_ref().unwrap().as_ptr(), vector);
+                let source_id = frame
+                    .sort
+                    .compile
+                    .prefix
+                    .capture
+                    .source_id
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr();
+                let integrity = frame
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .integrity
+                    .integrity_rows
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr();
+                let before = frame
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                assert_eq!(
+                    frame.sort.compile.options.rows.as_ref().unwrap().as_ptr(),
+                    vector
+                );
                 assert!(frame.iteration.iterator.is_none());
                 frame.digest_loan().test_code_call(0, 2);
                 // Initialization has really returned, but the Vec is still in
                 // its old owning slot until independent return observation.
-                assert!(frame.digest.hasher.is_some()); assert!(frame.iteration.iterator.is_none());
-                assert_eq!(frame.sort.compile.options.rows.as_ref().unwrap().as_ptr(), vector);
-                { let _short = frame.digest_loan(); } let mut moved = frame;
-                moved.digest_loan().test_code_return(); moved.digest_loan().test_code_move_iterator();
+                assert!(frame.digest.hasher.is_some());
+                assert!(frame.iteration.iterator.is_none());
+                assert_eq!(
+                    frame.sort.compile.options.rows.as_ref().unwrap().as_ptr(),
+                    vector
+                );
+                {
+                    let _short = frame.digest_loan();
+                }
+                let mut moved = frame;
+                moved.digest_loan().test_code_return();
+                moved.digest_loan().test_code_move_iterator();
                 assert!(moved.sort.compile.options.rows.is_none());
-                assert_eq!(moved.iteration.iterator.as_ref().unwrap().as_slice().as_ptr(), vector);
+                assert_eq!(
+                    moved
+                        .iteration
+                        .iterator
+                        .as_ref()
+                        .unwrap()
+                        .as_slice()
+                        .as_ptr(),
+                    vector
+                );
                 for child in children {
                     moved.digest_loan().test_code_next();
                     assert_eq!(moved.iteration.pending.as_ref().unwrap().as_ptr(), child);
                     moved.digest_loan().test_code_call(1, 2);
                     assert_eq!(moved.iteration.pending.as_ref().unwrap().as_ptr(), child);
-                    moved.digest_loan().test_code_return(); moved.digest_loan().test_code_consume_field();
+                    moved.digest_loan().test_code_return();
+                    moved.digest_loan().test_code_consume_field();
                     assert!(moved.iteration.pending.is_none());
                 }
-                moved.digest_loan().test_code_next(); assert!(moved.iteration.pending.is_none());
-                assert!(moved.iteration.iterator.as_ref().unwrap().as_slice().is_empty());
-                moved.digest_loan().test_code_finish_iterator(); assert!(moved.iteration.iterator.is_none());
+                moved.digest_loan().test_code_next();
+                assert!(moved.iteration.pending.is_none());
+                assert!(moved
+                    .iteration
+                    .iterator
+                    .as_ref()
+                    .unwrap()
+                    .as_slice()
+                    .is_empty());
+                moved.digest_loan().test_code_finish_iterator();
+                assert!(moved.iteration.iterator.is_none());
                 moved.digest_loan().test_code_call(2, 3);
                 let actual_version = moved.digest.version.unwrap();
                 moved.digest_loan().test_code_move_source();
-                assert_eq!(moved.digest.source_part.as_ref().unwrap().as_ptr(), source_id);
+                assert_eq!(
+                    moved.digest.source_part.as_ref().unwrap().as_ptr(),
+                    source_id
+                );
                 assert!(moved.sort.compile.prefix.capture.source_id.is_none());
                 moved.digest_loan().test_code_call(3, 2);
-                assert!(moved.digest.hasher.is_none()); assert!(moved.digest.output.is_some());
-                moved.digest_loan().test_code_return(); moved.digest_loan().test_code_call(4, 2);
+                assert!(moved.digest.hasher.is_none());
+                assert!(moved.digest.output.is_some());
+                moved.digest_loan().test_code_return();
+                moved.digest_loan().test_code_call(4, 2);
                 assert_eq!(moved.digest.encoded.as_deref(), Some(expected));
-                assert!(moved.digest.output.is_some()); let encoded = moved.digest.encoded.as_ref().unwrap().as_ptr();
-                moved.digest_loan().test_code_return(); assert!(moved.digest.output.is_none());
+                assert!(moved.digest.output.is_some());
+                let encoded = moved.digest.encoded.as_ref().unwrap().as_ptr();
+                moved.digest_loan().test_code_return();
+                assert!(moved.digest.output.is_none());
                 moved.digest_loan().test_code_build_identity();
                 let identity = moved.digest.identity.as_ref().unwrap();
-                assert_eq!(identity.source_id.as_ptr(), source_id); assert_eq!(identity.compile_options_sha256.as_ptr(), encoded);
+                assert_eq!(identity.source_id.as_ptr(), source_id);
+                assert_eq!(identity.compile_options_sha256.as_ptr(), encoded);
                 assert_eq!(identity.libversion_number, actual_version);
-                moved.digest_loan().test_code_call(5, 3); moved.digest_loan().test_code_retain_runtime();
-                let runtime = moved.digest.pending_runtime.as_ref().unwrap().as_ref().unwrap();
-                assert_eq!(runtime.compile_options_sha256, expected); assert_eq!(runtime.source_id.as_ptr(), source_id);
-                assert_eq!(runtime.compile_options_sha256.as_ptr(), encoded); assert_eq!(runtime.libversion_number, actual_version);
+                moved.digest_loan().test_code_call(5, 3);
+                moved.digest_loan().test_code_retain_runtime();
+                let runtime = moved
+                    .digest
+                    .pending_runtime
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(runtime.compile_options_sha256, expected);
+                assert_eq!(runtime.source_id.as_ptr(), source_id);
+                assert_eq!(runtime.compile_options_sha256.as_ptr(), encoded);
+                assert_eq!(runtime.libversion_number, actual_version);
                 assert!(moved.digest.identity.is_none() && moved.digest.validation.is_none());
-                assert_eq!(moved.sort.compile.prefix.integrity.integrity.integrity_rows.as_ref().unwrap().as_ptr(), integrity);
-                assert!(std::ptr::eq(moved.sort.compile.prefix.integrity.prefix.initial.purpose, &purpose));
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                assert_eq!(
+                    moved
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .integrity
+                        .integrity_rows
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    integrity
+                );
+                assert!(std::ptr::eq(
+                    moved.sort.compile.prefix.integrity.prefix.initial.purpose,
+                    &purpose
+                ));
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                assert_eq!(
+                    moved
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .audit_fields()
+                        .begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                assert_eq!(
+                    moved
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
             }
         }
         #[test]
         fn history_original_real_digest_validator_keeps_actual_error_and_return_debts() {
             let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-            let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, vec![String::from("A")]);
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
+            let mut frame =
+                fixed_compile_digest_frame(&purpose, &writer, &trace, vec![String::from("A")]);
             // Change only the test-owned captured input. The existing real
             // validator allocates and returns its own original diagnostic.
             frame.sort.compile.prefix.capture.source_id = Some(String::from("   "));
             advance_compile_digest_to_call(&mut frame, 5);
             frame.digest_loan().test_code_call(5, 2);
-            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.validation
-                else { panic!("actual fixed validator must return the empty-source-id error"); };
-            assert_eq!(detail, "source_id is empty"); let diagnostic = detail.as_ptr();
-            assert!(frame.digest.identity.is_some()); frame.digest_loan().test_code_return();
-            frame.digest_loan().test_code_retain_runtime(); assert!(frame.digest.identity.is_none());
-            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.pending_runtime
-                else { panic!("same owned error expression retained before Statement drop"); };
+            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) =
+                &frame.digest.validation
+            else {
+                panic!("actual fixed validator must return the empty-source-id error");
+            };
+            assert_eq!(detail, "source_id is empty");
+            let diagnostic = detail.as_ptr();
+            assert!(frame.digest.identity.is_some());
+            frame.digest_loan().test_code_return();
+            frame.digest_loan().test_code_retain_runtime();
+            assert!(frame.digest.identity.is_none());
+            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) =
+                &frame.digest.pending_runtime
+            else {
+                panic!("same owned error expression retained before Statement drop");
+            };
             assert_eq!(detail.as_ptr(), diagnostic);
-            assert!(frame.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
+            assert!(frame
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .physical
+                .primary
+                .is_none());
             let (primary, allocation) = fixed_primary();
             // Adverse existing-primary fixture only, not a paid-return issuer.
-            frame.sort.compile.prefix.integrity.prefix.source.physical.primary = Some(primary);
-            frame.sort.compile.prefix.integrity.prefix.source.physical.audit_phase = FinancialAuditPhase::Failed;
-            let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-            { let _short = frame.digest_loan(); } let mut moved = frame;
+            frame
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .physical
+                .primary = Some(primary);
+            frame
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .physical
+                .audit_phase = FinancialAuditPhase::Failed;
+            let before = frame
+                .sort
+                .compile
+                .prefix
+                .integrity
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_observation();
+            {
+                let _short = frame.digest_loan();
+            }
+            let mut moved = frame;
             moved.digest_loan().test_code_no_new_work();
-            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &moved.digest.pending_runtime
-                else { panic!("late first primary cannot discard or overwrite unissued error payment"); };
-            assert_eq!(detail.as_ptr(), diagnostic); assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation);
-            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
-            assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+            let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) =
+                &moved.digest.pending_runtime
+            else {
+                panic!("late first primary cannot discard or overwrite unissued error payment");
+            };
+            assert_eq!(detail.as_ptr(), diagnostic);
+            assert_primary(
+                &moved.sort.compile.prefix.integrity.prefix.source.physical,
+                allocation,
+            );
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .audit_fields()
+                    .begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
+            assert_eq!(trace.snapshot(), [None; 8]);
+            assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+            assert_eq!(
+                moved
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation(),
+                before
+            );
             drop(moved); // Release this actual audit pin before admitting the next independent fixture.
             for terminal in [false, true] {
                 let trace = Trace::new();
                 let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, Vec::new());
                 frame.sort.compile.prefix.capture.source_id = Some(String::from("   "));
-                advance_compile_digest_to_call(&mut frame, 5); frame.digest_loan().test_code_call(5, 2);
-                let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.validation
-                    else { panic!("actual independently returned validation error"); };
+                advance_compile_digest_to_call(&mut frame, 5);
+                frame.digest_loan().test_code_call(5, 2);
+                let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) =
+                    &frame.digest.validation
+                else {
+                    panic!("actual independently returned validation error");
+                };
                 let actual_error = detail.as_ptr();
                 let (primary, allocation) = fixed_primary();
-                let first = if terminal { drop(primary);
-                    Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err())
+                let first = if terminal {
+                    drop(primary);
+                    Some(
+                        frame
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_probe(OwnerStartProbe::ExceedProduction)
+                            .unwrap_err(),
+                    )
                 } else {
-                    frame.sort.compile.prefix.integrity.prefix.source.physical.primary = Some(primary);
-                    frame.sort.compile.prefix.integrity.prefix.source.physical.audit_phase = FinancialAuditPhase::Failed; None
+                    frame
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .physical
+                        .primary = Some(primary);
+                    frame
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .physical
+                        .audit_phase = FinancialAuditPhase::Failed;
+                    None
                 };
-                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                frame.digest_loan().test_code_return(); frame.digest_loan().test_code_no_new_work();
-                let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) = &frame.digest.validation
-                    else { panic!("late failure retains the same unpaid diagnostic owner"); };
+                let before = frame
+                    .sort
+                    .compile
+                    .prefix
+                    .integrity
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                frame.digest_loan().test_code_return();
+                frame.digest_loan().test_code_no_new_work();
+                let Some(Err(GlobalSchemaCatalogError::InvalidRuntimeIdentity { detail })) =
+                    &frame.digest.validation
+                else {
+                    panic!("late failure retains the same unpaid diagnostic owner");
+                };
                 assert_eq!(detail.as_ptr(), actual_error);
-                assert!(frame.digest.identity.is_some()); assert!(frame.digest.pending_runtime.is_none());
-                assert_eq!(frame.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&frame.sort.compile.prefix.integrity.prefix.source.audit);
+                assert!(frame.digest.identity.is_some());
+                assert!(frame.digest.pending_runtime.is_none());
+                assert_eq!(
+                    frame
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .audit_fields()
+                        .begin_release(),
+                    Err(FinancialAuditFault::UnexpectedCut)
+                );
+                assert_eq!(trace.snapshot(), [None; 8]);
+                assert_owned_pin(&frame.sort.compile.prefix.integrity.prefix.source.audit);
                 if let Some(first) = first {
-                    assert_eq!(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-                } else { assert_primary(&frame.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
-                assert_eq!(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
+                    assert_eq!(
+                        frame
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                        Err(first)
+                    );
+                } else {
+                    assert_primary(
+                        &frame.sort.compile.prefix.integrity.prefix.source.physical,
+                        allocation,
+                    );
+                }
+                assert_eq!(
+                    frame
+                        .sort
+                        .compile
+                        .prefix
+                        .integrity
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
             }
         }
         #[test]
         fn history_original_real_digest_unknown_and_late_first_failure_hold_whole() {
-            for step in 0..6 { for cut in 0..3 { for terminal in [false, true] {
-                let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-                let mut frame = fixed_compile_digest_frame(&purpose, &writer, &trace, vec![String::from("A")]);
-                advance_compile_digest_to_call(&mut frame, step);
-                frame.digest_loan().test_code_call(step, cut);
-                let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
-                let source_part = frame.digest.source_part.as_ref().map(|s| s.as_ptr());
-                let encoded = frame.digest.encoded.as_ref().map(|s| s.as_ptr());
-                let identity = frame.digest.identity.as_ref().map(|i| (i.source_id.as_ptr(), i.compile_options_sha256.as_ptr()));
-                let (primary, allocation) = fixed_primary();
-                let first = if terminal {
-                    drop(primary); Some(frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err())
-                } else {
-                    // This deliberately injected first-owner control carries no
-                    // payment observation and never mints production authority.
-                    frame.sort.compile.prefix.integrity.prefix.source.physical.primary = Some(primary);
-                    frame.sort.compile.prefix.integrity.prefix.source.physical.audit_phase = FinancialAuditPhase::Failed; None
-                };
-                let before = frame.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation();
-                { let _short = frame.digest_loan(); } let mut moved = frame;
-                moved.digest_loan().test_code_barrier();
-                assert_eq!(moved.iteration.pending.as_ref().map(|s| s.as_ptr()), pending);
-                assert_eq!(moved.digest.source_part.as_ref().map(|s| s.as_ptr()), source_part);
-                assert_eq!(moved.digest.encoded.as_ref().map(|s| s.as_ptr()), encoded);
-                assert_eq!(moved.digest.identity.as_ref().map(|i| (i.source_id.as_ptr(), i.compile_options_sha256.as_ptr())), identity);
-                if cut < 2 { moved.digest_loan().test_code_unobserved(cut == 1); }
-                else { moved.digest_loan().test_code_late_return(step); }
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
-                if let Some(first) = first {
-                    assert!(moved.sort.compile.prefix.integrity.prefix.source.physical.primary.is_none());
-                    assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-                } else { assert_primary(&moved.sort.compile.prefix.integrity.prefix.source.physical, allocation); }
-                assert_eq!(moved.sort.compile.prefix.integrity.prefix.source.fields().source_work().test_code_observation(), before);
-            } } }
+            for step in 0..6 {
+                for cut in 0..3 {
+                    for terminal in [false, true] {
+                        let purpose =
+                            SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
+                        let writer = financial_audit::fixed_writer();
+                        let trace = Trace::new();
+                        let mut frame = fixed_compile_digest_frame(
+                            &purpose,
+                            &writer,
+                            &trace,
+                            vec![String::from("A")],
+                        );
+                        advance_compile_digest_to_call(&mut frame, step);
+                        frame.digest_loan().test_code_call(step, cut);
+                        let pending = frame.iteration.pending.as_ref().map(|s| s.as_ptr());
+                        let source_part = frame.digest.source_part.as_ref().map(|s| s.as_ptr());
+                        let encoded = frame.digest.encoded.as_ref().map(|s| s.as_ptr());
+                        let identity = frame
+                            .digest
+                            .identity
+                            .as_ref()
+                            .map(|i| (i.source_id.as_ptr(), i.compile_options_sha256.as_ptr()));
+                        let (primary, allocation) = fixed_primary();
+                        let first = if terminal {
+                            drop(primary);
+                            Some(
+                                frame
+                                    .sort
+                                    .compile
+                                    .prefix
+                                    .integrity
+                                    .prefix
+                                    .source
+                                    .fields()
+                                    .source_work()
+                                    .test_code_probe(OwnerStartProbe::ExceedProduction)
+                                    .unwrap_err(),
+                            )
+                        } else {
+                            // This deliberately injected first-owner control carries no
+                            // payment observation and never mints production authority.
+                            frame
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .physical
+                                .primary = Some(primary);
+                            frame
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .physical
+                                .audit_phase = FinancialAuditPhase::Failed;
+                            None
+                        };
+                        let before = frame
+                            .sort
+                            .compile
+                            .prefix
+                            .integrity
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation();
+                        {
+                            let _short = frame.digest_loan();
+                        }
+                        let mut moved = frame;
+                        moved.digest_loan().test_code_barrier();
+                        assert_eq!(
+                            moved.iteration.pending.as_ref().map(|s| s.as_ptr()),
+                            pending
+                        );
+                        assert_eq!(
+                            moved.digest.source_part.as_ref().map(|s| s.as_ptr()),
+                            source_part
+                        );
+                        assert_eq!(moved.digest.encoded.as_ref().map(|s| s.as_ptr()), encoded);
+                        assert_eq!(
+                            moved
+                                .digest
+                                .identity
+                                .as_ref()
+                                .map(|i| (i.source_id.as_ptr(), i.compile_options_sha256.as_ptr())),
+                            identity
+                        );
+                        if cut < 2 {
+                            moved.digest_loan().test_code_unobserved(cut == 1);
+                        } else {
+                            moved.digest_loan().test_code_late_return(step);
+                        }
+                        assert_eq!(
+                            moved
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .audit_fields()
+                                .begin_release(),
+                            Err(FinancialAuditFault::UnexpectedCut)
+                        );
+                        assert_eq!(trace.snapshot(), [None; 8]);
+                        assert_owned_pin(&moved.sort.compile.prefix.integrity.prefix.source.audit);
+                        if let Some(first) = first {
+                            assert!(moved
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .physical
+                                .primary
+                                .is_none());
+                            assert_eq!(
+                                moved
+                                    .sort
+                                    .compile
+                                    .prefix
+                                    .integrity
+                                    .prefix
+                                    .source
+                                    .fields()
+                                    .source_work()
+                                    .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                                Err(first)
+                            );
+                        } else {
+                            assert_primary(
+                                &moved.sort.compile.prefix.integrity.prefix.source.physical,
+                                allocation,
+                            );
+                        }
+                        assert_eq!(
+                            moved
+                                .sort
+                                .compile
+                                .prefix
+                                .integrity
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_observation(),
+                            before
+                        );
+                    }
+                }
+            }
         }
 
         fn integrity_raw_allocation(raw: &rusqlite::Error) -> usize {
             match raw {
-                rusqlite::Error::InvalidColumnName(name) | rusqlite::Error::InvalidColumnType(_, name, _) => name.as_ptr() as usize,
-                rusqlite::Error::FromSqlConversionFailure(_, _, child) => child.as_ref() as *const _ as *const () as usize,
+                rusqlite::Error::InvalidColumnName(name)
+                | rusqlite::Error::InvalidColumnType(_, name, _) => name.as_ptr() as usize,
+                rusqlite::Error::FromSqlConversionFailure(_, _, child) => {
+                    child.as_ref() as *const _ as *const () as usize
+                }
                 _ => panic!("fixed actual owned driver error"),
             }
         }
         fn fixed_integrity_raw(case: FinancialIntegrityErrorCase) -> (rusqlite::Error, usize) {
             let raw = match case {
-                FinancialIntegrityErrorCase::WrongType | FinancialIntegrityErrorCase::WrongNull
-                    | FinancialIntegrityErrorCase::WrongReal | FinancialIntegrityErrorCase::WrongBlob => {
-                    let kind = match case { FinancialIntegrityErrorCase::WrongNull => rusqlite::types::Type::Null,
+                FinancialIntegrityErrorCase::WrongType
+                | FinancialIntegrityErrorCase::WrongNull
+                | FinancialIntegrityErrorCase::WrongReal
+                | FinancialIntegrityErrorCase::WrongBlob => {
+                    let kind = match case {
+                        FinancialIntegrityErrorCase::WrongNull => rusqlite::types::Type::Null,
                         FinancialIntegrityErrorCase::WrongReal => rusqlite::types::Type::Real,
-                        FinancialIntegrityErrorCase::WrongBlob => rusqlite::types::Type::Blob, _ => rusqlite::types::Type::Integer };
-                    rusqlite::Error::InvalidColumnType(0, String::from("TEST_CODE column zero"), kind)
+                        FinancialIntegrityErrorCase::WrongBlob => rusqlite::types::Type::Blob,
+                        _ => rusqlite::types::Type::Integer,
+                    };
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        String::from("TEST_CODE column zero"),
+                        kind,
+                    )
                 }
                 FinancialIntegrityErrorCase::InvalidUtf8 => {
-                    let bytes = [0xff]; let child = std::str::from_utf8(&bytes).unwrap_err();
-                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(child))
+                    let bytes = [0xff];
+                    let child = std::str::from_utf8(&bytes).unwrap_err();
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(child),
+                    )
                 }
-                _ => rusqlite::Error::InvalidColumnName(String::from("TEST_CODE actual retained driver child")),
+                _ => rusqlite::Error::InvalidColumnName(String::from(
+                    "TEST_CODE actual retained driver child",
+                )),
             };
-            let pointer = integrity_raw_allocation(&raw); (raw, pointer)
+            let pointer = integrity_raw_allocation(&raw);
+            (raw, pointer)
         }
         #[test]
         fn history_original_integrity_fixed_whole_results_keep_two_vm_and_prefix() {
             let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
             let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
             let journal = frame.prefix.initial.journal_mode.as_ref().unwrap().as_ptr();
-            let before = frame.prefix.source.fields().source_work().test_code_observation();
-            let rows = vec![String::from("ok")]; let vector = rows.as_ptr(); let child = rows[0].as_ptr();
+            let before = frame
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_observation();
+            let rows = vec![String::from("ok")];
+            let vector = rows.as_ptr();
+            let child = rows[0].as_ptr();
             assert!(frame.integrity_loan().test_code_whole_check(rows));
-            assert_eq!(frame.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
-            { let _short = frame.integrity_loan(); }
+            assert_eq!(
+                frame.integrity.integrity_rows.as_ref().unwrap().as_ptr(),
+                vector
+            );
+            {
+                let _short = frame.integrity_loan();
+            }
             let mut moved = frame;
             assert!(std::ptr::eq(moved.prefix.initial.purpose, &purpose));
-            assert_eq!(moved.prefix.initial.journal_mode.as_ref().unwrap().as_ptr(), journal);
+            assert_eq!(
+                moved.prefix.initial.journal_mode.as_ref().unwrap().as_ptr(),
+                journal
+            );
             moved.integrity_loan().test_code_foreign_rows(0, false);
-            assert_eq!(moved.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr(), child);
+            assert_eq!(
+                moved.integrity.integrity_rows.as_ref().unwrap()[0].as_ptr(),
+                child
+            );
             // Both VM finalizations precede the independent capture return;
             // the successful Vec is moved through that return, not discarded.
             moved.integrity_loan().test_code_finish_success();
-            assert_eq!(moved.integrity.integrity_rows.as_ref().unwrap().as_ptr(), vector);
+            assert_eq!(
+                moved.integrity.integrity_rows.as_ref().unwrap().as_ptr(),
+                vector
+            );
             assert_eq!(moved.integrity.foreign_key_violations, 0);
-            assert_eq!(moved.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-            assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.prefix.source.audit);
-            assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), before);
+            assert_eq!(
+                moved.prefix.source.audit_fields().begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
+            assert_eq!(trace.snapshot(), [None; 8]);
+            assert_owned_pin(&moved.prefix.source.audit);
+            assert_eq!(
+                moved
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation(),
+                before
+            );
             // A03/A04 success is not COMMIT or a publishable capture. Existing
             // terminal cleanup is still required for this unissued protocol.
-            let first = moved.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-            let terminal = moved.prefix.source.fields().source_work().test_code_observation();
+            let first = moved
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err();
+            let terminal = moved
+                .prefix
+                .source
+                .fields()
+                .source_work()
+                .test_code_observation();
             moved.integrity_loan().test_code_drain_interrupted();
-            moved.prefix.source.fields().original_transaction().test_code_terminal_exit();
-            drain_integrity_source_audit(&mut moved.prefix.source, &trace); moved.prefix.source.fields().test_code_sidecar_close_busy();
-            assert!(moved.prefix.source.physical.primary.is_none()); assert_owned_pin(&moved.prefix.source.audit);
+            moved
+                .prefix
+                .source
+                .fields()
+                .original_transaction()
+                .test_code_terminal_exit();
+            drain_integrity_source_audit(&mut moved.prefix.source, &trace);
+            moved.prefix.source.fields().test_code_sidecar_close_busy();
+            assert!(moved.prefix.source.physical.primary.is_none());
+            assert_owned_pin(&moved.prefix.source.audit);
             assert!(moved.prefix.source.physical.parent_sidecars_retained());
-            assert_eq!(moved.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-            assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), terminal);
+            assert_eq!(
+                moved
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                Err(first)
+            );
+            assert_eq!(
+                moved
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation(),
+                terminal
+            );
         }
         #[test]
         fn history_original_integrity_errors_preserve_owned_results_and_scope_order() {
-            for case in [FinancialIntegrityErrorCase::Prepare, FinancialIntegrityErrorCase::Query,
-                FinancialIntegrityErrorCase::Step, FinancialIntegrityErrorCase::DoneReset,
-                FinancialIntegrityErrorCase::WrongType, FinancialIntegrityErrorCase::WrongNull,
-                FinancialIntegrityErrorCase::WrongReal, FinancialIntegrityErrorCase::WrongBlob, FinancialIntegrityErrorCase::InvalidUtf8,
-                FinancialIntegrityErrorCase::ForeignPrepare, FinancialIntegrityErrorCase::ForeignQuery,
-                FinancialIntegrityErrorCase::ForeignStep] {
+            for case in [
+                FinancialIntegrityErrorCase::Prepare,
+                FinancialIntegrityErrorCase::Query,
+                FinancialIntegrityErrorCase::Step,
+                FinancialIntegrityErrorCase::DoneReset,
+                FinancialIntegrityErrorCase::WrongType,
+                FinancialIntegrityErrorCase::WrongNull,
+                FinancialIntegrityErrorCase::WrongReal,
+                FinancialIntegrityErrorCase::WrongBlob,
+                FinancialIntegrityErrorCase::InvalidUtf8,
+                FinancialIntegrityErrorCase::ForeignPrepare,
+                FinancialIntegrityErrorCase::ForeignQuery,
+                FinancialIntegrityErrorCase::ForeignStep,
+            ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
                 let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
-                let before = frame.prefix.source.fields().source_work().test_code_observation();
-                let (raw, allocation) = fixed_integrity_raw(case); let (cleanup, _) = fixed_initial_raw_error();
-                frame.integrity_loan().test_code_driver_error(case, raw, cleanup);
+                let before = frame
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
+                let (raw, allocation) = fixed_integrity_raw(case);
+                let (cleanup, _) = fixed_initial_raw_error();
+                frame
+                    .integrity_loan()
+                    .test_code_driver_error(case, raw, cleanup);
                 let expected = match case {
                     FinancialIntegrityErrorCase::Prepare => "prepare PRAGMA integrity_check",
                     FinancialIntegrityErrorCase::Query => "query PRAGMA integrity_check",
-                    FinancialIntegrityErrorCase::ForeignPrepare => "prepare PRAGMA foreign_key_check",
+                    FinancialIntegrityErrorCase::ForeignPrepare => {
+                        "prepare PRAGMA foreign_key_check"
+                    }
                     FinancialIntegrityErrorCase::ForeignQuery => "query PRAGMA foreign_key_check",
                     FinancialIntegrityErrorCase::ForeignStep => "read PRAGMA foreign_key_check",
                     _ => "read PRAGMA integrity_check",
                 };
-                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })) = &frame.prefix.source.physical.primary else { panic!("Source-correct driver wrapper before remaining Statements"); };
-                assert_eq!(*operation, expected); assert_eq!(integrity_raw_allocation(source), allocation);
-                { let _short = frame.integrity_loan(); }
-                let mut moved = frame; let (cleanup, _) = fixed_initial_raw_error();
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite {
+                    operation,
+                    source,
+                })) = &frame.prefix.source.physical.primary
+                else {
+                    panic!("Source-correct driver wrapper before remaining Statements");
+                };
+                assert_eq!(*operation, expected);
+                assert_eq!(integrity_raw_allocation(source), allocation);
+                {
+                    let _short = frame.integrity_loan();
+                }
+                let mut moved = frame;
+                let (cleanup, _) = fixed_initial_raw_error();
                 // FK scopes first; first successful Vec then first Statement.
                 // This asserts outer local order, never Vec children layout.
-                moved.integrity_loan().test_code_finish_failed_scope(cleanup);
+                moved
+                    .integrity_loan()
+                    .test_code_finish_failed_scope(cleanup);
                 assert!(moved.integrity.integrity_rows.is_none());
-                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { operation, source })) = &moved.prefix.source.physical.primary else { panic!("same wrapped child"); };
-                assert_eq!(*operation, expected); assert_eq!(integrity_raw_allocation(source), allocation);
-                let (ignored, _) = fixed_primary(); let (finalize, _) = fixed_primary();
-                moved.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, finalize);
-                drain_integrity_source_audit(&mut moved.prefix.source, &trace); moved.prefix.source.fields().test_code_sidecar_close_busy();
-                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite { source, .. })) = &moved.prefix.source.physical.primary else { panic!("first child survives failed Original close"); };
-                assert_eq!(integrity_raw_allocation(source), allocation); assert_owned_pin(&moved.prefix.source.audit);
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite {
+                    operation,
+                    source,
+                })) = &moved.prefix.source.physical.primary
+                else {
+                    panic!("same wrapped child");
+                };
+                assert_eq!(*operation, expected);
+                assert_eq!(integrity_raw_allocation(source), allocation);
+                let (ignored, _) = fixed_primary();
+                let (finalize, _) = fixed_primary();
+                moved
+                    .prefix
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_read_primary_rollback_once(ignored, finalize);
+                drain_integrity_source_audit(&mut moved.prefix.source, &trace);
+                moved.prefix.source.fields().test_code_sidecar_close_busy();
+                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSqlite {
+                    source,
+                    ..
+                })) = &moved.prefix.source.physical.primary
+                else {
+                    panic!("first child survives failed Original close");
+                };
+                assert_eq!(integrity_raw_allocation(source), allocation);
+                assert_owned_pin(&moved.prefix.source.audit);
                 assert!(moved.prefix.source.physical.parent_sidecars_retained());
-                assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), before);
+                assert_eq!(
+                    moved
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
             }
-            for (rows, foreign_rows, overflow) in [(Vec::<String>::new(), 0, false),
-                (vec![String::from("bad")], 0, false), (vec![String::from("ok"), String::from("ok")], 0, false),
-                (vec![String::from("ok")], 2, false), (vec![String::from("ok")], 1, true)] {
+            for (rows, foreign_rows, overflow) in [
+                (Vec::<String>::new(), 0, false),
+                (vec![String::from("bad")], 0, false),
+                (vec![String::from("ok"), String::from("ok")], 0, false),
+                (vec![String::from("ok")], 2, false),
+                (vec![String::from("ok")], 1, true),
+            ] {
                 let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                let writer = financial_audit::fixed_writer();
+                let trace = Trace::new();
                 let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
                 let reached_fk = frame.integrity_loan().test_code_whole_check(rows);
-                if reached_fk { frame.integrity_loan().test_code_foreign_rows(foreign_rows, overflow); }
+                if reached_fk {
+                    frame
+                        .integrity_loan()
+                        .test_code_foreign_rows(foreign_rows, overflow);
+                }
                 let detail = match frame.integrity.fault.unwrap() {
-                    FinancialIntegrityFault::IntegrityRows => format!("PRAGMA integrity_check failed: {:?}", frame.integrity.integrity_rows.as_ref().unwrap()),
-                    FinancialIntegrityFault::ForeignNonzero => format!("PRAGMA foreign_key_check found {} violation(s)", frame.integrity.foreign_key_violations),
-                    FinancialIntegrityFault::ForeignOverflow => String::from("PRAGMA foreign_key_check violation count overflowed i64"),
+                    FinancialIntegrityFault::IntegrityRows => format!(
+                        "PRAGMA integrity_check failed: {:?}",
+                        frame.integrity.integrity_rows.as_ref().unwrap()
+                    ),
+                    FinancialIntegrityFault::ForeignNonzero => format!(
+                        "PRAGMA foreign_key_check found {} violation(s)",
+                        frame.integrity.foreign_key_violations
+                    ),
+                    FinancialIntegrityFault::ForeignOverflow => {
+                        String::from("PRAGMA foreign_key_check violation count overflowed i64")
+                    }
                 };
-                let allocation = detail.as_ptr(); let before = frame.prefix.source.fields().source_work().test_code_observation();
+                let allocation = detail.as_ptr();
+                let before = frame
+                    .prefix
+                    .source
+                    .fields()
+                    .source_work()
+                    .test_code_observation();
                 frame.integrity_loan().test_code_paid_semantic_error(detail);
-                let (cleanup, _) = fixed_initial_raw_error(); frame.integrity_loan().test_code_finish_failed_scope(cleanup);
-                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &frame.prefix.source.physical.primary else { panic!("fixed semantic category retained once"); };
+                let (cleanup, _) = fixed_initial_raw_error();
+                frame
+                    .integrity_loan()
+                    .test_code_finish_failed_scope(cleanup);
+                let Some(SourceOperationError::Global(
+                    GlobalSchemaV1Error::SelectionSnapshotChanged { detail },
+                )) = &frame.prefix.source.physical.primary
+                else {
+                    panic!("fixed semantic category retained once");
+                };
                 assert_eq!(detail.as_ptr(), allocation);
-                frame.prefix.source.fields().original_transaction().test_code_existing_read_primary_exit();
-                drain_integrity_source_audit(&mut frame.prefix.source, &trace); frame.prefix.source.fields().test_code_sidecar_close_busy();
-                let Some(SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail })) = &frame.prefix.source.physical.primary else { panic!("same semantic primary after close BUSY"); };
-                assert_eq!(detail.as_ptr(), allocation); assert_owned_pin(&frame.prefix.source.audit);
-                assert_eq!(frame.prefix.source.fields().source_work().test_code_observation(), before);
+                frame
+                    .prefix
+                    .source
+                    .fields()
+                    .original_transaction()
+                    .test_code_existing_read_primary_exit();
+                drain_integrity_source_audit(&mut frame.prefix.source, &trace);
+                frame.prefix.source.fields().test_code_sidecar_close_busy();
+                let Some(SourceOperationError::Global(
+                    GlobalSchemaV1Error::SelectionSnapshotChanged { detail },
+                )) = &frame.prefix.source.physical.primary
+                else {
+                    panic!("same semantic primary after close BUSY");
+                };
+                assert_eq!(detail.as_ptr(), allocation);
+                assert_owned_pin(&frame.prefix.source.audit);
+                assert_eq!(
+                    frame
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation(),
+                    before
+                );
             }
         }
         #[test]
         fn history_original_integrity_terminal_and_first_primary_hold_same_frame() {
             for terminal in [false, true] {
-                for cut in [FinancialIntegrityTerminalCut::BeforePrepare, FinancialIntegrityTerminalCut::CompletedBeforeWhole,
-                    FinancialIntegrityTerminalCut::ForeignEofPending, FinancialIntegrityTerminalCut::SemanticDetail,
-                    FinancialIntegrityTerminalCut::PaidDetailPending, FinancialIntegrityTerminalCut::OwnedPaidDetail,
-                    FinancialIntegrityTerminalCut::AfterVector, FinancialIntegrityTerminalCut::ForeignRow,
-                    FinancialIntegrityTerminalCut::RowWithPartialOwner, FinancialIntegrityTerminalCut::OwnedRaw,
-                    FinancialIntegrityTerminalCut::OwnedIgnoredReset] {
+                for cut in [
+                    FinancialIntegrityTerminalCut::BeforePrepare,
+                    FinancialIntegrityTerminalCut::CompletedBeforeWhole,
+                    FinancialIntegrityTerminalCut::ForeignEofPending,
+                    FinancialIntegrityTerminalCut::SemanticDetail,
+                    FinancialIntegrityTerminalCut::PaidDetailPending,
+                    FinancialIntegrityTerminalCut::OwnedPaidDetail,
+                    FinancialIntegrityTerminalCut::AfterVector,
+                    FinancialIntegrityTerminalCut::ForeignRow,
+                    FinancialIntegrityTerminalCut::RowWithPartialOwner,
+                    FinancialIntegrityTerminalCut::OwnedRaw,
+                    FinancialIntegrityTerminalCut::OwnedIgnoredReset,
+                ] {
                     let purpose = SelectionSnapshotPurpose::RowsBackup(rows::Options::production());
-                    let writer = financial_audit::fixed_writer(); let trace = Trace::new();
+                    let writer = financial_audit::fixed_writer();
+                    let trace = Trace::new();
                     let mut frame = fixed_integrity_frame(&purpose, &writer, &trace);
-                    let (raw, _) = fixed_initial_raw_error(); let (cleanup, _) = fixed_initial_raw_error();
-                    frame.integrity_loan().test_code_interruption_cut(cut, raw, cleanup);
-                    let mut paid_detail = if matches!(cut, FinancialIntegrityTerminalCut::PaidDetailPending | FinancialIntegrityTerminalCut::OwnedPaidDetail) {
+                    let (raw, _) = fixed_initial_raw_error();
+                    let (cleanup, _) = fixed_initial_raw_error();
+                    frame
+                        .integrity_loan()
+                        .test_code_interruption_cut(cut, raw, cleanup);
+                    let mut paid_detail = if matches!(
+                        cut,
+                        FinancialIntegrityTerminalCut::PaidDetailPending
+                            | FinancialIntegrityTerminalCut::OwnedPaidDetail
+                    ) {
                         Some(String::from("PRAGMA integrity_check failed: [\"bad\"]"))
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let detail_pointer = paid_detail.as_ref().map(|s| s.as_ptr());
                     if matches!(cut, FinancialIntegrityTerminalCut::OwnedPaidDetail) {
-                        frame.integrity_loan().test_code_retain_detail_before_interruption(paid_detail.take().unwrap());
+                        frame
+                            .integrity_loan()
+                            .test_code_retain_detail_before_interruption(
+                                paid_detail.take().unwrap(),
+                            );
                     }
-                    let normal_reset_cleanup = if !terminal && matches!(cut, FinancialIntegrityTerminalCut::ForeignRow
-                        | FinancialIntegrityTerminalCut::RowWithPartialOwner | FinancialIntegrityTerminalCut::OwnedRaw) {
+                    let normal_reset_cleanup = if !terminal
+                        && matches!(
+                            cut,
+                            FinancialIntegrityTerminalCut::ForeignRow
+                                | FinancialIntegrityTerminalCut::RowWithPartialOwner
+                                | FinancialIntegrityTerminalCut::OwnedRaw
+                        ) {
                         Some(fixed_initial_raw_error().0)
-                    } else { None };
+                    } else {
+                        None
+                    };
                     let (primary, allocation) = fixed_primary();
                     let first = if terminal {
-                        drop(primary); Some(frame.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err())
+                        drop(primary);
+                        Some(
+                            frame
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                                .unwrap_err(),
+                        )
                     } else {
                         // The genuine G audit producer can retain its first
                         // owned error while Q still owns ROW/VM/raw state.
-                        frame.prefix.source.audit_fields().note_normal_failure().unwrap();
-                        frame.prefix.source.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first owned G primary")); None
+                        frame
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .note_normal_failure()
+                            .unwrap();
+                        frame
+                            .prefix
+                            .source
+                            .audit_fields()
+                            .retain_paid_primary(primary)
+                            .unwrap_or_else(|_| panic!("first owned G primary"));
+                        None
                     };
-                    let before = frame.prefix.source.fields().source_work().test_code_observation();
+                    let before = frame
+                        .prefix
+                        .source
+                        .fields()
+                        .source_work()
+                        .test_code_observation();
                     if matches!(cut, FinancialIntegrityTerminalCut::CompletedBeforeWhole) {
-                        frame.integrity_loan().test_code_completed_whole_at_interruption(vec![String::from("ok")]);
+                        frame
+                            .integrity_loan()
+                            .test_code_completed_whole_at_interruption(vec![String::from("ok")]);
                     }
                     if matches!(cut, FinancialIntegrityTerminalCut::ForeignEofPending) {
-                        frame.integrity_loan().test_code_foreign_eof_at_interruption();
+                        frame
+                            .integrity_loan()
+                            .test_code_foreign_eof_at_interruption();
                     }
                     if matches!(cut, FinancialIntegrityTerminalCut::RowWithPartialOwner) {
-                        frame.integrity_loan().test_code_partial_owner(String::from("TEST_CODE actual returned row"), vec![String::from("TEST_CODE actual returned partial owner")]);
+                        frame.integrity_loan().test_code_partial_owner(
+                            String::from("TEST_CODE actual returned row"),
+                            vec![String::from("TEST_CODE actual returned partial owner")],
+                        );
                     }
-                    { let _short = frame.integrity_loan(); }
+                    {
+                        let _short = frame.integrity_loan();
+                    }
                     let mut moved = frame;
                     if matches!(cut, FinancialIntegrityTerminalCut::PaidDetailPending) {
-                        moved.integrity_loan().test_code_detail_at_interruption(paid_detail.take().unwrap());
+                        moved
+                            .integrity_loan()
+                            .test_code_detail_at_interruption(paid_detail.take().unwrap());
                     }
-                    if matches!(cut, FinancialIntegrityTerminalCut::PaidDetailPending | FinancialIntegrityTerminalCut::OwnedPaidDetail) {
-                        assert_eq!(moved.integrity.paid_detail.as_ref().map(|s| s.as_ptr()), detail_pointer);
+                    if matches!(
+                        cut,
+                        FinancialIntegrityTerminalCut::PaidDetailPending
+                            | FinancialIntegrityTerminalCut::OwnedPaidDetail
+                    ) {
+                        assert_eq!(
+                            moved.integrity.paid_detail.as_ref().map(|s| s.as_ptr()),
+                            detail_pointer
+                        );
                     }
                     assert!(std::ptr::eq(moved.prefix.initial.purpose, &purpose));
-                    assert!(moved.prefix.initial.journal_mode.as_ref().is_some_and(|s| s == "wal"));
-                    assert_eq!(trace.snapshot(), [None; 8]); assert_owned_pin(&moved.prefix.source.audit);
-                    assert_eq!(moved.prefix.source.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-                    let reset_allocation = normal_reset_cleanup.map(|cleanup| moved.integrity_loan().test_code_primary_reset_cleanup(cleanup));
-                    { let _short = moved.integrity_loan(); }
+                    assert!(moved
+                        .prefix
+                        .initial
+                        .journal_mode
+                        .as_ref()
+                        .is_some_and(|s| s == "wal"));
+                    assert_eq!(trace.snapshot(), [None; 8]);
+                    assert_owned_pin(&moved.prefix.source.audit);
+                    assert_eq!(
+                        moved.prefix.source.audit_fields().begin_release(),
+                        Err(FinancialAuditFault::UnexpectedCut)
+                    );
+                    let reset_allocation = normal_reset_cleanup.map(|cleanup| {
+                        moved
+                            .integrity_loan()
+                            .test_code_primary_reset_cleanup(cleanup)
+                    });
+                    {
+                        let _short = moved.integrity_loan();
+                    }
                     let mut moved = moved;
                     if let Some(reset_allocation) = reset_allocation {
                         assert_primary(&moved.prefix.source.physical, allocation);
-                        moved.integrity_loan().test_code_primary_cleanup_once(reset_allocation);
+                        moved
+                            .integrity_loan()
+                            .test_code_primary_cleanup_once(reset_allocation);
                         assert_primary(&moved.prefix.source.physical, allocation);
                     }
                     moved.integrity_loan().test_code_drain_interrupted();
                     if terminal {
                         assert!(moved.prefix.source.physical.primary.is_none());
-                        moved.prefix.source.fields().original_transaction().test_code_terminal_exit();
+                        moved
+                            .prefix
+                            .source
+                            .fields()
+                            .original_transaction()
+                            .test_code_terminal_exit();
                     } else {
                         assert_primary(&moved.prefix.source.physical, allocation);
-                        let (ignored, _) = fixed_primary(); let (cleanup, _) = fixed_primary();
-                        moved.prefix.source.fields().original_transaction().test_code_read_primary_rollback_once(ignored, cleanup);
+                        let (ignored, _) = fixed_primary();
+                        let (cleanup, _) = fixed_primary();
+                        moved
+                            .prefix
+                            .source
+                            .fields()
+                            .original_transaction()
+                            .test_code_read_primary_rollback_once(ignored, cleanup);
                     }
-                    drain_integrity_source_audit(&mut moved.prefix.source, &trace); moved.prefix.source.fields().test_code_sidecar_close_busy();
-                    assert_owned_pin(&moved.prefix.source.audit); assert!(moved.prefix.source.physical.parent_sidecars_retained());
+                    drain_integrity_source_audit(&mut moved.prefix.source, &trace);
+                    moved.prefix.source.fields().test_code_sidecar_close_busy();
+                    assert_owned_pin(&moved.prefix.source.audit);
+                    assert!(moved.prefix.source.physical.parent_sidecars_retained());
                     if let Some(first) = first {
                         assert!(moved.prefix.source.physical.primary.is_none());
-                        assert_eq!(moved.prefix.source.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
-                    } else { assert_primary(&moved.prefix.source.physical, allocation); }
-                    assert_eq!(moved.prefix.source.fields().source_work().test_code_observation(), before);
+                        assert_eq!(
+                            moved
+                                .prefix
+                                .source
+                                .fields()
+                                .source_work()
+                                .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                            Err(first)
+                        );
+                    } else {
+                        assert_primary(&moved.prefix.source.physical, allocation);
+                    }
+                    assert_eq!(
+                        moved
+                            .prefix
+                            .source
+                            .fields()
+                            .source_work()
+                            .test_code_observation(),
+                        before
+                    );
                 }
             }
         }
@@ -3558,48 +7565,105 @@ mod financial_original_audit_acquisition_tests {
 
     #[test]
     fn history_original_audit_acquisition_partial_cuts_require_primary_and_ordered_drain() {
-        for case in [Case::GuardOnly, Case::ParentOpened, Case::OpenedLock, Case::LockedDataOpened, Case::Ready] {
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-            let (primary, allocation) = fixed_primary(); let (spare, spare_allocation) = fixed_primary();
-            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap();
+        for case in [
+            Case::GuardOnly,
+            Case::ParentOpened,
+            Case::OpenedLock,
+            Case::LockedDataOpened,
+            Case::Ready,
+        ] {
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
+            let (primary, allocation) = fixed_primary();
+            let (spare, spare_allocation) = fixed_primary();
+            let mut start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
             fixed_returned_sidecars(&mut start);
             let before = start.fields().source_work().test_code_observation();
             start.audit_fields().begin(&writer).unwrap();
             start.audit.resources.loan().seed_fixed_case(case, &trace);
-            { let _short = start.audit_fields(); }
-            start.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
+            {
+                let _short = start.audit_fields();
+            }
+            start.audit.resources.loan().assert_fixed_owned();
+            assert_eq!(trace.snapshot(), [None; 8]);
             start.fields().test_code_audit_blocks_close();
             start.audit_fields().note_normal_failure().unwrap();
-            assert_eq!(start.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
+            assert_eq!(
+                start.audit_fields().begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
             start.fields().test_code_audit_blocks_close();
-            start.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("first paid primary"));
-            let Err(spare) = start.audit_fields().retain_paid_primary(spare) else { panic!("second primary refused"); };
-            let SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged { detail }) = spare else { panic!("same spare category"); };
-            assert_eq!(detail.as_ptr() as usize, spare_allocation); assert_primary(&start.physical, allocation);
+            start
+                .audit_fields()
+                .retain_paid_primary(primary)
+                .unwrap_or_else(|_| panic!("first paid primary"));
+            let Err(spare) = start.audit_fields().retain_paid_primary(spare) else {
+                panic!("second primary refused");
+            };
+            let SourceOperationError::Global(GlobalSchemaV1Error::SelectionSnapshotChanged {
+                detail,
+            }) = spare
+            else {
+                panic!("same spare category");
+            };
+            assert_eq!(detail.as_ptr() as usize, spare_allocation);
+            assert_primary(&start.physical, allocation);
             start.audit_fields().begin_release().unwrap();
             if matches!(case, Case::LockedDataOpened | Case::Ready) {
-                assert_eq!(start.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(Action::Unlock)));
-                assert_eq!(trace.snapshot(), [None; 8]); start.audit.resources.loan().assert_fixed_owned();
+                assert_eq!(
+                    start.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::Session(Action::Unlock))
+                );
+                assert_eq!(trace.snapshot(), [None; 8]);
+                start.audit.resources.loan().assert_fixed_owned();
                 start.fields().test_code_audit_blocks_close();
                 start.audit.resources.loan().observe_fixed_unlock_ok();
             }
             let expected: &[Action] = match case {
                 Case::GuardOnly => &[Action::Guard, Action::Finished],
                 Case::ParentOpened => &[Action::Parent, Action::Guard, Action::Finished],
-                Case::OpenedLock => &[Action::LockFile, Action::Parent, Action::Guard, Action::Finished],
-                Case::LockedDataOpened | Case::Ready => &[Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished],
+                Case::OpenedLock => &[
+                    Action::LockFile,
+                    Action::Parent,
+                    Action::Guard,
+                    Action::Finished,
+                ],
+                Case::LockedDataOpened | Case::Ready => &[
+                    Action::LockFile,
+                    Action::Guard,
+                    Action::Parent,
+                    Action::Data,
+                    Action::Finished,
+                ],
             };
             for &action in expected {
-                assert_eq!(start.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+                assert_eq!(
+                    start.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::Session(action))
+                );
                 start.fields().test_code_audit_blocks_close(); // Even session Finished does not settle G.
             }
-            for (index, &action) in expected.iter().enumerate() { assert_eq!(trace.snapshot()[index], Some(action)); }
+            for (index, &action) in expected.iter().enumerate() {
+                assert_eq!(trace.snapshot()[index], Some(action));
+            }
             start.audit.resources.loan().assert_fixed_guard_released();
-            assert_eq!(start.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
-            assert_eq!(start.audit_fields().release_one(), Err(FinancialAuditFault::UnexpectedCut));
+            assert_eq!(
+                start.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Finished)
+            );
+            assert_eq!(
+                start.audit_fields().release_one(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
             start.fields().test_code_sidecar_close_ok();
-            assert_primary(&start.physical, allocation); assert!(start.physical.parent_sidecars_retained());
+            assert_primary(&start.physical, allocation);
+            assert!(start.physical.parent_sidecars_retained());
             assert_eq!(start.fields().source_work().test_code_observation(), before);
         }
     }
@@ -3608,52 +7672,155 @@ mod financial_original_audit_acquisition_tests {
         // Even an otherwise returned sidecar frame cannot start E05 after
         // an already attempted close. The absence of slots is not authority.
         let writer = financial_audit::fixed_writer();
-        let mut closed = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-        fixed_returned_sidecars(&mut closed); closed.fields().test_code_sidecar_close_busy();
-        assert_eq!(closed.audit_fields().begin(&writer), Err(FinancialAuditFault::UnexpectedCut));
+        let mut closed =
+            GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+        fixed_returned_sidecars(&mut closed);
+        closed.fields().test_code_sidecar_close_busy();
+        assert_eq!(
+            closed.audit_fields().begin(&writer),
+            Err(FinancialAuditFault::UnexpectedCut)
+        );
         assert!(closed.physical.audit_phase == FinancialAuditPhase::NotStarted);
-        for cut in [FinancialAuditPinPhase::LocalParent, FinancialAuditPinPhase::LocalComplete, FinancialAuditPinPhase::CompleteRetained] {
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new(); let (primary, allocation) = fixed_primary();
-            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_returned_sidecars(&mut start);
+        for cut in [
+            FinancialAuditPinPhase::LocalParent,
+            FinancialAuditPinPhase::LocalComplete,
+            FinancialAuditPinPhase::CompleteRetained,
+        ] {
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
+            let (primary, allocation) = fixed_primary();
+            let mut start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
+            fixed_returned_sidecars(&mut start);
             start.audit_fields().begin(&writer).unwrap();
             assert!(start.audit_fields().records_port().is_err()); // A ready cut is mandatory.
-            start.audit.resources.loan().seed_fixed_case(Case::Ready, &trace);
-            let records = financial_audit::fixed_snapshot(); let tail_allocation = records.validation().tail_hash.as_ref().unwrap().as_ptr() as usize;
+            start
+                .audit
+                .resources
+                .loan()
+                .seed_fixed_case(Case::Ready, &trace);
+            let records = financial_audit::fixed_snapshot();
+            let tail_allocation =
+                records.validation().tail_hash.as_ref().unwrap().as_ptr() as usize;
             start.audit_fields().records_port().unwrap().retain(records);
-            { let mut fields = start.audit_fields(); let _unused = fields.parent_port().unwrap(); }
-            assert!(start.audit.parent.is_none()); assert_eq!(trace.snapshot(), [None; 8]);
-            start.audit_fields().parent_port().unwrap().retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
+            {
+                let mut fields = start.audit_fields();
+                let _unused = fields.parent_port().unwrap();
+            }
+            assert!(start.audit.parent.is_none());
+            assert_eq!(trace.snapshot(), [None; 8]);
+            start
+                .audit_fields()
+                .parent_port()
+                .unwrap()
+                .retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
             assert!(start.audit_fields().parent_port().is_err());
-            if cut != FinancialAuditPinPhase::LocalParent { start.audit_fields().file_port().unwrap().retain(fixed_file()); }
-            if cut == FinancialAuditPinPhase::CompleteRetained { start.audit_fields().finish_pins().unwrap(); }
-            assert_owned_pin(&start.audit); let before = start.fields().source_work().test_code_observation();
+            if cut != FinancialAuditPinPhase::LocalParent {
+                start
+                    .audit_fields()
+                    .file_port()
+                    .unwrap()
+                    .retain(fixed_file());
+            }
+            if cut == FinancialAuditPinPhase::CompleteRetained {
+                start.audit_fields().finish_pins().unwrap();
+            }
+            assert_owned_pin(&start.audit);
+            let before = start.fields().source_work().test_code_observation();
             let mut frame = start.enter_rows(); // No new pool or second owned-work take.
-            { let _short = frame.audit_fields(); }
-            assert_owned_pin(&frame.audit); frame.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
-            assert_eq!(frame.audit.records.as_ref().unwrap().validation().tail_hash.as_ref().unwrap().as_ptr() as usize, tail_allocation);
-            frame.audit_fields().note_normal_failure().unwrap(); frame.fields().test_code_audit_blocks_close();
-            frame.audit_fields().retain_paid_primary(primary).unwrap_or_else(|_| panic!("same G primary"));
-            frame.audit_fields().begin_release().unwrap(); frame.audit.resources.loan().observe_fixed_unlock_ok();
-            for action in [Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished] {
-                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+            {
+                let _short = frame.audit_fields();
+            }
+            assert_owned_pin(&frame.audit);
+            frame.audit.resources.loan().assert_fixed_owned();
+            assert_eq!(trace.snapshot(), [None; 8]);
+            assert_eq!(
+                frame
+                    .audit
+                    .records
+                    .as_ref()
+                    .unwrap()
+                    .validation()
+                    .tail_hash
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr() as usize,
+                tail_allocation
+            );
+            frame.audit_fields().note_normal_failure().unwrap();
+            frame.fields().test_code_audit_blocks_close();
+            frame
+                .audit_fields()
+                .retain_paid_primary(primary)
+                .unwrap_or_else(|_| panic!("same G primary"));
+            frame.audit_fields().begin_release().unwrap();
+            frame.audit.resources.loan().observe_fixed_unlock_ok();
+            for action in [
+                Action::LockFile,
+                Action::Guard,
+                Action::Parent,
+                Action::Data,
+                Action::Finished,
+            ] {
+                assert_eq!(
+                    frame.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::Session(action))
+                );
                 frame.fields().test_code_audit_blocks_close();
             }
             if cut != FinancialAuditPinPhase::CompleteRetained {
                 if cut == FinancialAuditPinPhase::LocalComplete {
-                    assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::LocalFile)); frame.fields().test_code_audit_blocks_close();
+                    assert_eq!(
+                        frame.audit_fields().release_one(),
+                        Ok(FinancialAuditRelease::LocalFile)
+                    );
+                    frame.fields().test_code_audit_blocks_close();
                 }
-                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::LocalParent)); frame.fields().test_code_audit_blocks_close();
-                assert!(frame.audit.parent.is_none() && frame.audit.leaf.is_none() && frame.audit.file.is_none());
-                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::LocalRecords)); frame.fields().test_code_audit_blocks_close();
+                assert_eq!(
+                    frame.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::LocalParent)
+                );
+                frame.fields().test_code_audit_blocks_close();
+                assert!(
+                    frame.audit.parent.is_none()
+                        && frame.audit.leaf.is_none()
+                        && frame.audit.file.is_none()
+                );
+                assert_eq!(
+                    frame.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::LocalRecords)
+                );
+                frame.fields().test_code_audit_blocks_close();
                 assert!(frame.audit.records.is_none());
             }
-            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
+            assert_eq!(
+                frame.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Finished)
+            );
             frame.fields().test_code_sidecar_close_busy(); // Failed close holds retained audit/sidecar payload and first primary.
-            assert_primary(&frame.physical, allocation); assert!(frame.physical.parent_sidecars_retained());
+            assert_primary(&frame.physical, allocation);
+            assert!(frame.physical.parent_sidecars_retained());
             if cut == FinancialAuditPinPhase::CompleteRetained {
-                assert_owned_pin(&frame.audit); assert!(frame.audit.file.is_some() && frame.audit.parent.is_some());
-                assert_eq!(frame.audit.records.as_ref().unwrap().validation().tail_hash.as_ref().unwrap().as_ptr() as usize, tail_allocation);
+                assert_owned_pin(&frame.audit);
+                assert!(frame.audit.file.is_some() && frame.audit.parent.is_some());
+                assert_eq!(
+                    frame
+                        .audit
+                        .records
+                        .as_ref()
+                        .unwrap()
+                        .validation()
+                        .tail_hash
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr() as usize,
+                    tail_allocation
+                );
             }
             assert_eq!(frame.fields().source_work().test_code_observation(), before);
         }
@@ -3661,46 +7828,138 @@ mod financial_original_audit_acquisition_tests {
     #[test]
     fn history_original_audit_acquisition_terminal_keeps_unlock_errno_and_blocks_new_ports() {
         for complete in [false, true] {
-            let writer = financial_audit::fixed_writer(); let trace = Trace::new();
-            let mut start = GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
-            start.fields().source_work().test_code_probe(OwnerStartProbe::FundEarly).unwrap(); fixed_returned_sidecars(&mut start);
-            start.audit_fields().begin(&writer).unwrap(); start.audit.resources.loan().seed_fixed_case(Case::Ready, &trace);
-            start.audit_fields().records_port().unwrap().retain(financial_audit::fixed_snapshot());
-            start.audit_fields().parent_port().unwrap().retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
-            start.audit_fields().file_port().unwrap().retain(fixed_file());
-            if complete { start.audit_fields().finish_pins().unwrap(); }
-            let first = start.fields().source_work().test_code_probe(OwnerStartProbe::ExceedProduction).unwrap_err();
-            let before = start.fields().source_work().test_code_observation();
-            { let mut fields = start.audit_fields();
-                assert!(matches!(fields.records_port(), Err(FinancialAuditFault::Terminal)));
-                assert!(matches!(fields.parent_port(), Err(FinancialAuditFault::Terminal)));
-                assert!(matches!(fields.file_port(), Err(FinancialAuditFault::Terminal)));
-                assert_eq!(fields.finish_pins(), Err(FinancialAuditFault::Terminal));
-                assert_eq!(fields.note_normal_failure(), Err(FinancialAuditFault::Terminal));
+            let writer = financial_audit::fixed_writer();
+            let trace = Trace::new();
+            let mut start =
+                GlobalSchemaVersionOwner::for_test_code().start_fixed_financial_source_work();
+            start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::FundEarly)
+                .unwrap();
+            fixed_returned_sidecars(&mut start);
+            start.audit_fields().begin(&writer).unwrap();
+            start
+                .audit
+                .resources
+                .loan()
+                .seed_fixed_case(Case::Ready, &trace);
+            start
+                .audit_fields()
+                .records_port()
+                .unwrap()
+                .retain(financial_audit::fixed_snapshot());
+            start
+                .audit_fields()
+                .parent_port()
+                .unwrap()
+                .retain(fixed_parent(), OsString::from("TEST_CODE-audit"));
+            start
+                .audit_fields()
+                .file_port()
+                .unwrap()
+                .retain(fixed_file());
+            if complete {
+                start.audit_fields().finish_pins().unwrap();
             }
-            assert_owned_pin(&start.audit); start.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
-            let mut frame = start.enter_rows(); frame.fields().test_code_audit_blocks_close();
+            let first = start
+                .fields()
+                .source_work()
+                .test_code_probe(OwnerStartProbe::ExceedProduction)
+                .unwrap_err();
+            let before = start.fields().source_work().test_code_observation();
+            {
+                let mut fields = start.audit_fields();
+                assert!(matches!(
+                    fields.records_port(),
+                    Err(FinancialAuditFault::Terminal)
+                ));
+                assert!(matches!(
+                    fields.parent_port(),
+                    Err(FinancialAuditFault::Terminal)
+                ));
+                assert!(matches!(
+                    fields.file_port(),
+                    Err(FinancialAuditFault::Terminal)
+                ));
+                assert_eq!(fields.finish_pins(), Err(FinancialAuditFault::Terminal));
+                assert_eq!(
+                    fields.note_normal_failure(),
+                    Err(FinancialAuditFault::Terminal)
+                );
+            }
+            assert_owned_pin(&start.audit);
+            start.audit.resources.loan().assert_fixed_owned();
+            assert_eq!(trace.snapshot(), [None; 8]);
+            let mut frame = start.enter_rows();
+            frame.fields().test_code_audit_blocks_close();
             frame.audit_fields().begin_release().unwrap();
-            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(Action::Unlock)));
-            { let _short = frame.audit_fields(); }
-            frame.audit.resources.loan().assert_fixed_owned(); assert_eq!(trace.snapshot(), [None; 8]);
-            frame.fields().test_code_audit_blocks_close(); frame.audit.resources.loan().observe_fixed_unlock_error();
-            for action in [Action::LockFile, Action::Guard, Action::Parent, Action::Data, Action::Finished] {
-                assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Session(action)));
+            assert_eq!(
+                frame.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Session(Action::Unlock))
+            );
+            {
+                let _short = frame.audit_fields();
+            }
+            frame.audit.resources.loan().assert_fixed_owned();
+            assert_eq!(trace.snapshot(), [None; 8]);
+            frame.fields().test_code_audit_blocks_close();
+            frame.audit.resources.loan().observe_fixed_unlock_error();
+            for action in [
+                Action::LockFile,
+                Action::Guard,
+                Action::Parent,
+                Action::Data,
+                Action::Finished,
+            ] {
+                assert_eq!(
+                    frame.audit_fields().release_one(),
+                    Ok(FinancialAuditRelease::Session(action))
+                );
                 frame.fields().test_code_audit_blocks_close();
             }
             if !complete {
-                for action in [FinancialAuditRelease::LocalFile, FinancialAuditRelease::LocalParent, FinancialAuditRelease::LocalRecords] {
-                    assert_eq!(frame.audit_fields().release_one(), Ok(action)); frame.fields().test_code_audit_blocks_close();
+                for action in [
+                    FinancialAuditRelease::LocalFile,
+                    FinancialAuditRelease::LocalParent,
+                    FinancialAuditRelease::LocalRecords,
+                ] {
+                    assert_eq!(frame.audit_fields().release_one(), Ok(action));
+                    frame.fields().test_code_audit_blocks_close();
                 }
-                assert!(frame.audit.file.is_none() && frame.audit.parent.is_none() && frame.audit.records.is_none());
+                assert!(
+                    frame.audit.file.is_none()
+                        && frame.audit.parent.is_none()
+                        && frame.audit.records.is_none()
+                );
             }
-            frame.audit.resources.loan().assert_fixed_guard_released(); frame.audit.resources.loan().assert_fixed_unlock_error_retained();
-            assert_eq!(frame.audit_fields().release_one(), Ok(FinancialAuditRelease::Finished));
-            assert_eq!(frame.audit_fields().begin_release(), Err(FinancialAuditFault::UnexpectedCut));
-            frame.fields().test_code_sidecar_close_busy(); assert!(frame.physical.primary.is_none());
-            if complete { assert_owned_pin(&frame.audit); assert!(frame.audit.records.is_some()); }
-            assert_eq!(frame.fields().source_work().test_code_probe(OwnerStartProbe::TryAfterTerminal), Err(first));
+            frame.audit.resources.loan().assert_fixed_guard_released();
+            frame
+                .audit
+                .resources
+                .loan()
+                .assert_fixed_unlock_error_retained();
+            assert_eq!(
+                frame.audit_fields().release_one(),
+                Ok(FinancialAuditRelease::Finished)
+            );
+            assert_eq!(
+                frame.audit_fields().begin_release(),
+                Err(FinancialAuditFault::UnexpectedCut)
+            );
+            frame.fields().test_code_sidecar_close_busy();
+            assert!(frame.physical.primary.is_none());
+            if complete {
+                assert_owned_pin(&frame.audit);
+                assert!(frame.audit.records.is_some());
+            }
+            assert_eq!(
+                frame
+                    .fields()
+                    .source_work()
+                    .test_code_probe(OwnerStartProbe::TryAfterTerminal),
+                Err(first)
+            );
             assert_eq!(frame.fields().source_work().test_code_observation(), before);
         }
     }
@@ -3725,7 +7984,14 @@ impl GlobalSchemaVersionOwner {
             rows::original_source::StagedOriginalWork::stage_from_decision(decision);
         let native = replay_work::NativeOriginalOwner::from_start_decision(&decision);
         let release = replay_work::FixedDrainLedger::from_start_decision(&decision);
-        FinancialSourceStart { decision, native, staged, release, physical: FinancialPhysical::empty(), audit: FinancialAuditState::empty() }
+        FinancialSourceStart {
+            decision,
+            native,
+            staged,
+            release,
+            physical: FinancialPhysical::empty(),
+            audit: FinancialAuditState::empty(),
+        }
     }
 
     pub(crate) fn inspect_fixed_production(
@@ -7159,7 +11425,10 @@ mod tests {
         let saved = first(original);
         drop(fixture.acquire_exclusive().unwrap());
         assert_eq!(fs::read(fixture.database()).unwrap(), before);
-        assert_eq!(FileIdentity::from_metadata(&fs::metadata(fixture.database()).unwrap()), original_node);
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(fixture.database()).unwrap()),
+            original_node
+        );
         let mid_audit = match fs::read(writer.path()) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -7169,7 +11438,10 @@ mod tests {
         let original = rows_test_prepare(&fixture, &writer, rows::Options::production()).unwrap();
         second(saved, original);
         assert_eq!(fs::read(fixture.database()).unwrap(), before);
-        assert_eq!(FileIdentity::from_metadata(&fs::metadata(fixture.database()).unwrap()), original_node);
+        assert_eq!(
+            FileIdentity::from_metadata(&fs::metadata(fixture.database()).unwrap()),
+            original_node
+        );
         let after_audit = match fs::read(writer.path()) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -7734,7 +12006,13 @@ mod tests {
         ledger
             .apply(PaperCommand::Execute(
                 crate::trading::paper_ledger::ExecuteIntent {
-                    price_qualification: crate::trading::paper_ledger::ExecutionPriceQualification::for_test("TEST_CODE_000001", instant().with_timezone(&chrono::FixedOffset::east_opt(8*3600).unwrap()).date_naive()),
+                    price_qualification:
+                        crate::trading::paper_ledger::ExecutionPriceQualification::for_test(
+                            "TEST_CODE_000001",
+                            instant()
+                                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                                .date_naive(),
+                        ),
                     price_intent: crate::trading::paper_ledger::PriceIntent::FixedSignalPriceV1,
                     binding: binding.clone(),
                     command_id: "TEST_CODE_G6_BUY_V1".into(),

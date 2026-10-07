@@ -1,7 +1,6 @@
 //! CatalogV6 modeled parent orders. Old V1/V5 financial facts are immutable.
 //! No broker, production approval, startup DDL, or JSON capability factory.
 
-use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use super::paper_book_v2_budget_v1::{
     self as budget, BudgetRecord, CashPartitions, LotDisposition, MarkedAllocation,
     WorkingReservation,
@@ -22,6 +21,9 @@ use crate::performance::fee_policy::{
     AShareFeePolicyV2, ExcludedFeeReason, FeeCoverage, FeeListingSegment, FeeMarket, FeeRate,
     FeeSecurityKind, QualifiedInstrument,
 };
+use crate::trading::paper_replay_financial_work_v1::{
+    self as fw, ClosedFinancialText as Txt, FinancialFailure, FinancialWork,
+};
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Binary, Nullable, Text};
@@ -34,13 +36,21 @@ const PROJECTION_VERSION: &str = "paper-parent-projection/v1";
 const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, LedgerError> {
-    let bytes = serde_json::to_vec(value).map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
-    fw::historical(require_execution_record_extent_with_work(&bytes, &mut FinancialWork::Historical))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
+    fw::historical(require_execution_record_extent_with_work(
+        &bytes,
+        &mut FinancialWork::Historical,
+    ))?;
     Ok(bytes)
 }
 pub(crate) fn decode<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<T, LedgerError> {
-    fw::historical(require_execution_record_extent_with_work(&bytes, &mut FinancialWork::Historical))?;
-    let value: T = serde_json::from_slice(bytes).map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
+    fw::historical(require_execution_record_extent_with_work(
+        &bytes,
+        &mut FinancialWork::Historical,
+    ))?;
+    let value: T =
+        serde_json::from_slice(bytes).map_err(|e| LedgerError::IntegrityFailure(e.to_string()))?;
     require(encode(&value)? == bytes, "noncanonical execution record")?;
     Ok(value)
 }
@@ -63,11 +73,20 @@ fn raw_hash(bytes: &[u8]) -> String {
 }
 
 fn checked_shanghai_local(at: DateTime<Utc>) -> Result<DateTime<Utc>, LedgerError> {
-    fw::historical(checked_shanghai_local_with_work(at, &mut FinancialWork::Historical))
+    fw::historical(checked_shanghai_local_with_work(
+        at,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn checked_shanghai_local_with_work(at: DateTime<Utc>, w: &mut FinancialWork<'_, '_>) -> fw::Result<DateTime<Utc>> {
+fn checked_shanghai_local_with_work(
+    at: DateTime<Utc>,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<DateTime<Utc>> {
     w.finish()?;
-    w.option(at.checked_add_signed(chrono::Duration::hours(8)), Txt::Execution(fw::ExecutionText::PaperExecutionShanghaiClockExceedsSupportedRange))
+    w.option(
+        at.checked_add_signed(chrono::Duration::hours(8)),
+        Txt::Execution(fw::ExecutionText::PaperExecutionShanghaiClockExceedsSupportedRange),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -101,9 +120,20 @@ impl ExecutionManifest {
         self.budget.validate_shape_with_work(w)?;
         let fee = fee_from_record_with_work(&self.fee_descriptor, w)?;
         {
-            let condition = self.version == MANIFEST_VERSION && self.fill_model_version == MODEL_VERSION && budget::token(&self.account_id) && budget::token(&self.epoch_id) && budget::token(&self.cutover_id) && budget::token(&self.approved_reference) && self.genesis_event_hash.len() == 64 && self.genesis_projection_hash.len() == 64 && self.fee_policy_instance_id == w.fee_instance(&fee)?;
-            w.require(condition, Txt::Execution(fw::ExecutionText::ExecutionManifestInvalid))
-        } ?;
+            let condition = self.version == MANIFEST_VERSION
+                && self.fill_model_version == MODEL_VERSION
+                && budget::token(&self.account_id)
+                && budget::token(&self.epoch_id)
+                && budget::token(&self.cutover_id)
+                && budget::token(&self.approved_reference)
+                && self.genesis_event_hash.len() == 64
+                && self.genesis_projection_hash.len() == 64
+                && self.fee_policy_instance_id == w.fee_instance(&fee)?;
+            w.require(
+                condition,
+                Txt::Execution(fw::ExecutionText::ExecutionManifestInvalid),
+            )
+        }?;
         Ok(fee)
     }
 }
@@ -111,37 +141,63 @@ impl ExecutionManifest {
 /// A value-level fee descriptor reconstruction used only for exact replay.
 /// The original immutable database descriptor must additionally match it.
 fn fee_from_record(bytes: &[u8]) -> Result<AShareFeePolicyV2, LedgerError> {
-    fw::historical(fee_from_record_with_work(bytes, &mut FinancialWork::Historical))
+    fw::historical(fee_from_record_with_work(
+        bytes,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn fee_from_record_with_work(bytes: &[u8], w: &mut FinancialWork<'_, '_>) -> fw::Result<AShareFeePolicyV2> {
+fn fee_from_record_with_work(
+    bytes: &[u8],
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<AShareFeePolicyV2> {
     w.finish()?;
-    let text=match std::str::from_utf8(bytes){
-        Ok(t)=>t,
-        Err(_)=>return Err(w.error(Txt::Execution(fw::ExecutionText::FeeDescriptorUTF8))?)
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return Err(w.error(Txt::Execution(fw::ExecutionText::FeeDescriptorUTF8))?),
     };
-    let mut fields=BTreeMap::new();
-    for line in text.lines(){
-        let (key, value)=w.option(line.split_once('='), Txt::Execution(fw::ExecutionText::FeeDescriptorField))?;
-        let absent=w.descriptor(&mut fields, key, value)?.is_none();
-        w.require(absent, Txt::Execution(fw::ExecutionText::DuplicateFeeDescriptorField))?;
+    let mut fields = BTreeMap::new();
+    for line in text.lines() {
+        let (key, value) = w.option(
+            line.split_once('='),
+            Txt::Execution(fw::ExecutionText::FeeDescriptorField),
+        )?;
+        let absent = w.descriptor(&mut fields, key, value)?.is_none();
+        w.require(
+            absent,
+            Txt::Execution(fw::ExecutionText::DuplicateFeeDescriptorField),
+        )?;
     }
-    let segment=match descriptor_get(&fields, DescriptorField::Segment, w)?{
-        "ShanghaiMainA"=>FeeListingSegment::ShanghaiMainA,
-        "ShanghaiStarA"=>FeeListingSegment::ShanghaiStarA,
-        _=>return Err(w.error(Txt::Execution(fw::ExecutionText::FeeSegmentUnavailable))?)
+    let segment = match descriptor_get(&fields, DescriptorField::Segment, w)? {
+        "ShanghaiMainA" => FeeListingSegment::ShanghaiMainA,
+        "ShanghaiStarA" => FeeListingSegment::ShanghaiStarA,
+        _ => return Err(w.error(Txt::Execution(fw::ExecutionText::FeeSegmentUnavailable))?),
     };
-    let scope=fw::fee_evidence(QualifiedInstrument::new(FeeMarket::Shanghai, FeeSecurityKind::AShareStock, segment).map_err(Into::into), w)?;
-    let num=descriptor_integer(&fields, DescriptorField::RateNum, w)?;
-    let den=descriptor_integer(&fields, DescriptorField::RateDen, w)?;
-    let rate=fw::fee_evidence(FeeRate::new(num, den).map_err(Into::into), w)?;
-    let minimum=descriptor_integer(&fields, DescriptorField::Minimum, w)?;
-    let transfer=descriptor_reason(&fields, DescriptorField::Transfer, w)?;
-    let other=descriptor_reason(&fields, DescriptorField::Other, w)?;
-    let revision=descriptor_get(&fields, DescriptorField::Revision, w)?;
-    let result=AShareFeePolicyV2::new_with_work(scope, rate, minimum, FeeCoverage::new(transfer, other), revision, w);
-    let policy=fw::fee_evidence(result, w)?;
-    let canonical=w.fee_descriptor(&policy)?;
-    w.require(canonical==bytes, Txt::Execution(fw::ExecutionText::FeeDescriptorIsNotCanonicalReviewedPolicy))?;
+    let scope = fw::fee_evidence(
+        QualifiedInstrument::new(FeeMarket::Shanghai, FeeSecurityKind::AShareStock, segment)
+            .map_err(Into::into),
+        w,
+    )?;
+    let num = descriptor_integer(&fields, DescriptorField::RateNum, w)?;
+    let den = descriptor_integer(&fields, DescriptorField::RateDen, w)?;
+    let rate = fw::fee_evidence(FeeRate::new(num, den).map_err(Into::into), w)?;
+    let minimum = descriptor_integer(&fields, DescriptorField::Minimum, w)?;
+    let transfer = descriptor_reason(&fields, DescriptorField::Transfer, w)?;
+    let other = descriptor_reason(&fields, DescriptorField::Other, w)?;
+    let revision = descriptor_get(&fields, DescriptorField::Revision, w)?;
+    let result = AShareFeePolicyV2::new_with_work(
+        scope,
+        rate,
+        minimum,
+        FeeCoverage::new(transfer, other),
+        revision,
+        w,
+    );
+    let policy = fw::fee_evidence(result, w)?;
+    let canonical = w.fee_descriptor(&policy)?;
+    w.require(
+        canonical == bytes,
+        Txt::Execution(fw::ExecutionText::FeeDescriptorIsNotCanonicalReviewedPolicy),
+    )?;
     Ok(policy)
 }
 
@@ -274,17 +330,25 @@ pub(crate) struct ExecutionProjection {
 }
 impl ExecutionProjection {
     fn initial(genesis: &Projection, budget: &BudgetRecord) -> Result<Self, LedgerError> {
-        fw::historical(Self::initial_with_work(genesis, budget, &mut FinancialWork::Historical))
+        fw::historical(Self::initial_with_work(
+            genesis,
+            budget,
+            &mut FinancialWork::Historical,
+        ))
     }
-    pub(crate) fn initial_with_work(genesis: &Projection, budget: &BudgetRecord, w: &mut FinancialWork<'_, '_>) -> fw::Result<Self> {
+    pub(crate) fn initial_with_work(
+        genesis: &Projection,
+        budget: &BudgetRecord,
+        w: &mut FinancialWork<'_, '_>,
+    ) -> fw::Result<Self> {
         w.finish()?;
         let cash = budget.initial_cash_with_work(genesis, w)?;
-        let mut lot_assignments=BTreeMap::new();
+        let mut lot_assignments = BTreeMap::new();
         for r in &budget.initial_lots {
-            let key=w.copy(&r.lot_id)?;
-            let value=if r.disposition==LotDisposition::AllocatedToStrategy{
+            let key = w.copy(&r.lot_id)?;
+            let value = if r.disposition == LotDisposition::AllocatedToStrategy {
                 w.copy(&r.chain_id)?
-            } else{
+            } else {
                 None
             };
             w.insert(&mut lot_assignments, key, value)?;
@@ -309,85 +373,140 @@ impl ExecutionProjection {
         w.finish()?;
         self.cash.validate_with_work(w)?;
         {
-            let condition = self.version == PROJECTION_VERSION && self.account.cash.micros() == self.cash.account_cash;
-            w.require(condition, Txt::Execution(fw::ExecutionText::AccountCashDiffersFromExecutionPartition))
-        } ?;
+            let condition = self.version == PROJECTION_VERSION
+                && self.account.cash.micros() == self.cash.account_cash;
+            w.require(
+                condition,
+                Txt::Execution(fw::ExecutionText::AccountCashDiffersFromExecutionPartition),
+            )
+        }?;
         for (code, window) in &self.valuation_windows {
             window.validate_with_work(w)?;
             {
-                let condition = code == &window.instrument_code && self.account.marks.get(code) == Some(&mark_from_window_with_work(window, w)?);
-                w.require(condition, Txt::Execution(fw::ExecutionText::RecordedValuationWindowDiffersFromOriginalMark))
-            } ?;
+                let condition = code == &window.instrument_code
+                    && self.account.marks.get(code)
+                        == Some(&mark_from_window_with_work(window, w)?);
+                w.require(
+                    condition,
+                    Txt::Execution(
+                        fw::ExecutionText::RecordedValuationWindowDiffersFromOriginalMark,
+                    ),
+                )
+            }?;
         }
-        let mut lot_ids=BTreeSet::new();
-        for lot in &self.account.lots{
+        let mut lot_ids = BTreeSet::new();
+        for lot in &self.account.lots {
             w.set(&mut lot_ids, lot.lot_id.as_str())?;
         }
         {
             let condition = lot_ids.len() == self.account.lots.len() && {
-                let mut assignments=BTreeSet::new();
-                for key in self.lot_assignments.keys(){
+                let mut assignments = BTreeSet::new();
+                for key in self.lot_assignments.keys() {
                     w.set(&mut assignments, key.as_str())?;
                 }
-                lot_ids==assignments
+                lot_ids == assignments
             };
-            w.require(condition, Txt::Execution(fw::ExecutionText::FullLotDispositionsDiffer))
-        } ?;
+            w.require(
+                condition,
+                Txt::Execution(fw::ExecutionText::FullLotDispositionsDiffer),
+            )
+        }?;
         let mut total_reserve = 0_i128;
-        let mut claims: BTreeMap<&str,
-        u32> = BTreeMap::new();
+        let mut claims: BTreeMap<&str, u32> = BTreeMap::new();
         for (id, p) in &self.parents {
             p.intent.validate_with_work(w)?;
             {
-                let condition = id == &p.intent.parent_id && p.filled .checked_add(p.remaining) .and_then(|n| n.checked_add(p.cancelled)) == Some(p.intent.quantity);
-                w.require(condition, Txt::Execution(fw::ExecutionText::ParentQuantityDiffers))
-            } ?;
+                let condition = id == &p.intent.parent_id
+                    && p.filled
+                        .checked_add(p.remaining)
+                        .and_then(|n| n.checked_add(p.cancelled))
+                        == Some(p.intent.quantity);
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::ParentQuantityDiffers),
+                )
+            }?;
             if p.status.working() {
                 {
                     let condition = p.remaining > 0 && p.remaining % 100 == 0;
-                    w.require(condition, Txt::Execution(fw::ExecutionText::WorkingParentRemainderInvalid))
-                } ?;
-                total_reserve = total_reserve .checked_add(i128::from(p.reservation.cash_reserve)) .ok_or(LedgerError::Overflow)?;
+                    w.require(
+                        condition,
+                        Txt::Execution(fw::ExecutionText::WorkingParentRemainderInvalid),
+                    )
+                }?;
+                total_reserve = total_reserve
+                    .checked_add(i128::from(p.reservation.cash_reserve))
+                    .ok_or(LedgerError::Overflow)?;
                 {
-                    let condition = p.reservation.parent_id == *id && p.reservation.code == p.intent.instrument_code && p.reservation.chain_id == p.intent.chain_id;
-                    w.require(condition, Txt::Execution(fw::ExecutionText::ReservationOwnerDiffers))
-                } ?;
+                    let condition = p.reservation.parent_id == *id
+                        && p.reservation.code == p.intent.instrument_code
+                        && p.reservation.chain_id == p.intent.chain_id;
+                    w.require(
+                        condition,
+                        Txt::Execution(fw::ExecutionText::ReservationOwnerDiffers),
+                    )
+                }?;
                 {
-                    let condition = budget::checked( i128::from(p.reservation.buy_max_notional) + i128::from(p.reservation.fee_reserve), )? == p.reservation.cash_reserve;
-                    w.require(condition, Txt::Execution(fw::ExecutionText::ReservationComponentsDiffer))
-                } ?;
+                    let condition = budget::checked(
+                        i128::from(p.reservation.buy_max_notional)
+                            + i128::from(p.reservation.fee_reserve),
+                    )? == p.reservation.cash_reserve;
+                    w.require(
+                        condition,
+                        Txt::Execution(fw::ExecutionText::ReservationComponentsDiffer),
+                    )
+                }?;
                 for c in &p.sell_claims {
                     let sum = w.claim(&mut claims, &c.lot_id)?;
                     *sum = sum.checked_add(c.quantity).ok_or(LedgerError::Overflow)?;
                 }
             } else {
                 {
-                    let condition = p.reservation.cash_reserve == 0 && p.reservation.buy_max_notional == 0 && p.reservation.fee_reserve == 0 && p.sell_claims.is_empty();
-                    w.require(condition, Txt::Execution(fw::ExecutionText::TerminalParentRetainsReservation))
-                } ?;
+                    let condition = p.reservation.cash_reserve == 0
+                        && p.reservation.buy_max_notional == 0
+                        && p.reservation.fee_reserve == 0
+                        && p.sell_claims.is_empty();
+                    w.require(
+                        condition,
+                        Txt::Execution(fw::ExecutionText::TerminalParentRetainsReservation),
+                    )
+                }?;
             }
         }
         {
             let condition = budget::checked(total_reserve)? <= self.cash.strategy_cash;
-            w.require(condition, Txt::Execution(fw::ExecutionText::WorkingReservationExceedsStrategyCash))
-        } ?;
+            w.require(
+                condition,
+                Txt::Execution(fw::ExecutionText::WorkingReservationExceedsStrategyCash),
+            )
+        }?;
         for (id, claimed) in claims {
-            let lot=w.option(self.account.lots.iter().find(|l|l.lot_id==id), Txt::Execution(fw::ExecutionText::ClaimReferencesAbsentLot))?;
+            let lot = w.option(
+                self.account.lots.iter().find(|l| l.lot_id == id),
+                Txt::Execution(fw::ExecutionText::ClaimReferencesAbsentLot),
+            )?;
             {
                 let condition = claimed <= lot.quantity;
-                w.require(condition, Txt::Execution(fw::ExecutionText::SellClaimsOverbookLot))
-            } ?;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::SellClaimsOverbookLot),
+                )
+            }?;
         }
         Ok(())
     }
-    fn reservations(&self)->Vec<WorkingReservation>{
-        fw::historical(self.reservations_with_work(&mut FinancialWork::Historical)).expect("Historical reservation copies")
+    fn reservations(&self) -> Vec<WorkingReservation> {
+        fw::historical(self.reservations_with_work(&mut FinancialWork::Historical))
+            .expect("Historical reservation copies")
     }
-    fn reservations_with_work(&self, w:&mut FinancialWork<'_, '_>)->fw::Result<Vec<WorkingReservation>>{
+    fn reservations_with_work(
+        &self,
+        w: &mut FinancialWork<'_, '_>,
+    ) -> fw::Result<Vec<WorkingReservation>> {
         w.finish()?;
-        let mut out=Vec::new();
-        for p in self.parents.values().filter(|p|p.status.working()){
-            let v=w.copy(&p.reservation)?;
+        let mut out = Vec::new();
+        for p in self.parents.values().filter(|p| p.status.working()) {
+            let v = w.copy(&p.reservation)?;
             w.push(&mut out, v)?;
         }
         Ok(out)
@@ -396,23 +515,50 @@ impl ExecutionProjection {
     fn marked_at(&self, at: DateTime<Utc>) -> Result<Vec<MarkedAllocation>, LedgerError> {
         fw::historical(self.marked_at_with_work(at, &mut FinancialWork::Historical))
     }
-    fn marked_at_with_work(&self, at: DateTime<Utc>, w: &mut FinancialWork<'_, '_>) -> fw::Result<Vec<MarkedAllocation>> {
+    fn marked_at_with_work(
+        &self,
+        at: DateTime<Utc>,
+        w: &mut FinancialWork<'_, '_>,
+    ) -> fw::Result<Vec<MarkedAllocation>> {
         w.finish()?;
-        let day=checked_shanghai_local_with_work(at, w)?.date_naive();
-        let mut out=Vec::new();
-        for (lot, chain) in self.account.lots.iter().filter_map(|lot|self.lot_assignments.get(&lot.lot_id).and_then(|c|c.as_ref()).map(|c|(lot, c))){
-            let mark=w.option(self.account.marks.get(&lot.code), Txt::Execution(fw::ExecutionText::AllocatedHoldingMarkAbsent))?;
+        let day = checked_shanghai_local_with_work(at, w)?.date_naive();
+        let mut out = Vec::new();
+        for (lot, chain) in self.account.lots.iter().filter_map(|lot| {
+            self.lot_assignments
+                .get(&lot.lot_id)
+                .and_then(|c| c.as_ref())
+                .map(|c| (lot, c))
+        }) {
+            let mark = w.option(
+                self.account.marks.get(&lot.code),
+                Txt::Execution(fw::ExecutionText::AllocatedHoldingMarkAbsent),
+            )?;
             {
-                let condition = checked_shanghai_local_with_work(mark.observed_at, w)?.date_naive() == day;
-                w.require(condition, Txt::Execution(fw::ExecutionText::AllocatedHoldingMarkIsNotCurrentSession))
-            } ?;
-            let window=w.option(self.valuation_windows.get(&lot.code), Txt::Execution(fw::ExecutionText::AllocatedHoldingQualifiedValuationWindowAbsent))?;
+                let condition =
+                    checked_shanghai_local_with_work(mark.observed_at, w)?.date_naive() == day;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::AllocatedHoldingMarkIsNotCurrentSession),
+                )
+            }?;
+            let window = w.option(
+                self.valuation_windows.get(&lot.code),
+                Txt::Execution(fw::ExecutionText::AllocatedHoldingQualifiedValuationWindowAbsent),
+            )?;
             window.validate_with_work(w)?;
             {
-                let condition = mark == &mark_from_window_with_work(window, w)? && window.session_date == day && window.observed_at <= at && at <= window.fresh_through;
-                w.require(condition, Txt::Execution(fw::ExecutionText::AllocatedHoldingQualifiedValuationWindowExpiredOrDiffers))
-            } ?;
-            let incoming=MarkedAllocation {
+                let condition = mark == &mark_from_window_with_work(window, w)?
+                    && window.session_date == day
+                    && window.observed_at <= at
+                    && at <= window.fresh_through;
+                w.require(
+                    condition,
+                    Txt::Execution(
+                        fw::ExecutionText::AllocatedHoldingQualifiedValuationWindowExpiredOrDiffers,
+                    ),
+                )
+            }?;
+            let incoming = MarkedAllocation {
                 code: w.copy(&lot.code)?,
                 chain_id: w.copy(chain)?,
                 marked_value: budget::notional_with_work(mark.price.micros(), lot.quantity, w)?,
@@ -512,13 +658,28 @@ impl Fact {
 }
 
 fn require_fee_scope(policy: &AShareFeePolicyV2, window: &WindowRecord) -> Result<(), LedgerError> {
-    fw::historical(require_fee_scope_with_work(policy, window, &mut FinancialWork::Historical))
+    fw::historical(require_fee_scope_with_work(
+        policy,
+        window,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn require_fee_scope_with_work(policy: &AShareFeePolicyV2, window: &WindowRecord, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+fn require_fee_scope_with_work(
+    policy: &AShareFeePolicyV2,
+    window: &WindowRecord,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     w.finish()?;
     {
-        let condition = matches!( (policy.scope().segment(), window.fee_segment.as_str()), (FeeListingSegment::ShanghaiMainA, "ShanghaiMainA") | (FeeListingSegment::ShanghaiStarA, "ShanghaiStarA") );
-        w.require(condition, Txt::Execution(fw::ExecutionText::RecordedAdmittedBoardDiffersFromFeeScope))
+        let condition = matches!(
+            (policy.scope().segment(), window.fee_segment.as_str()),
+            (FeeListingSegment::ShanghaiMainA, "ShanghaiMainA")
+                | (FeeListingSegment::ShanghaiStarA, "ShanghaiStarA")
+        );
+        w.require(
+            condition,
+            Txt::Execution(fw::ExecutionText::RecordedAdmittedBoardDiffersFromFeeScope),
+        )
     }
 }
 fn command_hash(request: &CommandRecord) -> Result<String, LedgerError> {
@@ -557,12 +718,33 @@ fn require_live_request(request: &CommandRecord, now: DateTime<Utc>) -> Result<(
         _ => Ok(()),
     }
 }
-fn reservation( intent: &IntentRecord, remaining: u32, fee: &AShareFeePolicyV2, ) -> Result<WorkingReservation, LedgerError> {
-    fw::historical(reservation_with_work(intent, remaining, fee, &mut FinancialWork::Historical))
+fn reservation(
+    intent: &IntentRecord,
+    remaining: u32,
+    fee: &AShareFeePolicyV2,
+) -> Result<WorkingReservation, LedgerError> {
+    fw::historical(reservation_with_work(
+        intent,
+        remaining,
+        fee,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn reservation_with_work( intent: &IntentRecord, remaining: u32, fee: &AShareFeePolicyV2, w: &mut FinancialWork<'_, '_>) -> fw::Result<WorkingReservation> {
+fn reservation_with_work(
+    intent: &IntentRecord,
+    remaining: u32,
+    fee: &AShareFeePolicyV2,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<WorkingReservation> {
     w.finish()?;
-    let fees = fill_model::worst_case_fee_with_work( intent.side, remaining, intent.fee_price_cap_micro_cny, intent.session_date, fee, w, )?;
+    let fees = fill_model::worst_case_fee_with_work(
+        intent.side,
+        remaining,
+        intent.fee_price_cap_micro_cny,
+        intent.session_date,
+        fee,
+        w,
+    )?;
     let value = if intent.side == Side::Buy && remaining > 0 {
         budget::notional_with_work(intent.fee_price_cap_micro_cny, remaining, w)?
     } else {
@@ -578,9 +760,16 @@ fn reservation_with_work( intent: &IntentRecord, remaining: u32, fee: &AShareFee
     })
 }
 fn mark_from_window(window: &WindowRecord) -> Mark {
-    fw::historical(mark_from_window_with_work(window, &mut FinancialWork::Historical)).expect("Historical Mark copy")
+    fw::historical(mark_from_window_with_work(
+        window,
+        &mut FinancialWork::Historical,
+    ))
+    .expect("Historical Mark copy")
 }
-fn mark_from_window_with_work(window:&WindowRecord, w:&mut FinancialWork<'_, '_>)->fw::Result<Mark>{
+fn mark_from_window_with_work(
+    window: &WindowRecord,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<Mark> {
     w.finish()?;
     Ok(Mark {
         code: w.copy(&window.instrument_code)?,
@@ -589,93 +778,165 @@ fn mark_from_window_with_work(window:&WindowRecord, w:&mut FinancialWork<'_, '_>
         source: w.copy(&window.source_reference)?,
     })
 }
-fn apply_request( state: &mut ExecutionProjection, manifest: &ExecutionManifest, request: &CommandRecord, ) -> Result<Effect, LedgerError> {
-    fw::historical(apply_request_with_work(state, manifest, request, &mut FinancialWork::Historical))
+fn apply_request(
+    state: &mut ExecutionProjection,
+    manifest: &ExecutionManifest,
+    request: &CommandRecord,
+) -> Result<Effect, LedgerError> {
+    fw::historical(apply_request_with_work(
+        state,
+        manifest,
+        request,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn apply_request_with_work( state: &mut ExecutionProjection, manifest: &ExecutionManifest, request: &CommandRecord, w: &mut FinancialWork<'_, '_>) -> fw::Result<Effect> {
+pub(crate) fn apply_request_with_work(
+    state: &mut ExecutionProjection,
+    manifest: &ExecutionManifest,
+    request: &CommandRecord,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<Effect> {
     w.finish()?;
-    let mut staged=w.copy(state)?;
-    let effect=apply_request_body_with_work(&mut staged, manifest, request, w)?;
+    let mut staged = w.copy(state)?;
+    let effect = apply_request_body_with_work(&mut staged, manifest, request, w)?;
     w.finish()?;
-    *state=staged;
+    *state = staged;
     Ok(effect)
 }
 
-fn apply_request_body( state: &mut ExecutionProjection, manifest: &ExecutionManifest, request: &CommandRecord, ) -> Result<Effect, LedgerError> {
-    fw::historical(apply_request_body_with_work(state, manifest, request, &mut FinancialWork::Historical))
+fn apply_request_body(
+    state: &mut ExecutionProjection,
+    manifest: &ExecutionManifest,
+    request: &CommandRecord,
+) -> Result<Effect, LedgerError> {
+    fw::historical(apply_request_body_with_work(
+        state,
+        manifest,
+        request,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &ExecutionManifest, request: &CommandRecord, w: &mut FinancialWork<'_, '_>) -> fw::Result<Effect> {
+fn apply_request_body_with_work(
+    state: &mut ExecutionProjection,
+    manifest: &ExecutionManifest,
+    request: &CommandRecord,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<Effect> {
     w.finish()?;
     let fee = manifest.validate_with_work(w)?;
     match request {
-        CommandRecord::Open {
-            ..
-        }
-        => Err(LedgerError::IdentityConflict.into()),
-        CommandRecord::Submit {
-            intent,
-            ..
-        }
-        => {
+        CommandRecord::Open { .. } => Err(LedgerError::IdentityConflict.into()),
+        CommandRecord::Submit { intent, .. } => {
             intent.validate_with_work(w)?;
             {
-                let condition = intent.account_id == manifest.account_id && intent.epoch_id == manifest.epoch_id && intent.execution_manifest_hash == manifest.identity_with_work(w)? && intent.family_id == manifest.budget.family_id;
-                w.require(condition, Txt::Execution(fw::ExecutionText::SubmitManifestOwnerDiffers))
-            } ?;
-            if state.parents.contains_key(&intent.parent_id) || state .parents .values() .any(|p| p.intent.investment_decision_id == intent.investment_decision_id) {
+                let condition = intent.account_id == manifest.account_id
+                    && intent.epoch_id == manifest.epoch_id
+                    && intent.execution_manifest_hash == manifest.identity_with_work(w)?
+                    && intent.family_id == manifest.budget.family_id;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::SubmitManifestOwnerDiffers),
+                )
+            }?;
+            if state.parents.contains_key(&intent.parent_id)
+                || state
+                    .parents
+                    .values()
+                    .any(|p| p.intent.investment_decision_id == intent.investment_decision_id)
+            {
                 return Err(LedgerError::IdentityConflict.into());
             }
             {
-                let condition = intent.session_date >= manifest.budget.effective_from && intent.session_date <= manifest.budget.effective_through;
-                w.require(condition, Txt::Execution(fw::ExecutionText::BudgetPolicySessionNotEffective))
-            } ?;
+                let condition = intent.session_date >= manifest.budget.effective_from
+                    && intent.session_date <= manifest.budget.effective_through;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::BudgetPolicySessionNotEffective),
+                )
+            }?;
             require_fee_scope_with_work(&fee, &intent.source_window, w)?;
             {
                 let condition = intent.approved_at >= state.account.as_of;
-                w.require(condition, Txt::Execution(fw::ExecutionText::ParentObservationPrecedesPriorFinancialFact))
-            } ?;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::ParentObservationPrecedesPriorFinancialFact),
+                )
+            }?;
             {
-                let key=w.copy(&intent.instrument_code)?;
-                let incoming=mark_from_window_with_work(&intent.source_window, w)?;
+                let key = w.copy(&intent.instrument_code)?;
+                let incoming = mark_from_window_with_work(&intent.source_window, w)?;
                 w.insert(&mut state.account.marks, key, incoming)?;
             };
             {
-                let key=w.copy(&intent.instrument_code)?;
-                let incoming=w.copy(&intent.source_window)?;
+                let key = w.copy(&intent.instrument_code)?;
+                let incoming = w.copy(&intent.source_window)?;
                 w.insert(&mut state.valuation_windows, key, incoming)?;
             };
             let reserve = reservation_with_work(intent, intent.quantity, &fee, w)?;
             let mut claims = Vec::new();
             match intent.side {
                 Side::Buy => {
-                    let marked=state.marked_at_with_work(intent.approved_at, w)?;
-                    let reservations=state.reservations_with_work(w)?;
-                    budget::require_new_buy_with_work(&manifest.budget, &state.cash, &marked, &reservations, &reserve, w)?;
-                },
+                    let marked = state.marked_at_with_work(intent.approved_at, w)?;
+                    let reservations = state.reservations_with_work(w)?;
+                    budget::require_new_buy_with_work(
+                        &manifest.budget,
+                        &state.cash,
+                        &marked,
+                        &reservations,
+                        &reserve,
+                        w,
+                    )?;
+                }
                 Side::Sell => {
-                    let existing = state.reservations_with_work(w)?.iter().try_fold(0_i128, |sum, r| {
-                        sum.checked_add(i128::from(r.cash_reserve)) .ok_or(LedgerError::Overflow)
-                    })?;
+                    let existing =
+                        state
+                            .reservations_with_work(w)?
+                            .iter()
+                            .try_fold(0_i128, |sum, r| {
+                                sum.checked_add(i128::from(r.cash_reserve))
+                                    .ok_or(LedgerError::Overflow)
+                            })?;
                     {
-                        let condition = budget::checked(existing + i128::from(reserve.cash_reserve))? <= state.cash.strategy_cash;
-                        w.require(condition, Txt::Execution(fw::ExecutionText::StrategyCashCannotReserveSellFees))
-                    } ?;
+                        let condition =
+                            budget::checked(existing + i128::from(reserve.cash_reserve))?
+                                <= state.cash.strategy_cash;
+                        w.require(
+                            condition,
+                            Txt::Execution(fw::ExecutionText::StrategyCashCannotReserveSellFees),
+                        )
+                    }?;
                     let mut left = intent.quantity;
-                    let mut lots=Vec::new();
+                    let mut lots = Vec::new();
                     for lot in state.account.lots.iter().filter(|lot| {
-                        lot.code == intent.instrument_code && lot.sellable_from <= intent.session_date && state.lot_assignments.get(&lot.lot_id).and_then(Option::as_deref) == Some(intent.chain_id.as_str())
+                        lot.code == intent.instrument_code
+                            && lot.sellable_from <= intent.session_date
+                            && state
+                                .lot_assignments
+                                .get(&lot.lot_id)
+                                .and_then(Option::as_deref)
+                                == Some(intent.chain_id.as_str())
                     }) {
                         w.push(&mut lots, lot)?;
                     }
                     w.sort_fifo(&mut lots)?;
                     for lot in lots {
-                        let reserved = state .parents .values() .filter(|p| p.status.working()) .flat_map(|p| p.sell_claims.iter()) .filter(|c| c.lot_id == lot.lot_id) .try_fold(0_u32, |sum, c| {
-                            sum.checked_add(c.quantity).ok_or(LedgerError::Overflow)
-                        })?;
-                        let take = left.min( lot.quantity .checked_sub(reserved) .ok_or(LedgerError::Overflow)?, );
+                        let reserved = state
+                            .parents
+                            .values()
+                            .filter(|p| p.status.working())
+                            .flat_map(|p| p.sell_claims.iter())
+                            .filter(|c| c.lot_id == lot.lot_id)
+                            .try_fold(0_u32, |sum, c| {
+                                sum.checked_add(c.quantity).ok_or(LedgerError::Overflow)
+                            })?;
+                        let take = left.min(
+                            lot.quantity
+                                .checked_sub(reserved)
+                                .ok_or(LedgerError::Overflow)?,
+                        );
                         if take > 0 {
                             {
-                                let incoming=LotClaim {
+                                let incoming = LotClaim {
                                     lot_id: w.copy(&lot.lot_id)?,
                                     quantity: take,
                                 };
@@ -690,7 +951,7 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
                     {
                         let condition = left == 0;
                         w.require(condition, Txt::Execution(fw::ExecutionText::AllocatedFIFOSellableSharesUnavailableOrAlreadyReserved))
-                    } ?;
+                    }?;
                 }
             }
             let parent = ParentState {
@@ -703,8 +964,8 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
                 sell_claims: claims,
             };
             {
-                let key=w.copy(&intent.parent_id)?;
-                let incoming=w.copy(&parent)?;
+                let key = w.copy(&intent.parent_id)?;
+                let incoming = w.copy(&parent)?;
                 w.insert(&mut state.parents, key, incoming)?;
             };
             state.account.as_of = intent.approved_at;
@@ -712,39 +973,57 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
             Ok(Effect::Submitted(parent))
         }
         CommandRecord::Evaluate {
-            parent_id,
-            window,
-            ..
-        }
-        => {
+            parent_id, window, ..
+        } => {
             window.validate_with_work(w)?;
             require_fee_scope_with_work(&fee, window, w)?;
             {
                 let condition = window.observed_at >= state.account.as_of;
-                w.require(condition, Txt::Execution(fw::ExecutionText::FillObservationPrecedesPriorFinancialFact))
-            } ?;
-            let original = w.copy(state.parents.get(parent_id).ok_or(LedgerError::IdentityConflict)?)?;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::FillObservationPrecedesPriorFinancialFact),
+                )
+            }?;
+            let original = w.copy(
+                state
+                    .parents
+                    .get(parent_id)
+                    .ok_or(LedgerError::IdentityConflict)?,
+            )?;
             {
-                let condition = original.status.working() && window.instrument_code == original.intent.instrument_code && window.session_date == original.intent.session_date;
-                w.require(condition, Txt::Execution(fw::ExecutionText::WindowDoesNotMatchWorkingDayParent))
-            } ?;
+                let condition = original.status.working()
+                    && window.instrument_code == original.intent.instrument_code
+                    && window.session_date == original.intent.session_date;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::WindowDoesNotMatchWorkingDayParent),
+                )
+            }?;
             if state.used_windows.contains_key(&window.observation_id) {
                 return Err(LedgerError::IdentityConflict.into());
             }
             {
-                let key=w.copy(&window.observation_id)?;
-                let incoming=w.fixed_hash(fw::ClosedFinancialHash::ExecutionWindow(window))?;
+                let key = w.copy(&window.observation_id)?;
+                let incoming = w.fixed_hash(fw::ClosedFinancialHash::ExecutionWindow(window))?;
                 w.insert(&mut state.used_windows, key, incoming)?;
             };
-            let result = fill_model::model_with_work( original.intent.side, original.remaining, original.intent.limit_micro_cny, original.intent.fee_price_cap_micro_cny, window, &fee, w, )?;
+            let result = fill_model::model_with_work(
+                original.intent.side,
+                original.remaining,
+                original.intent.limit_micro_cny,
+                original.intent.fee_price_cap_micro_cny,
+                window,
+                &fee,
+                w,
+            )?;
             {
-                let key=w.copy(&window.instrument_code)?;
-                let incoming=mark_from_window_with_work(window, w)?;
+                let key = w.copy(&window.instrument_code)?;
+                let incoming = mark_from_window_with_work(window, w)?;
                 w.insert(&mut state.account.marks, key, incoming)?;
             };
             {
-                let key=w.copy(&window.instrument_code)?;
-                let incoming=w.copy(window)?;
+                let key = w.copy(&window.instrument_code)?;
+                let incoming = w.copy(window)?;
                 w.insert(&mut state.valuation_windows, key, incoming)?;
             };
             state.account.as_of = window.observed_at;
@@ -752,31 +1031,48 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
                 ModelOutcome::NoFill(reason) => Effect::ObservedNoFill(reason),
                 ModelOutcome::Fill(modeled) => {
                     let mut parent = original;
-                    parent.filled = parent .filled .checked_add(modeled.quantity) .ok_or(LedgerError::Overflow)?;
-                    parent.remaining = parent .remaining .checked_sub(modeled.quantity) .ok_or(LedgerError::Overflow)?;
-                    let fill_id=w.fixed_hash(fw::ClosedFinancialHash::FillIdentity{
-                        account:&manifest.account_id,
-                        parent:parent_id,
-                        observation:&window.observation_id
+                    parent.filled = parent
+                        .filled
+                        .checked_add(modeled.quantity)
+                        .ok_or(LedgerError::Overflow)?;
+                    parent.remaining = parent
+                        .remaining
+                        .checked_sub(modeled.quantity)
+                        .ok_or(LedgerError::Overflow)?;
+                    let fill_id = w.fixed_hash(fw::ClosedFinancialHash::FillIdentity {
+                        account: &manifest.account_id,
+                        parent: parent_id,
+                        observation: &window.observation_id,
                     })?;
                     let mut inherited_fee = 0_i128;
                     let mut basis = 0_i128;
                     match parent.intent.side {
                         Side::Buy => {
-                            let debit = budget::checked( i128::from(modeled.notional_micro_cny) + i128::from(modeled.total_fee_micro_cny), )?;
-                            state.cash.apply_strategy_delta_with_work( debit.checked_neg().ok_or(LedgerError::Overflow)?, w, )?;
+                            let debit = budget::checked(
+                                i128::from(modeled.notional_micro_cny)
+                                    + i128::from(modeled.total_fee_micro_cny),
+                            )?;
+                            state.cash.apply_strategy_delta_with_work(
+                                debit.checked_neg().ok_or(LedgerError::Overflow)?,
+                                w,
+                            )?;
                             {
                                 let condition = !state.lot_assignments.contains_key(&fill_id);
-                                w.require(condition, Txt::Execution(fw::ExecutionText::DuplicateFillLot))
-                            } ?;
+                                w.require(
+                                    condition,
+                                    Txt::Execution(fw::ExecutionText::DuplicateFillLot),
+                                )
+                            }?;
                             {
-                                let incoming=Lot {
+                                let incoming = Lot {
                                     lot_id: w.copy(&fill_id)?,
                                     code: w.copy(&parent.intent.instrument_code)?,
                                     name: w.copy(&parent.intent.instrument_name)?,
                                     quantity: modeled.quantity,
                                     basis_price: Money::from_micros(modeled.price_micro_cny),
-                                    buy_fee_remaining: Money::from_micros(modeled.total_fee_micro_cny),
+                                    buy_fee_remaining: Money::from_micros(
+                                        modeled.total_fee_micro_cny,
+                                    ),
                                     acquired_on: window.session_date,
                                     sellable_from: modeled.sellable_from,
                                     reported_cost: None,
@@ -784,8 +1080,8 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
                                 w.push(&mut state.account.lots, incoming)?;
                             };
                             {
-                                let key=w.copy(&fill_id)?;
-                                let incoming=Some(w.copy(&parent.intent.chain_id)?);
+                                let key = w.copy(&fill_id)?;
+                                let incoming = Some(w.copy(&parent.intent.chain_id)?);
                                 w.insert(&mut state.lot_assignments, key, incoming)?;
                             };
                         }
@@ -799,49 +1095,105 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
                                 if take == 0 {
                                     continue;
                                 }
-                                let lot=w.option(state.account.lots.iter_mut().find(|l|l.lot_id==claim.lot_id), Txt::Execution(fw::ExecutionText::ReservedSellLotDisappeared))?;
+                                let lot = w.option(
+                                    state
+                                        .account
+                                        .lots
+                                        .iter_mut()
+                                        .find(|l| l.lot_id == claim.lot_id),
+                                    Txt::Execution(fw::ExecutionText::ReservedSellLotDisappeared),
+                                )?;
                                 {
-                                    let condition = lot.sellable_from <= window.session_date && state.lot_assignments.get(&lot.lot_id).and_then(Option::as_deref) == Some(parent.intent.chain_id.as_str());
-                                    w.require(condition, Txt::Execution(fw::ExecutionText::SellLotIsNotAssignedSellable))
-                                } ?;
+                                    let condition = lot.sellable_from <= window.session_date
+                                        && state
+                                            .lot_assignments
+                                            .get(&lot.lot_id)
+                                            .and_then(Option::as_deref)
+                                            == Some(parent.intent.chain_id.as_str());
+                                    w.require(
+                                        condition,
+                                        Txt::Execution(
+                                            fw::ExecutionText::SellLotIsNotAssignedSellable,
+                                        ),
+                                    )
+                                }?;
                                 let allocated = if take == lot.quantity {
                                     lot.buy_fee_remaining.micros()
                                 } else {
-                                    budget::checked( i128::from(lot.buy_fee_remaining.micros()) * i128::from(take) / i128::from(lot.quantity), )?
+                                    budget::checked(
+                                        i128::from(lot.buy_fee_remaining.micros())
+                                            * i128::from(take)
+                                            / i128::from(lot.quantity),
+                                    )?
                                 };
-                                inherited_fee = inherited_fee .checked_add(i128::from(allocated)) .ok_or(LedgerError::Overflow)?;
-                                basis = basis .checked_add(i128::from(budget::notional_with_work( lot.basis_price.micros(), take, w, )?)) .ok_or(LedgerError::Overflow)?;
+                                inherited_fee = inherited_fee
+                                    .checked_add(i128::from(allocated))
+                                    .ok_or(LedgerError::Overflow)?;
+                                basis = basis
+                                    .checked_add(i128::from(budget::notional_with_work(
+                                        lot.basis_price.micros(),
+                                        take,
+                                        w,
+                                    )?))
+                                    .ok_or(LedgerError::Overflow)?;
                                 lot.quantity -= take;
-                                lot.buy_fee_remaining = Money::from_micros( lot.buy_fee_remaining .micros() .checked_sub(allocated) .ok_or(LedgerError::Overflow)?, );
+                                lot.buy_fee_remaining = Money::from_micros(
+                                    lot.buy_fee_remaining
+                                        .micros()
+                                        .checked_sub(allocated)
+                                        .ok_or(LedgerError::Overflow)?,
+                                );
                                 claim.quantity -= take;
                                 left -= take;
                             }
                             {
                                 let condition = left == 0;
-                                w.require(condition, Txt::Execution(fw::ExecutionText::FillExceedsReservedFIFOShares))
-                            } ?;
+                                w.require(
+                                    condition,
+                                    Txt::Execution(
+                                        fw::ExecutionText::FillExceedsReservedFIFOShares,
+                                    ),
+                                )
+                            }?;
                             parent.sell_claims.retain(|c| c.quantity > 0);
-                            let mut empty=Vec::new();
-                            for lot in state.account.lots.iter().filter(|l|l.quantity==0){
-                                let id=w.copy(&lot.lot_id)?;
+                            let mut empty = Vec::new();
+                            for lot in state.account.lots.iter().filter(|l| l.quantity == 0) {
+                                let id = w.copy(&lot.lot_id)?;
                                 w.push(&mut empty, id)?;
                             }
                             state.account.lots.retain(|l| l.quantity > 0);
                             for id in empty {
                                 state.lot_assignments.remove(&id);
                             }
-                            state.cash.apply_strategy_delta_with_work(budget::checked( i128::from(modeled.notional_micro_cny) - i128::from(modeled.total_fee_micro_cny), )?, w)?;
+                            state.cash.apply_strategy_delta_with_work(
+                                budget::checked(
+                                    i128::from(modeled.notional_micro_cny)
+                                        - i128::from(modeled.total_fee_micro_cny),
+                                )?,
+                                w,
+                            )?;
                         }
                     }
                     let realized = if parent.intent.side == Side::Sell {
-                        budget::checked( i128::from(modeled.notional_micro_cny) - i128::from(modeled.total_fee_micro_cny) - basis - inherited_fee, )?
+                        budget::checked(
+                            i128::from(modeled.notional_micro_cny)
+                                - i128::from(modeled.total_fee_micro_cny)
+                                - basis
+                                - inherited_fee,
+                        )?
                     } else {
                         0
                     };
-                    state.account.realized_pnl = Money::from_micros(budget::checked( i128::from(state.account.realized_pnl.micros()) + i128::from(realized), )?);
-                    state.account.fees = Money::from_micros(budget::checked( i128::from(state.account.fees.micros()) + i128::from(modeled.total_fee_micro_cny), )?);
+                    state.account.realized_pnl = Money::from_micros(budget::checked(
+                        i128::from(state.account.realized_pnl.micros()) + i128::from(realized),
+                    )?);
+                    state.account.fees = Money::from_micros(budget::checked(
+                        i128::from(state.account.fees.micros())
+                            + i128::from(modeled.total_fee_micro_cny),
+                    )?);
                     state.account.cash = Money::from_micros(state.cash.account_cash);
-                    parent.reservation = reservation_with_work(&parent.intent, parent.remaining, &fee, w)?;
+                    parent.reservation =
+                        reservation_with_work(&parent.intent, parent.remaining, &fee, w)?;
                     parent.status = if parent.remaining == 0 {
                         ParentStatus::Filled
                     } else {
@@ -858,12 +1210,12 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
                         realized_pnl_micro_cny: realized,
                     };
                     {
-                        let key=w.copy(parent_id)?;
-                        let incoming=parent;
+                        let key = w.copy(parent_id)?;
+                        let incoming = parent;
                         w.insert(&mut state.parents, key, incoming)?;
                     };
                     {
-                        let incoming=w.copy(&record)?;
+                        let incoming = w.copy(&record)?;
                         w.push(&mut state.fills, incoming)?;
                     };
                     Effect::Filled(record)
@@ -872,32 +1224,33 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
             state.validate_with_work(w)?;
             Ok(effect)
         }
-        CommandRecord::Cancel {
-            parent_id,
-            at,
-            ..
-        }
-        | CommandRecord::Expire {
-            parent_id,
-            at,
-            ..
-        }
-        => {
-            let parent = state .parents .get_mut(parent_id) .ok_or(LedgerError::IdentityConflict)?;
+        CommandRecord::Cancel { parent_id, at, .. }
+        | CommandRecord::Expire { parent_id, at, .. } => {
+            let parent = state
+                .parents
+                .get_mut(parent_id)
+                .ok_or(LedgerError::IdentityConflict)?;
             {
                 let condition = parent.status.working() && *at >= state.account.as_of;
-                w.require(condition, Txt::Execution(fw::ExecutionText::CancelExpireNotCurrentWorkingOrder))
-            } ?;
-            let expired = matches!(request, CommandRecord::Expire {
-                ..
-            });
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::CancelExpireNotCurrentWorkingOrder),
+                )
+            }?;
+            let expired = matches!(request, CommandRecord::Expire { .. });
             if expired {
                 let local = checked_shanghai_local_with_work(*at, w)?;
                 let day = local.date_naive();
                 {
-                    let condition = (day > parent.intent.session_date || (day == parent.intent.session_date && local.time().num_seconds_from_midnight() >= 15 * 3600)) && w.calendar_day(day)?;
-                    w.require(condition, Txt::Execution(fw::ExecutionText::DayOrderNotYetExpiredOnVerifiedSession))
-                } ?;
+                    let condition = (day > parent.intent.session_date
+                        || (day == parent.intent.session_date
+                            && local.time().num_seconds_from_midnight() >= 15 * 3600))
+                        && w.calendar_day(day)?;
+                    w.require(
+                        condition,
+                        Txt::Execution(fw::ExecutionText::DayOrderNotYetExpiredOnVerifiedSession),
+                    )
+                }?;
             }
             parent.status = if expired {
                 ParentStatus::Expired
@@ -916,46 +1269,55 @@ fn apply_request_body_with_work( state: &mut ExecutionProjection, manifest: &Exe
                 Effect::Cancelled
             })
         }
-        CommandRecord::QualifiedMarks {
-            windows,
-            ..
-        }
-        => {
+        CommandRecord::QualifiedMarks { windows, .. } => {
             {
                 let condition = !windows.is_empty();
-                w.require(condition, Txt::Execution(fw::ExecutionText::QualifiedMarkSetEmpty))
-            } ?;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::QualifiedMarkSetEmpty),
+                )
+            }?;
             let at = windows[0].observed_at;
             let mut seen = BTreeSet::new();
             {
                 let condition = at >= state.account.as_of;
-                w.require(condition, Txt::Execution(fw::ExecutionText::MarkPrecedesPriorFinancialFact))
-            } ?;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::MarkPrecedesPriorFinancialFact),
+                )
+            }?;
             for window in windows {
                 window.validate_with_work(w)?;
                 {
-                    let condition = window.observed_at == at && w.set(&mut seen, window.instrument_code.as_str())?;
-                    w.require(condition, Txt::Execution(fw::ExecutionText::MarkSetDateCodeDuplicate))
-                } ?;
+                    let condition = window.observed_at == at
+                        && w.set(&mut seen, window.instrument_code.as_str())?;
+                    w.require(
+                        condition,
+                        Txt::Execution(fw::ExecutionText::MarkSetDateCodeDuplicate),
+                    )
+                }?;
                 {
-                    let key=w.copy(&window.instrument_code)?;
-                    let incoming=mark_from_window_with_work(window, w)?;
+                    let key = w.copy(&window.instrument_code)?;
+                    let incoming = mark_from_window_with_work(window, w)?;
                     w.insert(&mut state.account.marks, key, incoming)?;
                 };
                 {
-                    let key=w.copy(&window.instrument_code)?;
-                    let incoming=w.copy(window)?;
+                    let key = w.copy(&window.instrument_code)?;
+                    let incoming = w.copy(window)?;
                     w.insert(&mut state.valuation_windows, key, incoming)?;
                 };
             }
-            let mut holdings=BTreeSet::new();
-            for lot in &state.account.lots{
+            let mut holdings = BTreeSet::new();
+            for lot in &state.account.lots {
                 w.set(&mut holdings, lot.code.as_str())?;
             }
             {
                 let condition = holdings.iter().all(|c| seen.contains(c));
-                w.require(condition, Txt::Execution(fw::ExecutionText::MarksOmitFullAccountHolding))
-            } ?;
+                w.require(
+                    condition,
+                    Txt::Execution(fw::ExecutionText::MarksOmitFullAccountHolding),
+                )
+            }?;
             state.account.as_of = at;
             state.validate_with_work(w)?;
             Ok(Effect::Marks)
@@ -4660,42 +5022,82 @@ pub(crate) fn replay_codec_fixtures(
 }
 
 struct ExecutionRecordExtentExceeded;
-fn execution_record_extent(bytes:&[u8])->std::result::Result<(), ExecutionRecordExtentExceeded>{
-    if bytes.len()<=MAX_RECORD_BYTES{
+fn execution_record_extent(bytes: &[u8]) -> std::result::Result<(), ExecutionRecordExtentExceeded> {
+    if bytes.len() <= MAX_RECORD_BYTES {
         Ok(())
-    } else{
+    } else {
         Err(ExecutionRecordExtentExceeded)
     }
 }
-pub(crate) fn require_execution_record_extent_with_work(bytes:&[u8], w:&mut FinancialWork<'_, '_>)->fw::Result<()>{
+pub(crate) fn require_execution_record_extent_with_work(
+    bytes: &[u8],
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     w.finish()?;
-    match execution_record_extent(bytes){
-        Ok(())=>Ok(()),
-        Err(_)=>Err(w.error(Txt::Execution(fw::ExecutionText::ExecutionRecordExceedsByteLimit))?)
+    match execution_record_extent(bytes) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(w.error(Txt::Execution(
+            fw::ExecutionText::ExecutionRecordExceedsByteLimit,
+        ))?),
     }
 }
-pub(crate) fn sort_fifo_lots_owner(lots:&mut Vec<&Lot>){
-    lots.sort_by(|a, b|(a.acquired_on, &a.lot_id).cmp(&(b.acquired_on, &b.lot_id)));
+pub(crate) fn sort_fifo_lots_owner(lots: &mut Vec<&Lot>) {
+    lots.sort_by(|a, b| (a.acquired_on, &a.lot_id).cmp(&(b.acquired_on, &b.lot_id)));
 }
 
-#[derive(Clone,Copy)]
-enum DescriptorField{Segment,RateNum,RateDen,Minimum,Transfer,Other,Revision}
-impl DescriptorField{fn key(self)->&'static str{match self{Self::Segment=>"segment",Self::RateNum=>"commission_rate_num",Self::RateDen=>"commission_rate_den",Self::Minimum=>"commission_minimum_micro_cny",Self::Transfer=>"coverage_transfer_fee",Self::Other=>"coverage_other_charges",Self::Revision=>"source_revision"}}}
-fn descriptor_get<'a>(fields:&BTreeMap<&'a str, &'a str>, key:DescriptorField, w:&mut FinancialWork<'_, '_>)->fw::Result<&'a str>{
-    w.option(fields.get(key.key()).copied(), Txt::Execution(fw::ExecutionText::FeeDescriptorMissingField))
+#[derive(Clone, Copy)]
+enum DescriptorField {
+    Segment,
+    RateNum,
+    RateDen,
+    Minimum,
+    Transfer,
+    Other,
+    Revision,
 }
-fn descriptor_integer(fields:&BTreeMap<&str, &str>, key:DescriptorField, w:&mut FinancialWork<'_, '_>)->fw::Result<i64>{
-    let value=descriptor_get(fields, key, w)?;
-    match value.parse(){
-        Ok(n)=>Ok(n),
-        Err(_)=>Err(w.error(Txt::Execution(fw::ExecutionText::FeeDescriptorInteger))?)
+impl DescriptorField {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Segment => "segment",
+            Self::RateNum => "commission_rate_num",
+            Self::RateDen => "commission_rate_den",
+            Self::Minimum => "commission_minimum_micro_cny",
+            Self::Transfer => "coverage_transfer_fee",
+            Self::Other => "coverage_other_charges",
+            Self::Revision => "source_revision",
+        }
     }
 }
-fn descriptor_reason(fields:&BTreeMap<&str, &str>, key:DescriptorField, w:&mut FinancialWork<'_, '_>)->fw::Result<ExcludedFeeReason>{
-    match descriptor_get(fields, key, w)?{
-        "excluded_unmodeled"=>Ok(ExcludedFeeReason::Unmodeled),
-        "excluded_unverified"=>Ok(ExcludedFeeReason::Unverified),
-        _=>Err(w.error(Txt::Execution(fw::ExecutionText::FeeCoverageField))?)
+fn descriptor_get<'a>(
+    fields: &BTreeMap<&'a str, &'a str>,
+    key: DescriptorField,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<&'a str> {
+    w.option(
+        fields.get(key.key()).copied(),
+        Txt::Execution(fw::ExecutionText::FeeDescriptorMissingField),
+    )
+}
+fn descriptor_integer(
+    fields: &BTreeMap<&str, &str>,
+    key: DescriptorField,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<i64> {
+    let value = descriptor_get(fields, key, w)?;
+    match value.parse() {
+        Ok(n) => Ok(n),
+        Err(_) => Err(w.error(Txt::Execution(fw::ExecutionText::FeeDescriptorInteger))?),
+    }
+}
+fn descriptor_reason(
+    fields: &BTreeMap<&str, &str>,
+    key: DescriptorField,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<ExcludedFeeReason> {
+    match descriptor_get(fields, key, w)? {
+        "excluded_unmodeled" => Ok(ExcludedFeeReason::Unmodeled),
+        "excluded_unverified" => Ok(ExcludedFeeReason::Unverified),
+        _ => Err(w.error(Txt::Execution(fw::ExecutionText::FeeCoverageField))?),
     }
 }
 
@@ -4729,12 +5131,24 @@ impl RetainedExecutionAcquired {
 }
 type RetainedExecutionOutcome<'db, 'a> =
     crate::database::global_schema_v1::paper_v6::RetainedPaperWriteOutcome<
-        'db, RetainedExecutionInput<'a>, RetainedExecutionAcquired, LedgerError>;
+        'db,
+        RetainedExecutionInput<'a>,
+        RetainedExecutionAcquired,
+        LedgerError,
+    >;
 
 fn retained_execution_input(account: &str, command: PaperV2Command) -> RetainedExecutionInput<'_> {
-    RetainedExecutionInput { account, command, replay_contract: SubmissionReplayContract::ExactCommand,
-        actual: None, sampled_at: None,
-        record: None, receipt: None, binding: None, recorded_windows: Vec::new() }
+    RetainedExecutionInput {
+        account,
+        command,
+        replay_contract: SubmissionReplayContract::ExactCommand,
+        actual: None,
+        sampled_at: None,
+        record: None,
+        receipt: None,
+        binding: None,
+        recorded_windows: Vec::new(),
+    }
 }
 fn retained_execution_command_id(command: &PaperV2Command) -> &str {
     match command {
@@ -4751,28 +5165,64 @@ fn retained_execution_record(
     now: DateTime<Utc>,
 ) -> Result<(), LedgerError> {
     let record = match &input.command {
-        PaperV2Command::Submit { expected, approved, .. } => {
+        PaperV2Command::Submit {
+            expected, approved, ..
+        } => {
             approved.require_binding(actual)?;
-            CommandRecord::Submit { expected: expected.clone(), intent: approved.record().clone() }
+            CommandRecord::Submit {
+                expected: expected.clone(),
+                intent: approved.record().clone(),
+            }
         }
-        PaperV2Command::Evaluate { expected, parent_id, window, .. } => {
+        PaperV2Command::Evaluate {
+            expected,
+            parent_id,
+            window,
+            ..
+        } => {
             window.require_binding(actual)?;
-            CommandRecord::Evaluate { expected: expected.clone(), parent_id: parent_id.clone(), window: window.record().clone() }
+            CommandRecord::Evaluate {
+                expected: expected.clone(),
+                parent_id: parent_id.clone(),
+                window: window.record().clone(),
+            }
         }
-        PaperV2Command::Cancel { expected, parent_id, .. } =>
-            CommandRecord::Cancel { expected: expected.clone(), parent_id: parent_id.clone(), at: now },
-        PaperV2Command::Expire { expected, parent_id, .. } =>
-            CommandRecord::Expire { expected: expected.clone(), parent_id: parent_id.clone(), at: now },
-        PaperV2Command::QualifiedMarks { expected, windows, .. } => {
+        PaperV2Command::Cancel {
+            expected,
+            parent_id,
+            ..
+        } => CommandRecord::Cancel {
+            expected: expected.clone(),
+            parent_id: parent_id.clone(),
+            at: now,
+        },
+        PaperV2Command::Expire {
+            expected,
+            parent_id,
+            ..
+        } => CommandRecord::Expire {
+            expected: expected.clone(),
+            parent_id: parent_id.clone(),
+            at: now,
+        },
+        PaperV2Command::QualifiedMarks {
+            expected, windows, ..
+        } => {
             for window in windows {
                 window.require_binding(actual)?;
                 input.recorded_windows.push(window.record().clone());
             }
-            CommandRecord::QualifiedMarks { expected: expected.clone(), windows: std::mem::take(&mut input.recorded_windows) }
+            CommandRecord::QualifiedMarks {
+                expected: expected.clone(),
+                windows: std::mem::take(&mut input.recorded_windows),
+            }
         }
     };
     input.record = Some(record);
-    require(budget::token(retained_execution_command_id(&input.command)), "command id invalid")?;
+    require(
+        budget::token(retained_execution_command_id(&input.command)),
+        "command id invalid",
+    )?;
     Ok(())
 }
 fn retained_execution_run<'db, 'a>(
@@ -4792,10 +5242,18 @@ fn retained_execution_run<'db, 'a>(
             let record_result = retained_execution_record(input, &actual, sampled_at);
             input.actual = Some(actual);
             record_result?;
-            input.receipt = Some(append_retained_submission_on(conn, input.account,
+            input.receipt = Some(append_retained_submission_on(
+                conn,
+                input.account,
                 retained_execution_command_id(&input.command),
-                input.record.as_ref().expect("actual record retained").clone(),
-                input.sampled_at.expect("actual time retained"), input.replay_contract)?);
+                input
+                    .record
+                    .as_ref()
+                    .expect("actual record retained")
+                    .clone(),
+                input.sampled_at.expect("actual time retained"),
+                input.replay_contract,
+            )?);
             input.binding = Some(SqlBinding::capture(conn)?);
             #[cfg(test)]
             if db.has_isolated_p05_consumer_origin() {
@@ -4803,14 +5261,24 @@ fn retained_execution_run<'db, 'a>(
                 run_test_hook(TestPhase::LastSqlBeforeCommit, conn);
             }
             let receipt = input.receipt.take().expect("actual receipt retained");
-            let fresh_request = if receipt.replayed { None } else { input.record.take() };
-            Ok(RetainedExecutionAcquired { receipt,
-                binding: input.binding.take().expect("actual SQL binding retained"), fresh_request })
+            let fresh_request = if receipt.replayed {
+                None
+            } else {
+                input.record.take()
+            };
+            Ok(RetainedExecutionAcquired {
+                receipt,
+                binding: input.binding.take().expect("actual SQL binding retained"),
+                fresh_request,
+            })
         },
         |conn, _authority, _proof, input, acquired| {
             acquired.binding.validate(conn)?;
-            acquired.binding.require_fresh_request(input.account,
-                acquired.fresh_request.as_ref(), operation_now(db, test_now)?)
+            acquired.binding.require_fresh_request(
+                input.account,
+                acquired.fresh_request.as_ref(),
+                operation_now(db, test_now)?,
+            )
         },
     )
 }
@@ -4820,11 +5288,16 @@ pub(crate) fn apply_retained_actual<'a>(
     account: &'a str,
     command: PaperV2Command,
 ) -> RetainedExecutionOutcome<'static, 'a> {
-    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWrite, RetainedPaperWriteOutcome};
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWrite, RetainedPaperWriteOutcome,
+    };
     let input = retained_execution_input(account, command);
     match DatabaseManager::try_get() {
         Some(db) => retained_execution_run(db, input, None),
-        None => RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(input, PaperCatalog6Error::Authority)),
+        None => RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(
+            input,
+            PaperCatalog6Error::Authority,
+        )),
     }
 }
 
@@ -4836,7 +5309,6 @@ pub(crate) fn retained_execution_command_for_test<'i, 'a>(
     &input.command
 }
 
-
 /// The existing constructor-issued Test manager is the only permitted source of
 /// this fixed-clock route. Input is owned before that origin check can fail.
 #[cfg(test)]
@@ -4846,11 +5318,15 @@ pub(crate) fn apply_retained_for_isolated_test<'db, 'a>(
     command: PaperV2Command,
     now: DateTime<Utc>,
 ) -> RetainedExecutionOutcome<'db, 'a> {
-    use crate::database::global_schema_v1::paper_v6::{RetainedPaperWrite, RetainedPaperWriteOutcome};
+    use crate::database::global_schema_v1::paper_v6::{
+        RetainedPaperWrite, RetainedPaperWriteOutcome,
+    };
     let input = retained_execution_input(account, command);
     if !db.has_isolated_p05_consumer_origin() {
         return RetainedPaperWriteOutcome::Held(RetainedPaperWrite::unopened(
-            input, PaperCatalog6Error::Catalog6RequalificationRequired));
+            input,
+            PaperCatalog6Error::Catalog6RequalificationRequired,
+        ));
     }
     retained_execution_run(db, input, Some(now))
 }

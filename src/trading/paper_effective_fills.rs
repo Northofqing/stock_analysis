@@ -493,8 +493,9 @@ pub(super) fn legacy_source(
     binding: &AccountBinding,
 ) -> Result<crate::database::attribution_epochs::VerifiedEpochFillSet, LedgerError> {
     let rows = events(conn, &binding.account_id)?;
-    let (legacy_high_water_id, legacy_audit_high_water) =
-        fw::historical(legacy_prefix_from_events(&rows, &mut FinancialWork::Historical))?;
+    let (legacy_high_water_id, legacy_audit_high_water) = fw::historical(
+        legacy_prefix_from_events(&rows, &mut FinancialWork::Historical),
+    )?;
     let audit_high_water =
         if legacy_audit_high_water == crate::database::order_audit::AUDIT_CHAIN_GENESIS {
             0
@@ -511,13 +512,19 @@ pub(super) fn legacy_source(
         legacy_high_water_id,
         audit_high_water,
     )
-    .map_err(|error| fw::historical(FinancialWork::Historical.source_error_to_ledger(error)).expect("Historical source error writer"))
+    .map_err(|error| {
+        fw::historical(FinancialWork::Historical.source_error_to_ledger(error))
+            .expect("Historical source error writer")
+    })
 }
 
 fn sort_rows(rows: &mut Vec<EconomicFillRow>) -> Result<(), LedgerError> {
     fw::historical(sort_rows_with_work(rows, &mut FinancialWork::Historical))
 }
-fn sort_rows_with_work(rows: &mut Vec<EconomicFillRow>, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+fn sort_rows_with_work(
+    rows: &mut Vec<EconomicFillRow>,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     let mut ordered = Vec::new();
     for row in rows.drain(..) {
         let at = work.ledger_timestamp(row.id, &row.occurred_at)?;
@@ -560,7 +567,14 @@ fn historical_rows(
         let raw = adjudication::raw_bytes(conn, pending.id)?;
         let hash = fw::historical(work.raw_hash(raw.as_bytes()))?;
         drop(raw);
-        let (row, proof) = fw::historical(finish_legacy_fill(pending, hash, fill.terminal_audit_hash(), actions.get(&fill.fill().id), cutover, &mut work))?;
+        let (row, proof) = fw::historical(finish_legacy_fill(
+            pending,
+            hash,
+            fill.terminal_audit_hash(),
+            actions.get(&fill.fill().id),
+            cutover,
+            &mut work,
+        ))?;
         if !proof.quarantined {
             fw::historical(work.history_push(&mut rows, row))?;
         }
@@ -569,44 +583,84 @@ fn historical_rows(
     let unavailable = fw::historical(finish_historical_rows(&mut rows, &mut work))?;
     Ok((rows, lineage, unavailable))
 }
-fn collect_legacy_actions(events: &[EventRow], extra: Option<&Adjudication>, work: &mut FinancialWork<'_, '_>) -> fw::Result<BTreeMap<i64, (AdjudicationAction, String)>> {
+fn collect_legacy_actions(
+    events: &[EventRow],
+    extra: Option<&Adjudication>,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<BTreeMap<i64, (AdjudicationAction, String)>> {
     let mut actions = BTreeMap::new();
     for event in events {
         if let Fact::AdjudicatedV1(fact) = work.decode(event.payload.as_bytes())? {
             if fact.request.original.legacy_before_cutover {
                 let hash = work.copy(&event.event_hash)?;
-                work.history_map_insert(&mut actions, fact.request.original.paper_trade_id, (fact.request.action, hash))?;
+                work.history_map_insert(
+                    &mut actions,
+                    fact.request.original.paper_trade_id,
+                    (fact.request.action, hash),
+                )?;
             }
         }
     }
     if let Some(request) = extra {
         let action = work.copy(&request.action)?;
-        let hash = work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::ExtraAdjudication(request))?;
-        work.history_map_insert(&mut actions, request.original.paper_trade_id, (action, hash))?;
+        let hash = work.history_hash(
+            crate::trading::paper_replay_codec_v1::HistoryOutput::ExtraAdjudication(request),
+        )?;
+        work.history_map_insert(
+            &mut actions,
+            request.original.paper_trade_id,
+            (action, hash),
+        )?;
     }
     Ok(actions)
 }
-pub(crate) fn copy_economic_fill(row: &EconomicFillRow, work: &mut FinancialWork<'_, '_>) -> fw::Result<EconomicFillRow> {
+pub(crate) fn copy_economic_fill(
+    row: &EconomicFillRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<EconomicFillRow> {
     Ok(EconomicFillRow {
-        id: row.id, plan_id: work.copy(&row.plan_id)?, code: work.copy(&row.code)?, name: work.copy(&row.name)?, direction: work.copy(&row.direction)?, fill_price: row.fill_price, quantity: row.quantity, occurred_at: work.copy(&row.occurred_at)?, virtual_reason: work.copy(&row.virtual_reason)?
+        id: row.id,
+        plan_id: work.copy(&row.plan_id)?,
+        code: work.copy(&row.code)?,
+        name: work.copy(&row.name)?,
+        direction: work.copy(&row.direction)?,
+        fill_price: row.fill_price,
+        quantity: row.quantity,
+        occurred_at: work.copy(&row.occurred_at)?,
+        virtual_reason: work.copy(&row.virtual_reason)?,
     })
 }
-fn begin_legacy_fill(fill: &EconomicFillRow, work: &mut FinancialWork<'_, '_>) -> fw::Result<EconomicFillRow> {
+fn begin_legacy_fill(
+    fill: &EconomicFillRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<EconomicFillRow> {
     let mut row = copy_economic_fill(fill, work)?;
     let utc = work.ledger_timestamp(row.id, &row.occurred_at)?;
-    row.occurred_at = work.history_time(fw::HistoryChrono::NaiveNanos(utc.checked_add_signed(chrono::Duration::hours(8)).ok_or(LedgerError::Overflow)?))?;
+    row.occurred_at = work.history_time(fw::HistoryChrono::NaiveNanos(
+        utc.checked_add_signed(chrono::Duration::hours(8))
+            .ok_or(LedgerError::Overflow)?,
+    ))?;
     Ok(row)
 }
-fn finish_legacy_fill(mut row: EconomicFillRow, raw_hash: String, audit_hash: Option<&str>, action: Option<&(AdjudicationAction, String)>, cutover: Option<DateTime<Utc>>, work: &mut FinancialWork<'_, '_>) -> fw::Result<(EconomicFillRow, FillLineage)> {
+fn finish_legacy_fill(
+    mut row: EconomicFillRow,
+    raw_hash: String,
+    audit_hash: Option<&str>,
+    action: Option<&(AdjudicationAction, String)>,
+    cutover: Option<DateTime<Utc>>,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<(EconomicFillRow, FillLineage)> {
     let mut proof = FillLineage {
-        fill_id: row.id, raw_hash,
+        fill_id: row.id,
+        raw_hash,
         authority: match audit_hash {
             Some(hash) => FillAuthority::LegacyAudited {
-                audit_hash: work.copy_terminal_hash(hash)?
+                audit_hash: work.copy_terminal_hash(hash)?,
             },
-            None => FillAuthority::LegacyNoTerminal
+            None => FillAuthority::LegacyNoTerminal,
         },
-        ruling_hash: None, quarantined: false,
+        ruling_hash: None,
+        quarantined: false,
     };
     if let Some((action, hash)) = action {
         proof.ruling_hash = Some(work.copy(hash)?);
@@ -615,30 +669,51 @@ fn finish_legacy_fill(mut row: EconomicFillRow, raw_hash: String, audit_hash: Op
             AdjudicationAction::CorrectionDeclared {
                 price,
                 quantity,
-                fact_at
+                fact_at,
             } => {
-                if *price <= Money::ZERO || *quantity == 0 || !quantity.is_multiple_of(100) || cutover.is_some_and(|cutover| *fact_at >= cutover) {
-                    return Err(LedgerError::InvalidInput(work.history_text(fw::HistoryText::EffectiveCorrection)?).into());
+                if *price <= Money::ZERO
+                    || *quantity == 0
+                    || !quantity.is_multiple_of(100)
+                    || cutover.is_some_and(|cutover| *fact_at >= cutover)
+                {
+                    return Err(LedgerError::InvalidInput(
+                        work.history_text(fw::HistoryText::EffectiveCorrection)?,
+                    )
+                    .into());
                 }
                 row.fill_price = Some(price.cny());
                 row.quantity = i64::from(*quantity);
-                row.occurred_at = work.history_time(fw::HistoryChrono::FixedNanos(fact_at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())))?;
+                row.occurred_at = work.history_time(fw::HistoryChrono::FixedNanos(
+                    fact_at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
+                ))?;
             }
         }
     }
     Ok((row, proof))
 }
-fn finish_historical_rows(rows: &mut Vec<EconomicFillRow>, work: &mut FinancialWork<'_, '_>) -> fw::Result<Option<String>> {
+fn finish_historical_rows(
+    rows: &mut Vec<EconomicFillRow>,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<Option<String>> {
     sort_rows_with_work(rows, work)?;
     let mut fills = Vec::new();
     for row in rows.iter() {
         let fill = crate::trading::paper_lot_ledger::PaperFill {
-            id: row.id, code: work.copy(&row.code)?, name: work.copy(&row.name)?, direction: work.copy(&row.direction)?,
-            fill_price: row.fill_price, quantity: row.quantity, occurred_at: work.ledger_timestamp(row.id, &row.occurred_at)?,
+            id: row.id,
+            code: work.copy(&row.code)?,
+            name: work.copy(&row.name)?,
+            direction: work.copy(&row.direction)?,
+            fill_price: row.fill_price,
+            quantity: row.quantity,
+            occurred_at: work.ledger_timestamp(row.id, &row.occurred_at)?,
         };
         work.history_push(&mut fills, fill)?;
     }
-    match crate::trading::paper_lot_ledger::rebuild_paper_positions_body(&fills, NaiveDate::MAX, work) {
+    match crate::trading::paper_lot_ledger::rebuild_paper_positions_body(
+        &fills,
+        NaiveDate::MAX,
+        work,
+    ) {
         Ok(_) => Ok(None),
         Err(FinancialFailure::History(text)) => Ok(Some(text)),
         Err(error) => Err(error),
@@ -652,9 +727,18 @@ pub(super) fn legacy_result(
     extra: Option<&Adjudication>,
 ) -> Result<(String, Option<String>), LedgerError> {
     let source = legacy_source(conn, binding)?;
-    let manifest = fw::historical(legacy_result_manifest(events, &mut FinancialWork::Historical))?;
-    let (rows, _, unavailable) = historical_rows(conn, &source, events, extra, Some(manifest.cutover_at))?;
-    fw::historical(finish_legacy_result(source.all_status_paper_manifest_hash(), &rows, unavailable, &mut FinancialWork::Historical))
+    let manifest = fw::historical(legacy_result_manifest(
+        events,
+        &mut FinancialWork::Historical,
+    ))?;
+    let (rows, _, unavailable) =
+        historical_rows(conn, &source, events, extra, Some(manifest.cutover_at))?;
+    fw::historical(finish_legacy_result(
+        source.all_status_paper_manifest_hash(),
+        &rows,
+        unavailable,
+        &mut FinancialWork::Historical,
+    ))
 }
 
 fn legacy_verified_on(
@@ -800,12 +884,24 @@ pub(crate) struct RecordedPaperV2EffectiveFillSet {
     fills: Vec<crate::trading::paper_book_v2_execution::FillRecord>,
 }
 impl RecordedPaperV2EffectiveFillSet {
-    pub(crate) fn identity_domain(&self) -> &'static str { "paper-parent-fill-id/v1" }
-    pub(crate) fn account_id(&self) -> &str { &self.account_id }
-    pub(crate) fn epoch_id(&self) -> &str { &self.epoch_id }
-    pub(crate) fn manifest_hash(&self) -> &str { &self.execution_manifest_hash }
-    pub(crate) fn revision(&self) -> (i64, &str) { (self.current_revision, &self.current_event_hash) }
-    pub(crate) fn fills(&self) -> &[crate::trading::paper_book_v2_execution::FillRecord] { &self.fills }
+    pub(crate) fn identity_domain(&self) -> &'static str {
+        "paper-parent-fill-id/v1"
+    }
+    pub(crate) fn account_id(&self) -> &str {
+        &self.account_id
+    }
+    pub(crate) fn epoch_id(&self) -> &str {
+        &self.epoch_id
+    }
+    pub(crate) fn manifest_hash(&self) -> &str {
+        &self.execution_manifest_hash
+    }
+    pub(crate) fn revision(&self) -> (i64, &str) {
+        (self.current_revision, &self.current_event_hash)
+    }
+    pub(crate) fn fills(&self) -> &[crate::trading::paper_book_v2_execution::FillRecord] {
+        &self.fills
+    }
 }
 pub(crate) fn observe_actual_parent_fills(
     account_id: &str,
@@ -832,7 +928,10 @@ impl fw::HistoryElement for EconomicFillRow {}
 impl fw::history_sealed::Element for FillLineage {}
 impl fw::HistoryElement for FillLineage {}
 
-fn legacy_prefix_from_events(events: &[EventRow], work: &mut FinancialWork<'_, '_>) -> fw::Result<(i64, String)> {
+fn legacy_prefix_from_events(
+    events: &[EventRow],
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<(i64, String)> {
     let row = events.first().ok_or(LedgerError::NotSeeded)?;
     match work.decode::<Fact>(row.payload.as_bytes())? {
         Fact::Seeded {
@@ -843,19 +942,28 @@ fn legacy_prefix_from_events(events: &[EventRow], work: &mut FinancialWork<'_, '
         _ => Err(ledger_history_error(work, LedgerHistoryText::LegacySeed)?),
     }
 }
-fn legacy_result_manifest(events: &[EventRow], work: &mut FinancialWork<'_, '_>) -> fw::Result<SeedManifest> {
+fn legacy_result_manifest(
+    events: &[EventRow],
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<SeedManifest> {
     match work.decode::<Fact>(events[0].payload.as_bytes())? {
-        Fact::Seeded {
-            manifest,
-            ..
-        } => Ok(manifest),
+        Fact::Seeded { manifest, .. } => Ok(manifest),
         _ => Err(LedgerError::NotSeeded.into()),
     }
 }
-fn finish_legacy_result(source: &str, rows: &[EconomicFillRow], unavailable: Option<String>, work: &mut FinancialWork<'_, '_>) -> fw::Result<(String, Option<String>)> {
-    let hash = work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Legacy {
-        source, rows, unavailable: &unavailable
-    })?;
+fn finish_legacy_result(
+    source: &str,
+    rows: &[EconomicFillRow],
+    unavailable: Option<String>,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<(String, Option<String>)> {
+    let hash = work.history_hash(
+        crate::trading::paper_replay_codec_v1::HistoryOutput::Legacy {
+            source,
+            rows,
+            unavailable: &unavailable,
+        },
+    )?;
     Ok((hash, unavailable))
 }
 
@@ -878,12 +986,18 @@ pub(super) fn history_legacy_fixture<'loan, 'pool>(
     let raw = r#"[7,"legacy-plan","600001","历史持仓","buy",10.0,200,"Filled",10.0,null,"legacy source","Normal","Full","2026-09-22 02:00:00","unused"]"#;
     let choices = [
         None,
-        Some((AdjudicationAction::Quarantine, "quarantine-ruling".to_owned())),
-        Some((AdjudicationAction::CorrectionDeclared {
-            price: Money::from_micros(12_000_000),
-            quantity: 100,
-            fact_at: test::at() - chrono::Duration::days(1),
-        }, "correction-ruling".to_owned())),
+        Some((
+            AdjudicationAction::Quarantine,
+            "quarantine-ruling".to_owned(),
+        )),
+        Some((
+            AdjudicationAction::CorrectionDeclared {
+                price: Money::from_micros(12_000_000),
+                quantity: 100,
+                fact_at: test::at() - chrono::Duration::days(1),
+            },
+            "correction-ruling".to_owned(),
+        )),
     ];
     for action in &choices {
         let before = work.history_used();
@@ -899,12 +1013,29 @@ pub(super) fn history_legacy_fixture<'loan, 'pool>(
         let paid_hash = frame.legacy_hash().unwrap();
         work = frame.finish();
         assert_eq!(paid_hash, digest(raw));
-        let expected = finish_legacy_fill(original_pending, digest(raw), Some("audit-tip"), action.as_ref(),
-            Some(test::at()), &mut FinancialWork::Historical).unwrap();
-        let actual = finish_legacy_fill(pending, paid_hash, Some("audit-tip"), action.as_ref(),
-            Some(test::at()), &mut work).unwrap();
+        let expected = finish_legacy_fill(
+            original_pending,
+            digest(raw),
+            Some("audit-tip"),
+            action.as_ref(),
+            Some(test::at()),
+            &mut FinancialWork::Historical,
+        )
+        .unwrap();
+        let actual = finish_legacy_fill(
+            pending,
+            paid_hash,
+            Some("audit-tip"),
+            action.as_ref(),
+            Some(test::at()),
+            &mut work,
+        )
+        .unwrap();
         assert_eq!(actual, expected);
-        assert_eq!(actual.1.quarantined, matches!(action, Some((AdjudicationAction::Quarantine, _))));
+        assert_eq!(
+            actual.1.quarantined,
+            matches!(action, Some((AdjudicationAction::Quarantine, _)))
+        );
         let mut original_rows = Vec::new();
         let mut rows = Vec::new();
         let mut lineage = Vec::new();
@@ -913,26 +1044,46 @@ pub(super) fn history_legacy_fixture<'loan, 'pool>(
             work.history_push(&mut rows, actual.0).unwrap();
         }
         work.history_push(&mut lineage, actual.1).unwrap();
-        let expected_unavailable = finish_historical_rows(&mut original_rows, &mut FinancialWork::Historical).unwrap();
+        let expected_unavailable =
+            finish_historical_rows(&mut original_rows, &mut FinancialWork::Historical).unwrap();
         let unavailable = finish_historical_rows(&mut rows, &mut work).unwrap();
         assert_eq!(rows, original_rows);
         assert_eq!(unavailable, expected_unavailable);
         assert_eq!(unavailable, None);
-        let original_bytes = encode(&("LegacyEconomicV1", "source-manifest", &original_rows, &expected_unavailable)).unwrap();
-        let result = finish_legacy_result("source-manifest", &rows, unavailable, &mut work).unwrap();
+        let original_bytes = encode(&(
+            "LegacyEconomicV1",
+            "source-manifest",
+            &original_rows,
+            &expected_unavailable,
+        ))
+        .unwrap();
+        let result =
+            finish_legacy_result("source-manifest", &rows, unavailable, &mut work).unwrap();
         assert_eq!(result.0, digest(&original_bytes));
         assert_eq!(lineage.len(), 1);
         assert!(work.history_used() > before);
     }
-    let invalid_action = (AdjudicationAction::CorrectionDeclared {
-        price: Money::ZERO,
-        quantity: 1,
-        fact_at: test::at(),
-    }, "invalid-ruling".to_owned());
+    let invalid_action = (
+        AdjudicationAction::CorrectionDeclared {
+            price: Money::ZERO,
+            quantity: 1,
+            fact_at: test::at(),
+        },
+        "invalid-ruling".to_owned(),
+    );
     let pending = begin_legacy_fill(&input, &mut work).unwrap();
-    let failure = finish_legacy_fill(pending, work.raw_hash(raw.as_bytes()).unwrap(), None,
-        Some(&invalid_action), Some(test::at()), &mut work).unwrap_err();
-    assert!(matches!(failure, FinancialFailure::Financial(LedgerError::InvalidInput(text))
-        if text == "historical correction outside legacy scope"));
+    let failure = finish_legacy_fill(
+        pending,
+        work.raw_hash(raw.as_bytes()).unwrap(),
+        None,
+        Some(&invalid_action),
+        Some(test::at()),
+        &mut work,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(failure, FinancialFailure::Financial(LedgerError::InvalidInput(text))
+        if text == "historical correction outside legacy scope")
+    );
     work
 }

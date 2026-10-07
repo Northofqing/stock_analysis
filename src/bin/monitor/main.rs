@@ -7523,7 +7523,9 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
             outcome_refresh_scanned = false;
         }
         if !outcome_refresh_scanned {
-            use stock_analysis::monitor::outcome_data::{refresh_outcome_data_page, OutcomeDataScope};
+            use stock_analysis::monitor::outcome_data::{
+                refresh_outcome_data_page, OutcomeDataScope,
+            };
             match prediction::completed_session_as_of_at(now.fixed_offset()) {
                 Ok(through) => match refresh_outcome_data_page(
                     stock_analysis::database::DatabaseManager::get(),
@@ -7532,7 +7534,8 @@ async fn post_session_review_scheduler(selection_v2_enabled: bool) {
                     outcome_refresh_cursor.as_deref(),
                     10,
                 )
-                .await {
+                .await
+                {
                     Ok(page) => {
                         // Exhaustion only ends this daily collection pass;
                         // deferred authority/errors remain explicitly unresolved.
@@ -9030,9 +9033,14 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 stock_analysis::calendar::current_session(),
                 None,
             );
-            wait_for_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,
-                tokio::time::Instant::now()+tokio::time::Duration::from_secs(60),
-                monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
+            wait_for_critical_completions(
+                &mut critical_completion_rx,
+                &mut news_flash_gate,
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(60),
+                monitor_config.news_critical_score_threshold,
+                monitor_config.news_max_critical_per_day,
+            )
+            .await;
             continue;
         }
 
@@ -9251,8 +9259,13 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
 
         // Preserve the original N02 CriticalFlash phase before handling queued
         // N01 scores. Never await an unfinished model or drain to exhaustion.
-        drain_ready_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,
-            monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
+        drain_ready_critical_completions(
+            &mut critical_completion_rx,
+            &mut news_flash_gate,
+            monitor_config.news_critical_score_threshold,
+            monitor_config.news_max_critical_per_day,
+        )
+        .await;
 
         // One owner always recovers durable work, with optional same-tick live
         // analysis. Missing batches/activation/market windows never hide recovery.
@@ -9354,9 +9367,9 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                         nm.linker_ref().concept_count()
                     );
                 }
-                Some(Ok(_)) => log::warn!(
-                    "[NewsMonitor][BR-188] L2 概念索引受众已变化，本轮保留上一份索引"
-                ),
+                Some(Ok(_)) => {
+                    log::warn!("[NewsMonitor][BR-188] L2 概念索引受众已变化，本轮保留上一份索引")
+                }
                 Some(Err(error)) => log::error!(
                     "[NewsMonitor][BR-188] L2 概念索引完整批次拒绝，本轮保留上一份索引: {}",
                     error
@@ -9364,15 +9377,15 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
                 None => {}
             }
 
-            if concept_index_refresh.is_none()
-                && last_concept_refresh.elapsed().as_secs() >= 300
-            {
+            if concept_index_refresh.is_none() && last_concept_refresh.elapsed().as_secs() >= 300 {
                 last_concept_refresh = std::time::Instant::now();
                 if let Some(our_codes) = &our_codes {
                     let codes = our_codes.clone();
                     concept_index_refresh = Some(tokio::task::spawn_blocking(move || {
-                        stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
-                            .map(|index| (codes, index))
+                        stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(
+                            &codes,
+                        )
+                        .map(|index| (codes, index))
                     }));
                 } else {
                     log::warn!("[NewsMonitor] L2 概念索引刷新跳过（标的来源不可用）");
@@ -9617,52 +9630,89 @@ async fn news_monitor_loop(selection_v2_enabled: bool) {
             if let Err(error) = outer_tick.finish() {
                 log::error!("[NewsMonitor][BR-138] outer tick contract failed: {error}");
             }
-            let sleep_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(poll_secs);
-            wait_for_critical_completions(&mut critical_completion_rx,&mut news_flash_gate,sleep_deadline,
-                monitor_config.news_critical_score_threshold,monitor_config.news_max_critical_per_day).await;
+            let sleep_deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(poll_secs);
+            wait_for_critical_completions(
+                &mut critical_completion_rx,
+                &mut news_flash_gate,
+                sleep_deadline,
+                monitor_config.news_critical_score_threshold,
+                monitor_config.news_max_critical_per_day,
+            )
+            .await;
         }
     }
 }
 
-async fn drain_ready_critical_completions(receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
-    gate: &mut crate::news_aggregator_init::NewsFlashGate,threshold:u8,max_per_day:u32) {
+async fn drain_ready_critical_completions(
+    receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
+    gate: &mut crate::news_aggregator_init::NewsFlashGate,
+    threshold: u8,
+    max_per_day: u32,
+) {
     for _ in 0..5 {
-        let Some(score) = receiver.try_receive() else { break; };
-        reserve_completed_critical_news(gate,score,threshold,max_per_day).await;
+        let Some(score) = receiver.try_receive() else {
+            break;
+        };
+        reserve_completed_critical_news(gate, score, threshold, max_per_day).await;
     }
 }
-async fn wait_for_critical_completions(receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
-    gate: &mut crate::news_aggregator_init::NewsFlashGate,deadline:tokio::time::Instant,threshold:u8,max_per_day:u32) {
+async fn wait_for_critical_completions(
+    receiver: &mut stock_analysis::monitor::news_ai::CriticalCompletionReceiver,
+    gate: &mut crate::news_aggregator_init::NewsFlashGate,
+    deadline: tokio::time::Instant,
+    threshold: u8,
+    max_per_day: u32,
+) {
     loop {
         match receiver.receive_until(deadline).await {
             stock_analysis::monitor::news_ai::CriticalCompletionWait::Score(score) => {
-                reserve_completed_critical_news(gate,score,threshold,max_per_day).await;
+                reserve_completed_critical_news(gate, score, threshold, max_per_day).await;
             }
             stock_analysis::monitor::news_ai::CriticalCompletionWait::Deadline => break,
             stock_analysis::monitor::news_ai::CriticalCompletionWait::Closed => {
-                tokio::time::sleep_until(deadline).await; break;
+                tokio::time::sleep_until(deadline).await;
+                break;
             }
         }
     }
 }
 
-async fn reserve_completed_critical_news(gate: &mut crate::news_aggregator_init::NewsFlashGate,
-    score: stock_analysis::monitor::news_ai::AuditedNewsCritical,threshold:u8,max_per_day:u32) {
+async fn reserve_completed_critical_news(
+    gate: &mut crate::news_aggregator_init::NewsFlashGate,
+    score: stock_analysis::monitor::news_ai::AuditedNewsCritical,
+    threshold: u8,
+    max_per_day: u32,
+) {
     let now = chrono::Local::now();
-    if matches!(stock_analysis::event::runtime_delivery_audit_health(),stock_analysis::event::AuditHealth::Degraded{..}) {
-        log::error!("[NewsFlash][BR244] score completion refused: delivery audit degraded"); return;
+    if matches!(
+        stock_analysis::event::runtime_delivery_audit_health(),
+        stock_analysis::event::AuditHealth::Degraded { .. }
+    ) {
+        log::error!("[NewsFlash][BR244] score completion refused: delivery audit degraded");
+        return;
     }
-    let authority = match stock_analysis::event::reconcile_news_flash_business_date(now.date_naive()) {
-        Ok(value)=>value, Err(error)=>{log::error!("[NewsFlash][BR244] critical authority unavailable: {error}");return;}
-    };
-    let now=chrono::Local::now();
-    let reservations=match score {
-        stock_analysis::monitor::news_ai::AuditedNewsCritical::Equity(value)=>gate.reserve_critical_from_authority(&authority,value,now,threshold,max_per_day),
-        stock_analysis::monitor::news_ai::AuditedNewsCritical::Global(value)=>gate.reserve_global_critical_from_authority(&authority,value,now,threshold,max_per_day),
+    let authority =
+        match stock_analysis::event::reconcile_news_flash_business_date(now.date_naive()) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("[NewsFlash][BR244] critical authority unavailable: {error}");
+                return;
+            }
+        };
+    let now = chrono::Local::now();
+    let reservations = match score {
+        stock_analysis::monitor::news_ai::AuditedNewsCritical::Equity(value) => {
+            gate.reserve_critical_from_authority(&authority, value, now, threshold, max_per_day)
+        }
+        stock_analysis::monitor::news_ai::AuditedNewsCritical::Global(value) => gate
+            .reserve_global_critical_from_authority(&authority, value, now, threshold, max_per_day),
     };
     match reservations {
-        Ok(reservations)=>{crate::news_aggregator_init::push_flash_reservations(gate,reservations).await;}
-        Err(error)=>log::error!("[NewsFlash][BR244] critical completion refused: {error}"),
+        Ok(reservations) => {
+            crate::news_aggregator_init::push_flash_reservations(gate, reservations).await;
+        }
+        Err(error) => log::error!("[NewsFlash][BR244] critical completion refused: {error}"),
     }
 }
 
@@ -13940,7 +13990,9 @@ mod tests_post_session_review_scheduler {
             "startup, tick preflight, N02 reserve and scored N01 completion use immutable authority"
         );
         assert!(production.contains("raw SourceOnly path cannot mint scored N01"));
-        assert!(production.contains("awaiting fresh model receipt, immutable score readback and delivery authority"));
+        assert!(production.contains(
+            "awaiting fresh model receipt, immutable score readback and delivery authority"
+        ));
         assert_eq!(
             production.matches("project_news_flash_events(").count(),
             1,
@@ -14469,7 +14521,9 @@ mod tests_v17_7_announcement_wiring {
     async fn news_concept_refresh_pending_keeps_worker_without_waiting() {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut task = Some(tokio::task::spawn_blocking(move || {
-            release_rx.recv().expect("test releases the retained worker");
+            release_rx
+                .recv()
+                .expect("test releases the retained worker");
             Err("TEST_CODE complete membership batch rejected".to_string())
         }));
         let worker_id = task.as_ref().unwrap().id();
@@ -14486,7 +14540,9 @@ mod tests_v17_7_announcement_wiring {
         }
         release_tx.send(()).expect("release the background worker");
         let result = task.take().unwrap().await.unwrap();
-        assert!(result.unwrap_err().contains("complete membership batch rejected"));
+        assert!(result
+            .unwrap_err()
+            .contains("complete membership batch rejected"));
     }
 
     #[tokio::test]
@@ -14496,7 +14552,10 @@ mod tests_v17_7_announcement_wiring {
             "TEST_CONCEPT".to_string(),
             vec!["TEST_CODE".to_string()],
         )]);
-        for expected in [Ok((codes, index)), Err("TEST_CODE provider failure".to_string())] {
+        for expected in [
+            Ok((codes, index)),
+            Err("TEST_CODE provider failure".to_string()),
+        ] {
             let completed = expected.clone();
             let mut task = Some(tokio::spawn(async move { completed }));
             let actual = tokio::time::timeout(std::time::Duration::from_secs(1), async {

@@ -26,11 +26,7 @@ pub struct OrderAuditRecord<'a> {
 }
 
 use crate::trading::paper_replay_financial_work_v1::{
-    self as financial,
-    FinancialWork,
-    FinancialSink,
-    HistoryText,
-    FinancialFailure
+    self as financial, FinancialFailure, FinancialSink, FinancialWork, HistoryText,
 };
 
 pub(crate) const AUDIT_CHAIN_GENESIS: &str = "BR086_ORDER_AUDIT_GENESIS_V1";
@@ -85,23 +81,42 @@ pub(crate) struct CanonicalOrderAuditView<'a> {
 impl<'a> CanonicalOrderAuditView<'a> {
     pub(crate) fn new(id: i64, record: OrderAuditRecord<'a>, created_at: &'a str) -> Self {
         Self {
-            id, business_order_id: record.business_order_id, source: record.source,
-            decision_basis: record.decision_basis, side: record.side, code: record.code,
-            requested_price: record.requested_price, execution_price: record.execution_price,
-            quantity: record.quantity, quote_observed_at: record.quote_observed_at,
-            outcome: record.outcome, failure_reason: record.failure_reason, created_at,
+            id,
+            business_order_id: record.business_order_id,
+            source: record.source,
+            decision_basis: record.decision_basis,
+            side: record.side,
+            code: record.code,
+            requested_price: record.requested_price,
+            execution_price: record.execution_price,
+            quantity: record.quantity,
+            quote_observed_at: record.quote_observed_at,
+            outcome: record.outcome,
+            failure_reason: record.failure_reason,
+            created_at,
         }
     }
 }
 impl Serialize for CanonicalOrderAuditRow {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        CanonicalOrderAuditView::new(self.id, OrderAuditRecord {
-            business_order_id: &self.business_order_id, source: &self.source,
-            decision_basis: &self.decision_basis, side: &self.side, code: &self.code,
-            requested_price: self.requested_price, execution_price: self.execution_price,
-            quantity: self.quantity, quote_observed_at: self.quote_observed_at.as_deref(),
-            outcome: &self.outcome, failure_reason: self.failure_reason.as_deref(),
-        }, &self.created_at).serialize(serializer)
+        CanonicalOrderAuditView::new(
+            self.id,
+            OrderAuditRecord {
+                business_order_id: &self.business_order_id,
+                source: &self.source,
+                decision_basis: &self.decision_basis,
+                side: &self.side,
+                code: &self.code,
+                requested_price: self.requested_price,
+                execution_price: self.execution_price,
+                quantity: self.quantity,
+                quote_observed_at: self.quote_observed_at.as_deref(),
+                outcome: &self.outcome,
+                failure_reason: self.failure_reason.as_deref(),
+            },
+            &self.created_at,
+        )
+        .serialize(serializer)
     }
 }
 
@@ -149,12 +164,25 @@ fn load_chain_rows(
     .load(conn)
 }
 
-pub(crate) fn canonical_order_audit_record_hash(previous_hash: &str, record: &CanonicalOrderAuditRow) -> Result<String, String> {
-    financial::historical_text(audit_record_hash_with_work(previous_hash, record, &mut FinancialWork::Historical))
+pub(crate) fn canonical_order_audit_record_hash(
+    previous_hash: &str,
+    record: &CanonicalOrderAuditRow,
+) -> Result<String, String> {
+    financial::historical_text(audit_record_hash_with_work(
+        previous_hash,
+        record,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn audit_record_hash_with_work(previous_hash: &str, record: &CanonicalOrderAuditRow, work: &mut FinancialWork<'_, '_>) -> financial::Result<String> {
+pub(crate) fn audit_record_hash_with_work(
+    previous_hash: &str,
+    record: &CanonicalOrderAuditRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<String> {
     if matches!(work, FinancialWork::Historical) {
-        let payload = serde_json::to_vec(record).map_err(|error| FinancialFailure::History(format!("BR-086 serialize audit row: {error}")))?;
+        let payload = serde_json::to_vec(record).map_err(|error| {
+            FinancialFailure::History(format!("BR-086 serialize audit row: {error}"))
+        })?;
         let mut hasher = Sha256::new();
         hasher.update(b"BR086_ORDER_AUDIT_V1\0");
         hasher.update(previous_hash.as_bytes());
@@ -162,22 +190,42 @@ pub(crate) fn audit_record_hash_with_work(previous_hash: &str, record: &Canonica
         hasher.update(payload);
         return Ok(hex::encode(hasher.finalize()));
     }
-    work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Audit {
-        previous: previous_hash, row: record
-    })
+    work.history_hash(
+        crate::trading::paper_replay_codec_v1::HistoryOutput::Audit {
+            previous: previous_hash,
+            row: record,
+        },
+    )
 }
-pub(crate) fn validate_canonical_order_audit_chain(audits: &[CanonicalOrderAuditRow], chain: &[CanonicalOrderAuditChainRow]) -> Result<String, String> {
-    financial::historical_text(validate_chain_rows_with_work(audits, chain, &mut FinancialWork::Historical))
+pub(crate) fn validate_canonical_order_audit_chain(
+    audits: &[CanonicalOrderAuditRow],
+    chain: &[CanonicalOrderAuditChainRow],
+) -> Result<String, String> {
+    financial::historical_text(validate_chain_rows_with_work(
+        audits,
+        chain,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn validate_chain_rows_with_work(audits: &[CanonicalOrderAuditRow], chain: &[CanonicalOrderAuditChainRow], work: &mut FinancialWork<'_, '_>) -> financial::Result<String> {
+pub(crate) fn validate_chain_rows_with_work(
+    audits: &[CanonicalOrderAuditRow],
+    chain: &[CanonicalOrderAuditChainRow],
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<String> {
     if audits.len() != chain.len() {
         return Err(work.history_error(HistoryText::Audit(AuditText::Length {
-            audits: audits.len(), chain: chain.len()
+            audits: audits.len(),
+            chain: chain.len(),
         }))?);
     }
     let mut previous = work.history_text(HistoryText::Audit(AuditText::Genesis))?;
     for (audit, evidence) in audits.iter().zip(chain.iter()) {
-        if !raw_order_audit_link_matches(audit.id, evidence.order_audit_id, &evidence.previous_hash, &previous) {
+        if !raw_order_audit_link_matches(
+            audit.id,
+            evidence.order_audit_id,
+            &evidence.previous_hash,
+            &previous,
+        ) {
             return Err(work.history_error(HistoryText::Audit(AuditText::Link(audit.id)))?);
         }
         let expected = audit_record_hash_with_work(&previous, audit, work)?;
@@ -190,13 +238,19 @@ pub(crate) fn validate_chain_rows_with_work(audits: &[CanonicalOrderAuditRow], c
 }
 #[derive(Clone, Copy)]
 pub(crate) enum AuditText {
-    Genesis, Length {
+    Genesis,
+    Length {
         audits: usize,
-        chain: usize
-    }, Link(i64), Hash(i64),
-    #[cfg(test)] FixtureUnicode,
-    #[cfg(test)] FixtureBusy,
-    #[cfg(test)] FixtureUppercaseBusy,
+        chain: usize,
+    },
+    Link(i64),
+    Hash(i64),
+    #[cfg(test)]
+    FixtureUnicode,
+    #[cfg(test)]
+    FixtureBusy,
+    #[cfg(test)]
+    FixtureUppercaseBusy,
 }
 impl AuditText {
     pub(crate) fn write(self, out: &mut FinancialSink<'_>) -> Result<(), ()> {
@@ -225,18 +279,34 @@ impl financial::history_sealed::HashEntry for (i64, &str) {}
 impl financial::HistoryHashEntry for (i64, &str) {}
 impl financial::history_sealed::HashEntry for (&str, Vec<&CanonicalOrderAuditRow>) {}
 impl financial::HistoryHashEntry for (&str, Vec<&CanonicalOrderAuditRow>) {}
-pub(crate) fn copy_audit_row(row: &CanonicalOrderAuditRow, work: &mut FinancialWork<'_, '_>) -> financial::Result<CanonicalOrderAuditRow> {
+pub(crate) fn copy_audit_row(
+    row: &CanonicalOrderAuditRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<CanonicalOrderAuditRow> {
     Ok(CanonicalOrderAuditRow {
-        id: row.id, business_order_id: work.copy(&row.business_order_id)?, source: work.copy(&row.source)?,
-        decision_basis: work.copy(&row.decision_basis)?, side: work.copy(&row.side)?, code: work.copy(&row.code)?,
-        requested_price: row.requested_price, execution_price: row.execution_price, quantity: row.quantity,
-        quote_observed_at: work.copy(&row.quote_observed_at)?, outcome: work.copy(&row.outcome)?,
-        failure_reason: work.copy(&row.failure_reason)?, created_at: work.copy(&row.created_at)?,
+        id: row.id,
+        business_order_id: work.copy(&row.business_order_id)?,
+        source: work.copy(&row.source)?,
+        decision_basis: work.copy(&row.decision_basis)?,
+        side: work.copy(&row.side)?,
+        code: work.copy(&row.code)?,
+        requested_price: row.requested_price,
+        execution_price: row.execution_price,
+        quantity: row.quantity,
+        quote_observed_at: work.copy(&row.quote_observed_at)?,
+        outcome: work.copy(&row.outcome)?,
+        failure_reason: work.copy(&row.failure_reason)?,
+        created_at: work.copy(&row.created_at)?,
     })
 }
-pub(crate) fn copy_chain_row(row: &CanonicalOrderAuditChainRow, work: &mut FinancialWork<'_, '_>) -> financial::Result<CanonicalOrderAuditChainRow> {
+pub(crate) fn copy_chain_row(
+    row: &CanonicalOrderAuditChainRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<CanonicalOrderAuditChainRow> {
     Ok(CanonicalOrderAuditChainRow {
-        order_audit_id: row.order_audit_id, previous_hash: work.copy(&row.previous_hash)?, record_hash: work.copy(&row.record_hash)?
+        order_audit_id: row.order_audit_id,
+        previous_hash: work.copy(&row.previous_hash)?,
+        record_hash: work.copy(&row.record_hash)?,
     })
 }
 
@@ -913,20 +983,28 @@ impl KnownAuditError {
     pub(crate) fn into_diesel(self) -> diesel::result::Error {
         self.error
     }
-    pub(crate) fn into_ledger(self, work: &mut FinancialWork<'_, '_>) -> financial::Result<crate::trading::paper_ledger::LedgerError> {
+    pub(crate) fn into_ledger(
+        self,
+        work: &mut FinancialWork<'_, '_>,
+    ) -> financial::Result<crate::trading::paper_ledger::LedgerError> {
         work.known_audit_display(&self)?;
         Ok(crate::trading::paper_ledger::LedgerError::from(self.error))
     }
 }
-fn known_audit_error(message: String, work: &mut FinancialWork<'_, '_>) -> financial::Result<KnownAuditError> {
+fn known_audit_error(
+    message: String,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<KnownAuditError> {
     let message_bytes = message.len();
     work.known_audit_boxes()?;
     Ok(KnownAuditError {
-        error: audit_chain_error(message), message_bytes
+        error: audit_chain_error(message),
+        message_bytes,
     })
 }
 pub(crate) fn validate_loaded_audit_for_ledger(
-    audits: &[CanonicalOrderAuditRow], chain: &[CanonicalOrderAuditChainRow],
+    audits: &[CanonicalOrderAuditRow],
+    chain: &[CanonicalOrderAuditChainRow],
     work: &mut FinancialWork<'_, '_>,
 ) -> financial::Result<String> {
     match validate_chain_rows_with_work(audits, chain, work) {
@@ -941,42 +1019,73 @@ pub(crate) fn validate_loaded_audit_for_ledger(
 #[cfg(test)]
 pub(crate) fn history_audit_fixture(work: &mut FinancialWork<'_, '_>) {
     let chain = [CanonicalOrderAuditChainRow {
-        order_audit_id: 1, previous_hash: "p".into(), record_hash: "r".into()
+        order_audit_id: 1,
+        previous_hash: "p".into(),
+        record_hash: "r".into(),
     }];
     let expected = crate::trading::paper_ledger::LedgerError::from(audit_chain_error(
-        validate_canonical_order_audit_chain(&[], &chain).unwrap_err()
+        validate_canonical_order_audit_chain(&[], &chain).unwrap_err(),
     ));
     let actual = validate_loaded_audit_for_ledger(&[], &chain, work).unwrap_err();
     match actual {
         financial::FinancialFailure::Financial(actual) => {
             assert_eq!(actual.to_string(), expected.to_string());
-            assert!(matches!(actual, crate::trading::paper_ledger::LedgerError::Database(_)));
+            assert!(matches!(
+                actual,
+                crate::trading::paper_ledger::LedgerError::Database(_)
+            ));
         }
         other => panic!("wrong audit error origin: {other:?}"),
     }
-    for kind in [AuditText::FixtureUnicode, AuditText::FixtureBusy, AuditText::FixtureUppercaseBusy] {
-        let original = FinancialWork::Historical.history_text(HistoryText::Audit(kind)).unwrap();
-        let expected_ledger = crate::trading::paper_ledger::LedgerError::from(audit_chain_error(original.clone()));
+    for kind in [
+        AuditText::FixtureUnicode,
+        AuditText::FixtureBusy,
+        AuditText::FixtureUppercaseBusy,
+    ] {
+        let original = FinancialWork::Historical
+            .history_text(HistoryText::Audit(kind))
+            .unwrap();
+        let expected_ledger =
+            crate::trading::paper_ledger::LedgerError::from(audit_chain_error(original.clone()));
         let paid = work.history_text(HistoryText::Audit(kind)).unwrap();
         let known = known_audit_error(paid, work).unwrap();
         let actual_ledger = known.into_ledger(work).unwrap();
         assert_eq!(actual_ledger.to_string(), expected_ledger.to_string());
-        assert_eq!(std::mem::discriminant(&actual_ledger), std::mem::discriminant(&expected_ledger));
-        let expected_source = crate::database::attribution_epochs::AttributionEpochStoreError::from(audit_chain_error(original));
+        assert_eq!(
+            std::mem::discriminant(&actual_ledger),
+            std::mem::discriminant(&expected_ledger)
+        );
+        let expected_source = crate::database::attribution_epochs::AttributionEpochStoreError::from(
+            audit_chain_error(original),
+        );
         let paid = work.history_text(HistoryText::Audit(kind)).unwrap();
         let known = known_audit_error(paid, work).unwrap();
-        let actual_source = crate::database::attribution_epochs::from_known_audit_error(known, work).unwrap();
+        let actual_source =
+            crate::database::attribution_epochs::from_known_audit_error(known, work).unwrap();
         assert_eq!(actual_source.to_string(), expected_source.to_string());
-        assert_eq!(std::mem::discriminant(&actual_source), std::mem::discriminant(&expected_source));
-        let expected_outer = crate::trading::paper_ledger::LedgerError::IntegrityFailure(expected_source.to_string());
-        assert_eq!(work.source_error_to_ledger(actual_source).unwrap().to_string(), expected_outer.to_string());
+        assert_eq!(
+            std::mem::discriminant(&actual_source),
+            std::mem::discriminant(&expected_source)
+        );
+        let expected_outer = crate::trading::paper_ledger::LedgerError::IntegrityFailure(
+            expected_source.to_string(),
+        );
+        assert_eq!(
+            work.source_error_to_ledger(actual_source)
+                .unwrap()
+                .to_string(),
+            expected_outer.to_string()
+        );
     }
 }
 
 // Borrowed linkage only. Content hashing, paid diagnostics and chain validity
 // stay in the existing caller; this predicate neither allocates nor issues a guard.
 pub(crate) fn raw_order_audit_link_matches(
-    audit_id: i64, evidence_id: i64, evidence_previous: &str, expected_previous: &str,
+    audit_id: i64,
+    evidence_id: i64,
+    evidence_previous: &str,
+    expected_previous: &str,
 ) -> bool {
     evidence_id == audit_id && evidence_previous == expected_previous
 }

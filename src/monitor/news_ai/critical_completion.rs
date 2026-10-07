@@ -3,12 +3,28 @@ use super::{AuditedCriticalNews, AuditedGlobalCriticalNews};
 
 /// The same five slots own either genuine audited purpose; no constructor capability.
 #[derive(Debug)]
-pub enum AuditedNewsCritical { Equity(AuditedCriticalNews), Global(AuditedGlobalCriticalNews) }
-impl AuditedNewsCritical {
-    pub fn evidence_sha256(&self)->&str { match self { Self::Equity(s)=>s.evidence_sha256(),Self::Global(s)=>s.evidence_sha256() } }
+pub enum AuditedNewsCritical {
+    Equity(AuditedCriticalNews),
+    Global(AuditedGlobalCriticalNews),
 }
-impl From<AuditedCriticalNews> for AuditedNewsCritical { fn from(value:AuditedCriticalNews)->Self { Self::Equity(value) } }
-impl From<AuditedGlobalCriticalNews> for AuditedNewsCritical { fn from(value:AuditedGlobalCriticalNews)->Self { Self::Global(value) } }
+impl AuditedNewsCritical {
+    pub fn evidence_sha256(&self) -> &str {
+        match self {
+            Self::Equity(s) => s.evidence_sha256(),
+            Self::Global(s) => s.evidence_sha256(),
+        }
+    }
+}
+impl From<AuditedCriticalNews> for AuditedNewsCritical {
+    fn from(value: AuditedCriticalNews) -> Self {
+        Self::Equity(value)
+    }
+}
+impl From<AuditedGlobalCriticalNews> for AuditedNewsCritical {
+    fn from(value: AuditedGlobalCriticalNews) -> Self {
+        Self::Global(value)
+    }
+}
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc::{self, OwnedPermit};
 
@@ -38,25 +54,52 @@ pub struct CriticalCompletionSlot {
 #[derive(Debug, PartialEq, Eq)]
 pub struct CriticalCompletionClosed;
 #[derive(Debug, PartialEq, Eq)]
-pub enum CriticalCompletionSubmitted { Queued, RetainedReceiverClosed }
-pub enum CriticalCompletionWait { Score(AuditedNewsCritical), Deadline, Closed }
+pub enum CriticalCompletionSubmitted {
+    Queued,
+    RetainedReceiverClosed,
+}
+pub enum CriticalCompletionWait {
+    Score(AuditedNewsCritical),
+    Deadline,
+    Closed,
+}
 
 /// Fixed capacity; opaque slots must be acquired before the existing model call.
-pub fn critical_news_completion_channel() -> (CriticalCompletionSender, CriticalCompletionReceiver) {
+pub fn critical_news_completion_channel() -> (CriticalCompletionSender, CriticalCompletionReceiver)
+{
     let (sender, receiver) = mpsc::channel(CAPACITY);
-    let state = Arc::new(Mutex::new(State { closed: false, retained: Vec::with_capacity(CAPACITY) }));
-    (CriticalCompletionSender { sender, state: state.clone() }, CriticalCompletionReceiver { receiver, state })
+    let state = Arc::new(Mutex::new(State {
+        closed: false,
+        retained: Vec::with_capacity(CAPACITY),
+    }));
+    (
+        CriticalCompletionSender {
+            sender,
+            state: state.clone(),
+        },
+        CriticalCompletionReceiver { receiver, state },
+    )
 }
 impl CriticalCompletionSender {
     pub async fn reserve(&self) -> Result<CriticalCompletionSlot, CriticalCompletionClosed> {
-        let permit = self.sender.clone().reserve_owned().await.map_err(|_| CriticalCompletionClosed)?;
+        let permit = self
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| CriticalCompletionClosed)?;
         if state_lock(&self.state).closed {
             drop(permit);
             return Err(CriticalCompletionClosed);
         }
-        Ok(CriticalCompletionSlot { permit, state: self.state.clone() })
+        Ok(CriticalCompletionSlot {
+            permit,
+            state: self.state.clone(),
+        })
     }
-    pub fn retained_count(&self) -> usize { state_lock(&self.state).retained.len() }
+    pub fn retained_count(&self) -> usize {
+        state_lock(&self.state).retained.len()
+    }
 }
 impl CriticalCompletionSlot {
     /// No fallible send after acquiring an actual score. Close and submit share
@@ -79,7 +122,10 @@ impl CriticalCompletionSlot {
 impl CriticalCompletionReceiver {
     /// A tick boundary wins a ready-score race. The score stays owned by the
     /// queue for the bounded drain after the next original N02 phase.
-    pub async fn receive_until(&mut self, deadline: tokio::time::Instant) -> CriticalCompletionWait {
+    pub async fn receive_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> CriticalCompletionWait {
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(deadline) => CriticalCompletionWait::Deadline,
@@ -89,16 +135,22 @@ impl CriticalCompletionReceiver {
             },
         }
     }
-    pub fn try_receive(&mut self) -> Option<AuditedNewsCritical> { self.receiver.try_recv().ok() }
+    pub fn try_receive(&mut self) -> Option<AuditedNewsCritical> {
+        self.receiver.try_recv().ok()
+    }
     pub fn close(&mut self) {
         let mut state = state_lock(&self.state);
         state.closed = true;
         self.receiver.close();
-        while let Ok(score) = self.receiver.try_recv() { state.retained.push(score); }
+        while let Ok(score) = self.receiver.try_recv() {
+            state.retained.push(score);
+        }
     }
 }
 impl Drop for CriticalCompletionReceiver {
-    fn drop(&mut self) { self.close(); }
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 #[cfg(test)]
@@ -117,20 +169,28 @@ mod tests {
         for i in 0..CAPACITY {
             let value = score(&format!("TEST_CODE_FULL_{i}"));
             expected.push(value.evidence_sha256().to_owned());
-            assert_eq!(tx.reserve().await.unwrap().submit(value), CriticalCompletionSubmitted::Queued);
+            assert_eq!(
+                tx.reserve().await.unwrap().submit(value),
+                CriticalCompletionSubmitted::Queued
+            );
         }
         let mut cancelled = Box::pin(tx.reserve());
         std::future::poll_fn(|cx| {
             assert!(cancelled.as_mut().poll(cx).is_pending());
             Poll::Ready(())
-        }).await;
+        })
+        .await;
         drop(cancelled); // cancellation cannot make room or start a sixth call
         let mut waiting = Box::pin(tx.reserve());
         std::future::poll_fn(|cx| {
             assert!(waiting.as_mut().poll(cx).is_pending()); // no sixth model slot
             Poll::Ready(())
-        }).await;
-        assert!(matches!(rx.receive_until(tokio::time::Instant::now()).await, CriticalCompletionWait::Deadline));
+        })
+        .await;
+        assert!(matches!(
+            rx.receive_until(tokio::time::Instant::now()).await,
+            CriticalCompletionWait::Deadline
+        ));
         // A ready deadline did not consume or destroy the queued score.
         let first = rx.try_receive().unwrap();
         assert_eq!(first.evidence_sha256(), expected[0]);
@@ -140,7 +200,9 @@ mod tests {
         assert_eq!(slot.submit(sixth), CriticalCompletionSubmitted::Queued);
         let mut seen = vec![first.evidence_sha256().to_owned()];
         // One bounded drain does not wait for an unfinished worker/model.
-        for _ in 0..CAPACITY { seen.push(rx.try_receive().unwrap().evidence_sha256().into()); }
+        for _ in 0..CAPACITY {
+            seen.push(rx.try_receive().unwrap().evidence_sha256().into());
+        }
         assert_eq!(seen, expected);
         assert!(rx.try_receive().is_none());
         assert_eq!(tx.retained_count(), 0);
@@ -155,7 +217,9 @@ mod tests {
         let digest = value.evidence_sha256().to_owned();
         reserved.submit(value);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        let CriticalCompletionWait::Score(value) = rx.receive_until(deadline).await else { panic!("real nonrunning wait wake"); };
+        let CriticalCompletionWait::Score(value) = rx.receive_until(deadline).await else {
+            panic!("real nonrunning wait wake");
+        };
         assert_eq!(value.evidence_sha256(), digest);
         drop(value); // explicit consumer refusal completes this handoff, no remint
         let slot = tx.reserve().await.unwrap();
@@ -174,18 +238,28 @@ mod tests {
         let mut in_flight = Vec::new();
         for i in 0..CAPACITY {
             let slot = tx.reserve().await.unwrap();
-            if i < 2 { slot.submit(score(&format!("TEST_CODE_QUEUED_CLOSE_{i}"))); }
-            else { in_flight.push((slot, score(&format!("TEST_CODE_RESERVED_CLOSE_{i}")))); }
+            if i < 2 {
+                slot.submit(score(&format!("TEST_CODE_QUEUED_CLOSE_{i}")));
+            } else {
+                in_flight.push((slot, score(&format!("TEST_CODE_RESERVED_CLOSE_{i}"))));
+            }
         }
         rx.close();
         assert_eq!(tx.retained_count(), 2);
         for (slot, value) in in_flight {
-            assert_eq!(slot.submit(value), CriticalCompletionSubmitted::RetainedReceiverClosed);
+            assert_eq!(
+                slot.submit(value),
+                CriticalCompletionSubmitted::RetainedReceiverClosed
+            );
         }
         assert_eq!(tx.retained_count(), CAPACITY);
         assert!(tx.reserve().await.is_err()); // closed endpoint cannot start another call
         let held = state_lock(&tx.state);
-        let distinct = held.retained.iter().map(|v|v.evidence_sha256()).collect::<std::collections::HashSet<_>>();
+        let distinct = held
+            .retained
+            .iter()
+            .map(|v| v.evidence_sha256())
+            .collect::<std::collections::HashSet<_>>();
         assert_eq!(distinct.len(), CAPACITY);
         drop(held);
         drop(rx);

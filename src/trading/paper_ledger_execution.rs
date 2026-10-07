@@ -169,27 +169,44 @@ fn check_head(view: &PaperView, version: i64, fingerprint: &str) -> Result<(), L
     }
     Ok(())
 }
-fn admit_marks( state: &Projection, marks: &[Mark], extra: Option<&str>, ) -> Result<BTreeMap<String, Mark>, LedgerError> {
-    fw::historical(admit_marks_with_work(state, marks, extra, &mut FinancialWork::Historical))
+fn admit_marks(
+    state: &Projection,
+    marks: &[Mark],
+    extra: Option<&str>,
+) -> Result<BTreeMap<String, Mark>, LedgerError> {
+    fw::historical(admit_marks_with_work(
+        state,
+        marks,
+        extra,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn admit_marks_with_work( state: &Projection, marks: &[Mark], extra: Option<&str>, w: &mut FinancialWork<'_, '_>) -> fw::Result<BTreeMap<String, Mark>> {
+fn admit_marks_with_work(
+    state: &Projection,
+    marks: &[Mark],
+    extra: Option<&str>,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<BTreeMap<String, Mark>> {
     w.finish()?;
-    let mut required=std::collections::BTreeSet::new();
-    for lot in &state.lots{
+    let mut required = std::collections::BTreeSet::new();
+    for lot in &state.lots {
         w.set(&mut required, lot.code.as_str())?;
     }
-    if let Some(code)=extra{
+    if let Some(code) = extra {
         w.set(&mut required, code)?;
     }
     let mut admitted = BTreeMap::new();
     for mark in marks {
-        if !required.contains(mark.code.as_str()) || mark.price <= Money::ZERO || mark.source.trim().is_empty() || {
-            let key=w.copy(&mark.code)?;
-            let value=w.copy(mark)?;
-            let duplicate=admitted.contains_key(&key);
-            w.insert(&mut admitted, key, value)?;
-            duplicate
-        }
+        if !required.contains(mark.code.as_str())
+            || mark.price <= Money::ZERO
+            || mark.source.trim().is_empty()
+            || {
+                let key = w.copy(&mark.code)?;
+                let value = w.copy(mark)?;
+                let duplicate = admitted.contains_key(&key);
+                w.insert(&mut admitted, key, value)?;
+                duplicate
+            }
         {
             return Err(w.error(Txt::V1(fw::V1Text::InvalidDuplicateExtraneousValuationMark))?);
         }
@@ -321,12 +338,9 @@ impl PaperLedger<'_> {
             ));
         }
         fresh(signal.quote_observed_at, now)?;
-        intent.price_qualification.require(
-            &signal.code,
-            day(now),
-            price,
-            intent.quote_price,
-        )?;
+        intent
+            .price_qualification
+            .require(&signal.code, day(now), price, intent.quote_price)?;
         if now < view.as_of {
             return Err(LedgerError::EvidenceUnavailable(
                 "execution before cutover/head".into(),
@@ -645,15 +659,21 @@ fn financial_check(
 }
 
 pub(super) fn apply_fact(state: &mut Projection, fact: &Fact) -> Result<(), LedgerError> {
-    fw::historical(apply_fact_with_work(state, fact, &mut FinancialWork::Historical))
+    fw::historical(apply_fact_with_work(
+        state,
+        fact,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(super) fn apply_fact_with_work(state: &mut Projection, fact: &Fact, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+pub(super) fn apply_fact_with_work(
+    state: &mut Projection,
+    fact: &Fact,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     match fact {
         Fact::DerivedSnapshotV1(revision) => super::snapshot::validate_with_work(revision, work)?,
         Fact::AdjudicatedV1(ruling) => *state = work.copy(&ruling.projection)?,
-        Fact::Seeded {
-            ..
-        } => return Err(work.error(Txt::V1(fw::V1Text::SecondGenesis))?),
+        Fact::Seeded { .. } => return Err(work.error(Txt::V1(fw::V1Text::SecondGenesis))?),
         Fact::Marked(batch) => apply_marked_with_work(state, batch, work)?,
         Fact::Order(order) => apply_order_with_work(state, order, work)?,
     }
@@ -1082,7 +1102,11 @@ pub(crate) fn replay_codec_fixtures(
 ) {
 }
 
-fn apply_marked_with_work(state:&mut Projection, batch:&ValuationBatch, w:&mut FinancialWork<'_, '_>)->fw::Result<()>{
+fn apply_marked_with_work(
+    state: &mut Projection,
+    batch: &ValuationBatch,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     w.finish()?;
     if state.inventory_fingerprint_with_work(w)? != batch.inventory_fingerprint {
         return Err(w.error(Txt::V1(fw::V1Text::MarkInventoryMismatch))?);
@@ -1093,20 +1117,30 @@ fn apply_marked_with_work(state:&mut Projection, batch:&ValuationBatch, w:&mut F
         if state.closes.contains_key(&day(batch.as_of)) {
             return Err(LedgerError::IdentityConflict.into());
         }
-        let equity=state.equity_with_work(w)?;
+        let equity = state.equity_with_work(w)?;
         w.insert(&mut state.closes, day(batch.as_of), equity)?;
     }
     Ok(())
 }
-fn apply_order_with_work(state:&mut Projection, order:&OrderFact, w:&mut FinancialWork<'_, '_>)->fw::Result<()>{
+fn apply_order_with_work(
+    state: &mut Projection,
+    order: &OrderFact,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     w.finish()?;
-    if order.status==LedgerStatus::Filled {
+    if order.status == LedgerStatus::Filled {
         state.cash = state.cash.add(order.cash_delta)?;
         state.fees = state.fees.add(order.commission)?.add(order.stamp)?;
         state.realized_pnl = state.realized_pnl.add(order.realized_delta)?;
         for change in &order.lot_changes {
             if let Some(before) = &change.before {
-                let index=w.option(state.lots.iter().position(|lot|lot.lot_id==before.lot_id&&lot==before), Txt::V1(fw::V1Text::FIFOBeforeLotMismatch))?;
+                let index = w.option(
+                    state
+                        .lots
+                        .iter()
+                        .position(|lot| lot.lot_id == before.lot_id && lot == before),
+                    Txt::V1(fw::V1Text::FIFOBeforeLotMismatch),
+                )?;
                 if let Some(after) = &change.after {
                     state.lots[index] = w.copy(after)?;
                 } else {
@@ -1116,19 +1150,26 @@ fn apply_order_with_work(state:&mut Projection, order:&OrderFact, w:&mut Financi
                 if state.lots.iter().any(|lot| lot.lot_id == after.lot_id) {
                     return Err(w.error(Txt::V1(fw::V1Text::DuplicateLotIdentity))?);
                 }
-                let incoming=w.copy(after)?;
+                let incoming = w.copy(after)?;
                 w.push(&mut state.lots, incoming)?;
             }
         }
         state.marks = w.copy(&order.marks)?;
-        state .marks .retain(|code, _| state.lots.iter().any(|lot| &lot.code == code));
+        state
+            .marks
+            .retain(|code, _| state.lots.iter().any(|lot| &lot.code == code));
         state.as_of = order.occurred_at;
         if state.cash < Money::ZERO {
             return Err(w.error(Txt::V1(fw::V1Text::NegativePaperCash))?);
         }
         state.equity_with_work(w)?;
-    } else{
-        if order.cash_delta != Money::ZERO || order.commission != Money::ZERO || order.stamp != Money::ZERO || order.realized_delta != Money::ZERO || !order.lot_changes.is_empty() {
+    } else {
+        if order.cash_delta != Money::ZERO
+            || order.commission != Money::ZERO
+            || order.stamp != Money::ZERO
+            || order.realized_delta != Money::ZERO
+            || !order.lot_changes.is_empty()
+        {
             return Err(w.error(Txt::V1(fw::V1Text::NonfillHasFinancialEffects))?);
         }
     }
@@ -1136,95 +1177,98 @@ fn apply_order_with_work(state:&mut Projection, order:&OrderFact, w:&mut Financi
 }
 
 #[cfg(test)]
-pub(super) fn transition_fixture(mut paid:Projection, w:&mut FinancialWork<'_, '_>){
-    let mut plain=paid.clone();
-    let batch=ValuationBatch{
-        binding:AccountBinding{
-            account_id:"a".into(),
-            epoch_id:"e".into(),
-            manifest_hash:"h".into()
+pub(super) fn transition_fixture(mut paid: Projection, w: &mut FinancialWork<'_, '_>) {
+    let mut plain = paid.clone();
+    let batch = ValuationBatch {
+        binding: AccountBinding {
+            account_id: "a".into(),
+            epoch_id: "e".into(),
+            manifest_hash: "h".into(),
         },
-        command_id:"mark".into(),
-        expected_version:1,
-        inventory_fingerprint:paid.inventory_fingerprint().unwrap(),
-        as_of:paid.as_of,
-        closing:true,
-        marks:paid.marks.values().cloned().collect()
+        command_id: "mark".into(),
+        expected_version: 1,
+        inventory_fingerprint: paid.inventory_fingerprint().unwrap(),
+        as_of: paid.as_of,
+        closing: true,
+        marks: paid.marks.values().cloned().collect(),
     };
     apply_marked_with_work(&mut paid, &batch, w).unwrap();
     apply_fact(&mut plain, &Fact::Marked(batch.clone())).unwrap();
     assert_eq!(paid, plain);
     assert_eq!(paid.closes.len(), 1);
-    let before=paid.lots[0].clone();
-    let mut after=before.clone();
-    after.quantity+=100;
-    let mut order=OrderFact{
-        plan_id:"p".into(),
-        intent_hash:"h".into(),
-        code:before.code.clone(),
-        direction:"Buy".into(),
-        requested_price:before.basis_price,
-        price_intent:PriceIntent::FixedSignalPriceV1,
-        quantity:100,
-        quote_price:before.basis_price,
-        quote_observed_at:paid.as_of,
-        account_mode:"test".into(),
-        data_mode:"test".into(),
-        decision_basis:"fixture".into(),
-        source_evidence:"fixture".into(),
-        occurred_at:paid.as_of,
-        status:LedgerStatus::Filled,
-        reason:None,
-        cash_delta:Money::from_micros(-1_005_000_000),
-        commission:Money::from_micros(5_000_000),
-        stamp:Money::ZERO,
-        realized_delta:Money::ZERO,
-        lot_changes:vec![LotChange{
-            before:Some(before),
-            after:Some(after)
-        } ],
-        marks:paid.marks.clone(),
-        paper_trade_id:None,
-        audit:AuditLink{
-            id:1,
-            previous_hash:"p".into(),
-            record_hash:"r".into(),
-            created_at:"fixture".into()
-        }
+    let before = paid.lots[0].clone();
+    let mut after = before.clone();
+    after.quantity += 100;
+    let mut order = OrderFact {
+        plan_id: "p".into(),
+        intent_hash: "h".into(),
+        code: before.code.clone(),
+        direction: "Buy".into(),
+        requested_price: before.basis_price,
+        price_intent: PriceIntent::FixedSignalPriceV1,
+        quantity: 100,
+        quote_price: before.basis_price,
+        quote_observed_at: paid.as_of,
+        account_mode: "test".into(),
+        data_mode: "test".into(),
+        decision_basis: "fixture".into(),
+        source_evidence: "fixture".into(),
+        occurred_at: paid.as_of,
+        status: LedgerStatus::Filled,
+        reason: None,
+        cash_delta: Money::from_micros(-1_005_000_000),
+        commission: Money::from_micros(5_000_000),
+        stamp: Money::ZERO,
+        realized_delta: Money::ZERO,
+        lot_changes: vec![LotChange {
+            before: Some(before),
+            after: Some(after),
+        }],
+        marks: paid.marks.clone(),
+        paper_trade_id: None,
+        audit: AuditLink {
+            id: 1,
+            previous_hash: "p".into(),
+            record_hash: "r".into(),
+            created_at: "fixture".into(),
+        },
     };
     apply_order_with_work(&mut paid, &order, w).unwrap();
     apply_fact(&mut plain, &Fact::Order(order.clone())).unwrap();
     assert_eq!(paid, plain);
     assert_eq!(paid.lots[0].quantity, 200);
-    let mut added=paid.lots[0].clone();
-    added.lot_id="second".into();
-    added.quantity=100;
-    order.lot_changes=vec![LotChange{
-        before:None,
-        after:Some(added)
-    } ];
+    let mut added = paid.lots[0].clone();
+    added.lot_id = "second".into();
+    added.quantity = 100;
+    order.lot_changes = vec![LotChange {
+        before: None,
+        after: Some(added),
+    }];
     apply_order_with_work(&mut paid, &order, w).unwrap();
     apply_fact(&mut plain, &Fact::Order(order.clone())).unwrap();
     assert_eq!(paid, plain);
     assert_eq!(paid.lots.len(), 2);
-    order.lot_changes=vec![LotChange{
-        before:Some(paid.lots[1].clone()),
-        after:None
-    } ];
-    order.cash_delta=Money::from_micros(995_000_000);
+    order.lot_changes = vec![LotChange {
+        before: Some(paid.lots[1].clone()),
+        after: None,
+    }];
+    order.cash_delta = Money::from_micros(995_000_000);
     apply_order_with_work(&mut paid, &order, w).unwrap();
     apply_fact(&mut plain, &Fact::Order(order.clone())).unwrap();
     assert_eq!(paid, plain);
     assert_eq!(paid.lots.len(), 1);
-    order.status=LedgerStatus::NotFilled;
-    order.cash_delta=Money::ZERO;
-    order.commission=Money::ZERO;
+    order.status = LedgerStatus::NotFilled;
+    order.cash_delta = Money::ZERO;
+    order.commission = Money::ZERO;
     order.lot_changes.clear();
-    let frozen=paid.clone();
+    let frozen = paid.clone();
     apply_order_with_work(&mut paid, &order, w).unwrap();
     assert_eq!(paid, frozen);
-    order.cash_delta=Money::from_micros(1);
-    let error=apply_order_with_work(&mut paid, &order, w).unwrap_err();
-    assert!(matches!(error, FinancialFailure::Financial(LedgerError::IntegrityFailure(_))));
+    order.cash_delta = Money::from_micros(1);
+    let error = apply_order_with_work(&mut paid, &order, w).unwrap_err();
+    assert!(matches!(
+        error,
+        FinancialFailure::Financial(LedgerError::IntegrityFailure(_))
+    ));
     assert_eq!(paid, frozen);
 }

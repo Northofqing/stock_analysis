@@ -109,8 +109,14 @@ pub struct NewsFlashAttemptReceipt {
 }
 
 impl NewsFlashAttemptReceipt {
-    pub fn critical_evidence(&self) -> Option<&crate::monitor::news_ai::CriticalNewsEvidence> { self.critical_evidence.as_ref() }
-    pub fn global_critical_evidence(&self) -> Option<&crate::monitor::news_ai::GlobalCriticalEvidence> { self.global_critical_evidence.as_ref() }
+    pub fn critical_evidence(&self) -> Option<&crate::monitor::news_ai::CriticalNewsEvidence> {
+        self.critical_evidence.as_ref()
+    }
+    pub fn global_critical_evidence(
+        &self,
+    ) -> Option<&crate::monitor::news_ai::GlobalCriticalEvidence> {
+        self.global_critical_evidence.as_ref()
+    }
 
     pub fn envelope_id(&self) -> &str {
         &self.envelope_id
@@ -365,8 +371,12 @@ fn validate_snapshot_fixture_boundary(
 }
 
 impl NewsFlashAuthoritySnapshot {
-    pub fn critical_source_identity_complete(&self) -> bool { self.critical_source_identity_complete }
-    pub fn blocked_critical_event_ids(&self) -> &std::collections::BTreeSet<String> { &self.blocked_critical_event_ids }
+    pub fn critical_source_identity_complete(&self) -> bool {
+        self.critical_source_identity_complete
+    }
+    pub fn blocked_critical_event_ids(&self) -> &std::collections::BTreeSet<String> {
+        &self.blocked_critical_event_ids
+    }
     pub fn business_date(&self) -> chrono::NaiveDate {
         self.business_date
     }
@@ -580,17 +590,19 @@ fn persist_news_flash_attempt_with(
     dispatcher: &AuditDispatcher,
     input: NewsFlashAttemptAuditInput,
 ) -> Result<NewsFlashAttemptReceipt, NewsFlashDeliveryAuditError> {
-    persist_news_flash_attempt_material_with(dispatcher,input,None)
+    persist_news_flash_attempt_material_with(dispatcher, input, None)
 }
 
 fn persist_news_flash_attempt_material_with(
-    dispatcher: &AuditDispatcher, input: NewsFlashAttemptAuditInput,
+    dispatcher: &AuditDispatcher,
+    input: NewsFlashAttemptAuditInput,
     critical_evidence: Option<crate::monitor::news_ai::CriticalNewsEvidence>,
 ) -> Result<NewsFlashAttemptReceipt, NewsFlashDeliveryAuditError> {
-    persist_news_flash_attempt_complete_with(dispatcher,input,critical_evidence,None)
+    persist_news_flash_attempt_complete_with(dispatcher, input, critical_evidence, None)
 }
 fn persist_news_flash_attempt_complete_with(
-    dispatcher: &AuditDispatcher, input: NewsFlashAttemptAuditInput,
+    dispatcher: &AuditDispatcher,
+    input: NewsFlashAttemptAuditInput,
     critical_evidence: Option<crate::monitor::news_ai::CriticalNewsEvidence>,
     global_critical_evidence: Option<crate::monitor::news_ai::GlobalCriticalEvidence>,
 ) -> Result<NewsFlashAttemptReceipt, NewsFlashDeliveryAuditError> {
@@ -612,7 +624,11 @@ fn persist_news_flash_attempt_complete_with(
         event.news_critical_evidence = Some(score.clone());
     }
     if let Some(score) = &global_critical_evidence {
-        if critical_evidence.is_some() { return Err(NewsFlashDeliveryAuditError::InvalidInput("two N01 purposes in one attempt".into())); }
+        if critical_evidence.is_some() {
+            return Err(NewsFlashDeliveryAuditError::InvalidInput(
+                "two N01 purposes in one attempt".into(),
+            ));
+        }
         event.audit_schema_version = envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION;
         event.news_global_critical_evidence = Some(score.clone());
     }
@@ -1269,13 +1285,19 @@ fn reconcile_news_flash_business_date_with(
     let envelopes = dispatcher
         .read_authoritative_year(business_date.year())
         .map_err(NewsFlashReconcileError::InvalidChain)?;
-    reconcile_news_flash_envelopes(envelopes,business_date)
+    reconcile_news_flash_envelopes(envelopes, business_date)
 }
 
-fn reconcile_news_flash_envelopes(envelopes: Vec<EventEnvelope>,business_date: chrono::NaiveDate)
-    -> Result<NewsFlashAuthoritySnapshot,NewsFlashReconcileError> {
+fn reconcile_news_flash_envelopes(
+    envelopes: Vec<EventEnvelope>,
+    business_date: chrono::NaiveDate,
+) -> Result<NewsFlashAuthoritySnapshot, NewsFlashReconcileError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum TerminalState { Accepted, DefinitivelyRejected, Uncertain }
+    enum TerminalState {
+        Accepted,
+        DefinitivelyRejected,
+        Uncertain,
+    }
     let mut attempts = std::collections::BTreeMap::<String, PushRecord>::new();
     let mut terminal_by_attempt = std::collections::BTreeMap::<String, TerminalState>::new();
     let mut next_attempt_ordinals = std::collections::BTreeMap::<String, u32>::new();
@@ -1286,11 +1308,16 @@ fn reconcile_news_flash_envelopes(envelopes: Vec<EventEnvelope>,business_date: c
     for envelope in envelopes {
         // Old source-less N01 formats are readable history, never proof of a new-purpose miss.
         // This observation affects only the new N01 completeness bit; old N02 sets keep their rules.
-        if envelope.payload.get("kind").and_then(serde_json::Value::as_str) == Some("news_flash_critical_v1")
+        if envelope
+            .payload
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("news_flash_critical_v1")
             && !matches!(envelope.payload.get("audit_schema_version").and_then(serde_json::Value::as_u64),
                 Some(version) if version == u64::from(envelope::NEWS_FLASH_DELIVERY_AUDIT_SCHEMA_VERSION)
                     || version == u64::from(envelope::NEWS_FLASH_CRITICAL_AUDIT_SCHEMA_VERSION)
-                || version == u64::from(envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION)) {
+                || version == u64::from(envelope::NEWS_FLASH_GLOBAL_CRITICAL_AUDIT_SCHEMA_VERSION))
+        {
             match PushRecord::try_from(&envelope) {
                 Ok(old) if old.ts.with_timezone(&chrono::Local).date_naive() != business_date => (),
                 _ => critical_source_identity_complete = false,
@@ -1305,12 +1332,13 @@ fn reconcile_news_flash_envelopes(envelopes: Vec<EventEnvelope>,business_date: c
         }
         let record = PushRecord::try_from_authoritative(&envelope)
             .map_err(|error| NewsFlashReconcileError::InvalidChain(error.to_string()))?;
-        if record.kind == "news_flash_critical_v1" && record.news_flash_transaction_stage.is_none()
-            && record.ts.with_timezone(&chrono::Local).date_naive() == business_date {
+        if record.kind == "news_flash_critical_v1"
+            && record.news_flash_transaction_stage.is_none()
+            && record.ts.with_timezone(&chrono::Local).date_naive() == business_date
+        {
             critical_source_identity_complete = false;
         }
-        if record.news_flash_business_date != Some(business_date)
-        {
+        if record.news_flash_business_date != Some(business_date) {
             continue;
         }
         let Some(stage) = record
@@ -1323,10 +1351,17 @@ fn reconcile_news_flash_envelopes(envelopes: Vec<EventEnvelope>,business_date: c
         validate_news_flash_decision_key(&record)?;
         if record.kind == "news_flash_critical_v1" {
             let complete = record.news_flash_sources.as_deref().is_some_and(|sources| {
-                sources.len() == 1 && envelope::is_lower_hex_sha256(&sources[0].event_id)
-                    && record.news_flash_decision_key.as_deref() == Some(sources[0].event_id.as_str())
-                    && matches!((sources[0].provider.as_str(),sources[0].source.as_str()),
-                        ("Eastmoney","eastmoney-web") | ("Cailianpress","cls-v1") | ("Jin10","jin10-flash-v1") | ("ThePaper","thepaper-finance-v1"))
+                sources.len() == 1
+                    && envelope::is_lower_hex_sha256(&sources[0].event_id)
+                    && record.news_flash_decision_key.as_deref()
+                        == Some(sources[0].event_id.as_str())
+                    && matches!(
+                        (sources[0].provider.as_str(), sources[0].source.as_str()),
+                        ("Eastmoney", "eastmoney-web")
+                            | ("Cailianpress", "cls-v1")
+                            | ("Jin10", "jin10-flash-v1")
+                            | ("ThePaper", "thepaper-finance-v1")
+                    )
             });
             critical_source_identity_complete &= complete;
         }
@@ -1405,11 +1440,16 @@ fn reconcile_news_flash_envelopes(envelopes: Vec<EventEnvelope>,business_date: c
     let mut unresolved_reservations = std::collections::BTreeSet::new();
     let mut definitively_rejected_reservations = std::collections::BTreeSet::new();
     for (attempt_id, attempt) in attempts {
-        let reservation = attempt.news_flash_reservation_sha256.as_ref()
-            .expect("validated attempt reservation").clone();
+        let reservation = attempt
+            .news_flash_reservation_sha256
+            .as_ref()
+            .expect("validated attempt reservation")
+            .clone();
         match terminal_by_attempt.get(&attempt_id) {
             None | Some(TerminalState::Uncertain) => {
-                if let AcceptedDecisionIdentity::Event(event_id) = accepted_decision_identity(&attempt)? {
+                if let AcceptedDecisionIdentity::Event(event_id) =
+                    accepted_decision_identity(&attempt)?
+                {
                     blocked_critical_event_ids.insert(event_id);
                 }
                 unresolved_reservations.insert(reservation);
@@ -1482,7 +1522,8 @@ fn validate_terminal_attempt_binding(
     attempt: &PushRecord,
     terminal: &PushRecord,
 ) -> Result<(), NewsFlashReconcileError> {
-    if attempt.audit_schema_version != terminal.audit_schema_version || attempt.kind != terminal.kind
+    if attempt.audit_schema_version != terminal.audit_schema_version
+        || attempt.kind != terminal.kind
         || attempt.channel != terminal.channel
         || attempt.rendered_len != terminal.rendered_len
         || attempt.news_flash_business_date != terminal.news_flash_business_date
@@ -2894,11 +2935,14 @@ mod delivery_observation_tests {
     }
     #[tokio::test]
     async fn news_n01_complete_old_new_attempt_history_blocks_revision_retries() {
-        for terminal in [None,Some("Uncertain"),Some("Accepted")] {
+        for terminal in [None, Some("Uncertain"), Some("Accepted")] {
             let fixture = dispatcher::TestAuditNamespace::new("TEST_CODE_N01_HISTORY");
             let dispatcher = fixture.dispatcher();
             let mut conn = crate::database::news_ai::tests::connection();
-            let score = crate::database::news_ai::tests::critical_fixture(&mut conn,"TEST_CODE_N01_HISTORY_ITEM");
+            let score = crate::database::news_ai::tests::critical_fixture(
+                &mut conn,
+                "TEST_CODE_N01_HISTORY_ITEM",
+            );
             let source = score.evidence().source().unwrap();
             let mut input = br244_attempt_input("N01_OLD");
             input.business_date = source.published_at.date_naive();
@@ -2906,158 +2950,466 @@ mod delivery_observation_tests {
             input.sources = vec![source];
             input.evidence_sha256 = envelope::news_flash_evidence_sha256(&input.sources);
             input.observed_at = input.sources[0].observed_at + chrono::Duration::seconds(2);
-            let old = persist_news_flash_attempt_with(&dispatcher,input.clone()).unwrap();
+            let old = persist_news_flash_attempt_with(&dispatcher, input.clone()).unwrap();
             if let Some(stage) = terminal {
                 let observed_at = input.observed_at + chrono::Duration::seconds(1);
                 let disposition = if stage == "Accepted" {
-                    NewsFlashTerminalDisposition::Accepted { remote_receipt:envelope::NewsFlashRemoteReceipt {
-                        channel:input.channel.clone(),provider:"TEST_CODE_remote".into(),message_id:"TEST_CODE_message".into(),
-                        platform_message_id:"TEST_CODE_platform".into(),accepted_at:observed_at,latency_ms:1 } }
-                } else { NewsFlashTerminalDisposition::Uncertain { reason_code:"TEST_CODE_timeout".into() } };
-                persist_news_flash_terminal_with(&dispatcher,&old,NewsFlashTerminalAuditInput { disposition,observed_at,latency_ms:1 }).unwrap();
+                    NewsFlashTerminalDisposition::Accepted {
+                        remote_receipt: envelope::NewsFlashRemoteReceipt {
+                            channel: input.channel.clone(),
+                            provider: "TEST_CODE_remote".into(),
+                            message_id: "TEST_CODE_message".into(),
+                            platform_message_id: "TEST_CODE_platform".into(),
+                            accepted_at: observed_at,
+                            latency_ms: 1,
+                        },
+                    }
+                } else {
+                    NewsFlashTerminalDisposition::Uncertain {
+                        reason_code: "TEST_CODE_timeout".into(),
+                    }
+                };
+                persist_news_flash_terminal_with(
+                    &dispatcher,
+                    &old,
+                    NewsFlashTerminalAuditInput {
+                        disposition,
+                        observed_at,
+                        latency_ms: 1,
+                    },
+                )
+                .unwrap();
             }
-            let snapshot = reconcile_news_flash_business_date_with(&dispatcher,input.business_date).unwrap();
-            assert!(snapshot.blocked_critical_event_ids().contains(&input.decision_key));
+            let snapshot =
+                reconcile_news_flash_business_date_with(&dispatcher, input.business_date).unwrap();
+            assert!(snapshot
+                .blocked_critical_event_ids()
+                .contains(&input.decision_key));
             // A different profile/revision evidence/render/reservation cannot reopen old day+source.
-            input.reservation_sha256 = "e".repeat(64); input.evidence_sha256 = score.evidence_sha256().into();
+            input.reservation_sha256 = "e".repeat(64);
+            input.evidence_sha256 = score.evidence_sha256().into();
             input.render_sha256 = "f".repeat(64);
-            assert!(matches!(persist_news_flash_attempt_material_with(&dispatcher,input,Some(score.evidence().clone())),
-                Err(NewsFlashDeliveryAuditError::DuplicateAuthority{..})));
+            assert!(matches!(
+                persist_news_flash_attempt_material_with(
+                    &dispatcher,
+                    input,
+                    Some(score.evidence().clone())
+                ),
+                Err(NewsFlashDeliveryAuditError::DuplicateAuthority { .. })
+            ));
         }
         let fixture = dispatcher::TestAuditNamespace::new("TEST_CODE_N01_NEW_TERMINAL");
         let dispatcher = fixture.dispatcher();
         let mut conn = crate::database::news_ai::tests::connection();
-        let produced = crate::database::news_ai::tests::critical_fixture(&mut conn,"TEST_CODE_N01_NEW_EVENT");
+        let produced =
+            crate::database::news_ai::tests::critical_fixture(&mut conn, "TEST_CODE_N01_NEW_EVENT");
         let produced_digest = produced.evidence_sha256().to_owned();
         let (sender, mut receiver) = crate::monitor::news_ai::critical_news_completion_channel();
-        assert_eq!(sender.reserve().await.unwrap().submit(produced),crate::monitor::news_ai::CriticalCompletionSubmitted::Queued);
-        let crate::monitor::news_ai::CriticalCompletionWait::Score(crate::monitor::news_ai::AuditedNewsCritical::Equity(score)) = receiver.receive_until(
-            tokio::time::Instant::now()+std::time::Duration::from_secs(1)).await else { panic!("completion handoff required"); };
-        assert_eq!(score.evidence_sha256(),produced_digest);
+        assert_eq!(
+            sender.reserve().await.unwrap().submit(produced),
+            crate::monitor::news_ai::CriticalCompletionSubmitted::Queued
+        );
+        let crate::monitor::news_ai::CriticalCompletionWait::Score(
+            crate::monitor::news_ai::AuditedNewsCritical::Equity(score),
+        ) = receiver
+            .receive_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+        else {
+            panic!("completion handoff required");
+        };
+        assert_eq!(score.evidence_sha256(), produced_digest);
         let source = score.evidence().source().unwrap();
         let mut input = br244_attempt_input("N01_NEW");
-        input.business_date=source.published_at.date_naive(); input.decision_key=source.event_id.clone();
-        input.sources=vec![source]; input.evidence_sha256=score.evidence_sha256().into(); input.observed_at=input.sources[0].observed_at+chrono::Duration::seconds(2);
-        let attempt = persist_news_flash_attempt_material_with(&dispatcher,input.clone(),Some(score.evidence().clone())).unwrap();
-        assert_eq!(attempt.critical_evidence(),Some(score.evidence()));
-        let now=input.observed_at+chrono::Duration::seconds(1);
-        let terminal=persist_news_flash_terminal_with(&dispatcher,&attempt,NewsFlashTerminalAuditInput {
-            disposition:NewsFlashTerminalDisposition::Accepted{remote_receipt:envelope::NewsFlashRemoteReceipt {
-                channel:input.channel.clone(),provider:"TEST_CODE_remote".into(),message_id:"TEST_CODE_message".into(),
-                platform_message_id:"TEST_CODE_platform".into(),accepted_at:now,latency_ms:1 }},observed_at:now,latency_ms:1,
-        }).unwrap();
-        let NewsFlashTerminalReceipt::Accepted(accepted)=terminal else { panic!("typed Accepted required"); };
-        assert_eq!(accepted.attempt().critical_evidence(),Some(score.evidence()));
-        assert!(reconcile_news_flash_business_date_with(&dispatcher,input.business_date).unwrap().accepted_event_ids().contains(&input.decision_key));
-        assert!(matches!(persist_news_flash_attempt_material_with(&dispatcher,input.clone(),Some(score.evidence().clone())),
-            Err(NewsFlashDeliveryAuditError::DuplicateAuthority{..})));
+        input.business_date = source.published_at.date_naive();
+        input.decision_key = source.event_id.clone();
+        input.sources = vec![source];
+        input.evidence_sha256 = score.evidence_sha256().into();
+        input.observed_at = input.sources[0].observed_at + chrono::Duration::seconds(2);
+        let attempt = persist_news_flash_attempt_material_with(
+            &dispatcher,
+            input.clone(),
+            Some(score.evidence().clone()),
+        )
+        .unwrap();
+        assert_eq!(attempt.critical_evidence(), Some(score.evidence()));
+        let now = input.observed_at + chrono::Duration::seconds(1);
+        let terminal = persist_news_flash_terminal_with(
+            &dispatcher,
+            &attempt,
+            NewsFlashTerminalAuditInput {
+                disposition: NewsFlashTerminalDisposition::Accepted {
+                    remote_receipt: envelope::NewsFlashRemoteReceipt {
+                        channel: input.channel.clone(),
+                        provider: "TEST_CODE_remote".into(),
+                        message_id: "TEST_CODE_message".into(),
+                        platform_message_id: "TEST_CODE_platform".into(),
+                        accepted_at: now,
+                        latency_ms: 1,
+                    },
+                },
+                observed_at: now,
+                latency_ms: 1,
+            },
+        )
+        .unwrap();
+        let NewsFlashTerminalReceipt::Accepted(accepted) = terminal else {
+            panic!("typed Accepted required");
+        };
+        assert_eq!(
+            accepted.attempt().critical_evidence(),
+            Some(score.evidence())
+        );
+        assert!(
+            reconcile_news_flash_business_date_with(&dispatcher, input.business_date)
+                .unwrap()
+                .accepted_event_ids()
+                .contains(&input.decision_key)
+        );
+        assert!(matches!(
+            persist_news_flash_attempt_material_with(
+                &dispatcher,
+                input.clone(),
+                Some(score.evidence().clone())
+            ),
+            Err(NewsFlashDeliveryAuditError::DuplicateAuthority { .. })
+        ));
 
         // A genuine legacy authority chain is readable but cannot establish new N01 absence.
         let legacy_fixture = dispatcher::TestAuditNamespace::new("TEST_CODE_N01_LEGACY_UNKNOWN");
         let legacy_dispatcher = legacy_fixture.dispatcher();
-        legacy_dispatcher.persist_legacy_envelope_for_test(&EventEnvelope {
-            id:"TEST_CODE_OLD_N01".into(), ts:input.observed_at.with_timezone(&chrono::Local),
-            trace_id:"TEST_CODE_trace".into(),source:"push_l4".into(),event_type:"push.delivery.audit".into(),
-            entity_key:None,payload:serde_json::json!({"kind":"news_flash_critical_v1","code":null,
+        legacy_dispatcher
+            .persist_legacy_envelope_for_test(&EventEnvelope {
+                id: "TEST_CODE_OLD_N01".into(),
+                ts: input.observed_at.with_timezone(&chrono::Local),
+                trace_id: "TEST_CODE_trace".into(),
+                source: "push_l4".into(),
+                event_type: "push.delivery.audit".into(),
+                entity_key: None,
+                payload: serde_json::json!({"kind":"news_flash_critical_v1","code":null,
                 "outcome":"Pushed","channel":"TEST_CODE_legacy","rendered_len":1,"latency_ms":0}),
-            version:1,replay_of:None,
-        }).unwrap();
-        let legacy = reconcile_news_flash_business_date_with(&legacy_dispatcher,input.business_date).unwrap();
+                version: 1,
+                replay_of: None,
+            })
+            .unwrap();
+        let legacy =
+            reconcile_news_flash_business_date_with(&legacy_dispatcher, input.business_date)
+                .unwrap();
         assert!(!legacy.critical_source_identity_complete());
         assert!(legacy.accepted_windows().is_empty());
-        let legacy_path = legacy_fixture.audit_path().join(format!("{}.jsonl",input.observed_at.with_timezone(&chrono::Local).format("%Y")));
+        let legacy_path = legacy_fixture.audit_path().join(format!(
+            "{}.jsonl",
+            input.observed_at.with_timezone(&chrono::Local).format("%Y")
+        ));
         let legacy_before = std::fs::read(&legacy_path).unwrap();
-        let error = persist_news_flash_attempt_material_with(&legacy_dispatcher,input,Some(score.evidence().clone())).unwrap_err();
-        assert!(matches!(error,NewsFlashDeliveryAuditError::ExactReadbackFailed(ref reason) if reason.contains("Unknown")));
-        assert_eq!(std::fs::read(&legacy_path).unwrap(),legacy_before);
+        let error = persist_news_flash_attempt_material_with(
+            &legacy_dispatcher,
+            input,
+            Some(score.evidence().clone()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error,NewsFlashDeliveryAuditError::ExactReadbackFailed(ref reason) if reason.contains("Unknown"))
+        );
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
     }
 
     #[tokio::test(start_paused = true)]
     async fn news_global_n01_mixed_completion_exact_v8_and_full_history() {
-        use crate::monitor::news_ai::{AuditedNewsCritical,CriticalCompletionWait,CriticalCompletionSubmitted};
+        use crate::monitor::news_ai::{
+            AuditedNewsCritical, CriticalCompletionSubmitted, CriticalCompletionWait,
+        };
         use std::future::Future;
         use std::task::Poll;
-        let mut conn=crate::database::news_ai::tests::connection();
-        let (tx,mut rx)=crate::monitor::news_ai::critical_news_completion_channel();
-        let mut expected=Vec::new();
+        let mut conn = crate::database::news_ai::tests::connection();
+        let (tx, mut rx) = crate::monitor::news_ai::critical_news_completion_channel();
+        let mut expected = Vec::new();
         for i in 0..5 {
-            let score=if i%2==0 { AuditedNewsCritical::Global(crate::database::news_ai::global_test_fixture(&mut conn,&format!("TEST_CODE_MIXED_GLOBAL_{i}"))) }
-                else { AuditedNewsCritical::Equity(crate::database::news_ai::tests::critical_fixture(&mut conn,&format!("TEST_CODE_MIXED_EQUITY_{i}"))) };
-            expected.push(score.evidence_sha256().to_owned());assert_eq!(tx.reserve().await.unwrap().submit(score),CriticalCompletionSubmitted::Queued);
+            let score = if i % 2 == 0 {
+                AuditedNewsCritical::Global(crate::database::news_ai::global_test_fixture(
+                    &mut conn,
+                    &format!("TEST_CODE_MIXED_GLOBAL_{i}"),
+                ))
+            } else {
+                AuditedNewsCritical::Equity(crate::database::news_ai::tests::critical_fixture(
+                    &mut conn,
+                    &format!("TEST_CODE_MIXED_EQUITY_{i}"),
+                ))
+            };
+            expected.push(score.evidence_sha256().to_owned());
+            assert_eq!(
+                tx.reserve().await.unwrap().submit(score),
+                CriticalCompletionSubmitted::Queued
+            );
         }
-        let mut blocked=Box::pin(tx.reserve());std::future::poll_fn(|cx| { assert!(blocked.as_mut().poll(cx).is_pending());Poll::Ready(()) }).await;
-        assert!(matches!(rx.receive_until(tokio::time::Instant::now()).await,CriticalCompletionWait::Deadline));
-        let Some(AuditedNewsCritical::Global(score))=rx.try_receive() else { panic!("first real global owner"); };
-        assert_eq!(score.evidence_sha256(),expected[0]);
-        let slot=blocked.await.unwrap();rx.close();assert_eq!(tx.retained_count(),4);
-        assert_eq!(slot.submit(crate::database::news_ai::global_test_fixture(&mut conn,"TEST_CODE_MIXED_CLOSE")),CriticalCompletionSubmitted::RetainedReceiverClosed);
-        assert_eq!(tx.retained_count(),5);assert!(tx.reserve().await.is_err());
-        let fixture=dispatcher::TestAuditNamespace::new("TEST_CODE_GLOBAL_V8");let dispatcher=fixture.dispatcher();
-        let source=score.evidence().source().unwrap();let mut input=br244_attempt_input("GLOBAL_V8");
-        input.business_date=source.published_at.with_timezone(&chrono::Local).date_naive();input.decision_key=source.event_id.clone();
-        input.observed_at=source.observed_at+chrono::Duration::seconds(3);input.sources=vec![source];input.evidence_sha256=score.evidence_sha256().into();
-        let attempt=persist_news_flash_attempt_complete_with(&dispatcher,input.clone(),None,Some(score.evidence().clone())).unwrap();
-        assert_eq!(attempt.global_critical_evidence(),Some(score.evidence()));assert!(attempt.critical_evidence().is_none());
-        let at=input.observed_at+chrono::Duration::seconds(1);
-        let terminal=persist_news_flash_terminal_with(&dispatcher,&attempt,NewsFlashTerminalAuditInput {
-            disposition:NewsFlashTerminalDisposition::Accepted { remote_receipt:envelope::NewsFlashRemoteReceipt { channel:input.channel.clone(),provider:"TEST_CODE_REMOTE".into(),message_id:"TEST_CODE_MESSAGE".into(),platform_message_id:"TEST_CODE_PLATFORM".into(),accepted_at:at,latency_ms:1 } },observed_at:at,latency_ms:1 }).unwrap();
-        let NewsFlashTerminalReceipt::Accepted(accepted)=terminal else { panic!("true typed Accepted"); };
-        assert_eq!(accepted.attempt().global_critical_evidence(),Some(score.evidence()));
-        let snapshot=reconcile_news_flash_business_date_with(&dispatcher,input.business_date).unwrap();assert!(snapshot.accepted_event_ids().contains(&input.decision_key));
-        let path=fixture.audit_path().join(format!("{}.jsonl",attempt.persisted_at().format("%Y")));let raw=std::fs::read_to_string(&path).unwrap();
-        let records=raw.lines().map(|l|serde_json::from_str::<serde_json::Value>(l).unwrap()).collect::<Vec<_>>();assert_eq!(records.len(),2);
-        for row in &records {
-            let original:EventEnvelope=serde_json::from_value(row["envelope"].clone()).unwrap();assert_eq!(original.payload["audit_schema_version"],8);
-            assert!(original.entity_key.is_none());assert!(PushRecord::try_from(&original).is_ok());assert!(matches!(dispatcher.dispatch(original.clone()),DispatchResult::Failed(_)));
-            assert_eq!(original.payload["subject_hash"].as_str(),Some(input.reservation_sha256.as_str()));
-            for field in ["news_global_critical_evidence","entity_key","code","subject_hash"] {
-                let mut bad=original.clone();match field {
-                    "news_global_critical_evidence"=>bad.payload[field]["importance"]=serde_json::json!(90),
-                    "entity_key"=>bad.entity_key=Some("600519".into()),
-                    "subject_hash"=>{
-                        let generic=PushDeliveryEvent::new(input.push_kind.clone(),None,"Attempted".into(),input.channel.clone(),input.rendered_len,0).subject_hash;
-                        bad.payload[field]=serde_json::json!(&generic);
-                        bad.payload["identity_hash"]=serde_json::json!(envelope::delivery_identity_hash_from_subject(&input.push_kind,&generic,&input.channel));
-                        let altered:PushDeliveryEvent=serde_json::from_value(bad.payload.clone()).unwrap();
-                        assert!(matches!(altered.validate(),Err(envelope::EnvelopeError::InvalidDeliveryAuditField(ref reason)) if reason=="news_flash delivery join"));
+        let mut blocked = Box::pin(tx.reserve());
+        std::future::poll_fn(|cx| {
+            assert!(blocked.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(matches!(
+            rx.receive_until(tokio::time::Instant::now()).await,
+            CriticalCompletionWait::Deadline
+        ));
+        let Some(AuditedNewsCritical::Global(score)) = rx.try_receive() else {
+            panic!("first real global owner");
+        };
+        assert_eq!(score.evidence_sha256(), expected[0]);
+        let slot = blocked.await.unwrap();
+        rx.close();
+        assert_eq!(tx.retained_count(), 4);
+        assert_eq!(
+            slot.submit(crate::database::news_ai::global_test_fixture(
+                &mut conn,
+                "TEST_CODE_MIXED_CLOSE"
+            )),
+            CriticalCompletionSubmitted::RetainedReceiverClosed
+        );
+        assert_eq!(tx.retained_count(), 5);
+        assert!(tx.reserve().await.is_err());
+        let fixture = dispatcher::TestAuditNamespace::new("TEST_CODE_GLOBAL_V8");
+        let dispatcher = fixture.dispatcher();
+        let source = score.evidence().source().unwrap();
+        let mut input = br244_attempt_input("GLOBAL_V8");
+        input.business_date = source
+            .published_at
+            .with_timezone(&chrono::Local)
+            .date_naive();
+        input.decision_key = source.event_id.clone();
+        input.observed_at = source.observed_at + chrono::Duration::seconds(3);
+        input.sources = vec![source];
+        input.evidence_sha256 = score.evidence_sha256().into();
+        let attempt = persist_news_flash_attempt_complete_with(
+            &dispatcher,
+            input.clone(),
+            None,
+            Some(score.evidence().clone()),
+        )
+        .unwrap();
+        assert_eq!(attempt.global_critical_evidence(), Some(score.evidence()));
+        assert!(attempt.critical_evidence().is_none());
+        let at = input.observed_at + chrono::Duration::seconds(1);
+        let terminal = persist_news_flash_terminal_with(
+            &dispatcher,
+            &attempt,
+            NewsFlashTerminalAuditInput {
+                disposition: NewsFlashTerminalDisposition::Accepted {
+                    remote_receipt: envelope::NewsFlashRemoteReceipt {
+                        channel: input.channel.clone(),
+                        provider: "TEST_CODE_REMOTE".into(),
+                        message_id: "TEST_CODE_MESSAGE".into(),
+                        platform_message_id: "TEST_CODE_PLATFORM".into(),
+                        accepted_at: at,
+                        latency_ms: 1,
                     },
-                    _=>bad.payload["code"]=serde_json::json!("600519"),
-                }assert!(PushRecord::try_from(&bad).is_err());
+                },
+                observed_at: at,
+                latency_ms: 1,
+            },
+        )
+        .unwrap();
+        let NewsFlashTerminalReceipt::Accepted(accepted) = terminal else {
+            panic!("true typed Accepted");
+        };
+        assert_eq!(
+            accepted.attempt().global_critical_evidence(),
+            Some(score.evidence())
+        );
+        let snapshot =
+            reconcile_news_flash_business_date_with(&dispatcher, input.business_date).unwrap();
+        assert!(snapshot.accepted_event_ids().contains(&input.decision_key));
+        let path = fixture
+            .audit_path()
+            .join(format!("{}.jsonl", attempt.persisted_at().format("%Y")));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let records = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        for row in &records {
+            let original: EventEnvelope = serde_json::from_value(row["envelope"].clone()).unwrap();
+            assert_eq!(original.payload["audit_schema_version"], 8);
+            assert!(original.entity_key.is_none());
+            assert!(PushRecord::try_from(&original).is_ok());
+            assert!(matches!(
+                dispatcher.dispatch(original.clone()),
+                DispatchResult::Failed(_)
+            ));
+            assert_eq!(
+                original.payload["subject_hash"].as_str(),
+                Some(input.reservation_sha256.as_str())
+            );
+            for field in [
+                "news_global_critical_evidence",
+                "entity_key",
+                "code",
+                "subject_hash",
+            ] {
+                let mut bad = original.clone();
+                match field {
+                    "news_global_critical_evidence" => {
+                        bad.payload[field]["importance"] = serde_json::json!(90)
+                    }
+                    "entity_key" => bad.entity_key = Some("600519".into()),
+                    "subject_hash" => {
+                        let generic = PushDeliveryEvent::new(
+                            input.push_kind.clone(),
+                            None,
+                            "Attempted".into(),
+                            input.channel.clone(),
+                            input.rendered_len,
+                            0,
+                        )
+                        .subject_hash;
+                        bad.payload[field] = serde_json::json!(&generic);
+                        bad.payload["identity_hash"] =
+                            serde_json::json!(envelope::delivery_identity_hash_from_subject(
+                                &input.push_kind,
+                                &generic,
+                                &input.channel
+                            ));
+                        let altered: PushDeliveryEvent =
+                            serde_json::from_value(bad.payload.clone()).unwrap();
+                        assert!(
+                            matches!(altered.validate(),Err(envelope::EnvelopeError::InvalidDeliveryAuditField(ref reason)) if reason=="news_flash delivery join")
+                        );
+                    }
+                    _ => bad.payload["code"] = serde_json::json!("600519"),
+                }
+                assert!(PushRecord::try_from(&bad).is_err());
             }
         }
-        assert_eq!(std::fs::read_to_string(&path).unwrap(),raw); // generic dispatch appended nothing
-        input.reservation_sha256="e".repeat(64);assert!(matches!(persist_news_flash_attempt_complete_with(&dispatcher,input.clone(),None,Some(score.evidence().clone())),Err(NewsFlashDeliveryAuditError::DuplicateAuthority{..})));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw); // generic dispatch appended nothing
+        input.reservation_sha256 = "e".repeat(64);
+        assert!(matches!(
+            persist_news_flash_attempt_complete_with(
+                &dispatcher,
+                input.clone(),
+                None,
+                Some(score.evidence().clone())
+            ),
+            Err(NewsFlashDeliveryAuditError::DuplicateAuthority { .. })
+        ));
         // Complete old v5/v7 and new v8, including open and uncertain, all share day+source.
-        for version in [5,7,8] { for stage in [None,Some("Accepted"),Some("Uncertain")] {
-            let prior=dispatcher::TestAuditNamespace::new("TEST_CODE_GLOBAL_HISTORY");let port=prior.dispatcher();
-            let old=if version==5 { persist_news_flash_attempt_with(&port,{let mut x=input.clone();x.evidence_sha256=envelope::news_flash_evidence_sha256(&x.sources);x}).unwrap() }
-                else if version==7 { let eq=crate::database::news_ai::tests::critical_fixture(&mut crate::database::news_ai::tests::connection(),"TEST_CODE_PRIOR_EQUITY");let src=eq.evidence().source().unwrap();let mut x=input.clone();x.decision_key=src.event_id.clone();x.sources=vec![src];x.evidence_sha256=eq.evidence_sha256().into();persist_news_flash_attempt_material_with(&port,x,Some(eq.evidence().clone())).unwrap() }
-                else { persist_news_flash_attempt_complete_with(&port,input.clone(),None,Some(score.evidence().clone())).unwrap() };
-            if let Some(stage)=stage {
-                let at=old.input.observed_at+chrono::Duration::seconds(1);let disposition=if stage=="Accepted" { NewsFlashTerminalDisposition::Accepted { remote_receipt:envelope::NewsFlashRemoteReceipt { channel:old.input.channel.clone(),provider:"TEST_CODE_REMOTE".into(),message_id:"TEST_CODE_M".into(),platform_message_id:"TEST_CODE_P".into(),accepted_at:at,latency_ms:1 } } } else { NewsFlashTerminalDisposition::Uncertain { reason_code:"TEST_CODE_TIMEOUT".into() } };
-                persist_news_flash_terminal_with(&port,&old,NewsFlashTerminalAuditInput { disposition,observed_at:at,latency_ms:1 }).unwrap();
+        for version in [5, 7, 8] {
+            for stage in [None, Some("Accepted"), Some("Uncertain")] {
+                let prior = dispatcher::TestAuditNamespace::new("TEST_CODE_GLOBAL_HISTORY");
+                let port = prior.dispatcher();
+                let old = if version == 5 {
+                    persist_news_flash_attempt_with(&port, {
+                        let mut x = input.clone();
+                        x.evidence_sha256 = envelope::news_flash_evidence_sha256(&x.sources);
+                        x
+                    })
+                    .unwrap()
+                } else if version == 7 {
+                    let eq = crate::database::news_ai::tests::critical_fixture(
+                        &mut crate::database::news_ai::tests::connection(),
+                        "TEST_CODE_PRIOR_EQUITY",
+                    );
+                    let src = eq.evidence().source().unwrap();
+                    let mut x = input.clone();
+                    x.decision_key = src.event_id.clone();
+                    x.sources = vec![src];
+                    x.evidence_sha256 = eq.evidence_sha256().into();
+                    persist_news_flash_attempt_material_with(&port, x, Some(eq.evidence().clone()))
+                        .unwrap()
+                } else {
+                    persist_news_flash_attempt_complete_with(
+                        &port,
+                        input.clone(),
+                        None,
+                        Some(score.evidence().clone()),
+                    )
+                    .unwrap()
+                };
+                if let Some(stage) = stage {
+                    let at = old.input.observed_at + chrono::Duration::seconds(1);
+                    let disposition = if stage == "Accepted" {
+                        NewsFlashTerminalDisposition::Accepted {
+                            remote_receipt: envelope::NewsFlashRemoteReceipt {
+                                channel: old.input.channel.clone(),
+                                provider: "TEST_CODE_REMOTE".into(),
+                                message_id: "TEST_CODE_M".into(),
+                                platform_message_id: "TEST_CODE_P".into(),
+                                accepted_at: at,
+                                latency_ms: 1,
+                            },
+                        }
+                    } else {
+                        NewsFlashTerminalDisposition::Uncertain {
+                            reason_code: "TEST_CODE_TIMEOUT".into(),
+                        }
+                    };
+                    persist_news_flash_terminal_with(
+                        &port,
+                        &old,
+                        NewsFlashTerminalAuditInput {
+                            disposition,
+                            observed_at: at,
+                            latency_ms: 1,
+                        },
+                    )
+                    .unwrap();
+                }
+                let mut next = input.clone();
+                next.decision_key = old.input.decision_key.clone();
+                next.sources = old.input.sources.clone();
+                next.reservation_sha256 = "a".repeat(64);
+                if version == 7 {
+                    // A separate real SQLite audit mints the empty-source revision; no legacy v5 publisher or forged capability.
+                    let mut global_db = crate::database::news_ai::tests::connection();
+                    let global = crate::database::news_ai::global_test_fixture(
+                        &mut global_db,
+                        "TEST_CODE_PRIOR_EQUITY",
+                    );
+                    let source = global.evidence().source().unwrap();
+                    assert_eq!(source.event_id, old.input.decision_key);
+                    assert_eq!(source.provider, old.input.sources[0].provider);
+                    assert_eq!(source.source, old.input.sources[0].source);
+                    assert_eq!(source.published_at, old.input.sources[0].published_at);
+                    assert_eq!(source.observed_at, old.input.sources[0].observed_at); // batch/content revision genuinely differs
+                    next.decision_key = source.event_id.clone();
+                    next.sources = vec![source];
+                    next.evidence_sha256 = global.evidence_sha256().into();
+                    next.business_date = old.input.business_date;
+                    next.observed_at = old.input.observed_at;
+                    assert_ne!(next.evidence_sha256, old.input.evidence_sha256);
+                    assert_ne!(next.reservation_sha256, old.input.reservation_sha256);
+                    let snapshot =
+                        reconcile_news_flash_business_date_with(&port, next.business_date).unwrap();
+                    assert!(snapshot
+                        .blocked_critical_event_ids()
+                        .contains(&next.decision_key));
+                    let path = prior
+                        .audit_path()
+                        .join(format!("{}.jsonl", old.persisted_at().format("%Y")));
+                    let before = std::fs::read(&path).unwrap();
+                    assert!(matches!(
+                        persist_news_flash_attempt_complete_with(
+                            &port,
+                            next,
+                            None,
+                            Some(global.evidence().clone())
+                        ),
+                        Err(NewsFlashDeliveryAuditError::DuplicateAuthority { .. })
+                    ));
+                    assert_eq!(std::fs::read(&path).unwrap(), before);
+                } else {
+                    assert!(matches!(
+                        persist_news_flash_attempt_complete_with(
+                            &port,
+                            next,
+                            None,
+                            Some(score.evidence().clone())
+                        ),
+                        Err(NewsFlashDeliveryAuditError::DuplicateAuthority { .. })
+                    ));
+                }
             }
-            let mut next=input.clone();next.decision_key=old.input.decision_key.clone();next.sources=old.input.sources.clone();next.reservation_sha256="a".repeat(64);
-            if version==7 {
-                // A separate real SQLite audit mints the empty-source revision; no legacy v5 publisher or forged capability.
-                let mut global_db=crate::database::news_ai::tests::connection();
-                let global=crate::database::news_ai::global_test_fixture(&mut global_db,"TEST_CODE_PRIOR_EQUITY");
-                let source=global.evidence().source().unwrap();
-                assert_eq!(source.event_id,old.input.decision_key);assert_eq!(source.provider,old.input.sources[0].provider);
-                assert_eq!(source.source,old.input.sources[0].source);assert_eq!(source.published_at,old.input.sources[0].published_at);
-                assert_eq!(source.observed_at,old.input.sources[0].observed_at); // batch/content revision genuinely differs
-                next.decision_key=source.event_id.clone();next.sources=vec![source];next.evidence_sha256=global.evidence_sha256().into();
-                next.business_date=old.input.business_date;next.observed_at=old.input.observed_at;
-                assert_ne!(next.evidence_sha256,old.input.evidence_sha256);assert_ne!(next.reservation_sha256,old.input.reservation_sha256);
-                let snapshot=reconcile_news_flash_business_date_with(&port,next.business_date).unwrap();assert!(snapshot.blocked_critical_event_ids().contains(&next.decision_key));
-                let path=prior.audit_path().join(format!("{}.jsonl",old.persisted_at().format("%Y")));let before=std::fs::read(&path).unwrap();
-                assert!(matches!(persist_news_flash_attempt_complete_with(&port,next,None,Some(global.evidence().clone())),Err(NewsFlashDeliveryAuditError::DuplicateAuthority{..})));
-                assert_eq!(std::fs::read(&path).unwrap(),before);
-            }
-            else { assert!(matches!(persist_news_flash_attempt_complete_with(&port,next,None,Some(score.evidence().clone())),Err(NewsFlashDeliveryAuditError::DuplicateAuthority{..}))); }
-        } }
+        }
     }
-
 }
 
 /// 2026-09-21 (系统评估 §4.3): NewsFlashGate 拒绝计数与原因落审计。
@@ -3123,26 +3475,62 @@ mod gate_rejection_audit_tests {
 }
 
 /// Only fresh transactional score readback owns this capability; declared JSON cannot call this seam.
-pub fn publish_critical_news_flash_attempt(input: NewsFlashAttemptAuditInput,
-    scored: &crate::monitor::news_ai::AuditedCriticalNews) -> Result<NewsFlashAttemptReceipt,NewsFlashDeliveryAuditError> {
-    if scored.evidence().digest().map_err(|e|NewsFlashDeliveryAuditError::InvalidInput(e.to_string()))? != scored.evidence_sha256()
-        || input.evidence_sha256 != scored.evidence_sha256() {
-        return Err(NewsFlashDeliveryAuditError::InvalidInput("N01 score readback changed".into()));
+pub fn publish_critical_news_flash_attempt(
+    input: NewsFlashAttemptAuditInput,
+    scored: &crate::monitor::news_ai::AuditedCriticalNews,
+) -> Result<NewsFlashAttemptReceipt, NewsFlashDeliveryAuditError> {
+    if scored
+        .evidence()
+        .digest()
+        .map_err(|e| NewsFlashDeliveryAuditError::InvalidInput(e.to_string()))?
+        != scored.evidence_sha256()
+        || input.evidence_sha256 != scored.evidence_sha256()
+    {
+        return Err(NewsFlashDeliveryAuditError::InvalidInput(
+            "N01 score readback changed".into(),
+        ));
     }
     if input.business_date != chrono::Local::now().date_naive() {
-        return Err(NewsFlashDeliveryAuditError::InvalidInput("N01 current business date changed".into()));
+        return Err(NewsFlashDeliveryAuditError::InvalidInput(
+            "N01 current business date changed".into(),
+        ));
     }
-    let dispatcher = runtime_delivery_audit().map_err(NewsFlashDeliveryAuditError::AuthorityUnavailable)?;
-    persist_news_flash_attempt_material_with(dispatcher.as_ref(),input,Some(scored.evidence().clone()))
+    let dispatcher =
+        runtime_delivery_audit().map_err(NewsFlashDeliveryAuditError::AuthorityUnavailable)?;
+    persist_news_flash_attempt_material_with(
+        dispatcher.as_ref(),
+        input,
+        Some(scored.evidence().clone()),
+    )
 }
 
 /// Global purpose uses the same immutable exact append authority, never generic publish.
-pub fn publish_global_critical_news_flash_attempt(input: NewsFlashAttemptAuditInput,
-    scored:&crate::monitor::news_ai::AuditedGlobalCriticalNews)->Result<NewsFlashAttemptReceipt,NewsFlashDeliveryAuditError> {
-    if scored.evidence().digest().map_err(|e|NewsFlashDeliveryAuditError::InvalidInput(e.to_string()))?!=scored.evidence_sha256() || input.evidence_sha256!=scored.evidence_sha256() {
-        return Err(NewsFlashDeliveryAuditError::InvalidInput("global immutable score readback changed".into()));
+pub fn publish_global_critical_news_flash_attempt(
+    input: NewsFlashAttemptAuditInput,
+    scored: &crate::monitor::news_ai::AuditedGlobalCriticalNews,
+) -> Result<NewsFlashAttemptReceipt, NewsFlashDeliveryAuditError> {
+    if scored
+        .evidence()
+        .digest()
+        .map_err(|e| NewsFlashDeliveryAuditError::InvalidInput(e.to_string()))?
+        != scored.evidence_sha256()
+        || input.evidence_sha256 != scored.evidence_sha256()
+    {
+        return Err(NewsFlashDeliveryAuditError::InvalidInput(
+            "global immutable score readback changed".into(),
+        ));
     }
-    if input.business_date!=chrono::Local::now().date_naive() { return Err(NewsFlashDeliveryAuditError::InvalidInput("global current business date changed".into())); }
-    let dispatcher=runtime_delivery_audit().map_err(NewsFlashDeliveryAuditError::AuthorityUnavailable)?;
-    persist_news_flash_attempt_complete_with(dispatcher.as_ref(),input,None,Some(scored.evidence().clone()))
+    if input.business_date != chrono::Local::now().date_naive() {
+        return Err(NewsFlashDeliveryAuditError::InvalidInput(
+            "global current business date changed".into(),
+        ));
+    }
+    let dispatcher =
+        runtime_delivery_audit().map_err(NewsFlashDeliveryAuditError::AuthorityUnavailable)?;
+    persist_news_flash_attempt_complete_with(
+        dispatcher.as_ref(),
+        input,
+        None,
+        Some(scored.evidence().clone()),
+    )
 }

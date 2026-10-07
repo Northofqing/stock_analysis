@@ -56,11 +56,11 @@ pub use status::{DeliveryStateCount, DeliveryStatusSnapshot, DELIVERY_STATUS_STA
 mod candidate_board;
 #[path = "coordinator_news_to_idea.rs"]
 mod news_to_idea;
-pub use news_to_idea::{NewsToIdeaCardObservation, NewsToIdeaTerminal};
 pub use candidate_board::{
     CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,
     CandidateBoardSourceLinkV1, CandidateBoardSourceRowV2,
 };
+pub use news_to_idea::{NewsToIdeaCardObservation, NewsToIdeaTerminal};
 #[path = "coordinator_p05_unit.rs"]
 mod p05_unit;
 pub(crate) use p05_unit::runtime::{P05ChildInspection, P05UnitReceiptObservation};

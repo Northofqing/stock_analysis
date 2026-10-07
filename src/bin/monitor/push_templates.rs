@@ -16936,7 +16936,10 @@ pub async fn push_news_to_idea(
     }
 }
 
-fn news_to_idea_bound_code<'a>(caller_code: &str, rendered_code: &'a str) -> Result<&'a str, String> {
+fn news_to_idea_bound_code<'a>(
+    caller_code: &str,
+    rendered_code: &'a str,
+) -> Result<&'a str, String> {
     if rendered_code.is_empty() || (!caller_code.is_empty() && caller_code != rendered_code) {
         return Err("D-01 rendered security and counted ticket identity disagree".into());
     }
@@ -16949,7 +16952,10 @@ mod d01_identity_regression_tests {
     #[test]
     fn rendered_security_owns_legacy_empty_scope_and_rejects_a_different_explicit_ticket() {
         assert_eq!(news_to_idea_bound_code("", "600000").unwrap(), "600000");
-        assert_eq!(news_to_idea_bound_code("600000", "600000").unwrap(), "600000");
+        assert_eq!(
+            news_to_idea_bound_code("600000", "600000").unwrap(),
+            "600000"
+        );
         assert!(news_to_idea_bound_code("600519", "600000").is_err());
         assert!(news_to_idea_bound_code("600000", "").is_err());
         let code = news_to_idea_bound_code("", "600000").unwrap();

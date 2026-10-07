@@ -1,13 +1,15 @@
 //! CatalogV5 zero-fill book cutover. The persistent reader validates both
 //! generations; the only writer is compiled for isolated tests.
 
-use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use crate::database::DatabaseManager;
 #[cfg(test)]
 use crate::trading::paper_ledger::verified_v1_snapshot_on;
 use crate::trading::paper_ledger::{
     verified_v1_snapshot_with_audit_guard_on, AccountBinding, LedgerError, Money,
     V1AuditReplayGuard, VerifiedV1Snapshot,
+};
+use crate::trading::paper_replay_financial_work_v1::{
+    self as fw, ClosedFinancialText as Txt, FinancialFailure, FinancialWork,
 };
 #[cfg(test)]
 use diesel::connection::SimpleConnection;
@@ -220,10 +222,31 @@ fn v2_head(conn: &mut SqliteConnection, account_id: &str) -> Result<V2HeadRow, L
     .get_result(conn)?)
 }
 
-fn expected_manifest( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, ) -> CutoverManifestV1 {
-    fw::historical(expected_manifest_with_work(old, account, event, snapshot, fee, &mut FinancialWork::Historical)).expect("Historical manifest construction")
+fn expected_manifest(
+    old: &V1AccountRow,
+    account: &V2AccountRow,
+    event: &V2EventRow,
+    snapshot: &VerifiedV1Snapshot,
+    fee: &FeeRow,
+) -> CutoverManifestV1 {
+    fw::historical(expected_manifest_with_work(
+        old,
+        account,
+        event,
+        snapshot,
+        fee,
+        &mut FinancialWork::Historical,
+    ))
+    .expect("Historical manifest construction")
 }
-fn expected_manifest_with_work( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, w: &mut FinancialWork<'_, '_>, ) -> fw::Result<CutoverManifestV1> {
+fn expected_manifest_with_work(
+    old: &V1AccountRow,
+    account: &V2AccountRow,
+    event: &V2EventRow,
+    snapshot: &VerifiedV1Snapshot,
+    fee: &FeeRow,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<CutoverManifestV1> {
     w.finish()?;
     Ok(CutoverManifestV1 {
         schema: w.text(Txt::CutoverSchema)?,
@@ -241,32 +264,62 @@ fn expected_manifest_with_work( old: &V1AccountRow, account: &V2AccountRow, even
     })
 }
 
-fn verify_genesis_rows( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, head: &V2HeadRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, ) -> Result<(), LedgerError> {
-    fw::historical(verify_genesis_rows_with_work(old, account, event, head, snapshot, fee, &mut FinancialWork::Historical))
+fn verify_genesis_rows(
+    old: &V1AccountRow,
+    account: &V2AccountRow,
+    event: &V2EventRow,
+    head: &V2HeadRow,
+    snapshot: &VerifiedV1Snapshot,
+    fee: &FeeRow,
+) -> Result<(), LedgerError> {
+    fw::historical(verify_genesis_rows_with_work(
+        old,
+        account,
+        event,
+        head,
+        snapshot,
+        fee,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn verify_genesis_rows_with_work( old: &V1AccountRow, account: &V2AccountRow, event: &V2EventRow, head: &V2HeadRow, snapshot: &VerifiedV1Snapshot, fee: &FeeRow, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+fn verify_genesis_rows_with_work(
+    old: &V1AccountRow,
+    account: &V2AccountRow,
+    event: &V2EventRow,
+    head: &V2HeadRow,
+    snapshot: &VerifiedV1Snapshot,
+    fee: &FeeRow,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     w.finish()?;
     {
-        let condition = account.account_id == old.account_id && event.account_id == old.account_id && head.account_id == old.account_id;
+        let condition = account.account_id == old.account_id
+            && event.account_id == old.account_id
+            && head.account_id == old.account_id;
         w.require(condition, Txt::Book(fw::BookText::GenesisAccountMismatch))
-    } ?;
+    }?;
     {
-        let condition = account.v1_epoch_id == old.epoch_id && account.v1_manifest_hash == old.manifest_hash && account.v1_head_version == snapshot.version && account.v1_head_hash == snapshot.event_hash && account.v1_projection_hash == snapshot.projection_hash;
+        let condition = account.v1_epoch_id == old.epoch_id
+            && account.v1_manifest_hash == old.manifest_hash
+            && account.v1_head_version == snapshot.version
+            && account.v1_head_hash == snapshot.event_hash
+            && account.v1_projection_hash == snapshot.projection_hash;
         w.require(condition, Txt::Book(fw::BookText::V1SourceAnchorMismatch))
-    } ?;
+    }?;
     {
         let condition = account.fee_policy_instance_id == fee.policy_instance_id;
         w.require(condition, Txt::Book(fw::BookText::FeeInstanceMismatch))
-    } ?;
+    }?;
     let manifest: CutoverManifestV1 = decode_canonical_with_work(&account.manifest_bytes, w)?;
     {
-        let condition = manifest == expected_manifest_with_work(old, account, event, snapshot, fee, w)?;
+        let condition =
+            manifest == expected_manifest_with_work(old, account, event, snapshot, fee, w)?;
         w.require(condition, Txt::Book(fw::BookText::ManifestFieldsMismatch))
-    } ?;
+    }?;
     {
         let condition = account.manifest_hash == w.cutover_hash(&account.manifest_bytes)?;
         w.require(condition, Txt::Book(fw::BookText::ManifestHashMismatch))
-    } ?;
+    }?;
     let expected_payload = GenesisPayloadV1 {
         schema: w.text(Txt::GenesisSchema)?,
         manifest_hash: w.copy(&account.manifest_hash)?,
@@ -277,34 +330,61 @@ fn verify_genesis_rows_with_work( old: &V1AccountRow, account: &V2AccountRow, ev
     };
     let payload: GenesisPayloadV1 = decode_canonical_with_work(&event.payload, w)?;
     {
-        let condition = payload == expected_payload && event.kind == "Genesis" && event.seq == 1 && event.previous_hash == snapshot.event_hash;
+        let condition = payload == expected_payload
+            && event.kind == "Genesis"
+            && event.seq == 1
+            && event.previous_hash == snapshot.event_hash;
         w.require(condition, Txt::Book(fw::BookText::GenesisEventMismatch))
-    } ?;
+    }?;
     {
-        let condition = event.event_hash == w.fixed_hash(fw::ClosedFinancialHash::Genesis{
-            account:&old.account_id,
-            command:&event.command_id,
-            previous:&event.previous_hash,
-            payload:&event.payload
-        })?;
+        let condition = event.event_hash
+            == w.fixed_hash(fw::ClosedFinancialHash::Genesis {
+                account: &old.account_id,
+                command: &event.command_id,
+                previous: &event.previous_hash,
+                payload: &event.payload,
+            })?;
         w.require(condition, Txt::Book(fw::BookText::GenesisHashMismatch))
-    } ?;
+    }?;
     {
-        let condition = head.version == 1 && head.event_hash == event.event_hash && head.projection_bytes.as_slice() == snapshot.projection_bytes.as_bytes() && head.projection_hash == snapshot.projection_hash && head.projection_hash == w.raw_hash(&head.projection_bytes)?;
+        let condition = head.version == 1
+            && head.event_hash == event.event_hash
+            && head.projection_bytes.as_slice() == snapshot.projection_bytes.as_bytes()
+            && head.projection_hash == snapshot.projection_hash
+            && head.projection_hash == w.raw_hash(&head.projection_bytes)?;
         w.require(condition, Txt::Book(fw::BookText::V2ProjectionMismatch))
-    } ?;
+    }?;
     Ok(())
 }
 
 // Shared scalar predicates only: callers retain their own presence, epoch,
 // SQL, audit and genesis obligations. These functions issue no authority.
-pub(crate) fn owner_v1_fields_match(revision: i64, cutover: Option<&str>,
-    active_epoch: &str, active_manifest: &str, old_epoch: &str, old_manifest: &str) -> bool {
-    revision == 1 && cutover.is_none() && active_epoch == old_epoch && active_manifest == old_manifest
+pub(crate) fn owner_v1_fields_match(
+    revision: i64,
+    cutover: Option<&str>,
+    active_epoch: &str,
+    active_manifest: &str,
+    old_epoch: &str,
+    old_manifest: &str,
+) -> bool {
+    revision == 1
+        && cutover.is_none()
+        && active_epoch == old_epoch
+        && active_manifest == old_manifest
 }
-pub(crate) fn owner_v2_fields_match(revision: i64, cutover: Option<&str>,
-    active_epoch: &str, active_manifest: &str, new_epoch: &str, new_manifest: &str, new_cutover: &str) -> bool {
-    revision == 2 && cutover == Some(new_cutover) && active_epoch == new_epoch && active_manifest == new_manifest
+pub(crate) fn owner_v2_fields_match(
+    revision: i64,
+    cutover: Option<&str>,
+    active_epoch: &str,
+    active_manifest: &str,
+    new_epoch: &str,
+    new_manifest: &str,
+    new_cutover: &str,
+) -> bool {
+    revision == 2
+        && cutover == Some(new_cutover)
+        && active_epoch == new_epoch
+        && active_manifest == new_manifest
 }
 
 /// Row-level half of the CatalogV5 verifier. Caller first checks the exact
@@ -381,9 +461,14 @@ fn verify_owner_rows_in_transaction_on(conn: &mut SqliteConnection) -> Result<()
         match owner.active_generation {
             1 => {
                 require(
-                    owner_v1_fields_match(owner.owner_revision, owner.cutover_id.as_deref(),
-                        &owner.active_epoch_id, &owner.active_manifest_hash, &old.epoch_id, &old.manifest_hash)
-                        && !accounts.contains_key(&old.account_id)
+                    owner_v1_fields_match(
+                        owner.owner_revision,
+                        owner.cutover_id.as_deref(),
+                        &owner.active_epoch_id,
+                        &owner.active_manifest_hash,
+                        &old.epoch_id,
+                        &old.manifest_hash,
+                    ) && !accounts.contains_key(&old.account_id)
                         && !events.contains_key(&old.account_id)
                         && !heads.contains_key(&old.account_id),
                     "V1Active owner mismatch",
@@ -400,10 +485,15 @@ fn verify_owner_rows_in_transaction_on(conn: &mut SqliteConnection) -> Result<()
                     .remove(&old.account_id)
                     .ok_or_else(|| invalid("missing V2 head"))?;
                 require(
-                    owner_v2_fields_match(owner.owner_revision, owner.cutover_id.as_deref(),
-                        &owner.active_epoch_id, &owner.active_manifest_hash, &account.epoch_id,
-                        &account.manifest_hash, &account.cutover_id)
-                        && !old_epochs.contains(&account.epoch_id),
+                    owner_v2_fields_match(
+                        owner.owner_revision,
+                        owner.cutover_id.as_deref(),
+                        &owner.active_epoch_id,
+                        &owner.active_manifest_hash,
+                        &account.epoch_id,
+                        &account.manifest_hash,
+                        &account.cutover_id,
+                    ) && !old_epochs.contains(&account.epoch_id),
                     "V2Active owner or epoch mismatch",
                 )?;
                 let binding = AccountBinding {
@@ -942,23 +1032,28 @@ pub(crate) fn replay_codec_fixtures(
     crate::trading::paper_replay_codec_v1::exercise_root::<GenesisPayloadV1>(case, work);
 }
 
-fn decode_canonical_with_work<T:crate::trading::paper_replay_codec_v1::Root+serde::de::DeserializeOwned>(bytes:&[u8], w:&mut FinancialWork<'_, '_>)->fw::Result<T>{
+fn decode_canonical_with_work<
+    T: crate::trading::paper_replay_codec_v1::Root + serde::de::DeserializeOwned,
+>(
+    bytes: &[u8],
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<T> {
     w.finish()?;
-    if matches!(w, FinancialWork::Historical){
+    if matches!(w, FinancialWork::Historical) {
         Ok(decode_canonical(bytes)?)
-    } else{
+    } else {
         w.decode(bytes)
     }
 }
 
 #[cfg(test)]
-pub(crate) fn transition_genesis_fixture(w:&mut FinancialWork<'_, '_>){
-    let old=V1AccountRow{
-        account_id:"account".into(),
-        epoch_id:"v1".into(),
-        manifest_hash:"v1m".into()
+pub(crate) fn transition_genesis_fixture(w: &mut FinancialWork<'_, '_>) {
+    let old = V1AccountRow {
+        account_id: "account".into(),
+        epoch_id: "v1".into(),
+        manifest_hash: "v1m".into(),
     };
-    let projection=serde_json::to_string(&serde_json::json!({
+    let projection = serde_json::to_string(&serde_json::json!({
         "cash":100,
         "lots":[],
         "marks":{
@@ -969,66 +1064,76 @@ pub(crate) fn transition_genesis_fixture(w:&mut FinancialWork<'_, '_>){
         "as_of":"2026-09-24T02:00:00Z",
         "closes":{
         }
-    })).unwrap();
-    let snapshot=VerifiedV1Snapshot{
-        version:7,
-        event_hash:"previous".into(),
-        projection_hash:projection_hash(projection.as_bytes()),
-        projection_bytes:projection,
-        equity:Money::from_micros(100)
+    }))
+    .unwrap();
+    let snapshot = VerifiedV1Snapshot {
+        version: 7,
+        event_hash: "previous".into(),
+        projection_hash: projection_hash(projection.as_bytes()),
+        projection_bytes: projection,
+        equity: Money::from_micros(100),
     };
-    let fee=FeeRow{
-        policy_instance_id:"fee".into(),
-        descriptor_bytes:vec![1]
+    let fee = FeeRow {
+        policy_instance_id: "fee".into(),
+        descriptor_bytes: vec![1],
     };
-    let mut account=V2AccountRow{
-        account_id:old.account_id.clone(),
-        epoch_id:"v2".into(),
-        manifest_hash:String::new(),
-        manifest_bytes:Vec::new(),
-        fee_policy_instance_id:fee.policy_instance_id.clone(),
-        v1_epoch_id:old.epoch_id.clone(),
-        v1_manifest_hash:old.manifest_hash.clone(),
-        v1_head_version:snapshot.version,
-        v1_head_hash:snapshot.event_hash.clone(),
-        v1_projection_hash:snapshot.projection_hash.clone(),
-        cutover_id:"cutover".into()
+    let mut account = V2AccountRow {
+        account_id: old.account_id.clone(),
+        epoch_id: "v2".into(),
+        manifest_hash: String::new(),
+        manifest_bytes: Vec::new(),
+        fee_policy_instance_id: fee.policy_instance_id.clone(),
+        v1_epoch_id: old.epoch_id.clone(),
+        v1_manifest_hash: old.manifest_hash.clone(),
+        v1_head_version: snapshot.version,
+        v1_head_hash: snapshot.event_hash.clone(),
+        v1_projection_hash: snapshot.projection_hash.clone(),
+        cutover_id: "cutover".into(),
     };
-    let mut event=V2EventRow{
-        account_id:old.account_id.clone(),
-        seq:1,
-        command_id:"cutover-command".into(),
-        previous_hash:snapshot.event_hash.clone(),
-        event_hash:String::new(),
-        kind:"Genesis".into(),
-        payload:Vec::new()
+    let mut event = V2EventRow {
+        account_id: old.account_id.clone(),
+        seq: 1,
+        command_id: "cutover-command".into(),
+        previous_hash: snapshot.event_hash.clone(),
+        event_hash: String::new(),
+        kind: "Genesis".into(),
+        payload: Vec::new(),
     };
-    let manifest=expected_manifest(&old, &account, &event, &snapshot, &fee);
-    account.manifest_bytes=canonical(&manifest).unwrap();
-    account.manifest_hash=manifest_hash(&account.manifest_bytes);
-    let payload=GenesisPayloadV1{
-        schema:GENESIS_SCHEMA.into(),
-        manifest_hash:account.manifest_hash.clone(),
-        v1_head_hash:snapshot.event_hash.clone(),
-        v1_projection_hash:snapshot.projection_hash.clone(),
-        fee_policy_instance_id:fee.policy_instance_id.clone(),
-        cutover_id:account.cutover_id.clone()
+    let manifest = expected_manifest(&old, &account, &event, &snapshot, &fee);
+    account.manifest_bytes = canonical(&manifest).unwrap();
+    account.manifest_hash = manifest_hash(&account.manifest_bytes);
+    let payload = GenesisPayloadV1 {
+        schema: GENESIS_SCHEMA.into(),
+        manifest_hash: account.manifest_hash.clone(),
+        v1_head_hash: snapshot.event_hash.clone(),
+        v1_projection_hash: snapshot.projection_hash.clone(),
+        fee_policy_instance_id: fee.policy_instance_id.clone(),
+        cutover_id: account.cutover_id.clone(),
     };
-    event.payload=canonical(&payload).unwrap();
-    event.event_hash=genesis_hash(&old.account_id, &event.command_id, &event.previous_hash, &event.payload).unwrap();
-    let head=V2HeadRow{
-        account_id:old.account_id.clone(),
-        version:1,
-        event_hash:event.event_hash.clone(),
-        projection_bytes:snapshot.projection_bytes.as_bytes().to_vec(),
-        projection_hash:snapshot.projection_hash.clone()
+    event.payload = canonical(&payload).unwrap();
+    event.event_hash = genesis_hash(
+        &old.account_id,
+        &event.command_id,
+        &event.previous_hash,
+        &event.payload,
+    )
+    .unwrap();
+    let head = V2HeadRow {
+        account_id: old.account_id.clone(),
+        version: 1,
+        event_hash: event.event_hash.clone(),
+        projection_bytes: snapshot.projection_bytes.as_bytes().to_vec(),
+        projection_hash: snapshot.projection_hash.clone(),
     };
     verify_genesis_rows(&old, &account, &event, &head, &snapshot, &fee).unwrap();
     verify_genesis_rows_with_work(&old, &account, &event, &head, &snapshot, &fee, w).unwrap();
-    account.fee_policy_instance_id="wrong".into();
-    let error=verify_genesis_rows_with_work(&old, &account, &event, &head, &snapshot, &fee, w).unwrap_err();
-    match error{
-        FinancialFailure::Financial(LedgerError::IntegrityFailure(text))=>assert_eq!(text, "V2 book fee instance mismatch"),
-        other=>panic!("wrong branch: {other:?}")
+    account.fee_policy_instance_id = "wrong".into();
+    let error = verify_genesis_rows_with_work(&old, &account, &event, &head, &snapshot, &fee, w)
+        .unwrap_err();
+    match error {
+        FinancialFailure::Financial(LedgerError::IntegrityFailure(text)) => {
+            assert_eq!(text, "V2 book fee instance mismatch")
+        }
+        other => panic!("wrong branch: {other:?}"),
     };
 }

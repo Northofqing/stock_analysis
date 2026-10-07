@@ -186,19 +186,42 @@ pub struct AShareFeePolicyV2 {
 }
 
 impl AShareFeePolicyV2 {
-    pub fn new( scope: QualifiedInstrument, commission_rate: FeeRate, commission_minimum_micro_cny: i64, coverage: FeeCoverage, source_revision: impl Into<String>, ) -> Result<Self, AShareFeeV2Error> {
+    pub fn new(
+        scope: QualifiedInstrument,
+        commission_rate: FeeRate,
+        commission_minimum_micro_cny: i64,
+        coverage: FeeCoverage,
+        source_revision: impl Into<String>,
+    ) -> Result<Self, AShareFeeV2Error> {
         Self::validate_minimum(commission_minimum_micro_cny)?;
-        Self::from_owned_revision(scope, commission_rate, commission_minimum_micro_cny, coverage, source_revision.into())
+        Self::from_owned_revision(
+            scope,
+            commission_rate,
+            commission_minimum_micro_cny,
+            coverage,
+            source_revision.into(),
+        )
     }
-    fn validate_minimum(value:i64)->Result<(), AShareFeeV2Error>{
-        if value<0{
+    fn validate_minimum(value: i64) -> Result<(), AShareFeeV2Error> {
+        if value < 0 {
             Err(AShareFeeV2Error::InvalidCommissionMinimum)
-        } else{
+        } else {
             Ok(())
         }
     }
-    fn from_owned_revision(scope:QualifiedInstrument, commission_rate:FeeRate, commission_minimum_micro_cny:i64, coverage:FeeCoverage, source_revision:String)->Result<Self, AShareFeeV2Error>{
-        if source_revision.is_empty() || source_revision.len() > 128 || !source_revision .bytes() .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte)) {
+    fn from_owned_revision(
+        scope: QualifiedInstrument,
+        commission_rate: FeeRate,
+        commission_minimum_micro_cny: i64,
+        coverage: FeeCoverage,
+        source_revision: String,
+    ) -> Result<Self, AShareFeeV2Error> {
+        if source_revision.is_empty()
+            || source_revision.len() > 128
+            || !source_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+        {
             return Err(AShareFeeV2Error::InvalidSourceRevision);
         }
         Ok(Self {
@@ -237,15 +260,19 @@ impl AShareFeePolicyV2 {
     }
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out=fw::FinancialSink::Owned(Vec::new());
-        self.write_replay_descriptor(&mut out).expect("Historical descriptor writer");
+        let mut out = fw::FinancialSink::Owned(Vec::new());
+        self.write_replay_descriptor(&mut out)
+            .expect("Historical descriptor writer");
         match out {
-            fw::FinancialSink::Owned(bytes)=>bytes,
-            _=>unreachable!()
+            fw::FinancialSink::Owned(bytes) => bytes,
+            _ => unreachable!(),
         }
     }
 
-    pub(crate) fn write_replay_descriptor(&self, out:&mut fw::FinancialSink<'_>)->std::result::Result<(), ()>{
+    pub(crate) fn write_replay_descriptor(
+        &self,
+        out: &mut fw::FinancialSink<'_>,
+    ) -> std::result::Result<(), ()> {
         out.bytes(b"schema=")?;
         out.bytes(DESCRIPTOR_SCHEMA.as_bytes())?;
         out.bytes(b"\nschedule=")?;
@@ -271,11 +298,20 @@ impl AShareFeePolicyV2 {
         out.bytes(b"\n")?;
         Ok(())
     }
-    pub(crate) fn new_with_work(scope:QualifiedInstrument, rate:FeeRate, minimum:i64, coverage:FeeCoverage, revision:&str, w:&mut fw::FinancialWork<'_, '_>)->fw::Result<Self>{
+    pub(crate) fn new_with_work(
+        scope: QualifiedInstrument,
+        rate: FeeRate,
+        minimum: i64,
+        coverage: FeeCoverage,
+        revision: &str,
+        w: &mut fw::FinancialWork<'_, '_>,
+    ) -> fw::Result<Self> {
         w.finish()?;
         Self::validate_minimum(minimum)?;
-        let owned=w.fee_source_revision(revision)?;
-        Ok(Self::from_owned_revision(scope, rate, minimum, coverage, owned)?)
+        let owned = w.fee_source_revision(revision)?;
+        Ok(Self::from_owned_revision(
+            scope, rate, minimum, coverage, owned,
+        )?)
     }
     pub fn descriptor_hash(&self) -> String {
         let mut digest = Sha256::new();
@@ -332,10 +368,33 @@ pub fn shanghai_execution_date(executed_at_utc: DateTime<Utc>) -> NaiveDate {
 
 /// `trade_date` must be the actual fill date in Asia/Shanghai, not signal or
 /// report date. The pure model deliberately does not validate exchange days.
-pub fn a_share_stock_fill_fee_with_policy_v2( policy: &AShareFeePolicyV2, instrument: QualifiedInstrument, side: FillSide, notional_micro_cny: i64, trade_date: NaiveDate, required_coverage: FeeCoverageRequirement, ) -> Result<AShareFillFeeV2, AShareFeeV2Error> {
-    fw::historical_fee(fill_fee_with_work(policy, instrument, side, notional_micro_cny, trade_date, required_coverage, &mut fw::FinancialWork::Historical))
+pub fn a_share_stock_fill_fee_with_policy_v2(
+    policy: &AShareFeePolicyV2,
+    instrument: QualifiedInstrument,
+    side: FillSide,
+    notional_micro_cny: i64,
+    trade_date: NaiveDate,
+    required_coverage: FeeCoverageRequirement,
+) -> Result<AShareFillFeeV2, AShareFeeV2Error> {
+    fw::historical_fee(fill_fee_with_work(
+        policy,
+        instrument,
+        side,
+        notional_micro_cny,
+        trade_date,
+        required_coverage,
+        &mut fw::FinancialWork::Historical,
+    ))
 }
-pub(crate) fn fill_fee_with_work( policy: &AShareFeePolicyV2, instrument: QualifiedInstrument, side: FillSide, notional_micro_cny: i64, trade_date: NaiveDate, required_coverage: FeeCoverageRequirement, w: &mut fw::FinancialWork<'_, '_>, ) -> fw::Result<AShareFillFeeV2> {
+pub(crate) fn fill_fee_with_work(
+    policy: &AShareFeePolicyV2,
+    instrument: QualifiedInstrument,
+    side: FillSide,
+    notional_micro_cny: i64,
+    trade_date: NaiveDate,
+    required_coverage: FeeCoverageRequirement,
+    w: &mut fw::FinancialWork<'_, '_>,
+) -> fw::Result<AShareFillFeeV2> {
     w.finish()?;
     if instrument != policy.scope {
         return Err(AShareFeeV2Error::ScopeMismatch.into());
@@ -349,12 +408,14 @@ pub(crate) fn fill_fee_with_work( policy: &AShareFeePolicyV2, instrument: Qualif
     if trade_date < NaiveDate::from_ymd_opt(2008, 9, 19).expect("fixed date") {
         return Err(AShareFeeV2Error::UnsupportedTradeDate.into());
     }
-    let stamp_tax_bracket = if trade_date < NaiveDate::from_ymd_opt(2023, 8, 28).expect("fixed date") {
-        StampTaxBracketV2::SellerOnePerThousand
-    } else {
-        StampTaxBracketV2::SellerHalfPerThousand
-    };
-    let commission = rounded_rate_micro(notional_micro_cny, policy.commission_rate)? .max(policy.commission_minimum_micro_cny);
+    let stamp_tax_bracket =
+        if trade_date < NaiveDate::from_ymd_opt(2023, 8, 28).expect("fixed date") {
+            StampTaxBracketV2::SellerOnePerThousand
+        } else {
+            StampTaxBracketV2::SellerHalfPerThousand
+        };
+    let commission = rounded_rate_micro(notional_micro_cny, policy.commission_rate)?
+        .max(policy.commission_minimum_micro_cny);
     let stamp_tax_micro_cny = if side == FillSide::Buy {
         0
     } else {
@@ -380,7 +441,9 @@ pub(crate) fn fill_fee_with_work( policy: &AShareFeePolicyV2, instrument: Qualif
         notional_micro_cny,
         commission_micro_cny: commission,
         stamp_tax_micro_cny,
-        total_micro_cny: commission .checked_add(stamp_tax_micro_cny) .ok_or(AShareFeeV2Error::Overflow)?,
+        total_micro_cny: commission
+            .checked_add(stamp_tax_micro_cny)
+            .ok_or(AShareFeeV2Error::Overflow)?,
         coverage: policy.coverage,
     })
 }

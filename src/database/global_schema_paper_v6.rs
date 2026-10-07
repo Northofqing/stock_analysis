@@ -708,9 +708,16 @@ pub(crate) enum RetainedPaperWritePhase {
     Complete,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RetainedPaperFirstFault { Callback, Driver, Readback }
+enum RetainedPaperFirstFault {
+    Callback,
+    Driver,
+    Readback,
+}
 #[derive(Debug)]
-enum RetainedPaperCallbackFault<E> { Catalog(PaperCatalog6Error), Consumer(E) }
+enum RetainedPaperCallbackFault<E> {
+    Catalog(PaperCatalog6Error),
+    Consumer(E),
+}
 #[derive(Debug)]
 enum RetainedPaperBoundary {
     Authority(crate::database::DatabaseAuthorityError),
@@ -718,7 +725,9 @@ enum RetainedPaperBoundary {
     CallbackStopped,
 }
 impl From<diesel::result::Error> for RetainedPaperBoundary {
-    fn from(error: diesel::result::Error) -> Self { Self::Driver(error) }
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Driver(error)
+    }
 }
 
 // Field order preserves the original checkout-before-maintenance-lease release.
@@ -755,7 +764,10 @@ pub(crate) enum RetainedPaperWriteOutcome<'db, I, T, E> {
 /// operation. No clone, summary or later database read reconstructs T.
 fn retain_paper_return<T, E>(slot: &mut Option<T>, result: Result<T, E>) -> Result<(), E> {
     match result {
-        Ok(value) => { *slot = Some(value); Ok(()) }
+        Ok(value) => {
+            *slot = Some(value);
+            Ok(())
+        }
         Err(error) => Err(error),
     }
 }
@@ -767,62 +779,136 @@ impl<'db, I, T, E> RetainedPaperWrite<'db, I, T, E> {
         frame.first_fault = None;
         match frame.open_acquire(db) {
             Ok(()) => frame.phase = RetainedPaperWritePhase::Ready,
-            Err(error) => { frame.callback_fault = Some(RetainedPaperCallbackFault::Catalog(error)); frame.first_fault = Some(RetainedPaperFirstFault::Callback); }
+            Err(error) => {
+                frame.callback_fault = Some(RetainedPaperCallbackFault::Catalog(error));
+                frame.first_fault = Some(RetainedPaperFirstFault::Callback);
+            }
         }
         frame
     }
     fn open_acquire(&mut self, db: &'db DatabaseManager) -> Result<(), PaperCatalog6Error> {
         self.opening.paths = Some(paths(db)?); // Original production refusal is first.
-        self.opening.namespace = Some(PinnedNamespace::open(self.opening.paths.as_ref().expect("actual paths retained"))
-            .map_err(|_| PaperCatalog6Error::Namespace)?);
-        self.opening.lease = Some(GlobalSchemaMaintenanceLease::acquire_shared(
-            self.opening.paths.as_ref().expect("actual paths retained"),
-            self.opening.namespace.as_ref().expect("actual namespace retained"))
-            .map_err(|_| PaperCatalog6Error::Namespace)?);
-        self.opening.checkout = Some(db.attribution_checkout().map_err(|_| PaperCatalog6Error::Authority)?);
+        self.opening.namespace = Some(
+            PinnedNamespace::open(self.opening.paths.as_ref().expect("actual paths retained"))
+                .map_err(|_| PaperCatalog6Error::Namespace)?,
+        );
+        self.opening.lease = Some(
+            GlobalSchemaMaintenanceLease::acquire_shared(
+                self.opening.paths.as_ref().expect("actual paths retained"),
+                self.opening
+                    .namespace
+                    .as_ref()
+                    .expect("actual namespace retained"),
+            )
+            .map_err(|_| PaperCatalog6Error::Namespace)?,
+        );
+        self.opening.checkout = Some(
+            db.attribution_checkout()
+                .map_err(|_| PaperCatalog6Error::Authority)?,
+        );
         let references = refs()?;
         self.session = Some(PaperCatalog6Session {
-            checkout: self.opening.checkout.take().expect("actual checkout retained"),
-            namespace: self.opening.namespace.take().expect("actual namespace retained"),
-            _lease: self.opening.lease.take().expect("actual maintenance lease retained"),
-            _db: db, references, work: RefCell::new(CopyWork::new()), generation: ClosedGeneration::Six,
+            checkout: self
+                .opening
+                .checkout
+                .take()
+                .expect("actual checkout retained"),
+            namespace: self
+                .opening
+                .namespace
+                .take()
+                .expect("actual namespace retained"),
+            _lease: self
+                .opening
+                .lease
+                .take()
+                .expect("actual maintenance lease retained"),
+            _db: db,
+            references,
+            work: RefCell::new(CopyWork::new()),
+            generation: ClosedGeneration::Six,
         });
         Ok(())
     }
     pub(crate) fn unopened(input: I, error: PaperCatalog6Error) -> Self {
-        Self { session: None,
-            opening: RetainedPaperOpening { checkout: None, namespace: None, lease: None, paths: None },
-            input, value: None, authority: None,
+        Self {
+            session: None,
+            opening: RetainedPaperOpening {
+                checkout: None,
+                namespace: None,
+                lease: None,
+                paths: None,
+            },
+            input,
+            value: None,
+            authority: None,
             callback_fault: Some(RetainedPaperCallbackFault::Catalog(error)),
-            driver_boundary: None, readback_boundary: None,
+            driver_boundary: None,
+            readback_boundary: None,
             first_fault: Some(RetainedPaperFirstFault::Callback),
-            phase: RetainedPaperWritePhase::Unopened }
+            phase: RetainedPaperWritePhase::Unopened,
+        }
     }
-    pub(crate) fn phase(&self) -> RetainedPaperWritePhase { self.phase }
+    pub(crate) fn phase(&self) -> RetainedPaperWritePhase {
+        self.phase
+    }
     fn outcome(self) -> RetainedPaperWriteOutcome<'db, I, T, E> {
         match self.phase {
             RetainedPaperWritePhase::Complete => RetainedPaperWriteOutcome::Complete(self),
-            RetainedPaperWritePhase::CommitUnknown | RetainedPaperWritePhase::CommittedReadbackPending => RetainedPaperWriteOutcome::Pending(self),
+            RetainedPaperWritePhase::CommitUnknown
+            | RetainedPaperWritePhase::CommittedReadbackPending => {
+                RetainedPaperWriteOutcome::Pending(self)
+            }
             _ => RetainedPaperWriteOutcome::Held(self),
         }
     }
     /// Explicit known-success release of this pooled checkout, not an observed
     /// SQLite consuming-close result. The original input is also returned.
     pub(crate) fn finish_complete(mut self) -> Result<(I, T), Self> {
-        if self.phase != RetainedPaperWritePhase::Complete || self.value.is_none() { return Err(self); }
-        let value = self.value.take().expect("complete requires the actual return");
+        if self.phase != RetainedPaperWritePhase::Complete || self.value.is_none() {
+            return Err(self);
+        }
+        let value = self
+            .value
+            .take()
+            .expect("complete requires the actual return");
         drop(self.session.take());
         Ok((self.input, value))
     }
     pub(crate) fn run_once(
         mut self,
-        operation: impl for<'s> FnOnce(&mut SqliteConnection, &DatabaseConnectionAuthority, &VerifiedCatalog6<'s>, &mut I) -> Result<T, E>,
-        mut tail: impl for<'s> FnMut(&mut SqliteConnection, &DatabaseConnectionAuthority, &VerifiedCatalog6<'s>, &I, &T) -> Result<(), E>,
+        operation: impl for<'s> FnOnce(
+            &mut SqliteConnection,
+            &DatabaseConnectionAuthority,
+            &VerifiedCatalog6<'s>,
+            &mut I,
+        ) -> Result<T, E>,
+        mut tail: impl for<'s> FnMut(
+            &mut SqliteConnection,
+            &DatabaseConnectionAuthority,
+            &VerifiedCatalog6<'s>,
+            &I,
+            &T,
+        ) -> Result<(), E>,
     ) -> RetainedPaperWriteOutcome<'db, I, T, E> {
-        if self.phase != RetainedPaperWritePhase::Ready { return self.outcome(); }
-        let Self { session, input, value, authority, callback_fault, driver_boundary,
-            readback_boundary, first_fault, phase, .. } = &mut self;
-        let session = session.as_mut().expect("Ready requires the acquired session");
+        if self.phase != RetainedPaperWritePhase::Ready {
+            return self.outcome();
+        }
+        let Self {
+            session,
+            input,
+            value,
+            authority,
+            callback_fault,
+            driver_boundary,
+            readback_boundary,
+            first_fault,
+            phase,
+            ..
+        } = &mut self;
+        let session = session
+            .as_mut()
+            .expect("Ready requires the acquired session");
         let source = Arc::clone(&session.checkout.source);
         let namespace = &session.namespace;
         let references = session.references;
@@ -834,15 +920,25 @@ impl<'db, I, T, E> RetainedPaperWrite<'db, I, T, E> {
             |conn, actual| {
                 *authority = Some(actual.clone());
                 let scope = LoanScope;
-                let proof = ClosedCatalogProof { loan: CatalogLoan::new(conn, &scope),
-                    authority: actual, source: &source, namespace, references, work,
-                    purpose: Purpose::Writer, generation };
+                let proof = ClosedCatalogProof {
+                    loan: CatalogLoan::new(conn, &scope),
+                    authority: actual,
+                    source: &source,
+                    namespace,
+                    references,
+                    work,
+                    purpose: Purpose::Writer,
+                    generation,
+                };
                 if let Err(error) = proof.validate_on(conn) {
                     *callback_fault = Some(RetainedPaperCallbackFault::Catalog(error));
                     *first_fault = Some(RetainedPaperFirstFault::Callback);
                     return Err(RetainedPaperBoundary::CallbackStopped);
                 }
-                if let Err(error) = retain_paper_return(value, operation(conn, actual, &VerifiedCatalog6(&proof), input)) {
+                if let Err(error) = retain_paper_return(
+                    value,
+                    operation(conn, actual, &VerifiedCatalog6(&proof), input),
+                ) {
                     *callback_fault = Some(RetainedPaperCallbackFault::Consumer(error));
                     *first_fault = Some(RetainedPaperFirstFault::Callback);
                     return Err(RetainedPaperBoundary::CallbackStopped);
@@ -860,7 +956,13 @@ impl<'db, I, T, E> RetainedPaperWrite<'db, I, T, E> {
                     *first_fault = Some(RetainedPaperFirstFault::Callback);
                     return Err(RetainedPaperBoundary::CallbackStopped);
                 }
-                if let Err(error) = tail(conn, actual, &VerifiedCatalog6(&proof), input, value.as_ref().expect("actual return retained")) {
+                if let Err(error) = tail(
+                    conn,
+                    actual,
+                    &VerifiedCatalog6(&proof),
+                    input,
+                    value.as_ref().expect("actual return retained"),
+                ) {
                     *callback_fault = Some(RetainedPaperCallbackFault::Consumer(error));
                     *first_fault = Some(RetainedPaperFirstFault::Callback);
                     return Err(RetainedPaperBoundary::CallbackStopped);
@@ -876,22 +978,33 @@ impl<'db, I, T, E> RetainedPaperWrite<'db, I, T, E> {
         );
         if let Err(error) = writer {
             *driver_boundary = Some(error);
-            if first_fault.is_none() { *first_fault = Some(RetainedPaperFirstFault::Driver); }
+            if first_fault.is_none() {
+                *first_fault = Some(RetainedPaperFirstFault::Driver);
+            }
             *phase = if *phase == RetainedPaperWritePhase::BeforeCommitReturned {
                 RetainedPaperWritePhase::CommitUnknown
-            } else { RetainedPaperWritePhase::WriterStopped };
+            } else {
+                RetainedPaperWritePhase::WriterStopped
+            };
             return self.outcome();
         }
         // This phase follows the real lower transaction's successful return,
         // not merely the callback's BeforeCommitReturned marker.
         *phase = RetainedPaperWritePhase::CommittedReadbackPending;
-        let expected = authority.as_ref().expect("successful writer acquired actual authority");
+        let expected = authority
+            .as_ref()
+            .expect("successful writer acquired actual authority");
         let reader = session.with_committed_readback_closed(
             expected,
             |_conn, _proof| Ok::<(), RetainedPaperBoundary>(()),
             |conn, proof, _| {
-                if let Err(error) = tail(conn, expected, &VerifiedCatalog6(proof), input,
-                    value.as_ref().expect("actual return retained")) {
+                if let Err(error) = tail(
+                    conn,
+                    expected,
+                    &VerifiedCatalog6(proof),
+                    input,
+                    value.as_ref().expect("actual return retained"),
+                ) {
                     *callback_fault = Some(RetainedPaperCallbackFault::Consumer(error));
                     *first_fault = Some(RetainedPaperFirstFault::Callback);
                     return Err(RetainedPaperBoundary::CallbackStopped);
@@ -903,7 +1016,9 @@ impl<'db, I, T, E> RetainedPaperWrite<'db, I, T, E> {
             Ok(()) => *phase = RetainedPaperWritePhase::Complete,
             Err(error) => {
                 *readback_boundary = Some(error);
-                if first_fault.is_none() { *first_fault = Some(RetainedPaperFirstFault::Readback); }
+                if first_fault.is_none() {
+                    *first_fault = Some(RetainedPaperFirstFault::Readback);
+                }
             }
         }
         self.outcome()
@@ -1228,19 +1343,27 @@ mod tests {
         dropped: std::rc::Rc<std::cell::Cell<usize>>,
     }
     impl Drop for RetainedTestReturn {
-        fn drop(&mut self) { self.dropped.set(self.dropped.get() + 1); }
+        fn drop(&mut self) {
+            self.dropped.set(self.dropped.get() + 1);
+        }
     }
     fn retained_test_command() -> crate::trading::paper_book_v2_execution::PaperV2Command {
         crate::trading::paper_book_v2_execution::PaperV2Command::Cancel {
             command_id: "TEST_CODE_RETAINED_ORIGINAL_COMMAND".into(),
             expected: crate::trading::paper_book_v2_execution::HeadIdentity {
-                version: 1, event_hash: "a".repeat(64) },
+                version: 1,
+                event_hash: "a".repeat(64),
+            },
             parent_id: "TEST_CODE_RETAINED_ORIGINAL_PARENT".into(),
         }
     }
-    fn retained_command_pointer(command: &crate::trading::paper_book_v2_execution::PaperV2Command) -> *const u8 {
+    fn retained_command_pointer(
+        command: &crate::trading::paper_book_v2_execution::PaperV2Command,
+    ) -> *const u8 {
         match command {
-            crate::trading::paper_book_v2_execution::PaperV2Command::Cancel { command_id, .. } => command_id.as_ptr(),
+            crate::trading::paper_book_v2_execution::PaperV2Command::Cancel {
+                command_id, ..
+            } => command_id.as_ptr(),
             _ => panic!("fixed Cancel fixture only"),
         }
     }
@@ -1254,12 +1377,19 @@ mod tests {
             let command = retained_test_command();
             let command_pointer = retained_command_pointer(&command);
             let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-            let owned = RetainedTestReturn { bytes: Box::new("TEST_CODE_actual_owned_return".into()), dropped: drops.clone() };
+            let owned = RetainedTestReturn {
+                bytes: Box::new("TEST_CODE_actual_owned_return".into()),
+                dropped: drops.clone(),
+            };
             let value_pointer = owned.bytes.as_ptr();
             let calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let counted = calls.clone();
             let guard = set_hook(move |phase, _| {
-                if cut == 1 && phase == TestPhase::AfterCommit { Err(PaperCatalog6Error::InjectedFailure) } else { Ok(()) }
+                if cut == 1 && phase == TestPhase::AfterCommit {
+                    Err(PaperCatalog6Error::InjectedFailure)
+                } else {
+                    Ok(())
+                }
             });
             let outcome = RetainedPaperWrite::open(&f.db, command).run_once(
                 move |conn, _, _, _| {
@@ -1269,7 +1399,11 @@ mod tests {
                 },
                 |conn, _, proof, _, _| {
                     tail_count(conn, 1)?;
-                    if cut == 2 && proof.purpose == Purpose::Reader { Err(PaperCatalog6Error::InjectedFailure) } else { Ok(()) }
+                    if cut == 2 && proof.purpose == Purpose::Reader {
+                        Err(PaperCatalog6Error::InjectedFailure)
+                    } else {
+                        Ok(())
+                    }
                 },
             );
             let frame = match outcome {
@@ -1283,30 +1417,63 @@ mod tests {
             assert_eq!(frame.value.as_ref().unwrap().bytes.as_ptr(), value_pointer);
             assert_eq!(drops.get(), 0);
             assert!(frame.session.is_some() && frame.authority.is_some());
-            let work_before = frame.session.as_ref().unwrap().work.borrow().remaining_for_test();
-            let repeated = frame.run_once(|_, _, _, _| panic!("operation must never replay"),
-                |_, _, _, _, _| panic!("tail must never replay"));
+            let work_before = frame
+                .session
+                .as_ref()
+                .unwrap()
+                .work
+                .borrow()
+                .remaining_for_test();
+            let repeated = frame.run_once(
+                |_, _, _, _| panic!("operation must never replay"),
+                |_, _, _, _, _| panic!("tail must never replay"),
+            );
             let frame = match repeated {
                 RetainedPaperWriteOutcome::Complete(frame) if cut == 0 => frame,
                 RetainedPaperWriteOutcome::Pending(frame) if cut != 0 => frame,
                 _ => panic!("repeat must retain the same terminal phase"),
             };
-            assert_eq!(frame.session.as_ref().unwrap().work.borrow().remaining_for_test(), work_before);
+            assert_eq!(
+                frame
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .work
+                    .borrow()
+                    .remaining_for_test(),
+                work_before
+            );
             assert_eq!(frame.value.as_ref().unwrap().bytes.as_ptr(), value_pointer);
             if cut == 0 {
-                let (input, value) = match frame.finish_complete() { Ok(done) => done, Err(_) => panic!("complete must release explicitly") };
+                let (input, value) = match frame.finish_complete() {
+                    Ok(done) => done,
+                    Err(_) => panic!("complete must release explicitly"),
+                };
                 assert_eq!(retained_command_pointer(&input), command_pointer);
                 assert_eq!(value.bytes.as_ptr(), value_pointer);
                 assert_eq!(drops.get(), 0);
                 drop(value);
             } else {
-                assert_eq!(frame.phase(), RetainedPaperWritePhase::CommittedReadbackPending);
+                assert_eq!(
+                    frame.phase(),
+                    RetainedPaperWritePhase::CommittedReadbackPending
+                );
                 assert!(frame.readback_boundary.is_some());
                 if cut == 2 {
-                    assert!(matches!(frame.callback_fault, Some(RetainedPaperCallbackFault::Consumer(PaperCatalog6Error::InjectedFailure))));
+                    assert!(matches!(
+                        frame.callback_fault,
+                        Some(RetainedPaperCallbackFault::Consumer(
+                            PaperCatalog6Error::InjectedFailure
+                        ))
+                    ));
                     assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Callback));
-                } else { assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Readback)); }
-                let frame = match frame.finish_complete() { Err(retained) => retained, Ok(_) => panic!("Pending cannot release as success") };
+                } else {
+                    assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Readback));
+                }
+                let frame = match frame.finish_complete() {
+                    Err(retained) => retained,
+                    Ok(_) => panic!("Pending cannot release as success"),
+                };
                 assert_eq!(drops.get(), 0);
                 drop(frame); // Explicit fixture teardown, not production recovery.
             }
@@ -1321,25 +1488,66 @@ mod tests {
         let command = retained_test_command();
         let command_pointer = retained_command_pointer(&command);
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-        let owned = RetainedTestReturn { bytes: Box::new("TEST_CODE_retained_before_tail".into()), dropped: drops.clone() };
+        let owned = RetainedTestReturn {
+            bytes: Box::new("TEST_CODE_retained_before_tail".into()),
+            dropped: drops.clone(),
+        };
         let value_pointer = owned.bytes.as_ptr();
         let outcome = RetainedPaperWrite::open(&f.db, command).run_once(
-            move |conn, _, _, _| { insert(conn, "2026-09-28")?; Ok::<_, PaperCatalog6Error>(owned) },
-            |conn, _, _, _, _| { tail_count(conn, 1)?; Err(PaperCatalog6Error::InjectedFailure) },
+            move |conn, _, _, _| {
+                insert(conn, "2026-09-28")?;
+                Ok::<_, PaperCatalog6Error>(owned)
+            },
+            |conn, _, _, _, _| {
+                tail_count(conn, 1)?;
+                Err(PaperCatalog6Error::InjectedFailure)
+            },
         );
-        let frame = match outcome { RetainedPaperWriteOutcome::Held(frame) => frame, _ => panic!("writer tail refusal must hold") };
+        let frame = match outcome {
+            RetainedPaperWriteOutcome::Held(frame) => frame,
+            _ => panic!("writer tail refusal must hold"),
+        };
         assert_eq!(f.daily_count(), 0); // Independent actual DB observation after real driver rollback path.
         assert_eq!(frame.phase(), RetainedPaperWritePhase::WriterStopped);
         assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Callback));
-        assert!(matches!(frame.callback_fault, Some(RetainedPaperCallbackFault::Consumer(PaperCatalog6Error::InjectedFailure))));
-        assert!(matches!(frame.driver_boundary, Some(RetainedPaperBoundary::CallbackStopped)));
+        assert!(matches!(
+            frame.callback_fault,
+            Some(RetainedPaperCallbackFault::Consumer(
+                PaperCatalog6Error::InjectedFailure
+            ))
+        ));
+        assert!(matches!(
+            frame.driver_boundary,
+            Some(RetainedPaperBoundary::CallbackStopped)
+        ));
         assert_eq!(frame.value.as_ref().unwrap().bytes.as_ptr(), value_pointer);
         assert_eq!(retained_command_pointer(&frame.input), command_pointer);
         assert_eq!(drops.get(), 0);
-        let work_before = frame.session.as_ref().unwrap().work.borrow().remaining_for_test();
-        let held = frame.run_once(|_, _, _, _| panic!("no second SQL operation"), |_, _, _, _, _| panic!("no second tail"));
-        let frame = match held { RetainedPaperWriteOutcome::Held(frame) => frame, _ => panic!("same Held owner required") };
-        assert_eq!(frame.session.as_ref().unwrap().work.borrow().remaining_for_test(), work_before);
+        let work_before = frame
+            .session
+            .as_ref()
+            .unwrap()
+            .work
+            .borrow()
+            .remaining_for_test();
+        let held = frame.run_once(
+            |_, _, _, _| panic!("no second SQL operation"),
+            |_, _, _, _, _| panic!("no second tail"),
+        );
+        let frame = match held {
+            RetainedPaperWriteOutcome::Held(frame) => frame,
+            _ => panic!("same Held owner required"),
+        };
+        assert_eq!(
+            frame
+                .session
+                .as_ref()
+                .unwrap()
+                .work
+                .borrow()
+                .remaining_for_test(),
+            work_before
+        );
         assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Callback));
         assert_eq!(drops.get(), 0);
         drop(frame); // Only explicit fixture cleanup consumes the retained T.
@@ -1350,15 +1558,35 @@ mod tests {
         short.session.as_mut().unwrap().work = RefCell::new(CopyWork::limited(0));
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let counted = calls.clone();
-        let short = short.run_once(move |_, _, _, _| {
-            counted.set(counted.get() + 1);
-            Ok::<_, PaperCatalog6Error>(1u8)
-        }, |_, _, _, _, _| panic!("short-before-owned cannot reach the tail"));
-        let short = match short { RetainedPaperWriteOutcome::Held(frame) => frame, _ => panic!("short gate must retain") };
+        let short = short.run_once(
+            move |_, _, _, _| {
+                counted.set(counted.get() + 1);
+                Ok::<_, PaperCatalog6Error>(1u8)
+            },
+            |_, _, _, _, _| panic!("short-before-owned cannot reach the tail"),
+        );
+        let short = match short {
+            RetainedPaperWriteOutcome::Held(frame) => frame,
+            _ => panic!("short gate must retain"),
+        };
         assert_eq!(calls.get(), 0);
         assert!(short.value.is_none());
-        assert!(matches!(short.callback_fault, Some(RetainedPaperCallbackFault::Catalog(PaperCatalog6Error::CopyBudgetExceeded))));
-        assert_eq!(short.session.as_ref().unwrap().work.borrow().remaining_for_test(), 0);
+        assert!(matches!(
+            short.callback_fault,
+            Some(RetainedPaperCallbackFault::Catalog(
+                PaperCatalog6Error::CopyBudgetExceeded
+            ))
+        ));
+        assert_eq!(
+            short
+                .session
+                .as_ref()
+                .unwrap()
+                .work
+                .borrow()
+                .remaining_for_test(),
+            0
+        );
         drop(short);
     }
     #[test]
@@ -1367,7 +1595,10 @@ mod tests {
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
         conn.batch_execute("PRAGMA foreign_keys=ON; CREATE TABLE retained_parent(id INTEGER PRIMARY KEY); CREATE TABLE retained_child(parent_id INTEGER REFERENCES retained_parent(id) DEFERRABLE INITIALLY DEFERRED);").unwrap();
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-        let owned = RetainedTestReturn { bytes: Box::new("TEST_CODE_commit_error_owned".into()), dropped: drops.clone() };
+        let owned = RetainedTestReturn {
+            bytes: Box::new("TEST_CODE_commit_error_owned".into()),
+            dropped: drops.clone(),
+        };
         let value_pointer = owned.bytes.as_ptr();
         let mut outer = None;
         let callback_returned = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -1379,14 +1610,26 @@ mod tests {
             Ok(())
         });
         assert!(callback_returned.get());
-        assert!(matches!(actual, Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::ForeignKeyViolation, _))));
+        assert!(matches!(
+            actual,
+            Err(diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::ForeignKeyViolation,
+                _
+            ))
+        ));
         assert_eq!(outer.as_ref().unwrap().bytes.as_ptr(), value_pointer);
         assert_eq!(drops.get(), 0);
         // Explicit fixture cleanup; no inference about an opaque driver-internal rollback.
         let cleanup_return = conn.batch_execute("ROLLBACK");
         #[derive(diesel::QueryableByName)]
-        struct Count { #[diesel(sql_type=diesel::sql_types::BigInt)] value: i64 }
-        let actual_rows = diesel::sql_query("SELECT COUNT(*) AS value FROM retained_child").get_result::<Count>(&mut conn).unwrap().value;
+        struct Count {
+            #[diesel(sql_type=diesel::sql_types::BigInt)]
+            value: i64,
+        }
+        let actual_rows = diesel::sql_query("SELECT COUNT(*) AS value FROM retained_child")
+            .get_result::<Count>(&mut conn)
+            .unwrap()
+            .value;
         assert_eq!(actual_rows, 0);
         assert_eq!(drops.get(), 0);
         drop(outer.take());
@@ -1403,17 +1646,23 @@ mod tests {
         // constructor-origin witness. Do not replace its OnceCell with a V6 fixture.
         DatabaseManager::init(None).unwrap();
         assert!(!DatabaseManager::get().has_isolated_p05_consumer_origin());
-        let observe = |command: &PaperV2Command| {
-            match command {
-                PaperV2Command::Cancel { command_id, expected, parent_id } => {
-                    assert_eq!(command_id, "TEST_CODE_RETAINED_ORIGINAL_COMMAND");
-                    assert_eq!(parent_id, "TEST_CODE_RETAINED_ORIGINAL_PARENT");
-                    assert_eq!(expected.version, 1);
-                    assert_eq!(expected.event_hash, "a".repeat(64));
-                    (command_id.as_ptr(), parent_id.as_ptr(), expected.event_hash.as_ptr())
-                }
-                _ => panic!("the genuine fixed Cancel command must remain owned"),
+        let observe = |command: &PaperV2Command| match command {
+            PaperV2Command::Cancel {
+                command_id,
+                expected,
+                parent_id,
+            } => {
+                assert_eq!(command_id, "TEST_CODE_RETAINED_ORIGINAL_COMMAND");
+                assert_eq!(parent_id, "TEST_CODE_RETAINED_ORIGINAL_PARENT");
+                assert_eq!(expected.version, 1);
+                assert_eq!(expected.event_hash, "a".repeat(64));
+                (
+                    command_id.as_ptr(),
+                    parent_id.as_ptr(),
+                    expected.event_hash.as_ptr(),
+                )
             }
+            _ => panic!("the genuine fixed Cancel command must remain owned"),
         };
         let command = retained_test_command();
         let original_buffers = observe(&command);
@@ -1424,10 +1673,17 @@ mod tests {
             _ => panic!("ordinary global manager must keep the original opening refusal"),
         };
         assert_eq!(frame.phase(), RetainedPaperWritePhase::Unopened);
-        assert!(matches!(frame.callback_fault.as_ref(), Some(RetainedPaperCallbackFault::Catalog(
-            PaperCatalog6Error::Catalog6RequalificationRequired))));
+        assert!(matches!(
+            frame.callback_fault.as_ref(),
+            Some(RetainedPaperCallbackFault::Catalog(
+                PaperCatalog6Error::Catalog6RequalificationRequired
+            ))
+        ));
         assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Callback));
-        assert_eq!(observe(retained_execution_command_for_test(&frame.input)), original_buffers);
+        assert_eq!(
+            observe(retained_execution_command_for_test(&frame.input)),
+            original_buffers
+        );
         // paths() refused before a session/Work existed. This proves no pool
         // was created or reset, not a successful allocation/consumption witness.
         assert!(frame.session.is_none());
@@ -1445,11 +1701,18 @@ mod tests {
         };
         assert_eq!(frame.phase(), RetainedPaperWritePhase::Unopened);
         assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Callback));
-        assert!(matches!(frame.callback_fault.as_ref(), Some(RetainedPaperCallbackFault::Catalog(
-            PaperCatalog6Error::Catalog6RequalificationRequired))));
+        assert!(matches!(
+            frame.callback_fault.as_ref(),
+            Some(RetainedPaperCallbackFault::Catalog(
+                PaperCatalog6Error::Catalog6RequalificationRequired
+            ))
+        ));
         assert!(frame.session.is_none() && frame.value.is_none());
         assert!(frame.driver_boundary.is_none() && frame.readback_boundary.is_none());
-        assert_eq!(observe(retained_execution_command_for_test(&frame.input)), original_buffers);
+        assert_eq!(
+            observe(retained_execution_command_for_test(&frame.input)),
+            original_buffers
+        );
         let frame = match frame.finish_complete() {
             Err(held) => held,
             Ok(_) => panic!("unopened failure must never release a successful command/return"),
@@ -1457,23 +1720,29 @@ mod tests {
         assert_eq!(frame.phase(), RetainedPaperWritePhase::Unopened);
         assert_eq!(frame.first_fault, Some(RetainedPaperFirstFault::Callback));
         assert!(frame.session.is_none() && frame.value.is_none());
-        assert_eq!(observe(retained_execution_command_for_test(&frame.input)), original_buffers);
+        assert_eq!(
+            observe(retained_execution_command_for_test(&frame.input)),
+            original_buffers
+        );
         drop(frame); // Explicit fixture teardown, not production recovery/retry.
     }
 }
-
 
 // A specialized cfg-only short loan of the fixed execution's actual owner.
 // Work's address identifies two observations in the same stable test placement;
 // it is not a persistent origin/connection witness across moves.
 #[cfg(test)]
-impl<'db, 'a> RetainedPaperWrite<
-    'db,
-    crate::trading::paper_book_v2_execution::RetainedExecutionInput<'a>,
-    crate::trading::paper_book_v2_execution::RetainedExecutionAcquired,
-    crate::trading::paper_ledger::LedgerError,
-> {
-    pub(crate) fn observe_fixed_execution_for_test(&self) -> (
+impl<'db, 'a>
+    RetainedPaperWrite<
+        'db,
+        crate::trading::paper_book_v2_execution::RetainedExecutionInput<'a>,
+        crate::trading::paper_book_v2_execution::RetainedExecutionAcquired,
+        crate::trading::paper_ledger::LedgerError,
+    >
+{
+    pub(crate) fn observe_fixed_execution_for_test(
+        &self,
+    ) -> (
         &crate::trading::paper_book_v2_execution::RetainedExecutionInput<'a>,
         Option<&crate::trading::paper_book_v2_execution::RetainedExecutionAcquired>,
         Option<(usize, usize)>,
@@ -1481,15 +1750,25 @@ impl<'db, 'a> RetainedPaperWrite<
         (bool, bool, bool),
     ) {
         let work = self.session.as_ref().map(|session| {
-            (&session.work as *const RefCell<CopyWork> as usize,
-                session.work.borrow().remaining_for_test())
+            (
+                &session.work as *const RefCell<CopyWork> as usize,
+                session.work.borrow().remaining_for_test(),
+            )
         });
         let consumer = match self.callback_fault.as_ref() {
             Some(RetainedPaperCallbackFault::Consumer(error)) => Some(error),
             _ => None,
         };
-        (&self.input, self.value.as_ref(), work, consumer,
-            (self.first_fault == Some(RetainedPaperFirstFault::Callback),
-                self.driver_boundary.is_some(), self.readback_boundary.is_some()))
+        (
+            &self.input,
+            self.value.as_ref(),
+            work,
+            consumer,
+            (
+                self.first_fault == Some(RetainedPaperFirstFault::Callback),
+                self.driver_boundary.is_some(),
+                self.readback_boundary.is_some(),
+            ),
+        )
     }
 }

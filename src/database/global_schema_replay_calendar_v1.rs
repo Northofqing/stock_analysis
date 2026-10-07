@@ -1,8 +1,8 @@
 //! Fixed calendar request accounting. Pure arithmetic is not an applicability token.
 //! Native dispatch/TLS/allocator workspace is outside the logical Rust-request scope.
 use super::{
-    add, btree_node_bounds, layout, mul, record_upper, round_up, BorrowedReplayWork,
-    FieldLayout, LayoutFailure, ReplayMemory, ReplaySite, ReplayTerminalFailure, ResourceCause,
+    add, btree_node_bounds, layout, mul, record_upper, round_up, BorrowedReplayWork, FieldLayout,
+    LayoutFailure, ReplayMemory, ReplaySite, ReplayTerminalFailure, ResourceCause,
 };
 use chrono::NaiveDate;
 use std::ffi::c_void;
@@ -64,7 +64,8 @@ fn qualify(
     work: &mut BorrowedReplayWork<'_>,
     reason: ReplayCalendarQualificationFailure,
 ) -> ReplayTerminalFailure {
-    work.terminal.latch(ReplayTerminalFailure::CalendarQualification(reason))
+    work.terminal
+        .latch(ReplayTerminalFailure::CalendarQualification(reason))
 }
 fn checked_eligibility(
     work: &mut BorrowedReplayWork<'_>,
@@ -81,7 +82,10 @@ fn calendar_wait_thread_request_upper() -> Result<u64, LayoutFailure> {
     let tag = FieldLayout::of::<u128>();
     let option_align = name.align.max(tag.align);
     let optional_name = layout(
-        round_up(add(add(tag.size, name.size)?, option_align - 1)?, option_align)?,
+        round_up(
+            add(add(tag.size, name.size)?, option_align - 1)?,
+            option_align,
+        )?,
         option_align,
     )?;
     let id = record_upper(&[FieldLayout::of::<NonZeroU64>()])?;
@@ -99,7 +103,8 @@ fn calendar_wait_thread_request_upper() -> Result<u64, LayoutFailure> {
     layout(
         round_up(add(round_up(header, inner.align)?, inner.size)?, arc_align)?,
         arc_align,
-    ).map(|value| value.size)
+    )
+    .map(|value| value.size)
 }
 
 const QUERY_REQUEST: u64 = 122; // max(2 * original literal prefix61, 48, 43).
@@ -107,7 +112,11 @@ const URL_REQUEST: u64 = 2 * (82 + 13);
 fn date_node_requests() -> Result<u64, LayoutFailure> {
     let mut total = 0;
     for n in 0_u64..37 {
-        let height = if n == 0 { 0 } else { u64::from(64 - n.leading_zeros()) };
+        let height = if n == 0 {
+            0
+        } else {
+            u64::from(64 - n.leading_zeros())
+        };
         total = add(total, add(height, 2)?)?;
     }
     Ok(total)
@@ -135,16 +144,17 @@ fn call_paid(
         work.reserve(ReplaySite::CalendarCold, bytes)?.consume();
         *payment = CalendarPaymentState::Paid;
     }
-    work.reserve(ReplaySite::CalendarQuery, QUERY_REQUEST)?.consume();
+    work.reserve(ReplaySite::CalendarQuery, QUERY_REQUEST)?
+        .consume();
     let permit = CalendarCallPermit { request };
     match crate::calendar::replay_calendar_dispatch(permit) {
         Ok(value) => Ok(value),
         Err(ReplayCalendarCallFailure::Historical(text)) => {
             Err(ReplayCalendarCallFailure::Historical(text))
         }
-        Err(ReplayCalendarCallFailure::Terminal(ReplayTerminalFailure::CalendarQualification(reason))) => {
-            Err(qualify(work, reason).into())
-        }
+        Err(ReplayCalendarCallFailure::Terminal(ReplayTerminalFailure::CalendarQualification(
+            reason,
+        ))) => Err(qualify(work, reason).into()),
         // The closed dispatcher only emits the fixed calendar contradiction.
         Err(ReplayCalendarCallFailure::Terminal(failure)) => {
             Err(work.terminal.latch(failure).into())
@@ -153,27 +163,47 @@ fn call_paid(
 }
 
 impl ReplayMemory<'_, '_> {
-    fn calendar_call(&mut self, request: CalendarRequest) -> Result<CalendarResponse, ReplayCalendarCallFailure> {
+    fn calendar_call(
+        &mut self,
+        request: CalendarRequest,
+    ) -> Result<CalendarResponse, ReplayCalendarCallFailure> {
         self.work.finish()?;
-        self.pin.calendar_rules().map_err(|reason| qualify(self.work, reason))?;
+        self.pin
+            .calendar_rules()
+            .map_err(|reason| qualify(self.work, reason))?;
         call_paid(self.work, &mut self.calendar_payment, request)
     }
-    pub(crate) fn calendar_day(&mut self, day: NaiveDate) -> Result<bool, ReplayCalendarCallFailure> {
+    pub(crate) fn calendar_day(
+        &mut self,
+        day: NaiveDate,
+    ) -> Result<bool, ReplayCalendarCallFailure> {
         match self.calendar_call(CalendarRequest::Day(day))? {
             CalendarResponse::Day(value) => Ok(value),
-            CalendarResponse::Date(_) => Err(qualify(self.work, ReplayCalendarQualificationFailure::InputMismatch).into()),
+            CalendarResponse::Date(_) => {
+                Err(qualify(self.work, ReplayCalendarQualificationFailure::InputMismatch).into())
+            }
         }
     }
-    pub(crate) fn calendar_prev(&mut self, from: NaiveDate) -> Result<NaiveDate, ReplayCalendarCallFailure> {
+    pub(crate) fn calendar_prev(
+        &mut self,
+        from: NaiveDate,
+    ) -> Result<NaiveDate, ReplayCalendarCallFailure> {
         match self.calendar_call(CalendarRequest::Prev(from))? {
             CalendarResponse::Date(value) => Ok(value),
-            CalendarResponse::Day(_) => Err(qualify(self.work, ReplayCalendarQualificationFailure::InputMismatch).into()),
+            CalendarResponse::Day(_) => {
+                Err(qualify(self.work, ReplayCalendarQualificationFailure::InputMismatch).into())
+            }
         }
     }
-    pub(crate) fn calendar_next(&mut self, from: NaiveDate) -> Result<NaiveDate, ReplayCalendarCallFailure> {
+    pub(crate) fn calendar_next(
+        &mut self,
+        from: NaiveDate,
+    ) -> Result<NaiveDate, ReplayCalendarCallFailure> {
         match self.calendar_call(CalendarRequest::Next(from))? {
             CalendarResponse::Date(value) => Ok(value),
-            CalendarResponse::Day(_) => Err(qualify(self.work, ReplayCalendarQualificationFailure::InputMismatch).into()),
+            CalendarResponse::Day(_) => {
+                Err(qualify(self.work, ReplayCalendarQualificationFailure::InputMismatch).into())
+            }
         }
     }
 }
@@ -184,6 +214,10 @@ mod tests;
 
 // Fixed lower financial fixtures share the original borrower and per-loan payment state.
 #[cfg(test)]
-pub(super) fn fixture_call_paid(work:&mut BorrowedReplayWork<'_>, payment:&mut CalendarPaymentState, request:CalendarRequest)->Result<CalendarResponse, ReplayCalendarCallFailure>{
+pub(super) fn fixture_call_paid(
+    work: &mut BorrowedReplayWork<'_>,
+    payment: &mut CalendarPaymentState,
+    request: CalendarRequest,
+) -> Result<CalendarResponse, ReplayCalendarCallFailure> {
     call_paid(work, payment, request)
 }

@@ -125,18 +125,30 @@ fn find(
     Ok(None)
 }
 fn result_hash(revision: &SnapshotRevision) -> Result<String, LedgerError> {
-    fw::historical(result_hash_with_work(revision, &mut FinancialWork::Historical))
+    fw::historical(result_hash_with_work(
+        revision,
+        &mut FinancialWork::Historical,
+    ))
 }
-fn result_hash_with_work(revision: &SnapshotRevision, work: &mut FinancialWork<'_, '_>) -> fw::Result<String> {
+fn result_hash_with_work(
+    revision: &SnapshotRevision,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<String> {
     work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Snapshot(revision))
 }
 pub(super) fn validate(revision: &SnapshotRevision) -> Result<(), LedgerError> {
     fw::historical(validate_with_work(revision, &mut FinancialWork::Historical))
 }
-pub(super) fn validate_with_work(revision: &SnapshotRevision, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
-    if revision.algorithm != ALGORITHM || revision.target_date != revision.projection.request.as_of
-        || revision.metrics.date != work.history_time(fw::HistoryChrono::Date(revision.target_date))?
-        || result_hash_with_work(revision, work)? != revision.result_hash {
+pub(super) fn validate_with_work(
+    revision: &SnapshotRevision,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
+    if revision.algorithm != ALGORITHM
+        || revision.target_date != revision.projection.request.as_of
+        || revision.metrics.date
+            != work.history_time(fw::HistoryChrono::Date(revision.target_date))?
+        || result_hash_with_work(revision, work)? != revision.result_hash
+    {
         return Err(ledger_history_error(work, LedgerHistoryText::Snapshot)?);
     }
     Ok(())

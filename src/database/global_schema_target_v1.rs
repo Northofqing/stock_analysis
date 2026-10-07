@@ -78,7 +78,11 @@ impl Limits {
             && self.review <= b.review
     }
     fn record(&self, slot: usize) -> u64 {
-        if slot == 0 { self.intent } else { self.event }
+        if slot == 0 {
+            self.intent
+        } else {
+            self.event
+        }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1373,7 +1377,9 @@ mod tests {
     fn test_work(limits: Limits) -> TargetWork {
         TargetWork {
             metadata: RowsSpecWork::new(limits.metadata, 0, 0),
-            replay_terminal: replay_work::ReplayTerminalState::new(ReplayOwnerInit { _private: () }),
+            replay_terminal: replay_work::ReplayTerminalState::new(ReplayOwnerInit {
+                _private: (),
+            }),
             limits,
             physical: 0,
             journal: 0,
@@ -1449,13 +1455,17 @@ mod tests {
 // domain, options, lifecycle and function bodies remain unchanged.
 impl TargetWork {
     pub(super) fn additive_encode(&mut self, value: &impl Serialize, max: u64) -> Result<Vec<u8>> {
-        if self.limits != Limits::production() { return Err(fail("additive fixed limits changed")); }
+        if self.limits != Limits::production() {
+            return Err(fail("additive fixed limits changed"));
+        }
         let padded = add(max, 1)?;
         let n = encoded_len(value, padded)?;
         self.journal(n)?;
         self.metadata(n)?;
         let mut bytes = prospective::bounded_json(value, padded as usize)?;
-        if bytes.pop() != Some(b'\n') { return Err(fail("additive canonical encoder terminator")); }
+        if bytes.pop() != Some(b'\n') {
+            return Err(fail("additive canonical encoder terminator"));
+        }
         // The actual allocation included the newline; removing it never refunds.
         Ok(bytes)
     }
@@ -1475,7 +1485,9 @@ impl TargetWork {
     }
     pub(super) fn additive_hash_read(&mut self, file: &File) -> Result<u64> {
         let n = io(file.metadata())?.len();
-        if n > self.limits.extent { return Err(fail("additive target extent")); }
+        if n > self.limits.extent {
+            return Err(fail("additive target extent"));
+        }
         self.physical(add(n, 1)?)?;
         self.metadata(64)?;
         Ok(n)
@@ -1495,7 +1507,9 @@ impl TargetWork {
         self.metadata(64)?;
         self.physical(1)?;
         let n = io(file.metadata())?.len();
-        if n > self.limits.extent { return Err(fail("additive sidecar extent exceeded")); }
+        if n > self.limits.extent {
+            return Err(fail("additive sidecar extent exceeded"));
+        }
         Ok(n)
     }
 }
@@ -1509,22 +1523,36 @@ pub(super) fn copy_additive_created(
 ) -> Result<()> {
     let file = permit.take_file()?;
     let options = Options::production();
-    let mut created = CreatedTarget { file, options: &options };
+    let mut created = CreatedTarget {
+        file,
+        options: &options,
+    };
     let mut copy_primary = None;
     let result = source.with_copy_origin(work, |loan, work| {
-        if let Err(error) = loan.copy_to(&mut created, work) { copy_primary = Some(error); }
+        if let Err(error) = loan.copy_to(&mut created, work) {
+            copy_primary = Some(error);
+        }
         // This transports ownership through B's unconditional tail checks; it
         // does not report copy success. The actual copy error below wins.
         Ok(())
     });
     let result = if let Some(primary) = copy_primary {
-        if let Err(error) = result { permit.retain_post_copy_failure(error); }
+        if let Err(error) = result {
+            permit.retain_post_copy_failure(error);
+        }
         Err(primary)
-    } else { result };
+    } else {
+        result
+    };
     let returned = permit.return_file(created.file);
-    if returned { result } else {
+    if returned {
+        result
+    } else {
         // A retains the actual wrong-return diagnostic and File. Preserve an
         // already-owned copy primary instead of replacing it with this failure.
-        match result { Err(primary) => Err(primary), Ok(()) => Err(fail("additive copy File return failed")) }
+        match result {
+            Err(primary) => Err(primary),
+            Ok(()) => Err(fail("additive copy File return failed")),
+        }
     }
 }

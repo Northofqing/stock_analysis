@@ -1,6 +1,9 @@
 //! Independent, explicitly seeded paper account. No live-account balance refresh.
 
 use crate::database::DatabaseManager;
+use crate::trading::paper_replay_financial_work_v1::{
+    self as fw, ClosedFinancialText as Txt, FinancialFailure, FinancialWork,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(test)]
 use diesel::connection::SimpleConnection;
@@ -9,7 +12,6 @@ use diesel::{
     sql_types::{BigInt, Text},
 };
 use serde::{Deserialize, Serialize};
-use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,14 +23,9 @@ pub use execution::{ExecuteIntent, ExecutionPriceQualification, PriceIntent, Val
 #[path = "paper_ledger_adjudication.rs"]
 mod adjudication;
 pub(crate) use adjudication::{
-    parse_raw_timestamp_with_work,
-    raw_decision_prefix_with_work,
-    raw_contradiction_with_work,
-    AdjudText,
-    RecomputeFill,
+    parse_raw_timestamp_with_work, raw_contradiction_with_work, raw_decision_prefix_with_work,
+    sort_recompute_fills_owner, sort_recompute_markets_owner, AdjudText, RecomputeFill,
     RecomputeMarket,
-    sort_recompute_fills_owner,
-    sort_recompute_markets_owner
 };
 pub use adjudication::{
     AccountProjectionImpact, Adjudication, AdjudicationAction, AdjudicationPreview,
@@ -36,16 +33,12 @@ pub use adjudication::{
 };
 #[path = "paper_effective_fills.rs"]
 mod effective;
-pub(crate) use effective::{
-    copy_economic_fill,
-    OrderedEconomic,
-    sort_economic_owner
-};
+pub(crate) use effective::{copy_economic_fill, sort_economic_owner, OrderedEconomic};
+pub(crate) use effective::{observe_actual_parent_fills, RecordedPaperV2EffectiveFillSet};
 pub use effective::{
     EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, EffectiveProjectionReceipt,
     FillAuthority, FillLineage, VerifiedEffectiveFillSet,
 };
-pub(crate) use effective::{observe_actual_parent_fills, RecordedPaperV2EffectiveFillSet};
 #[path = "paper_ledger_snapshot.rs"]
 mod snapshot;
 pub use snapshot::SnapshotRevision;
@@ -244,7 +237,10 @@ impl SeedManifest {
     pub fn binding(&self) -> Result<AccountBinding, LedgerError> {
         fw::historical(self.binding_with_work(&mut FinancialWork::Historical))
     }
-    pub(crate) fn binding_with_work(&self, work: &mut FinancialWork<'_, '_>) -> fw::Result<AccountBinding> {
+    pub(crate) fn binding_with_work(
+        &self,
+        work: &mut FinancialWork<'_, '_>,
+    ) -> fw::Result<AccountBinding> {
         Ok(AccountBinding {
             account_id: work.copy(&self.account_id)?,
             epoch_id: work.copy(&self.epoch_id)?,
@@ -279,7 +275,7 @@ pub struct Projection {
     economic_unavailable: Option<String>,
 }
 impl Projection {
-    pub(crate) fn replay_unavailable_reason(&self)->Option<&str>{
+    pub(crate) fn replay_unavailable_reason(&self) -> Option<&str> {
         self.economic_unavailable.as_deref()
     }
 
@@ -288,8 +284,10 @@ impl Projection {
     }
     fn require_available_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
         w.finish()?;
-        if self.economic_unavailable.is_some(){
-            return Err(LedgerError::EvidenceUnavailable(w.text(Txt::EconomicUnavailable(self))?).into());
+        if self.economic_unavailable.is_some() {
+            return Err(
+                LedgerError::EvidenceUnavailable(w.text(Txt::EconomicUnavailable(self))?).into(),
+            );
         }
         Ok(())
     }
@@ -299,7 +297,7 @@ impl Projection {
     pub(crate) fn equity_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<Money> {
         w.finish()?;
         self.lots.iter().try_fold(self.cash, |equity, lot| {
-            let mark=w.option(self.marks.get(&lot.code), Txt::MissingMark(lot))?;
+            let mark = w.option(self.marks.get(&lot.code), Txt::MissingMark(lot))?;
             Ok(equity.add(mark.price.mul(lot.quantity)?)?)
         })
     }
@@ -310,7 +308,10 @@ impl Projection {
     pub fn inventory_fingerprint(&self) -> Result<String, LedgerError> {
         fw::historical(self.inventory_fingerprint_with_work(&mut FinancialWork::Historical))
     }
-    pub(crate) fn inventory_fingerprint_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<String> {
+    pub(crate) fn inventory_fingerprint_with_work(
+        &self,
+        w: &mut FinancialWork<'_, '_>,
+    ) -> fw::Result<String> {
         w.finish()?;
         w.fixed_hash(fw::ClosedFinancialHash::Inventory(&self.lots))
     }
@@ -754,23 +755,53 @@ fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerEr
     Ok(())
 }
 fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
-    fw::historical(seed_projection_with_work(seed, &mut FinancialWork::Historical))
+    fw::historical(seed_projection_with_work(
+        seed,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn seed_projection_with_work(seed: &SeedManifest, w: &mut FinancialWork<'_, '_>) -> fw::Result<Projection> {
+pub(crate) fn seed_projection_with_work(
+    seed: &SeedManifest,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<Projection> {
     w.finish()?;
-    if [ &seed.account_id, &seed.epoch_id, &seed.command_id, &seed.source_reference, &seed.approved_by, ] .iter() .any(|v| v.trim().is_empty()) || seed.source_hash.len() != 64 || !seed.source_hash.bytes().all(|c| c.is_ascii_hexdigit()) || seed.account_effective_at != seed.positions_effective_at || seed.account_effective_at != seed.cutover_at || seed.cash < Money::ZERO || seed .excluded_residual .is_some_and(|residual| residual < Money::ZERO) || seed.policy.max_position_bps > 10000 || seed.policy.cash_floor_bps > 10000 {
-        return Err(w.error(Txt::Seed(fw::SeedText::InvalidSeedIdentityEffectiveTimeOrPolicy))?);
+    if [
+        &seed.account_id,
+        &seed.epoch_id,
+        &seed.command_id,
+        &seed.source_reference,
+        &seed.approved_by,
+    ]
+    .iter()
+    .any(|v| v.trim().is_empty())
+        || seed.source_hash.len() != 64
+        || !seed.source_hash.bytes().all(|c| c.is_ascii_hexdigit())
+        || seed.account_effective_at != seed.positions_effective_at
+        || seed.account_effective_at != seed.cutover_at
+        || seed.cash < Money::ZERO
+        || seed
+            .excluded_residual
+            .is_some_and(|residual| residual < Money::ZERO)
+        || seed.policy.max_position_bps > 10000
+        || seed.policy.cash_floor_bps > 10000
+    {
+        return Err(w.error(Txt::Seed(
+            fw::SeedText::InvalidSeedIdentityEffectiveTimeOrPolicy,
+        ))?);
     }
     let next = w.calendar_next(day(seed.cutover_at))?;
     let mut marks = BTreeMap::new();
     for mark in &seed.marks {
-        if mark.price <= Money::ZERO || mark.observed_at != seed.cutover_at || mark.source.trim().is_empty() || {
-            let key=w.copy(&mark.code)?;
-            let value=w.copy(mark)?;
-            let duplicate=marks.contains_key(&key);
-            w.insert(&mut marks, key, value)?;
-            duplicate
-        }
+        if mark.price <= Money::ZERO
+            || mark.observed_at != seed.cutover_at
+            || mark.source.trim().is_empty()
+            || {
+                let key = w.copy(&mark.code)?;
+                let value = w.copy(mark)?;
+                let duplicate = marks.contains_key(&key);
+                w.insert(&mut marks, key, value)?;
+                duplicate
+            }
         {
             return Err(w.error(Txt::Seed(fw::SeedText::InvalidSeedMark))?);
         }
@@ -780,17 +811,23 @@ pub(crate) fn seed_projection_with_work(seed: &SeedManifest, w: &mut FinancialWo
         if lot.quantity == 0 || !lot.quantity.is_multiple_of(100) || lot.code.trim().is_empty() {
             return Err(w.error(Txt::Seed(fw::SeedText::InvalidSeedLot))?);
         }
-        let mark = w.option(marks.get(&lot.code), Txt::Seed(fw::SeedText::SeedLotMarkMissing))?;
+        let mark = w.option(
+            marks.get(&lot.code),
+            Txt::Seed(fw::SeedText::SeedLotMarkMissing),
+        )?;
         let sellable_from = match lot.sellable_from {
-            Some(date) if lot .sellability_evidence .as_ref() .is_some_and(|e| !e.trim().is_empty()) => {
+            Some(date)
+                if lot
+                    .sellability_evidence
+                    .as_ref()
+                    .is_some_and(|e| !e.trim().is_empty()) =>
+            {
                 date
             }
             None => next,
-            _ => {
-                return Err(w.error(Txt::Seed(fw::SeedText::ExplicitSellabilityLacksEvidence))?)
-            }
+            _ => return Err(w.error(Txt::Seed(fw::SeedText::ExplicitSellabilityLacksEvidence))?),
         };
-        let incoming=Lot {
+        let incoming = Lot {
             lot_id: w.text(Txt::SeedLotOrdinal(i))?,
             code: w.copy(&lot.code)?,
             name: w.copy(&lot.name)?,
@@ -803,11 +840,11 @@ pub(crate) fn seed_projection_with_work(seed: &SeedManifest, w: &mut FinancialWo
         };
         w.push(&mut lots, incoming)?;
     }
-    let mut codes=std::collections::BTreeSet::new();
+    let mut codes = std::collections::BTreeSet::new();
     for lot in &lots {
         w.set(&mut codes, lot.code.as_str())?;
     }
-    if marks.len()!=codes.len() {
+    if marks.len() != codes.len() {
         return Err(w.error(Txt::Seed(fw::SeedText::SeedMarkCoverageMismatch))?);
     }
     let mut projection = Projection {
@@ -822,7 +859,10 @@ pub(crate) fn seed_projection_with_work(seed: &SeedManifest, w: &mut FinancialWo
         economic_unavailable: None,
     };
     projection.seed_equity = projection.equity_with_work(w)?;
-    if projection.seed_equity <= Money::ZERO || seed.original_total.sub(projection.seed_equity)? != seed.excluded_residual.unwrap_or(Money::ZERO) {
+    if projection.seed_equity <= Money::ZERO
+        || seed.original_total.sub(projection.seed_equity)?
+            != seed.excluded_residual.unwrap_or(Money::ZERO)
+    {
         return Err(w.error(Txt::Seed(fw::SeedText::UnapprovedSeedResidualEmptyEquity))?);
     }
     Ok(projection)
@@ -1011,12 +1051,25 @@ fn replay_through_inner(
         if until.is_some_and(|version| row.seq > version) {
             break;
         }
-        let pending = fw::historical(validate_next_original_event(binding, &mut cursor, row, &mut work))?;
+        let pending = fw::historical(validate_next_original_event(
+            binding,
+            &mut cursor,
+            row,
+            &mut work,
+        ))?;
         if let Fact::AdjudicatedV1(ruling) = &pending.fact {
             adjudication::verify_ruling(
-                conn, binding, pending.version, &cursor.previous, ruling,
-                catalog_already_verified, audit_guard.as_deref_mut(),
-                cursor.state.as_ref().ok_or_else(|| LedgerError::IntegrityFailure("ruling before genesis".into()))?,
+                conn,
+                binding,
+                pending.version,
+                &cursor.previous,
+                ruling,
+                catalog_already_verified,
+                audit_guard.as_deref_mut(),
+                cursor
+                    .state
+                    .as_ref()
+                    .ok_or_else(|| LedgerError::IntegrityFailure("ruling before genesis".into()))?,
             )?;
         }
         fw::historical(apply_original_pending(&mut cursor, pending, &mut work))?;
@@ -1035,49 +1088,98 @@ struct OriginalPending {
     row: EventRow,
     version: i64,
 }
-fn start_original_replay(binding: &AccountBinding, account: &AccountRow, work: &mut FinancialWork<'_, '_>) -> fw::Result<OriginalReplayCursor> {
+fn start_original_replay(
+    binding: &AccountBinding,
+    account: &AccountRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<OriginalReplayCursor> {
     let manifest: SeedManifest = work.decode(account.manifest_bytes.as_bytes())?;
-    if account.epoch_id != binding.epoch_id || account.manifest_hash != binding.manifest_hash || manifest.binding_with_work(work)? != *binding {
+    if account.epoch_id != binding.epoch_id
+        || account.manifest_hash != binding.manifest_hash
+        || manifest.binding_with_work(work)? != *binding
+    {
         return Err(LedgerError::InactiveEpoch.into());
     }
     Ok(OriginalReplayCursor {
-        manifest, previous: work.history_text(fw::HistoryText::Ledger(LedgerHistoryText::Genesis))?, state: None, version: 0
+        manifest,
+        previous: work.history_text(fw::HistoryText::Ledger(LedgerHistoryText::Genesis))?,
+        state: None,
+        version: 0,
     })
 }
-fn validate_next_original_event(binding: &AccountBinding, cursor: &mut OriginalReplayCursor, mut row: EventRow, work: &mut FinancialWork<'_, '_>) -> fw::Result<OriginalPending> {
+fn validate_next_original_event(
+    binding: &AccountBinding,
+    cursor: &mut OriginalReplayCursor,
+    mut row: EventRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<OriginalPending> {
     cursor.version += 1;
-    if !raw_v1_event_link_matches(row.seq, cursor.version, &row.previous_hash, Some(&cursor.previous)) || row.event_hash != work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Event {
-        account: &binding.account_id, seq: row.seq, command: &row.command_id, previous: &cursor.previous, payload: &row.payload,
-    })? {
+    if !raw_v1_event_link_matches(
+        row.seq,
+        cursor.version,
+        &row.previous_hash,
+        Some(&cursor.previous),
+    ) || row.event_hash
+        != work.history_hash(
+            crate::trading::paper_replay_codec_v1::HistoryOutput::Event {
+                account: &binding.account_id,
+                seq: row.seq,
+                command: &row.command_id,
+                previous: &cursor.previous,
+                payload: &row.payload,
+            },
+        )?
+    {
         return Err(ledger_history_error(work, LedgerHistoryText::EventChain)?);
     }
     let fact: Fact = work.decode(row.payload.as_bytes())?;
     let indexed = match &fact {
-        Fact::Order(order) => (Some(work.copy(&order.plan_id)?), Some(work.copy(&order.intent_hash)?), i64::from(order.status != LedgerStatus::Rejected), order.paper_trade_id, Some(order.audit.id)),
+        Fact::Order(order) => (
+            Some(work.copy(&order.plan_id)?),
+            Some(work.copy(&order.intent_hash)?),
+            i64::from(order.status != LedgerStatus::Rejected),
+            order.paper_trade_id,
+            Some(order.audit.id),
+        ),
         _ => (None, None, 0, None, None),
     };
-    if indexed != (row.business_plan_id.take(), row.intent_hash.take(), row.is_terminal, row.paper_trade_id, row.order_audit_id) {
+    if indexed
+        != (
+            row.business_plan_id.take(),
+            row.intent_hash.take(),
+            row.is_terminal,
+            row.paper_trade_id,
+            row.order_audit_id,
+        )
+    {
         return Err(ledger_history_error(work, LedgerHistoryText::Metadata)?);
     }
     Ok(OriginalPending {
-        fact, row, version: cursor.version
+        fact,
+        row,
+        version: cursor.version,
     })
 }
 // Private to this owner: its SQL orchestrator verifies a ruling between the
 // pending step and this application. No Target/capability entry is introduced.
-fn apply_original_pending(cursor: &mut OriginalReplayCursor, pending: OriginalPending, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+fn apply_original_pending(
+    cursor: &mut OriginalReplayCursor,
+    pending: OriginalPending,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     match pending.fact {
-        Fact::Seeded {
-            manifest: seed,
-            ..
-        }
-        if pending.version == 1 && seed == cursor.manifest => {
+        Fact::Seeded { manifest: seed, .. } if pending.version == 1 && seed == cursor.manifest => {
             cursor.state = Some(seed_projection_with_work(&seed, work)?);
         }
         fact if pending.version > 1 => {
             let state = match cursor.state.as_mut() {
                 Some(state) => state,
-                None => return Err(ledger_history_error(work, LedgerHistoryText::MissingGenesis)?),
+                None => {
+                    return Err(ledger_history_error(
+                        work,
+                        LedgerHistoryText::MissingGenesis,
+                    )?)
+                }
             };
             execution::apply_fact_with_work(state, &fact, work)?;
         }
@@ -1086,18 +1188,35 @@ fn apply_original_pending(cursor: &mut OriginalReplayCursor, pending: OriginalPe
     cursor.previous = pending.row.event_hash;
     Ok(())
 }
-fn finish_original_events(cursor: OriginalReplayCursor, work: &mut FinancialWork<'_, '_>) -> fw::Result<PaperView> {
+fn finish_original_events(
+    cursor: OriginalReplayCursor,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<PaperView> {
     let projection = match cursor.state {
         Some(state) => state,
-        None => return Err(ledger_history_error(work, LedgerHistoryText::MissingGenesis)?),
+        None => {
+            return Err(ledger_history_error(
+                work,
+                LedgerHistoryText::MissingGenesis,
+            )?)
+        }
     };
     Ok(PaperView {
-        version: cursor.version, event_hash: cursor.previous, projection
+        version: cursor.version,
+        event_hash: cursor.previous,
+        projection,
     })
 }
 #[derive(Clone, Copy)]
 pub(crate) enum LedgerHistoryText {
-    Genesis, EventChain, Metadata, MissingGenesis, GenesisOrder, Snapshot, HeadMismatch, LegacySeed,
+    Genesis,
+    EventChain,
+    Metadata,
+    MissingGenesis,
+    GenesisOrder,
+    Snapshot,
+    HeadMismatch,
+    LegacySeed,
 }
 impl LedgerHistoryText {
     pub(crate) fn write(self, out: &mut fw::FinancialSink<'_>) -> Result<(), ()> {
@@ -1113,11 +1232,17 @@ impl LedgerHistoryText {
         })
     }
 }
-fn ledger_history_error(work: &mut FinancialWork<'_, '_>, text: LedgerHistoryText) -> fw::Result<FinancialFailure> {
+fn ledger_history_error(
+    work: &mut FinancialWork<'_, '_>,
+    text: LedgerHistoryText,
+) -> fw::Result<FinancialFailure> {
     Ok(LedgerError::IntegrityFailure(work.history_text(fw::HistoryText::Ledger(text))?).into())
 }
 
-fn head(conn: &mut SqliteConnection, binding: &AccountBinding) -> Result<Option<HeadRow>, LedgerError> {
+fn head(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+) -> Result<Option<HeadRow>, LedgerError> {
     match V1ReadSource::Historical(conn).head(binding) {
         Ok(row) => Ok(row),
         Err(V1RowsError::Historical(error)) => Err(error),
@@ -1152,12 +1277,27 @@ fn load_inner_with_audit_guard(
     let head = head(conn, binding)?.ok_or_else(|| {
         LedgerError::IntegrityFailure("missing projection; explicit repair required".into())
     })?;
-    fw::historical(compare_original_head(&view, &head, &mut FinancialWork::Historical))?;
+    fw::historical(compare_original_head(
+        &view,
+        &head,
+        &mut FinancialWork::Historical,
+    ))?;
     Ok(view)
 }
 
-fn compare_original_head(view: &PaperView, head: &HeadRow, work: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
-    if !raw_v1_head_link_matches(head.version, &head.event_hash, view.version, &view.event_hash) || head.projection_hash != work.raw_hash(head.projection_bytes.as_bytes())? || !work.canonical_equal(&view.projection, head.projection_bytes.as_bytes())? {
+fn compare_original_head(
+    view: &PaperView,
+    head: &HeadRow,
+    work: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
+    if !raw_v1_head_link_matches(
+        head.version,
+        &head.event_hash,
+        view.version,
+        &view.event_hash,
+    ) || head.projection_hash != work.raw_hash(head.projection_bytes.as_bytes())?
+        || !work.canonical_equal(&view.projection, head.projection_bytes.as_bytes())?
+    {
         return Err(ledger_history_error(work, LedgerHistoryText::HeadMismatch)?);
     }
     Ok(())
@@ -1173,11 +1313,7 @@ pub(crate) fn verified_v1_snapshot_on(
     binding: &AccountBinding,
 ) -> Result<VerifiedV1Snapshot, LedgerError> {
     conn.transaction(|conn| {
-        verified_v1_snapshot_with_audit_guard_on(
-            conn,
-            binding,
-            &mut V1AuditReplayGuard::default(),
-        )
+        verified_v1_snapshot_with_audit_guard_on(conn, binding, &mut V1AuditReplayGuard::default())
     })
 }
 
@@ -3457,7 +3593,7 @@ pub(crate) fn replay_codec_nonfinite(
 }
 
 #[cfg(test)]
-pub(crate) fn transition_v1_fixture(state:Projection, w:&mut FinancialWork<'_, '_>){
+pub(crate) fn transition_v1_fixture(state: Projection, w: &mut FinancialWork<'_, '_>) {
     execution::transition_fixture(state, w)
 }
 
@@ -3466,29 +3602,34 @@ pub(crate) fn history_owner_fixture(
     case: crate::trading::paper_replay_history_v1_tests::Case,
     work: &mut FinancialWork<'_, '_>,
 ) {
-    use crate::trading::paper_replay_history_v1_tests::{
-        self as test,
-        Case
-    };
+    use crate::trading::paper_replay_history_v1_tests::{self as test, Case};
     let seed = test::seed();
     let binding = seed.binding().unwrap();
     let account = AccountRow {
-        epoch_id: seed.epoch_id.clone(), manifest_hash: binding.manifest_hash.clone(),
+        epoch_id: seed.epoch_id.clone(),
+        manifest_hash: binding.manifest_hash.clone(),
         manifest_bytes: encode(&seed).unwrap(),
     };
     let marked = ValuationBatch {
-        binding: binding.clone(), command_id: "history-mark".into(), expected_version: 1,
-        inventory_fingerprint: seed_projection(&seed).unwrap().inventory_fingerprint().unwrap(),
-        as_of: test::at(), closing: true,
+        binding: binding.clone(),
+        command_id: "history-mark".into(),
+        expected_version: 1,
+        inventory_fingerprint: seed_projection(&seed)
+            .unwrap()
+            .inventory_fingerprint()
+            .unwrap(),
+        as_of: test::at(),
+        closing: true,
         marks: vec![Mark {
-            price: Money::from_micros(11_000_000), ..seed.marks[0].clone()
+            price: Money::from_micros(11_000_000),
+            ..seed.marks[0].clone()
         }],
     };
     let facts = [
         Fact::Seeded {
             manifest: seed.clone(),
             legacy_high_water_id: 0,
-            legacy_audit_high_water: "0".into()
+            legacy_audit_high_water: "0".into(),
         },
         Fact::Marked(marked),
     ];
@@ -3497,11 +3638,25 @@ pub(crate) fn history_owner_fixture(
     for (index, fact) in facts.iter().enumerate() {
         let command = format!("history-command-{index}");
         let payload = encode(fact).unwrap();
-        let hash = event_hash(&binding.account_id, index as i64 + 1, &command, &previous, &payload).unwrap();
+        let hash = event_hash(
+            &binding.account_id,
+            index as i64 + 1,
+            &command,
+            &previous,
+            &payload,
+        )
+        .unwrap();
         events.push(EventRow {
-            seq: index as i64 + 1, command_id: command, previous_hash: previous,
-            event_hash: hash.clone(), payload, business_plan_id: None, intent_hash: None,
-            is_terminal: 0, paper_trade_id: None, order_audit_id: None,
+            seq: index as i64 + 1,
+            command_id: command,
+            previous_hash: previous,
+            event_hash: hash.clone(),
+            payload,
+            business_plan_id: None,
+            intent_hash: None,
+            is_terminal: 0,
+            paper_trade_id: None,
+            order_audit_id: None,
         });
         previous = hash;
     }
@@ -3511,7 +3666,9 @@ pub(crate) fn history_owner_fixture(
     }
     if matches!(case, Case::Serialization) {
         let snapshot = crate::trading::paper_replay_codec_v1::fixed_snapshot_fixture();
-        let Fact::DerivedSnapshotV1(mut revision) = decode(&String::from_utf8(snapshot).unwrap()).unwrap() else {
+        let Fact::DerivedSnapshotV1(mut revision) =
+            decode(&String::from_utf8(snapshot).unwrap()).unwrap()
+        else {
             panic!("fixed snapshot");
         };
         revision.algorithm = "PaperSnapshotNetFifoV1".into();
@@ -3526,48 +3683,88 @@ pub(crate) fn history_owner_fixture(
         let mut state = work.copy(&original_state).unwrap();
         let fact = Fact::DerivedSnapshotV1(revision.clone());
         execution::apply_fact_with_work(&mut state, &fact, work).unwrap();
-        assert_eq!(state, original_state, "a valid different receipt is validated, never applied as Projection");
+        assert_eq!(
+            state, original_state,
+            "a valid different receipt is validated, never applied as Projection"
+        );
         for broken_algorithm in [true, false] {
             let mut invalid = revision.clone();
             if broken_algorithm {
                 invalid.algorithm = "wrong".into();
-            }
-            else {
+            } else {
                 invalid.result_hash = "different".into();
             }
             let expected = snapshot::validate(&invalid).unwrap_err();
             let actual = snapshot::validate_with_work(&invalid, work).unwrap_err();
-            assert!(matches!(actual, FinancialFailure::Financial(LedgerError::IntegrityFailure(ref text))
-                if expected.to_string() == LedgerError::IntegrityFailure(text.clone()).to_string()));
+            assert!(
+                matches!(actual, FinancialFailure::Financial(LedgerError::IntegrityFailure(ref text))
+                if expected.to_string() == LedgerError::IntegrityFailure(text.clone()).to_string())
+            );
         }
-        let expected = encode(&("PaperSnapshotNetFifoV1", revision.target_date, &revision.projection,
-            &revision.metrics, &revision.opening_exclusions, revision.account_realized_pnl)).unwrap();
-        let actual = work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Snapshot(&revision)).unwrap();
+        let expected = encode(&(
+            "PaperSnapshotNetFifoV1",
+            revision.target_date,
+            &revision.projection,
+            &revision.metrics,
+            &revision.opening_exclusions,
+            revision.account_realized_pnl,
+        ))
+        .unwrap();
+        let actual = work
+            .history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Snapshot(&revision))
+            .unwrap();
         assert_eq!(actual, digest(&expected));
         for row in &events {
-            assert_eq!(work.history_hash(crate::trading::paper_replay_codec_v1::HistoryOutput::Event {
-                account: &binding.account_id, seq: row.seq, command: &row.command_id,
-                previous: &row.previous_hash, payload: &row.payload,
-            }).unwrap(), row.event_hash);
+            assert_eq!(
+                work.history_hash(
+                    crate::trading::paper_replay_codec_v1::HistoryOutput::Event {
+                        account: &binding.account_id,
+                        seq: row.seq,
+                        command: &row.command_id,
+                        previous: &row.previous_hash,
+                        payload: &row.payload,
+                    }
+                )
+                .unwrap(),
+                row.event_hash
+            );
         }
         return;
     }
-    let mut original = start_original_replay(&binding, &account, &mut FinancialWork::Historical).unwrap();
+    let mut original =
+        start_original_replay(&binding, &account, &mut FinancialWork::Historical).unwrap();
     for row in &events {
-        let copied = EventRow::from_bounded_sql_parts(row.seq, row.command_id.clone(), row.previous_hash.clone(),
-            row.event_hash.clone(), row.payload.clone(), None, None, 0, None, None);
-        let pending = validate_next_original_event(&binding, &mut original, copied, &mut FinancialWork::Historical).unwrap();
+        let copied = EventRow::from_bounded_sql_parts(
+            row.seq,
+            row.command_id.clone(),
+            row.previous_hash.clone(),
+            row.event_hash.clone(),
+            row.payload.clone(),
+            None,
+            None,
+            0,
+            None,
+            None,
+        );
+        let pending = validate_next_original_event(
+            &binding,
+            &mut original,
+            copied,
+            &mut FinancialWork::Historical,
+        )
+        .unwrap();
         apply_original_pending(&mut original, pending, &mut FinancialWork::Historical).unwrap();
     }
     let original = finish_original_events(original, &mut FinancialWork::Historical).unwrap();
     let head = HeadRow {
-        version: original.version, event_hash: original.event_hash.clone(),
-        projection_bytes: encode(&original.projection).unwrap(), projection_hash: digest(&encode(&original.projection).unwrap()),
+        version: original.version,
+        event_hash: original.event_hash.clone(),
+        projection_bytes: encode(&original.projection).unwrap(),
+        projection_hash: digest(&encode(&original.projection).unwrap()),
     };
     let passes = if matches!(case, Case::Gen1Double) {
         2
-    }
-    else {
+    } else {
         1
     };
     for _ in 0..passes {
@@ -3576,8 +3773,18 @@ pub(crate) fn history_owner_fixture(
         for row in &events {
             // Fixtures supply retained rows as data. This constructor does not
             // establish SQL source payment or a provider/Target capability.
-            let copied = EventRow::from_bounded_sql_parts(row.seq, row.command_id.clone(), row.previous_hash.clone(),
-                row.event_hash.clone(), row.payload.clone(), None, None, 0, None, None);
+            let copied = EventRow::from_bounded_sql_parts(
+                row.seq,
+                row.command_id.clone(),
+                row.previous_hash.clone(),
+                row.event_hash.clone(),
+                row.payload.clone(),
+                None,
+                None,
+                0,
+                None,
+                None,
+            );
             let pending = validate_next_original_event(&binding, &mut paid, copied, work).unwrap();
             apply_original_pending(&mut paid, pending, work).unwrap();
         }
@@ -3585,7 +3792,10 @@ pub(crate) fn history_owner_fixture(
         assert_eq!(paid.version, 2);
         assert_eq!(paid.projection, original.projection);
         assert_eq!(paid.event_hash, original.event_hash);
-        assert_eq!(paid.projection.marks["600001"].price, Money::from_micros(11_000_000));
+        assert_eq!(
+            paid.projection.marks["600001"].price,
+            Money::from_micros(11_000_000)
+        );
         assert_eq!(paid.projection.closes.len(), 1);
         compare_original_head(&paid, &head, work).unwrap();
         assert!(work.history_used() > used);
@@ -3596,7 +3806,9 @@ pub(crate) fn history_owner_fixture(
 }
 
 #[cfg(test)]
-pub(crate) fn history_raw_fixture<'loan, 'pool>(work: FinancialWork<'loan, 'pool>) -> FinancialWork<'loan, 'pool> {
+pub(crate) fn history_raw_fixture<'loan, 'pool>(
+    work: FinancialWork<'loan, 'pool>,
+) -> FinancialWork<'loan, 'pool> {
     adjudication::history_raw_fixture(work)
 }
 
@@ -3611,12 +3823,18 @@ pub(crate) fn history_legacy_fixture<'loan, 'pool>(
 // None is the actual first-event domain constant; old replay supplies its
 // existing paid cursor.previous, preserving its exact short-circuit position.
 pub(crate) fn raw_v1_event_link_matches(
-    sequence: i64, expected_sequence: i64, previous: &str, previous_event_hash: Option<&str>,
+    sequence: i64,
+    expected_sequence: i64,
+    previous: &str,
+    previous_event_hash: Option<&str>,
 ) -> bool {
     sequence == expected_sequence && previous == previous_event_hash.unwrap_or(GENESIS)
 }
 pub(crate) fn raw_v1_head_link_matches(
-    head_version: i64, head_hash: &str, last_version: i64, last_event_hash: &str,
+    head_version: i64,
+    head_hash: &str,
+    last_version: i64,
+    last_event_hash: &str,
 ) -> bool {
     head_version == last_version && head_hash == last_event_hash
 }

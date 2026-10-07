@@ -24,6 +24,6 @@ pub mod veto_rules_live;
 pub mod account_mode;
 pub mod action_gate;
 
+mod veto_execution_engine_v1;
 /// Observed execution diagnostics; no risk approval capability.
 pub mod veto_execution_report_v1;
-mod veto_execution_engine_v1;

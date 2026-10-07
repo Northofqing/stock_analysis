@@ -1,34 +1,45 @@
 //! Ordinary-cfg lower mechanics, using the actual persistent test borrower.
 //! Fixtures are owned inputs, not SQL origin, layout/provider or identity proof.
 use super::paper_replay_financial_work_v1::{
-    self as fw,
-    FinancialFailure,
-    FinancialWork,
-    RawRowFrame
+    self as fw, FinancialFailure, FinancialWork, RawRowFrame,
 };
-use crate::database::global_schema_v1::replay_work::{
-    self as work,
-    ReplayTerminalFailure
-};
-use chrono::{
-    NaiveDate,
-    TimeZone,
-    Utc
-};
-use sha2::{
-    Digest,
-    Sha256
-};
+use crate::database::global_schema_v1::replay_work::{self as work, ReplayTerminalFailure};
+use chrono::{NaiveDate, TimeZone, Utc};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Case {
     Boundary(Boundary),
     Qualification,
     FloatSink,
-    RawErrorShort, RawCurrent, RawUnused, RawExtras, RawNumbers, RawDepth, RawUnicode,
-    RawPositions, RawRoots, RawExact, RawShort, Cumulative, Identity,
-    SourceLower, SourceErrors, SourceBoundaries, AuditKnown, OriginalReplay, Gen1Double,
-    Adjudication, LegacyFifo, LegacyHistory, Serialization, CloneOrder, Chrono, HashDuplicates, SortBranches, QueueGrowth,
+    RawErrorShort,
+    RawCurrent,
+    RawUnused,
+    RawExtras,
+    RawNumbers,
+    RawDepth,
+    RawUnicode,
+    RawPositions,
+    RawRoots,
+    RawExact,
+    RawShort,
+    Cumulative,
+    Identity,
+    SourceLower,
+    SourceErrors,
+    SourceBoundaries,
+    AuditKnown,
+    OriginalReplay,
+    Gen1Double,
+    Adjudication,
+    LegacyFifo,
+    LegacyHistory,
+    Serialization,
+    CloneOrder,
+    Chrono,
+    HashDuplicates,
+    SortBranches,
+    QueueGrowth,
 }
 
 #[test]
@@ -152,7 +163,10 @@ fn history_chrono_fixed_recipes_match_boundaries_and_fractional_widths() {
     work::history_fixture(Case::Chrono);
 }
 
-fn paid_row<'loan, 'pool>(raw: &str, work: FinancialWork<'loan, 'pool>) -> RawRowFrame<'loan, 'pool> {
+fn paid_row<'loan, 'pool>(
+    raw: &str,
+    work: FinancialWork<'loan, 'pool>,
+) -> RawRowFrame<'loan, 'pool> {
     match RawRowFrame::fixture_copy(raw, work) {
         Ok(frame) => frame,
         Err((error, _)) => panic!("unexpected paid raw request refusal: {error:?}"),
@@ -160,24 +174,39 @@ fn paid_row<'loan, 'pool>(raw: &str, work: FinancialWork<'loan, 'pool>) -> RawRo
 }
 fn ledger_error(error: FinancialFailure) -> String {
     match error {
-        FinancialFailure::Financial(super::paper_ledger::LedgerError::IntegrityFailure(text)) => text,
+        FinancialFailure::Financial(super::paper_ledger::LedgerError::IntegrityFailure(text)) => {
+            text
+        }
         other => panic!("expected exact raw syntax error, got {other:?}"),
     }
 }
-fn raw_oracle<'loan, 'pool>(raw: &str, work: FinancialWork<'loan, 'pool>) -> FinancialWork<'loan, 'pool> {
+fn raw_oracle<'loan, 'pool>(
+    raw: &str,
+    work: FinancialWork<'loan, 'pool>,
+) -> FinancialWork<'loan, 'pool> {
     let original = serde_json::from_str::<Vec<serde_json::Value>>(raw);
     let mut frame = paid_row(raw, work);
     {
         let mut scan = frame.scan().unwrap();
         match original {
-            Err(error) => assert_eq!(ledger_error(scan.require_decoded().unwrap_err()), error.to_string(), "{raw:?}"),
+            Err(error) => assert_eq!(
+                ledger_error(scan.require_decoded().unwrap_err()),
+                error.to_string(),
+                "{raw:?}"
+            ),
             Ok(values) => {
                 assert_eq!(scan.len().unwrap(), values.len());
                 for (index, value) in values.iter().take(15).enumerate() {
                     assert_eq!(scan.is_null(index).unwrap(), value.is_null());
                     assert_eq!(scan.text(index).unwrap().as_deref(), value.as_str());
-                    assert_eq!(scan.number(index).unwrap().map(|n| n.as_f64().to_bits()), value.as_f64().map(f64::to_bits));
-                    assert_eq!(scan.number(index).unwrap().and_then(|n| n.as_u64()), value.as_u64());
+                    assert_eq!(
+                        scan.number(index).unwrap().map(|n| n.as_f64().to_bits()),
+                        value.as_f64().map(f64::to_bits)
+                    );
+                    assert_eq!(
+                        scan.number(index).unwrap().and_then(|n| n.as_u64()),
+                        value.as_u64()
+                    );
                 }
             }
         }
@@ -190,7 +219,10 @@ fn resource(error: FinancialFailure) -> ReplayTerminalFailure {
         other => panic!("expected resource failure: {other:?}"),
     }
 }
-fn retry_copy<'loan, 'pool>(work: FinancialWork<'loan, 'pool>, raw: &str) -> FinancialWork<'loan, 'pool> {
+fn retry_copy<'loan, 'pool>(
+    work: FinancialWork<'loan, 'pool>,
+    raw: &str,
+) -> FinancialWork<'loan, 'pool> {
     let (first, work) = match RawRowFrame::fixture_copy(raw, work) {
         Err(pair) => pair,
         Ok(_) => panic!("expected pre-owned refusal"),
@@ -209,12 +241,17 @@ fn retry_copy<'loan, 'pool>(work: FinancialWork<'loan, 'pool>, raw: &str) -> Fin
     work
 }
 
-pub(crate) fn run<'loan, 'pool>(case: Case, mut work: FinancialWork<'loan, 'pool>) -> FinancialWork<'loan, 'pool> {
+pub(crate) fn run<'loan, 'pool>(
+    case: Case,
+    mut work: FinancialWork<'loan, 'pool>,
+) -> FinancialWork<'loan, 'pool> {
     match case {
         Case::Boundary(_) | Case::Qualification | Case::FloatSink => unreachable!(),
         Case::RawErrorShort => {
             let raw = format!("\"{}\"", "a".repeat(8 * 1024 * 1024));
-            let expected = serde_json::from_str::<Vec<serde_json::Value>>(&raw).unwrap_err().to_string();
+            let expected = serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+                .unwrap_err()
+                .to_string();
             let expected_used = (raw.len() + expected.len()) as u64;
             assert!(expected_used > 16 * 1024 * 1024);
             let mut frame = paid_row(&raw, work);
@@ -228,46 +265,108 @@ pub(crate) fn run<'loan, 'pool>(case: Case, mut work: FinancialWork<'loan, 'pool
             assert_eq!(work.history_used(), expected_used);
             assert_eq!(work.history_entries()[0], 1);
             assert_eq!(work.history_entries()[4], 0);
-            assert!(matches!(work.finish(), Err(FinancialFailure::Terminal(error)) if error == first));
+            assert!(
+                matches!(work.finish(), Err(FinancialFailure::Terminal(error)) if error == first)
+            );
         }
         Case::RawCurrent => work = super::paper_ledger::history_raw_fixture(work),
         Case::RawUnused => {
-            for raw in [r#"[0,{"a":[true,null,{"x":false}],"a":4},[],"unused"]"#,
-                r#"[0,{"a":[true,]},1]"#, r#"[0,{"a":1 "b":2}]"#] {
+            for raw in [
+                r#"[0,{"a":[true,null,{"x":false}],"a":4},[],"unused"]"#,
+                r#"[0,{"a":[true,]},1]"#,
+                r#"[0,{"a":1 "b":2}]"#,
+            ] {
                 work = raw_oracle(raw, work);
             }
         }
         Case::RawExtras => {
-            for raw in ["[]", "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,{\"x\":[]}]",
-                "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,{\"x\":] ]"] {
+            for raw in [
+                "[]",
+                "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,{\"x\":[]}]",
+                "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,{\"x\":] ]",
+            ] {
                 work = raw_oracle(raw, work);
             }
         }
         Case::RawNumbers => {
-            for token in ["0", "-0", "-0.0", "1.234567890123456789", "18446744073709551615", "18446744073709551616",
-                "-9223372036854775808", "-9223372036854775809", "1e308", "1e309", "0e99999999999999", "1e-99999999999999", "1.", "01", "1e+", "--1"] {
+            for token in [
+                "0",
+                "-0",
+                "-0.0",
+                "1.234567890123456789",
+                "18446744073709551615",
+                "18446744073709551616",
+                "-9223372036854775808",
+                "-9223372036854775809",
+                "1e308",
+                "1e309",
+                "0e99999999999999",
+                "1e-99999999999999",
+                "1.",
+                "01",
+                "1e+",
+                "--1",
+            ] {
                 work = raw_oracle(&format!("[{token}]"), work);
             }
         }
         Case::RawDepth => {
             for depth in [126, 127, 128, 129] {
-                work = raw_oracle(&format!("{}0{}", "[".repeat(depth), "]".repeat(depth)), work);
+                work = raw_oracle(
+                    &format!("{}0{}", "[".repeat(depth), "]".repeat(depth)),
+                    work,
+                );
             }
         }
         Case::RawUnicode => {
-            for raw in [r#"["中文","\u4e2d\u6587","\ud83d\ude03","\"\\\/\b\f\n\r\t"]"#,
-                r#"["\ud800"]"#, r#"["\udc00"]"#, r#"["\ud800\u0041"]"#, r#"["\u00xx"]"#,
-                r#"["\x"]"#, "[\"a\u{0001}b\"]"] {
+            for raw in [
+                r#"["中文","\u4e2d\u6587","\ud83d\ude03","\"\\\/\b\f\n\r\t"]"#,
+                r#"["\ud800"]"#,
+                r#"["\udc00"]"#,
+                r#"["\ud800\u0041"]"#,
+                r#"["\u00xx"]"#,
+                r#"["\x"]"#,
+                "[\"a\u{0001}b\"]",
+            ] {
                 work = raw_oracle(raw, work);
             }
         }
         Case::RawPositions => {
-            for raw in ["", " ", "[", "[\n1,\n]", "[true false]", "[\"x\"", "[]\nfalse", "[truX]", "[nul]", "[1e9999,0]", "[\n{\"x\":1,}\n]"] {
+            for raw in [
+                "",
+                " ",
+                "[",
+                "[\n1,\n]",
+                "[true false]",
+                "[\"x\"",
+                "[]\nfalse",
+                "[truX]",
+                "[nul]",
+                "[1e9999,0]",
+                "[\n{\"x\":1,}\n]",
+            ] {
                 work = raw_oracle(raw, work);
             }
         }
         Case::RawRoots => {
-            for raw in ["null", "true", "4", "-2.5", "-0.0", "1e308", "1e-300", "5e-324", "1.7976931348623157e308", "1e-6", "1e16", r#""中文\n""#, r#""a'\u0000\u0301\u2028\u200d\ud83d\ude03""#, "{\"bad\": [", "{}", "false trailing"] {
+            for raw in [
+                "null",
+                "true",
+                "4",
+                "-2.5",
+                "-0.0",
+                "1e308",
+                "1e-300",
+                "5e-324",
+                "1.7976931348623157e308",
+                "1e-6",
+                "1e16",
+                r#""中文\n""#,
+                r#""a'\u0000\u0301\u2028\u200d\ud83d\ude03""#,
+                "{\"bad\": [",
+                "{}",
+                "false trailing",
+            ] {
                 work = raw_oracle(raw, work);
             }
         }
@@ -297,11 +396,19 @@ pub(crate) fn run<'loan, 'pool>(case: Case, mut work: FinancialWork<'loan, 'pool
             work = retry_copy(work, "r");
             assert_eq!(work.history_entries()[0], 8);
         }
-        Case::Identity | Case::SourceLower | Case::SourceErrors | Case::SourceBoundaries | Case::CloneOrder | Case::HashDuplicates | Case::SortBranches =>
-            crate::database::attribution_epochs::history_source_fixture(case, &mut work),
+        Case::Identity
+        | Case::SourceLower
+        | Case::SourceErrors
+        | Case::SourceBoundaries
+        | Case::CloneOrder
+        | Case::HashDuplicates
+        | Case::SortBranches => {
+            crate::database::attribution_epochs::history_source_fixture(case, &mut work)
+        }
         Case::AuditKnown => crate::database::order_audit::history_audit_fixture(&mut work),
-        Case::OriginalReplay | Case::Gen1Double | Case::Adjudication | Case::Serialization =>
-            super::paper_ledger::history_owner_fixture(case, &mut work),
+        Case::OriginalReplay | Case::Gen1Double | Case::Adjudication | Case::Serialization => {
+            super::paper_ledger::history_owner_fixture(case, &mut work)
+        }
         Case::LegacyFifo => fifo_fixture(&mut work),
         Case::LegacyHistory => work = super::paper_ledger::history_legacy_fixture(work),
         Case::QueueGrowth => queue_fixture(&mut work),
@@ -319,94 +426,154 @@ pub(crate) fn at() -> chrono::DateTime<Utc> {
 pub(crate) fn seed() -> super::paper_ledger::SeedManifest {
     use super::paper_ledger::*;
     SeedManifest {
-        account_id: "TEST_CODE_HISTORY_ACCOUNT".into(), epoch_id: "TEST_CODE_HISTORY_EPOCH".into(),
-        command_id: "TEST_CODE_HISTORY_SEED".into(), cutover_at: at(), account_effective_at: at(), positions_effective_at: at(),
-        source_reference: "history lower fixture".into(), source_hash: "a".repeat(64), approved_by: "fixture".into(),
-        cash: Money::from_micros(10_000_000_000), original_total: Money::from_micros(11_000_000_000), excluded_residual: None,
+        account_id: "TEST_CODE_HISTORY_ACCOUNT".into(),
+        epoch_id: "TEST_CODE_HISTORY_EPOCH".into(),
+        command_id: "TEST_CODE_HISTORY_SEED".into(),
+        cutover_at: at(),
+        account_effective_at: at(),
+        positions_effective_at: at(),
+        source_reference: "history lower fixture".into(),
+        source_hash: "a".repeat(64),
+        approved_by: "fixture".into(),
+        cash: Money::from_micros(10_000_000_000),
+        original_total: Money::from_micros(11_000_000_000),
+        excluded_residual: None,
         lots: vec![SeedLot {
-            code: "600001".into(), name: "原始持仓".into(), quantity: 100,
-            reported_cost: None, sellable_from: Some(date()), sellability_evidence: Some("old lot".into())
-            }],
+            code: "600001".into(),
+            name: "原始持仓".into(),
+            quantity: 100,
+            reported_cost: None,
+            sellable_from: Some(date()),
+            sellability_evidence: Some("old lot".into()),
+        }],
         marks: vec![Mark {
-            code: "600001".into(), price: Money::from_micros(10_000_000), observed_at: at(), source: "original mark".into()
+            code: "600001".into(),
+            price: Money::from_micros(10_000_000),
+            observed_at: at(),
+            source: "original mark".into(),
         }],
         policy: RiskPolicyV1::default(),
     }
 }
 fn fifo_fixture(work: &mut FinancialWork<'_, '_>) {
     use crate::performance::economic_position::EconomicFillRow;
-    let rows: Vec<EconomicFillRow> = [(1, "buy", 200, "2026-09-23 10:00:00"),
-        (2, "buy", 100, "2026-09-23 11:00:00"), (3, "sell", 100, "2026-09-24 10:00:00")]
-        .into_iter().map(|(id, direction, quantity, time)| EconomicFillRow {
-            id, plan_id: format!("plan-{id}"), code: "600001".into(), name: "名字".into(), direction: direction.into(),
-            fill_price: Some(10.0), quantity, occurred_at: time.into(), virtual_reason: "decision".into(),
-        }).collect();
-    let expected = crate::performance::attribution_epoch::build_legacy_carry(&rows, date()).unwrap();
-    let actual = crate::performance::attribution_epoch::build_legacy_carry_body(&rows, date(), work).unwrap();
+    let rows: Vec<EconomicFillRow> = [
+        (1, "buy", 200, "2026-09-23 10:00:00"),
+        (2, "buy", 100, "2026-09-23 11:00:00"),
+        (3, "sell", 100, "2026-09-24 10:00:00"),
+    ]
+    .into_iter()
+    .map(|(id, direction, quantity, time)| EconomicFillRow {
+        id,
+        plan_id: format!("plan-{id}"),
+        code: "600001".into(),
+        name: "名字".into(),
+        direction: direction.into(),
+        fill_price: Some(10.0),
+        quantity,
+        occurred_at: time.into(),
+        virtual_reason: "decision".into(),
+    })
+    .collect();
+    let expected =
+        crate::performance::attribution_epoch::build_legacy_carry(&rows, date()).unwrap();
+    let actual =
+        crate::performance::attribution_epoch::build_legacy_carry_body(&rows, date(), work)
+            .unwrap();
     assert_eq!(actual, expected);
     assert_eq!(actual[0].quantity, 200);
     let mut fills = Vec::new();
     for row in &rows {
         fills.push(super::paper_lot_ledger::PaperFill {
-            id: row.id, code: row.code.clone(), name: row.name.clone(), direction: row.direction.clone(),
-            fill_price: row.fill_price, quantity: row.quantity,
-            occurred_at: super::paper_lot_ledger::parse_paper_fill_timestamp(row.id, &row.occurred_at).unwrap(),
+            id: row.id,
+            code: row.code.clone(),
+            name: row.name.clone(),
+            direction: row.direction.clone(),
+            fill_price: row.fill_price,
+            quantity: row.quantity,
+            occurred_at: super::paper_lot_ledger::parse_paper_fill_timestamp(
+                row.id,
+                &row.occurred_at,
+            )
+            .unwrap(),
         });
     }
     let original = super::paper_lot_ledger::rebuild_paper_positions(&fills, date()).unwrap();
-    let actual = super::paper_lot_ledger::rebuild_paper_positions_body(&fills, date(), work).unwrap();
+    let actual =
+        super::paper_lot_ledger::rebuild_paper_positions_body(&fills, date(), work).unwrap();
     assert_eq!(actual, original);
     let mut invalid = fills.clone();
     invalid[2].occurred_at = invalid[1].occurred_at + chrono::Duration::seconds(1);
     let expected = super::paper_lot_ledger::rebuild_paper_positions(&invalid, date()).unwrap_err();
     assert!(expected.contains("T+1"));
-    match super::paper_lot_ledger::rebuild_paper_positions_body(&invalid, date(), work).unwrap_err() {
-        FinancialFailure::History(actual) => assert_eq!(actual, expected), other => panic!("{other:?}"),
+    match super::paper_lot_ledger::rebuild_paper_positions_body(&invalid, date(), work).unwrap_err()
+    {
+        FinancialFailure::History(actual) => assert_eq!(actual, expected),
+        other => panic!("{other:?}"),
     }
 }
 fn chrono_fixture(work: &mut FinancialWork<'_, '_>) {
     use fw::HistoryChrono as C;
-    for raw in ["2026-09-24 10:00:00", "2026-09-24 10:00:00.123456789", "1900-01-01 00:00:00", "1991-09-15 01:59:59"] {
+    for raw in [
+        "2026-09-24 10:00:00",
+        "2026-09-24 10:00:00.123456789",
+        "1900-01-01 00:00:00",
+        "1991-09-15 01:59:59",
+    ] {
         let value = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f").unwrap();
-        for request in [C::Whole(value), C::NaiveNanos(value), C::Date(value.date()), C::UtcMillis(value.and_utc())] {
+        for request in [
+            C::Whole(value),
+            C::NaiveNanos(value),
+            C::Date(value.date()),
+            C::UtcMillis(value.and_utc()),
+        ] {
             assert_eq!(work.history_time(request).unwrap(), request.historical());
         }
-        let fixed = chrono::FixedOffset::east_opt(28_800).unwrap().from_utc_datetime(&value);
-        assert_eq!(work.history_time(C::FixedNanos(fixed)).unwrap(), C::FixedNanos(fixed).historical());
+        let fixed = chrono::FixedOffset::east_opt(28_800)
+            .unwrap()
+            .from_utc_datetime(&value);
+        assert_eq!(
+            work.history_time(C::FixedNanos(fixed)).unwrap(),
+            C::FixedNanos(fixed).historical()
+        );
     }
     let raw = "escaped\\raw 中文\n";
-    assert_eq!(work.raw_hash(raw.as_bytes()).unwrap(), hex::encode(Sha256::digest(raw.as_bytes())));
+    assert_eq!(
+        work.raw_hash(raw.as_bytes()).unwrap(),
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    );
 }
 
 fn queue_fixture(work: &mut FinancialWork<'_, '_>) {
     use super::paper_lot_ledger::{
-        PaperFill,
-        rebuild_paper_positions,
-        rebuild_paper_positions_body
+        rebuild_paper_positions, rebuild_paper_positions_body, PaperFill,
     };
     let mut fills = Vec::new();
     for index in 0..48 {
         let (date, direction) = if index < 12 {
             (23, "buy")
-        }
-            else if index < 20 {
-                (24, "sell")
-            }
-            else if index < 40 {
-                (24, "buy")
-            }
-            else {
-                (25, "sell")
-            };
+        } else if index < 20 {
+            (24, "sell")
+        } else if index < 40 {
+            (24, "buy")
+        } else {
+            (25, "sell")
+        };
         fills.push(PaperFill {
-            id: index + 1, code: "600001".into(), name: if index < 20 {
+            id: index + 1,
+            code: "600001".into(),
+            name: if index < 20 {
                 "a".into()
-            }
-            else {
+            } else {
                 "grown name containing 中文".into()
             },
-            direction: direction.into(), fill_price: Some(10.0), quantity: 100,
-            occurred_at: NaiveDate::from_ymd_opt(2026, 9, date).unwrap().and_hms_opt(10, 0, index as u32).unwrap(),
+            direction: direction.into(),
+            fill_price: Some(10.0),
+            quantity: 100,
+            occurred_at: NaiveDate::from_ymd_opt(2026, 9, date)
+                .unwrap()
+                .and_hms_opt(10, 0, index as u32)
+                .unwrap(),
         });
     }
     let as_of = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
@@ -417,7 +584,10 @@ fn queue_fixture(work: &mut FinancialWork<'_, '_>) {
     assert_eq!(actual[0].total_quantity, 1600);
     let first = work.history_used() - before;
     assert!(first > 0);
-    assert_eq!(rebuild_paper_positions_body(&fills, as_of, work).unwrap(), expected);
+    assert_eq!(
+        rebuild_paper_positions_body(&fills, as_of, work).unwrap(),
+        expected
+    );
     assert_eq!(work.history_used() - before, first * 2);
 }
 
@@ -425,15 +595,28 @@ fn queue_fixture(work: &mut FinancialWork<'_, '_>) {
 // test_borrow. Within a case, prefix/operation/retry share that one borrower.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Boundary {
-    HashExact, HashShort,
-    TerminalExact, TerminalTableShort, TerminalVectorShort,
-    VectorNewExact, VectorNewShort, VectorExact, VectorShort,
-    TreeExact, TreeShort,
-    MarkedExact, MarkedShort,
-    SortExact, SortShort,
-    QueueExact, QueueShort,
-    NameExact, NameShort,
-    ChronoExact, ChronoOffsetShort, ChronoFormatterShort,
+    HashExact,
+    HashShort,
+    TerminalExact,
+    TerminalTableShort,
+    TerminalVectorShort,
+    VectorNewExact,
+    VectorNewShort,
+    VectorExact,
+    VectorShort,
+    TreeExact,
+    TreeShort,
+    MarkedExact,
+    MarkedShort,
+    SortExact,
+    SortShort,
+    QueueExact,
+    QueueShort,
+    NameExact,
+    NameShort,
+    ChronoExact,
+    ChronoOffsetShort,
+    ChronoFormatterShort,
 }
 
 #[test]
@@ -444,7 +627,11 @@ fn history_full_duplicate_hash_independent_h_exact_short_and_sticky() {
 }
 #[test]
 fn history_absent_terminal_table_then_nested_vec_independent_boundaries() {
-    for case in [Boundary::TerminalExact, Boundary::TerminalTableShort, Boundary::TerminalVectorShort] {
+    for case in [
+        Boundary::TerminalExact,
+        Boundary::TerminalTableShort,
+        Boundary::TerminalVectorShort,
+    ] {
         work::history_fixture(Case::Boundary(case));
     }
 }
@@ -486,7 +673,11 @@ fn history_name_clone_from_full_growth_independent_exact_short_and_sticky() {
 }
 #[test]
 fn history_fixed_nanos_offset_and_hidden_formatter_independent_boundaries() {
-    for case in [Boundary::ChronoExact, Boundary::ChronoOffsetShort, Boundary::ChronoFormatterShort] {
+    for case in [
+        Boundary::ChronoExact,
+        Boundary::ChronoOffsetShort,
+        Boundary::ChronoFormatterShort,
+    ] {
         work::history_fixture(Case::Boundary(case));
     }
 }

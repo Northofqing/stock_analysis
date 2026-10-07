@@ -410,7 +410,10 @@ fn memory_pin_refusal_survives_swallow_drop_and_reborrow() {
     {
         let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
         assert_eq!(work.codec_memory().err(), Some(expected));
-        assert_eq!(work.reserve(ReplaySite::Collection, 0).err(), Some(expected));
+        assert_eq!(
+            work.reserve(ReplaySite::Collection, 0).err(),
+            Some(expected)
+        );
         assert_eq!(work.reserve(ReplaySite::StateCopy, 1).err(), Some(expected));
         assert_eq!(work.finish(), Err(expected));
         assert_eq!(work.used(), 3);
@@ -488,9 +491,8 @@ fn sql_provider_refusal_is_independent_and_persistent() {
     let mut metadata = RowsSpecWork::new(20, 1, 1);
     metadata.charge(4).unwrap();
     let mut terminal = super::super::target::test_replay_terminal();
-    let expected = ReplayTerminalFailure::Qualification(
-        ReplaySqlQualificationFailure::SqlProviderUnavailable,
-    );
+    let expected =
+        ReplayTerminalFailure::Qualification(ReplaySqlQualificationFailure::SqlProviderUnavailable);
     {
         let mut work = BorrowedReplayWork::test_borrow(&mut metadata, &mut terminal);
         // Exercise the real independent gate, without a synthetic layout token.
@@ -540,7 +542,9 @@ fn refusal_writer_failure_cannot_leave_a_successful_directive_result() {
     let pending_path = dir.path().join("replay_layout_pin_v1_refusal.rs.pending");
     std::fs::write(&pending_path, b"interrupted write").unwrap();
     assert_eq!(
-        refusal_writer::write_refusal(dir.path()).unwrap_err().kind(),
+        refusal_writer::write_refusal(dir.path())
+            .unwrap_err()
+            .kind(),
         std::io::ErrorKind::AlreadyExists
     );
     assert!(!final_path.exists());
@@ -553,8 +557,12 @@ fn refusal_writer_failure_cannot_leave_a_successful_directive_result() {
     assert!(refusal_writer::write_refusal(blocked.path()).is_err());
     assert!(blocked_final.is_dir());
     assert_eq!(
-        std::fs::read_to_string(blocked.path().join("replay_layout_pin_v1_refusal.rs.pending"))
-            .unwrap(),
+        std::fs::read_to_string(
+            blocked
+                .path()
+                .join("replay_layout_pin_v1_refusal.rs.pending")
+        )
+        .unwrap(),
         EXPECTED_REFUSAL
     );
 

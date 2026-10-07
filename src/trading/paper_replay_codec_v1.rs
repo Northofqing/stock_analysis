@@ -1071,7 +1071,7 @@ impl<'row, 'loan, 'pool> RawScanLoan<'row, 'loan, 'pool> {
         Self {
             raw,
             work,
-            outcome: shapes::scan_paid_raw_array(raw)
+            outcome: shapes::scan_paid_raw_array(raw),
         }
     }
     pub(crate) fn require_decoded(&mut self) -> super::paper_replay_financial_work_v1::Result<()> {
@@ -1081,7 +1081,8 @@ impl<'row, 'loan, 'pool> RawScanLoan<'row, 'loan, 'pool> {
             Ok(_) => Ok(()),
             Err(fault) => {
                 let text = self.work.history_text(HistoryText::RawFault {
-                    raw: self.raw, fault
+                    raw: self.raw,
+                    fault,
                 })?;
                 Err(super::paper_ledger::LedgerError::IntegrityFailure(text).into())
             }
@@ -1091,33 +1092,57 @@ impl<'row, 'loan, 'pool> RawScanLoan<'row, 'loan, 'pool> {
         self.require_decoded()?;
         Ok(self.outcome.as_ref().expect("checked outcome").len())
     }
-    pub(crate) fn text(&mut self, index: usize) -> super::paper_replay_financial_work_v1::Result<Option<String>> {
+    pub(crate) fn text(
+        &mut self,
+        index: usize,
+    ) -> super::paper_replay_financial_work_v1::Result<Option<String>> {
         use super::paper_replay_financial_work_v1::HistoryText;
         self.require_decoded()?;
         match self.outcome.as_ref().expect("checked outcome").slot(index) {
-            Some(shapes::RawSlot::Text(text)) => self.work.history_text(HistoryText::RawDecoded {
-                raw: self.raw, text
-            }).map(Some),
+            Some(shapes::RawSlot::Text(text)) => self
+                .work
+                .history_text(HistoryText::RawDecoded {
+                    raw: self.raw,
+                    text,
+                })
+                .map(Some),
             _ => Ok(None),
         }
     }
-    pub(crate) fn text_equal(&mut self, index: usize, expected: &str) -> super::paper_replay_financial_work_v1::Result<bool> {
+    pub(crate) fn text_equal(
+        &mut self,
+        index: usize,
+        expected: &str,
+    ) -> super::paper_replay_financial_work_v1::Result<bool> {
         self.require_decoded()?;
-        Ok(match self.outcome.as_ref().expect("checked outcome").slot(index) {
-            Some(shapes::RawSlot::Text(text)) => text.chars(self.raw).eq(expected.chars()),
-            _ => false,
-        })
+        Ok(
+            match self.outcome.as_ref().expect("checked outcome").slot(index) {
+                Some(shapes::RawSlot::Text(text)) => text.chars(self.raw).eq(expected.chars()),
+                _ => false,
+            },
+        )
     }
-    pub(crate) fn number(&mut self, index: usize) -> super::paper_replay_financial_work_v1::Result<Option<shapes::RawNumber>> {
+    pub(crate) fn number(
+        &mut self,
+        index: usize,
+    ) -> super::paper_replay_financial_work_v1::Result<Option<shapes::RawNumber>> {
         self.require_decoded()?;
-        Ok(match self.outcome.as_ref().expect("checked outcome").slot(index) {
-            Some(shapes::RawSlot::Number(n)) => Some(n),
-            _ => None,
-        })
+        Ok(
+            match self.outcome.as_ref().expect("checked outcome").slot(index) {
+                Some(shapes::RawSlot::Number(n)) => Some(n),
+                _ => None,
+            },
+        )
     }
-    pub(crate) fn is_null(&mut self, index: usize) -> super::paper_replay_financial_work_v1::Result<bool> {
+    pub(crate) fn is_null(
+        &mut self,
+        index: usize,
+    ) -> super::paper_replay_financial_work_v1::Result<bool> {
         self.require_decoded()?;
-        Ok(matches!(self.outcome.as_ref().expect("checked outcome").slot(index), Some(shapes::RawSlot::Null)))
+        Ok(matches!(
+            self.outcome.as_ref().expect("checked outcome").slot(index),
+            Some(shapes::RawSlot::Null)
+        ))
     }
 }
 
@@ -1127,11 +1152,11 @@ pub(crate) enum HistoryOutput<'a> {
         seq: i64,
         command: &'a str,
         previous: &'a str,
-        payload: &'a str
+        payload: &'a str,
     },
     Audit {
         previous: &'a str,
-        row: &'a crate::database::order_audit::CanonicalOrderAuditRow
+        row: &'a crate::database::order_audit::CanonicalOrderAuditRow,
     },
     FrozenAll(&'a [crate::database::attribution_epochs::FrozenPaperFill]),
     FrozenFilled(&'a [crate::database::attribution_epochs::FrozenPaperFill]),
@@ -1142,7 +1167,7 @@ pub(crate) enum HistoryOutput<'a> {
     Legacy {
         source: &'a str,
         rows: &'a [crate::performance::economic_position::EconomicFillRow],
-        unavailable: &'a Option<String>
+        unavailable: &'a Option<String>,
     },
 }
 impl HistoryOutput<'_> {
@@ -1153,21 +1178,31 @@ impl HistoryOutput<'_> {
                 seq,
                 command,
                 previous,
-                payload
-            } => serde_json::to_writer(out, &("PAPER_EVENT_V1", account, seq, command, previous, payload)),
-            Self::Audit {
-                row,
-                ..
-            } => serde_json::to_writer(out, row),
+                payload,
+            } => serde_json::to_writer(
+                out,
+                &("PAPER_EVENT_V1", account, seq, command, previous, payload),
+            ),
+            Self::Audit { row, .. } => serde_json::to_writer(out, row),
             Self::FrozenAll(rows) | Self::FrozenFilled(rows) => serde_json::to_writer(out, rows),
             Self::FrozenCarry(rows) => serde_json::to_writer(out, rows),
             Self::TerminalBindings(rows) => serde_json::to_writer(out, rows),
-            Self::Snapshot(revision) => serde_json::to_writer(out, &("PaperSnapshotNetFifoV1", revision.target_date, &revision.projection, &revision.metrics, &revision.opening_exclusions, revision.account_realized_pnl)),
+            Self::Snapshot(revision) => serde_json::to_writer(
+                out,
+                &(
+                    "PaperSnapshotNetFifoV1",
+                    revision.target_date,
+                    &revision.projection,
+                    &revision.metrics,
+                    &revision.opening_exclusions,
+                    revision.account_realized_pnl,
+                ),
+            ),
             Self::ExtraAdjudication(request) => serde_json::to_writer(out, request),
             Self::Legacy {
                 source,
                 rows,
-                unavailable
+                unavailable,
             } => serde_json::to_writer(out, &("LegacyEconomicV1", source, rows, unavailable)),
         }
     }
@@ -1189,11 +1224,7 @@ impl HistoryOutput<'_> {
             hash.update(domain);
             hash.update((bytes.len() as u64).to_be_bytes());
         }
-        if let Self::Audit {
-            previous,
-            ..
-        }
-        = self {
+        if let Self::Audit { previous, .. } = self {
             hash.update(b"BR086_ORDER_AUDIT_V1\0");
             hash.update(previous.as_bytes());
             hash.update(b"\0");
@@ -1202,33 +1233,54 @@ impl HistoryOutput<'_> {
         hash.finalize().into()
     }
 }
-pub(crate) fn encode_history_output(input: &HistoryOutput<'_>, work: &mut CodecMechanics<'_, '_>) -> Result<Vec<u8>, ReplayTerminalFailure> {
+pub(crate) fn encode_history_output(
+    input: &HistoryOutput<'_>,
+    work: &mut CodecMechanics<'_, '_>,
+) -> Result<Vec<u8>, ReplayTerminalFailure> {
     work.serializer_escrow()?;
     let mut count = Counter(0);
-    input.write(&mut count).map_err(|_| work.refuse(K::RecordExtent, None))?;
+    input
+        .write(&mut count)
+        .map_err(|_| work.refuse(K::RecordExtent, None))?;
     let mut bytes = work.output(count.0)?;
-    input.write(Output {
-        bytes: &mut bytes, limit: count.0
-    }).map_err(|_| work.refuse(K::PlanMismatch, None))?;
+    input
+        .write(Output {
+            bytes: &mut bytes,
+            limit: count.0,
+        })
+        .map_err(|_| work.refuse(K::PlanMismatch, None))?;
     if bytes.len() != count.0 {
         return Err(work.refuse(K::PlanMismatch, None));
     }
     Ok(bytes)
 }
-pub(crate) fn seed_binding_digest(value: &super::paper_ledger::SeedManifest, work: &mut CodecMechanics<'_, '_>) -> Result<String, ReplayTerminalFailure> {
+pub(crate) fn seed_binding_digest(
+    value: &super::paper_ledger::SeedManifest,
+    work: &mut CodecMechanics<'_, '_>,
+) -> Result<String, ReplayTerminalFailure> {
     digest_core(HashInput::SeedBinding(value), work)
 }
 
 impl RawScanLoan<'_, '_, '_> {
-    pub(crate) fn current_timestamp(&mut self, id: i64) -> super::paper_replay_financial_work_v1::Result<chrono::DateTime<chrono::Utc>> {
+    pub(crate) fn current_timestamp(
+        &mut self,
+        id: i64,
+    ) -> super::paper_replay_financial_work_v1::Result<chrono::DateTime<chrono::Utc>> {
         let text = self.text(13)?;
         super::paper_ledger::parse_raw_timestamp_with_work(id, text.as_deref(), self.work)
     }
-    pub(crate) fn current_decision_prefix(&mut self, decision: &str) -> super::paper_replay_financial_work_v1::Result<bool> {
+    pub(crate) fn current_decision_prefix(
+        &mut self,
+        decision: &str,
+    ) -> super::paper_replay_financial_work_v1::Result<bool> {
         let text = self.text(10)?;
         super::paper_ledger::raw_decision_prefix_with_work(text.as_deref(), decision, self.work)
     }
-    pub(crate) fn current_contradiction(&mut self) -> super::paper_replay_financial_work_v1::Result<super::paper_replay_financial_work_v1::FinancialFailure> {
+    pub(crate) fn current_contradiction(
+        &mut self,
+    ) -> super::paper_replay_financial_work_v1::Result<
+        super::paper_replay_financial_work_v1::FinancialFailure,
+    > {
         super::paper_ledger::raw_contradiction_with_work(self.work)
     }
 }

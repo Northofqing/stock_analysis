@@ -1590,18 +1590,30 @@ fn catalog_v5_cutover_fixture() -> (
     let seed = manifest();
     let binding = seed.binding().unwrap();
     ledger.apply(PaperCommand::Seed(seed)).unwrap();
-    ledger.apply(PaperCommand::Execute(order(
-        &ledger, &binding, "nonempty-lot", Direction::Buy, 10.0, instant(),
-    ))).unwrap();
+    ledger
+        .apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "nonempty-lot",
+            Direction::Buy,
+            10.0,
+            instant(),
+        )))
+        .unwrap();
     {
         let mut conn = db.get_conn().unwrap();
         crate::database::daily_change_review_schema_v1::create_schema(&mut conn).unwrap();
         conn.batch_execute("PRAGMA user_version=3").unwrap();
-        let policy = crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
+        let policy =
+            crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption();
         crate::database::paper_book_owner_schema_v1::install_catalog_v4_for_isolated_test(
             &mut conn, &policy,
-        ).unwrap();
-        crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(&mut conn).unwrap();
+        )
+        .unwrap();
+        crate::database::paper_book_owner_schema_v2::install_catalog_v5_for_isolated_test(
+            &mut conn,
+        )
+        .unwrap();
     }
     let snapshot = {
         let mut conn = db.get_conn().unwrap();
@@ -1616,7 +1628,8 @@ fn catalog_v5_cutover_fixture() -> (
         expected_v1_version: snapshot.version,
         expected_v1_head_hash: snapshot.event_hash,
         expected_v1_projection_hash: snapshot.projection_hash,
-        reviewed_fee_policy: crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption(),
+        reviewed_fee_policy:
+            crate::performance::fee_policy::AShareFeePolicyV2::fixed_compatibility_assumption(),
     };
     (dir, db, binding, request)
 }
@@ -1625,7 +1638,10 @@ fn catalog_v5_cutover_fixture() -> (
 fn catalog_v5_cutover_replays_nonempty_v1_and_closes_v1_writes() {
     use crate::trading::paper_book_v2::{cutover_for_isolated_test, read_v2_on, TestCutoverFault};
     let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
-    assert!(matches!(read_v2_on(&db, &binding.account_id), Err(LedgerError::InactiveEpoch)));
+    assert!(matches!(
+        read_v2_on(&db, &binding.account_id),
+        Err(LedgerError::InactiveEpoch)
+    ));
     let ledger = PaperLedger::open(&db, &instant);
     let before = ledger.read(&binding).unwrap();
     let effective_request = EffectiveFillRequest {
@@ -1636,8 +1652,14 @@ fn catalog_v5_cutover_replays_nonempty_v1_and_closes_v1_writes() {
     let before_fills = ledger.verified_effective_fills(&effective_request).unwrap();
     let before_bytes = {
         let mut conn = db.get_conn().unwrap();
-        (events(&mut conn, &binding.account_id).unwrap().into_iter().map(|e| e.payload).collect::<Vec<_>>(),
-         head(&mut conn, &binding).unwrap().unwrap().projection_bytes)
+        (
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.payload)
+                .collect::<Vec<_>>(),
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
+        )
     };
     let receipt = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
     assert!(!receipt.already_applied);
@@ -1656,8 +1678,18 @@ fn catalog_v5_cutover_replays_nonempty_v1_and_closes_v1_writes() {
     assert_eq!(before_fills.lineage(), after_fills.lineage());
     {
         let mut conn = db.get_conn().unwrap();
-        assert_eq!(events(&mut conn, &binding.account_id).unwrap().into_iter().map(|e| e.payload).collect::<Vec<_>>(), before_bytes.0);
-        assert_eq!(head(&mut conn, &binding).unwrap().unwrap().projection_bytes, before_bytes.1);
+        assert_eq!(
+            events(&mut conn, &binding.account_id)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.payload)
+                .collect::<Vec<_>>(),
+            before_bytes.0
+        );
+        assert_eq!(
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
+            before_bytes.1
+        );
         crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
         for sql in [
             "INSERT INTO paper_ledger_event (account_id,seq,command_id,previous_hash,event_hash,payload) VALUES ('TEST_CODE_ACCOUNT',3,'raw','prev','new','new')",
@@ -1670,15 +1702,26 @@ fn catalog_v5_cutover_replays_nonempty_v1_and_closes_v1_writes() {
             assert!(diesel::sql_query(sql).execute(&mut conn).is_err(), "{sql}");
         }
     }
-    assert!(matches!(ledger.apply(PaperCommand::Execute(order(
-        &ledger, &binding, "after-cutover", Direction::Buy, 10.0, instant(),
-    ))), Err(LedgerError::InactiveEpoch)));
+    assert!(matches!(
+        ledger.apply(PaperCommand::Execute(order(
+            &ledger,
+            &binding,
+            "after-cutover",
+            Direction::Buy,
+            10.0,
+            instant(),
+        ))),
+        Err(LedgerError::InactiveEpoch)
+    ));
     let repeated = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
     assert!(repeated.already_applied);
     assert_eq!(repeated.event_hash, receipt.event_hash);
     let mut different = request.clone();
     different.cutover_id = "TEST_CODE_DIFFERENT_CUTOVER".into();
-    assert!(matches!(cutover_for_isolated_test(&db, &different, TestCutoverFault::None), Err(LedgerError::IdentityConflict)));
+    assert!(matches!(
+        cutover_for_isolated_test(&db, &different, TestCutoverFault::None),
+        Err(LedgerError::IdentityConflict)
+    ));
 }
 
 #[test]
@@ -1687,7 +1730,14 @@ fn catalog_v5_cutover_replays_adjudicated_v1_without_catalog_recursion() {
     let (_dir, db, binding, mut request) = catalog_v5_cutover_fixture();
     let ledger = PaperLedger::open(&db, &instant);
     let fill_id = ledger.effective_fills(&binding).unwrap()[0].paper_trade_id;
-    ledger.adjudicate(ruling_for(&ledger, &binding, fill_id, "TEST_CODE_v5_ruling")).unwrap();
+    ledger
+        .adjudicate(ruling_for(
+            &ledger,
+            &binding,
+            fill_id,
+            "TEST_CODE_v5_ruling",
+        ))
+        .unwrap();
     let before = ledger.read(&binding).unwrap();
     let snapshot = {
         let mut conn = db.get_conn().unwrap();
@@ -1741,7 +1791,8 @@ fn catalog_v5_owner_replay_validates_global_audit_chain_once_for_multiple_ruling
              CREATE TRIGGER IF NOT EXISTS trg_order_audit_chain_no_update
              BEFORE UPDATE ON order_audit_chain
              BEGIN SELECT RAISE(ABORT, 'BR-086 order audit hash chain is immutable'); END",
-        ).unwrap();
+        )
+        .unwrap();
         crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn)
             .unwrap();
     }
@@ -1757,19 +1808,39 @@ fn catalog_v5_owner_replay_validates_global_audit_chain_once_for_multiple_ruling
 fn catalog_v5_cutover_faults_roll_back_guard_owner_and_genesis() {
     use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
     let (_dir, db, binding, request) = catalog_v5_cutover_fixture();
-    for fault in [TestCutoverFault::AfterGenesisWrites, TestCutoverFault::AfterOwnerCas] {
-        assert!(matches!(cutover_for_isolated_test(&db, &request, fault), Err(LedgerError::Database(_))));
+    for fault in [
+        TestCutoverFault::AfterGenesisWrites,
+        TestCutoverFault::AfterOwnerCas,
+    ] {
+        assert!(matches!(
+            cutover_for_isolated_test(&db, &request, fault),
+            Err(LedgerError::Database(_))
+        ));
         let mut conn = db.get_conn().unwrap();
         crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
         assert_eq!(diesel::sql_query("SELECT active_generation AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_ACCOUNT'")
             .get_result::<IntegerRow>(&mut conn).unwrap().value, 1);
-        assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
-            .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+        assert_eq!(
+            diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+                .get_result::<IntegerRow>(&mut conn)
+                .unwrap()
+                .value,
+            0
+        );
         assert!(diesel::sql_query("UPDATE paper_book_owner_v2 SET active_generation=2 WHERE account_id='TEST_CODE_ACCOUNT'")
             .execute(&mut conn).is_err());
     }
-    assert_eq!(PaperLedger::open(&db, &instant).read(&binding).unwrap().version, request.expected_v1_version);
-    assert!(matches!(cutover_for_isolated_test(&db, &request, TestCutoverFault::AfterCommitOutcomeUnknown), Err(LedgerError::CommitOutcomeUnknown)));
+    assert_eq!(
+        PaperLedger::open(&db, &instant)
+            .read(&binding)
+            .unwrap()
+            .version,
+        request.expected_v1_version
+    );
+    assert!(matches!(
+        cutover_for_isolated_test(&db, &request, TestCutoverFault::AfterCommitOutcomeUnknown),
+        Err(LedgerError::CommitOutcomeUnknown)
+    ));
     let repeated = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
     assert!(repeated.already_applied);
 }
@@ -1787,35 +1858,56 @@ fn catalog_v5_cutover_reports_real_commit_failure_as_unknown_and_retries_same_id
         crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
         assert_eq!(diesel::sql_query("SELECT active_generation AS value FROM paper_book_owner_v2 WHERE account_id='TEST_CODE_ACCOUNT'")
             .get_result::<IntegerRow>(&mut conn).unwrap().value, 1);
-        assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
-            .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+        assert_eq!(
+            diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+                .get_result::<IntegerRow>(&mut conn)
+                .unwrap()
+                .value,
+            0
+        );
     }
     let retried = cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap();
     assert!(!retried.already_applied);
-    assert!(cutover_for_isolated_test(&db, &request, TestCutoverFault::None).unwrap().already_applied);
+    assert!(
+        cutover_for_isolated_test(&db, &request, TestCutoverFault::None)
+            .unwrap()
+            .already_applied
+    );
 }
 
 #[test]
 fn catalog_v5_cutover_rejects_fee_head_and_epoch_claims_without_residue() {
-    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
     use crate::performance::fee_policy::{AShareFeePolicyV2, FeeRate};
+    use crate::trading::paper_book_v2::{cutover_for_isolated_test, TestCutoverFault};
     let (_dir, db, _binding, request) = catalog_v5_cutover_fixture();
     let mut stale = request.clone();
     stale.expected_v1_version += 1;
-    assert!(matches!(cutover_for_isolated_test(&db, &stale, TestCutoverFault::None), Err(LedgerError::VersionChanged)));
+    assert!(matches!(
+        cutover_for_isolated_test(&db, &stale, TestCutoverFault::None),
+        Err(LedgerError::VersionChanged)
+    ));
     let mut reused = request.clone();
     reused.new_epoch_id = request.old_binding.epoch_id.clone();
     assert!(cutover_for_isolated_test(&db, &reused, TestCutoverFault::None).is_err());
     let mut wrong_fee = request.clone();
     wrong_fee.reviewed_fee_policy = AShareFeePolicyV2::new(
-        request.reviewed_fee_policy.scope(), FeeRate::new(4,10_000).unwrap(),
-        5_000_000, request.reviewed_fee_policy.coverage(), "TEST_CODE_other_review",
-    ).unwrap();
+        request.reviewed_fee_policy.scope(),
+        FeeRate::new(4, 10_000).unwrap(),
+        5_000_000,
+        request.reviewed_fee_policy.coverage(),
+        "TEST_CODE_other_review",
+    )
+    .unwrap();
     assert!(cutover_for_isolated_test(&db, &wrong_fee, TestCutoverFault::None).is_err());
     let mut conn = db.get_conn().unwrap();
     crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).unwrap();
-    assert_eq!(diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
-        .get_result::<IntegerRow>(&mut conn).unwrap().value, 0);
+    assert_eq!(
+        diesel::sql_query("SELECT COUNT(*) AS value FROM paper_book_v2_account")
+            .get_result::<IntegerRow>(&mut conn)
+            .unwrap()
+            .value,
+        0
+    );
 }
 
 #[test]
@@ -1834,15 +1926,28 @@ fn catalog_v5_cutover_reader_rejects_projection_and_v1_anchor_tamper() {
              "UPDATE paper_ledger_head SET version=version+1 WHERE account_id='TEST_CODE_ACCOUNT'",
              crate::database::paper_book_owner_schema_v2::V1_GUARD_STATEMENTS)
         };
-        diesel::sql_query(format!("DROP TRIGGER {guard}")).execute(&mut conn).unwrap();
+        diesel::sql_query(format!("DROP TRIGGER {guard}"))
+            .execute(&mut conn)
+            .unwrap();
         diesel::sql_query(update).execute(&mut conn).unwrap();
-        let restore = statements.iter().find(|(_, name, _, _)| *name == guard).unwrap().3;
+        let restore = statements
+            .iter()
+            .find(|(_, name, _, _)| *name == guard)
+            .unwrap()
+            .3;
         diesel::sql_query(restore).execute(&mut conn).unwrap();
-        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn).unwrap();
-        assert!(crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).is_err(), "{target}");
+        crate::database::paper_book_owner_schema_v2::verify_catalog_v5_structure_on(&mut conn)
+            .unwrap();
+        assert!(
+            crate::database::paper_book_owner_schema_v2::verify_catalog_v5_on(&mut conn).is_err(),
+            "{target}"
+        );
         drop(conn);
         assert!(read_v2_on(&db, &binding.account_id).is_err(), "{target}");
-        assert!(PaperLedger::open(&db, &instant).read(&binding).is_err(), "{target}");
+        assert!(
+            PaperLedger::open(&db, &instant).read(&binding).is_err(),
+            "{target}"
+        );
     }
 }
 
@@ -1998,10 +2103,7 @@ fn catalog_v4_owner_backfill_keeps_v1_history_and_fences_new_seed() {
                 .into_iter()
                 .map(|row| row.payload)
                 .collect::<Vec<_>>(),
-            head(&mut conn, &binding)
-                .unwrap()
-                .unwrap()
-                .projection_bytes,
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
         )
     };
 
@@ -2020,7 +2122,10 @@ fn catalog_v4_owner_backfill_keeps_v1_history_and_fences_new_seed() {
     let after = ledger.verified_effective_fills(&request).unwrap();
     assert_eq!(after.rows().unwrap(), before.rows().unwrap());
     assert_eq!(after.lineage(), before.lineage());
-    assert_ne!(after.snapshot_input_hash().unwrap(), before.snapshot_input_hash().unwrap());
+    assert_ne!(
+        after.snapshot_input_hash().unwrap(),
+        before.snapshot_input_hash().unwrap()
+    );
     assert!(matches!(
         ledger.verified_effective_fills(&EffectiveFillRequest {
             scope: EffectiveFillScope::LegacyRaw,
@@ -2044,10 +2149,7 @@ fn catalog_v4_owner_backfill_keeps_v1_history_and_fences_new_seed() {
             before_events,
         );
         assert_eq!(
-            head(&mut conn, &binding)
-                .unwrap()
-                .unwrap()
-                .projection_bytes,
+            head(&mut conn, &binding).unwrap().unwrap().projection_bytes,
             before_projection,
         );
     }
@@ -2070,16 +2172,18 @@ fn catalog_v4_owner_backfill_keeps_v1_history_and_fences_new_seed() {
         ledger.apply(PaperCommand::Seed(another_seed.clone())),
         Err(LedgerError::InactiveEpoch)
     ));
-    assert!(account(&mut db.get_conn().unwrap(), &another_seed.account_id)
-        .unwrap()
-        .is_none());
+    assert!(
+        account(&mut db.get_conn().unwrap(), &another_seed.account_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
 fn catalog_v4_historical_reads_reject_missing_owner_namespace() {
     let dir = tempfile::tempdir().unwrap();
-    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v4_reads.db"))
-        .unwrap();
+    let db =
+        DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_v4_reads.db")).unwrap();
     declare_test_catalog_v2(&db);
     let ledger = PaperLedger::open(&db, &instant);
     let seed = manifest();
@@ -2193,8 +2297,15 @@ fn catalog_v4_runtime_rejects_wrong_owner_before_quote_or_terminal_recovery() {
     }
     let mut wrong = binding.clone();
     wrong.epoch_id = "TEST_CODE_other_epoch".into();
-    let mut signal = order(&ledger, &binding, "wrong-owner", Direction::Buy, 10.0, instant())
-        .signal;
+    let mut signal = order(
+        &ledger,
+        &binding,
+        "wrong-owner",
+        Direction::Buy,
+        10.0,
+        instant(),
+    )
+    .signal;
     signal.plan_id = "TEST_CODE_wrong_owner_plan".into();
     let quote = crate::broker::ExecutionQuote {
         price: 10.0,
@@ -2218,7 +2329,9 @@ fn catalog_v4_runtime_rejects_wrong_owner_before_quote_or_terminal_recovery() {
         None,
     );
     assert!(
-        result.as_ref().is_err_and(|error| error.contains("inactive paper")),
+        result
+            .as_ref()
+            .is_err_and(|error| error.contains("inactive paper")),
         "wrong owner entered runtime: {result:?}"
     );
     assert_eq!(quote_calls.load(Ordering::SeqCst), 0);
@@ -2253,15 +2366,21 @@ fn catalog_v4_all_v1_writer_paths_reject_unowned_binding_without_partial_writes(
     let original = ledger.read(&binding).unwrap();
     let mut wrong = binding.clone();
     wrong.manifest_hash = "f".repeat(64);
-    let mut intent = order(&ledger, &binding, "blocked", Direction::Buy, 10.0, instant());
+    let mut intent = order(
+        &ledger,
+        &binding,
+        "blocked",
+        Direction::Buy,
+        10.0,
+        instant(),
+    );
     intent.binding = wrong.clone();
     assert!(matches!(
         ledger.apply(PaperCommand::Execute(intent)),
         Err(LedgerError::InactiveEpoch)
     ));
     assert!(matches!(
-        ledger
-        .apply(PaperCommand::Mark(ValuationBatch {
+        ledger.apply(PaperCommand::Mark(ValuationBatch {
             binding: wrong.clone(),
             command_id: "TEST_CODE_blocked_mark".into(),
             expected_version: original.version,
@@ -2277,8 +2396,7 @@ fn catalog_v4_all_v1_writer_paths_reject_unowned_binding_without_partial_writes(
         Err(LedgerError::InactiveEpoch)
     ));
     assert!(matches!(
-        ledger
-        .settle_snapshot(&EffectiveFillRequest {
+        ledger.settle_snapshot(&EffectiveFillRequest {
             scope: EffectiveFillScope::Epoch(wrong),
             history: EffectiveHistory::RestatedLatest,
             as_of: day(instant()),
@@ -2764,12 +2882,10 @@ fn golden_order_fees(db: &DatabaseManager, account_id: &str, command_id: &str) -
 }
 
 fn golden_filled_trade_count(db: &DatabaseManager) -> i64 {
-    diesel::sql_query(
-        "SELECT COUNT(*) AS value FROM paper_trades WHERE status='Filled'",
-    )
-    .get_result::<GoldenCount>(&mut db.get_conn().unwrap())
-    .unwrap()
-    .value
+    diesel::sql_query("SELECT COUNT(*) AS value FROM paper_trades WHERE status='Filled'")
+        .get_result::<GoldenCount>(&mut db.get_conn().unwrap())
+        .unwrap()
+        .value
 }
 
 #[test]
@@ -2793,32 +2909,85 @@ fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
         let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
         let ledger = PaperLedger::open(&db, &clock);
         let seeded = ledger.apply(PaperCommand::Seed(seed)).unwrap();
-        let buy_one = order(&ledger, &binding, "v1-golden-buy-10", Direction::Buy, 10.0, clock());
-        let bought_one = ledger.apply(PaperCommand::Execute(buy_one.clone())).unwrap();
-        let buy_two = order(&ledger, &binding, "v1-golden-buy-12", Direction::Buy, 12.0, clock());
-        let bought_two = ledger.apply(PaperCommand::Execute(buy_two.clone())).unwrap();
+        let buy_one = order(
+            &ledger,
+            &binding,
+            "v1-golden-buy-10",
+            Direction::Buy,
+            10.0,
+            clock(),
+        );
+        let bought_one = ledger
+            .apply(PaperCommand::Execute(buy_one.clone()))
+            .unwrap();
+        let buy_two = order(
+            &ledger,
+            &binding,
+            "v1-golden-buy-12",
+            Direction::Buy,
+            12.0,
+            clock(),
+        );
+        let bought_two = ledger
+            .apply(PaperCommand::Execute(buy_two.clone()))
+            .unwrap();
         now.store(instant().timestamp() + 86400, Ordering::SeqCst);
-        let sell = order(&ledger, &binding, "v1-golden-sell-11", Direction::Sell, 11.0, clock());
+        let sell = order(
+            &ledger,
+            &binding,
+            "v1-golden-sell-11",
+            Direction::Sell,
+            11.0,
+            clock(),
+        );
         let sold = ledger.apply(PaperCommand::Execute(sell.clone())).unwrap();
         let view = ledger.read(&binding).unwrap();
         let report = serde_json::to_string(&*view).unwrap();
-        let head = diesel::sql_query("SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?")
-            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
-            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
-        let model = diesel::sql_query("SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?")
-            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
-            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        let head = diesel::sql_query(
+            "SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+        .get_result::<TextValue>(&mut db.get_conn().unwrap())
+        .unwrap();
+        let model = diesel::sql_query(
+            "SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+        .get_result::<TextValue>(&mut db.get_conn().unwrap())
+        .unwrap();
         assert_eq!(model.value, "lot-rates-v1");
-        assert_eq!(binding.manifest_hash, "1e660132eccbbdeb97f032c4563da29cf6f0c551c59223f430ce97966d8806e6");
-        assert_eq!(seeded.event_hash, "122741b580f8da54f096a8bb0df8da9e4ec242229548f8a02551f92bc5f39770");
+        assert_eq!(
+            binding.manifest_hash,
+            "1e660132eccbbdeb97f032c4563da29cf6f0c551c59223f430ce97966d8806e6"
+        );
+        assert_eq!(
+            seeded.event_hash,
+            "122741b580f8da54f096a8bb0df8da9e4ec242229548f8a02551f92bc5f39770"
+        );
         assert_ne!(bought_one.event_hash, bought_two.event_hash);
         assert_ne!(bought_two.event_hash, sold.event_hash);
-        assert_eq!(head.value, "6c63fb6457630277f623bb2a16af312c88a416cc473818898e6d8357a2fcaed2");
-        assert_eq!(report, r#"{"cash":98883900000,"lots":[{"lot_id":"fill:v1-golden-buy-12","code":"TEST_CODE_000001","name":"fixture","quantity":100,"basis_price":12000000,"buy_fee_remaining":5000000,"acquired_on":"2026-09-14","sellable_from":"2026-09-15","reported_cost":null}],"marks":{"TEST_CODE_000001":{"code":"TEST_CODE_000001","price":11000000,"observed_at":"2026-09-15T02:00:00Z","source":"TEST_CODE_realtime"}},"fees":16100000,"realized_pnl":88900000,"seed_equity":100000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#);
-        assert_eq!([bought_one.fee, bought_two.fee, sold.fee], [Money::from_cny(5.0).unwrap(), Money::from_cny(5.0).unwrap(), Money::from_cny(6.10).unwrap()]);
+        assert_eq!(
+            head.value,
+            "6c63fb6457630277f623bb2a16af312c88a416cc473818898e6d8357a2fcaed2"
+        );
+        assert_eq!(
+            report,
+            r#"{"cash":98883900000,"lots":[{"lot_id":"fill:v1-golden-buy-12","code":"TEST_CODE_000001","name":"fixture","quantity":100,"basis_price":12000000,"buy_fee_remaining":5000000,"acquired_on":"2026-09-14","sellable_from":"2026-09-15","reported_cost":null}],"marks":{"TEST_CODE_000001":{"code":"TEST_CODE_000001","price":11000000,"observed_at":"2026-09-15T02:00:00Z","source":"TEST_CODE_realtime"}},"fees":16100000,"realized_pnl":88900000,"seed_equity":100000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#
+        );
+        assert_eq!(
+            [bought_one.fee, bought_two.fee, sold.fee],
+            [
+                Money::from_cny(5.0).unwrap(),
+                Money::from_cny(5.0).unwrap(),
+                Money::from_cny(6.10).unwrap()
+            ]
+        );
         assert_eq!(
             golden_order_fees(&db, &binding.account_id, "v1-golden-sell-11"),
-            (Money::from_cny(5.0).unwrap(), Money::from_cny(1.10).unwrap())
+            (
+                Money::from_cny(5.0).unwrap(),
+                Money::from_cny(1.10).unwrap()
+            )
         );
         assert_eq!(golden_filled_trade_count(&db), 3);
         assert_eq!(view.cash, Money::from_cny(98_883.90).unwrap());
@@ -2827,7 +2996,10 @@ fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
         assert_eq!(view.lots.len(), 1);
         assert_eq!(view.lots[0].basis_price, Money::from_cny(12.0).unwrap());
         assert_eq!(view.lots[0].quantity, 100);
-        assert_eq!(view.lots[0].buy_fee_remaining, Money::from_cny(5.0).unwrap());
+        assert_eq!(
+            view.lots[0].buy_fee_remaining,
+            Money::from_cny(5.0).unwrap()
+        );
         assert_eq!(FEE_MODEL, "lot-rates-v1");
         let rejected = diesel::sql_query("INSERT INTO paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes,money_model,fee_model) SELECT 'TEST_CODE_V1_GOLDEN_REJECT_V2','TEST_CODE_V1_GOLDEN_REJECT_V2_EPOCH',manifest_hash,manifest_bytes,money_model,'lot-rates-v2' FROM paper_ledger_account WHERE account_id=?")
             .bind::<diesel::sql_types::Text, _>(&binding.account_id)
@@ -2836,11 +3008,24 @@ fn paper_ledger_v1_golden_minimum_fees_fifo_replay() {
             matches!(&rejected, Err(diesel::result::Error::DatabaseError(diesel::result::DatabaseErrorKind::CheckViolation, info)) if info.message().contains("fee_model")),
             "v1 fee_model CHECK must reject a v2 identity: {rejected:?}"
         );
-        ((buy_one, buy_two, sell), [seeded.event_hash, bought_one.event_hash, bought_two.event_hash, sold.event_hash], report)
+        (
+            (buy_one, buy_two, sell),
+            [
+                seeded.event_hash,
+                bought_one.event_hash,
+                bought_two.event_hash,
+                sold.event_hash,
+            ],
+            report,
+        )
     };
     let db = DatabaseManager::open_isolated_for_test(path).unwrap();
     let ledger = PaperLedger::open(&db, &clock);
-    for (command, expected) in [(commands.0, &hashes[1]), (commands.1, &hashes[2]), (commands.2, &hashes[3])] {
+    for (command, expected) in [
+        (commands.0, &hashes[1]),
+        (commands.1, &hashes[2]),
+        (commands.2, &hashes[3]),
+    ] {
         let receipt = ledger.apply(PaperCommand::Execute(command)).unwrap();
         assert!(receipt.already_applied);
         assert_eq!(&receipt.event_hash, expected);
@@ -2875,32 +3060,67 @@ fn paper_ledger_v1_golden_percentage_fees_replay() {
         let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
         let ledger = PaperLedger::open(&db, &clock);
         let seeded = ledger.apply(PaperCommand::Seed(seed)).unwrap();
-        let buy = order(&ledger, &binding, "v1-golden-buy-200", Direction::Buy, 200.0, clock());
+        let buy = order(
+            &ledger,
+            &binding,
+            "v1-golden-buy-200",
+            Direction::Buy,
+            200.0,
+            clock(),
+        );
         let bought = ledger.apply(PaperCommand::Execute(buy.clone())).unwrap();
         now.store(instant().timestamp() + 86400, Ordering::SeqCst);
-        let sell = order(&ledger, &binding, "v1-golden-sell-210", Direction::Sell, 210.0, clock());
+        let sell = order(
+            &ledger,
+            &binding,
+            "v1-golden-sell-210",
+            Direction::Sell,
+            210.0,
+            clock(),
+        );
         let sold = ledger.apply(PaperCommand::Execute(sell.clone())).unwrap();
         let view = ledger.read(&binding).unwrap();
         let report = serde_json::to_string(&*view).unwrap();
-        let head = diesel::sql_query("SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?")
-            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
-            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
-        let model = diesel::sql_query("SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?")
-            .bind::<diesel::sql_types::Text, _>(&binding.account_id)
-            .get_result::<TextValue>(&mut db.get_conn().unwrap()).unwrap();
+        let head = diesel::sql_query(
+            "SELECT projection_hash AS value FROM paper_ledger_head WHERE account_id=?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+        .get_result::<TextValue>(&mut db.get_conn().unwrap())
+        .unwrap();
+        let model = diesel::sql_query(
+            "SELECT fee_model AS value FROM paper_ledger_account WHERE account_id=?",
+        )
+        .bind::<diesel::sql_types::Text, _>(&binding.account_id)
+        .get_result::<TextValue>(&mut db.get_conn().unwrap())
+        .unwrap();
         assert_eq!(model.value, "lot-rates-v1");
-        assert_eq!(binding.manifest_hash, "9b25b982eb2218fc661995dbe1de70663c3ab45f186159ef782230e8622523dd");
-        assert_eq!(seeded.event_hash, "e5f6c5340a5ec7e96e939491e3a8e63b4451b6ed4e62fb7991997a41a80e3b3f");
+        assert_eq!(
+            binding.manifest_hash,
+            "9b25b982eb2218fc661995dbe1de70663c3ab45f186159ef782230e8622523dd"
+        );
+        assert_eq!(
+            seeded.event_hash,
+            "e5f6c5340a5ec7e96e939491e3a8e63b4451b6ed4e62fb7991997a41a80e3b3f"
+        );
         assert_ne!(bought.event_hash, sold.event_hash);
-        assert_eq!(head.value, "0ce46e10ee317b7d133047c4b178351f87221e259e4f00628c03f5e615b74aa7");
-        assert_eq!(report, r#"{"cash":1000966700000,"lots":[],"marks":{},"fees":33300000,"realized_pnl":966700000,"seed_equity":1000000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#);
+        assert_eq!(
+            head.value,
+            "0ce46e10ee317b7d133047c4b178351f87221e259e4f00628c03f5e615b74aa7"
+        );
+        assert_eq!(
+            report,
+            r#"{"cash":1000966700000,"lots":[],"marks":{},"fees":33300000,"realized_pnl":966700000,"seed_equity":1000000000000,"as_of":"2026-09-15T02:00:00Z","closes":{}}"#
+        );
         assert_eq!(bought.status, LedgerStatus::Filled);
         assert_eq!(sold.status, LedgerStatus::Filled);
         assert_eq!(bought.fee, Money::from_cny(6.0).unwrap());
         assert_eq!(sold.fee, Money::from_cny(27.30).unwrap());
         assert_eq!(
             golden_order_fees(&db, &binding.account_id, "v1-golden-sell-210"),
-            (Money::from_cny(6.30).unwrap(), Money::from_cny(21.0).unwrap())
+            (
+                Money::from_cny(6.30).unwrap(),
+                Money::from_cny(21.0).unwrap()
+            )
         );
         assert_eq!(golden_filled_trade_count(&db), 2);
         assert_eq!(view.cash, Money::from_cny(1_000_966.70).unwrap());
@@ -2908,7 +3128,11 @@ fn paper_ledger_v1_golden_percentage_fees_replay() {
         assert_eq!(view.realized_pnl, Money::from_cny(966.70).unwrap());
         assert!(view.lots.is_empty());
         assert_eq!(FEE_MODEL, "lot-rates-v1");
-        ((buy, sell), [seeded.event_hash, bought.event_hash, sold.event_hash], report)
+        (
+            (buy, sell),
+            [seeded.event_hash, bought.event_hash, sold.event_hash],
+            report,
+        )
     };
     let db = DatabaseManager::open_isolated_for_test(path).unwrap();
     let ledger = PaperLedger::open(&db, &clock);

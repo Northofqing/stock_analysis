@@ -520,27 +520,76 @@ fn outcome_item_feedback_original_card_two_rows_unsent_and_pending_keep_denomina
     prepare_reserved(&f, &envelope, &append);
     let port = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
     let sinks: Vec<AuthoritativeSink> = vec![port.clone()];
-    f.coordinator.resume_deliverable(&envelope.decision_identity, &sinks, now()).unwrap();
-    reconcile_terminal(&f, &append, DecisionState::Delivered, &envelope.decision_identity);
+    f.coordinator
+        .resume_deliverable(&envelope.decision_identity, &sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &f,
+        &append,
+        DecisionState::Delivered,
+        &envelope.decision_identity,
+    );
     for (index, row) in frozen.ordered_rows().iter().enumerate() {
         qualified_close(&db, row.code(), frozen.business_date(), 10.);
-        qualified_close(&db, row.code(), frozen.target_date(), if index == 0 { 11. } else { 9. });
+        qualified_close(
+            &db,
+            row.code(),
+            frozen.target_date(),
+            if index == 0 { 11. } else { 9. },
+        );
     }
     // A real additional row with the same code/date cannot borrow the card.
-    db.save_prediction_legacy(frozen.business_date(), frozen.target_date(), None,
-        Some(frozen.ordered_rows()[0].code()), "up", 80., None).unwrap();
-    crate::monitor::prediction::verify_due_predictions(&db,
-        NaiveDate::parse_from_str(frozen.target_date(), "%Y-%m-%d").unwrap()).unwrap();
-    let before = db.read_outcome_prediction_window(&[frozen.target_date().into()]).unwrap();
-    let durable_before = audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap());
+    db.save_prediction_legacy(
+        frozen.business_date(),
+        frozen.target_date(),
+        None,
+        Some(frozen.ordered_rows()[0].code()),
+        "up",
+        80.,
+        None,
+    )
+    .unwrap();
+    crate::monitor::prediction::verify_due_predictions(
+        &db,
+        NaiveDate::parse_from_str(frozen.target_date(), "%Y-%m-%d").unwrap(),
+    )
+    .unwrap();
+    let before = db
+        .read_outcome_prediction_window(&[frozen.target_date().into()])
+        .unwrap();
+    let durable_before =
+        audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap());
     let tracker = OutcomeTracker::new(&db, Some(&f.coordinator));
-    let report = tracker.read_at_for_test(report_at(frozen.target_date())).unwrap();
+    let report = tracker
+        .read_at_for_test(report_at(frozen.target_date()))
+        .unwrap();
     let items: Vec<_> = report.daily.item_feedback().items().collect();
-    assert_eq!((report.daily.item_feedback().displayed(), report.daily.item_feedback().total()), (3, 3));
-    assert_eq!(items.iter().map(|item| item.prediction_row_id()).collect::<Vec<_>>(),
-        before.rows.iter().map(|row| row.id).collect::<Vec<_>>());
-    assert_eq!((items[0].recorded_hit(), items[1].recorded_hit(), items[2].recorded_hit()), (Some(false), Some(true), Some(true)));
-    assert_eq!(items[1].prediction_row_id(), frozen.ordered_rows()[0].prediction_row_id());
+    assert_eq!(
+        (
+            report.daily.item_feedback().displayed(),
+            report.daily.item_feedback().total()
+        ),
+        (3, 3)
+    );
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.prediction_row_id())
+            .collect::<Vec<_>>(),
+        before.rows.iter().map(|row| row.id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        (
+            items[0].recorded_hit(),
+            items[1].recorded_hit(),
+            items[2].recorded_hit()
+        ),
+        (Some(false), Some(true), Some(true))
+    );
+    assert_eq!(
+        items[1].prediction_row_id(),
+        frozen.ordered_rows()[0].prediction_row_id()
+    );
     for item in &items[..2] {
         assert_eq!(item.delivery_status(), Status::PhysicallyAccepted);
         let card = item.original_card().unwrap();
@@ -549,21 +598,54 @@ fn outcome_item_feedback_original_card_two_rows_unsent_and_pending_keep_denomina
         assert!(card.terminal_evidence_sha256().is_some());
         assert!(card.accepted_channel().is_some());
     }
-    assert!(std::ptr::eq(items[0].original_card().unwrap(), items[1].original_card().unwrap()));
+    assert!(std::ptr::eq(
+        items[0].original_card().unwrap(),
+        items[1].original_card().unwrap()
+    ));
     assert_eq!(items[2].code(), Some(frozen.ordered_rows()[0].code()));
     assert_eq!(items[2].delivery_status(), Status::Unlinked);
     assert!(items[2].original_card().is_none());
     for period in [&report.daily, &report.weekly] {
-        assert_eq!((period.observed.due_samples, period.observed.recorded_samples, period.observed.hits), (3, 3, 2));
+        assert_eq!(
+            (
+                period.observed.due_samples,
+                period.observed.recorded_samples,
+                period.observed.hits
+            ),
+            (3, 3, 2)
+        );
         let linked = observed_counts(period);
-        assert_eq!((linked.physically_accepted_cards, linked.covered_samples, linked.recorded_samples, linked.hits), (1, 2, 2, 1));
+        assert_eq!(
+            (
+                linked.physically_accepted_cards,
+                linked.covered_samples,
+                linked.recorded_samples,
+                linked.hits
+            ),
+            (1, 2, 2, 1)
+        );
         assert_eq!(linked.rate, Some(0.5));
     }
-    assert_eq!(report.render().matches("[OutcomeTracker][周窗项]").count(), 3);
+    assert_eq!(
+        report.render().matches("[OutcomeTracker][周窗项]").count(),
+        3
+    );
     assert!(!format!("{report:?}").contains("TEST_CODE_P05_V2_CARD"));
-    assert_eq!(tracker.read_at_for_test(report_at(frozen.target_date())).unwrap(), report);
-    assert_eq!(db.read_outcome_prediction_window(&[frozen.target_date().into()]).unwrap(), before);
-    assert_eq!(audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap()), durable_before);
+    assert_eq!(
+        tracker
+            .read_at_for_test(report_at(frozen.target_date()))
+            .unwrap(),
+        report
+    );
+    assert_eq!(
+        db.read_outcome_prediction_window(&[frozen.target_date().into()])
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap()),
+        durable_before
+    );
     assert_eq!(port.calls.load(Ordering::SeqCst), 1);
 
     let (_pending_dir, pending_db, pending_freeze) = original_source();
@@ -573,12 +655,25 @@ fn outcome_item_feedback_original_card_two_rows_unsent_and_pending_keep_denomina
     prepare_reserved(&pending_f, &pending_e, &pending_append);
     let pending_port = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
     let pending_sinks: Vec<AuthoritativeSink> = vec![pending_port.clone()];
-    pending_f.coordinator.resume_deliverable(&pending_e.decision_identity, &pending_sinks, now()).unwrap();
-    reconcile_terminal(&pending_f, &pending_append, DecisionState::Delivered, &pending_e.decision_identity);
+    pending_f
+        .coordinator
+        .resume_deliverable(&pending_e.decision_identity, &pending_sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &pending_f,
+        &pending_append,
+        DecisionState::Delivered,
+        &pending_e.decision_identity,
+    );
     let pending = OutcomeTracker::new(&pending_db, Some(&pending_f.coordinator))
-        .read_at_for_test(report_at(pending_freeze.target_date())).unwrap();
-    assert!(pending.daily.item_feedback().items().all(|item| item.recorded_hit().is_none()
-        && item.delivery_status() == Status::PhysicallyAccepted));
+        .read_at_for_test(report_at(pending_freeze.target_date()))
+        .unwrap();
+    assert!(pending
+        .daily
+        .item_feedback()
+        .items()
+        .all(|item| item.recorded_hit().is_none()
+            && item.delivery_status() == Status::PhysicallyAccepted));
     assert_eq!(observed_counts(&pending.daily).rate, None);
     assert_eq!(pending_port.calls.load(Ordering::SeqCst), 1);
 }
@@ -586,16 +681,36 @@ fn outcome_item_feedback_original_card_two_rows_unsent_and_pending_keep_denomina
 #[test]
 fn outcome_item_feedback_typed_pending_manual_v1_and_same_key_never_gain_membership() {
     use crate::monitor::prediction::OutcomeItemDeliveryStatus as Status;
-    for stage in ["FrozenOnly", "Pending", "Uncertain", "ManualAccepted", "ManualNotDelivered", "Rejected", "UnlinkedV1"] {
+    for stage in [
+        "FrozenOnly",
+        "Pending",
+        "Uncertain",
+        "ManualAccepted",
+        "ManualNotDelivered",
+        "Rejected",
+        "UnlinkedV1",
+    ] {
         let (_dir, db, frozen) = original_source();
         let f = Fixture::new("OUTCOME_ITEM_TERMINAL");
         let append = MemoryAppendPort::default();
         let e = if stage == "UnlinkedV1" {
-            p05_v1_envelope_at(frozen.business_date(), frozen.occurrence_identity(), "OUTCOME_ITEM_V1", false)
-        } else { p05_v2_envelope(&frozen, frozen.source_canonical().to_vec()) };
-        if stage != "FrozenOnly" { prepare_reserved(&f, &e, &append); }
+            p05_v1_envelope_at(
+                frozen.business_date(),
+                frozen.occurrence_identity(),
+                "OUTCOME_ITEM_V1",
+                false,
+            )
+        } else {
+            p05_v2_envelope(&frozen, frozen.source_canonical().to_vec())
+        };
+        if stage != "FrozenOnly" {
+            prepare_reserved(&f, &e, &append);
+        }
         let mut port = None;
-        if matches!(stage, "Uncertain" | "ManualAccepted" | "ManualNotDelivered" | "Rejected" | "UnlinkedV1") {
+        if matches!(
+            stage,
+            "Uncertain" | "ManualAccepted" | "ManualNotDelivered" | "Rejected" | "UnlinkedV1"
+        ) {
             let result = match stage {
                 "Rejected" => AuthoritativeSinkResult::Rejected(rejection(now(), false)),
                 "UnlinkedV1" => AuthoritativeSinkResult::Accepted(receipt(now())),
@@ -603,63 +718,131 @@ fn outcome_item_feedback_typed_pending_manual_v1_and_same_key_never_gain_members
             };
             let sink = StaticSink::new(result);
             let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
-            f.coordinator.resume_deliverable(&e.decision_identity, &sinks, now()).unwrap();
-            reconcile_terminal(&f, &append, match stage {
-                "Rejected" => DecisionState::RejectedDurable,
-                "UnlinkedV1" => DecisionState::Delivered,
-                _ => DecisionState::UncertainManualReview,
-            }, &e.decision_identity);
+            f.coordinator
+                .resume_deliverable(&e.decision_identity, &sinks, now())
+                .unwrap();
+            reconcile_terminal(
+                &f,
+                &append,
+                match stage {
+                    "Rejected" => DecisionState::RejectedDurable,
+                    "UnlinkedV1" => DecisionState::Delivered,
+                    _ => DecisionState::UncertainManualReview,
+                },
+                &e.decision_identity,
+            );
             if matches!(stage, "ManualAccepted" | "ManualNotDelivered") {
-                f.coordinator.resolve_uncertain(&ManualResolutionCommand {
-                    decision_identity: e.decision_identity.clone(),
-                    disposition: if stage == "ManualAccepted" {
-                        ManualDisposition::Accepted { receipt: Some(receipt(now())) }
-                    } else { ManualDisposition::Rejected },
-                    operator_identity: "TEST_CODE_OUTCOME_ITEM_OPERATOR_0123456789".into(),
-                    reason: "TEST_CODE actual manual resolution".into(),
-                    external_evidence: b"TEST_CODE independent external evidence".to_vec(),
-                    resolved_at: now(),
-                }, &append).unwrap();
-                reconcile_terminal(&f, &append, if stage == "ManualAccepted" {
-                    DecisionState::Delivered
-                } else { DecisionState::ManualResolvedRejected }, &e.decision_identity);
+                f.coordinator
+                    .resolve_uncertain(
+                        &ManualResolutionCommand {
+                            decision_identity: e.decision_identity.clone(),
+                            disposition: if stage == "ManualAccepted" {
+                                ManualDisposition::Accepted {
+                                    receipt: Some(receipt(now())),
+                                }
+                            } else {
+                                ManualDisposition::Rejected
+                            },
+                            operator_identity: "TEST_CODE_OUTCOME_ITEM_OPERATOR_0123456789".into(),
+                            reason: "TEST_CODE actual manual resolution".into(),
+                            external_evidence: b"TEST_CODE independent external evidence".to_vec(),
+                            resolved_at: now(),
+                        },
+                        &append,
+                    )
+                    .unwrap();
+                reconcile_terminal(
+                    &f,
+                    &append,
+                    if stage == "ManualAccepted" {
+                        DecisionState::Delivered
+                    } else {
+                        DecisionState::ManualResolvedRejected
+                    },
+                    &e.decision_identity,
+                );
             }
             assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
             port = Some(sink);
         }
-        db.save_prediction_legacy(frozen.business_date(), frozen.target_date(), None,
-            Some(frozen.ordered_rows()[0].code()), "up", 80., None).unwrap();
-        let before = db.read_outcome_prediction_window(&[frozen.target_date().into()]).unwrap();
-        let durable_before = audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap());
+        db.save_prediction_legacy(
+            frozen.business_date(),
+            frozen.target_date(),
+            None,
+            Some(frozen.ordered_rows()[0].code()),
+            "up",
+            80.,
+            None,
+        )
+        .unwrap();
+        let before = db
+            .read_outcome_prediction_window(&[frozen.target_date().into()])
+            .unwrap();
+        let durable_before =
+            audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap());
         let tracker = OutcomeTracker::new(&db, Some(&f.coordinator));
-        let report = tracker.read_at_for_test(report_at(frozen.target_date())).unwrap();
+        let report = tracker
+            .read_at_for_test(report_at(frozen.target_date()))
+            .unwrap();
         let expected = match stage {
-            "FrozenOnly" => Status::FrozenOnly, "Pending" => Status::Pending,
-            "Uncertain" => Status::Uncertain, "ManualAccepted" => Status::ManualAccepted,
-            "ManualNotDelivered" => Status::ManualNotDelivered, "Rejected" => Status::Rejected,
+            "FrozenOnly" => Status::FrozenOnly,
+            "Pending" => Status::Pending,
+            "Uncertain" => Status::Uncertain,
+            "ManualAccepted" => Status::ManualAccepted,
+            "ManualNotDelivered" => Status::ManualNotDelivered,
+            "Rejected" => Status::Rejected,
             _ => Status::UnlinkedV1,
         };
         let items: Vec<_> = report.daily.item_feedback().items().collect();
         assert_eq!(items.len(), 3, "{stage}");
         for item in &items[..2] {
             assert_eq!(item.delivery_status(), expected, "{stage}");
-            assert_eq!(item.frozen_occurrence_identity(), Some(frozen.occurrence_identity()));
+            assert_eq!(
+                item.frozen_occurrence_identity(),
+                Some(frozen.occurrence_identity())
+            );
             assert!(item.recorded_hit().is_none());
             if matches!(stage, "FrozenOnly" | "UnlinkedV1") {
                 assert!(item.original_card().is_none(), "{stage}");
             } else {
-                assert_eq!(item.original_card().unwrap().decision_identity(), e.decision_identity);
+                assert_eq!(
+                    item.original_card().unwrap().decision_identity(),
+                    e.decision_identity
+                );
             }
         }
         assert_eq!(items[2].code(), Some(frozen.ordered_rows()[0].code()));
         assert_eq!(items[2].delivery_status(), Status::Unlinked, "{stage}");
         assert!(items[2].original_card().is_none());
-        assert_eq!(report.daily.item_feedback().unlinked_v1_cards(), Some(usize::from(stage == "UnlinkedV1")));
-        assert_eq!((observed_counts(&report.daily).covered_samples, observed_counts(&report.daily).rate), (0, None));
-        assert_eq!(tracker.read_at_for_test(report_at(frozen.target_date())).unwrap(), report);
-        assert_eq!(db.read_outcome_prediction_window(&[frozen.target_date().into()]).unwrap(), before);
-        assert_eq!(audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap()), durable_before);
-        if let Some(sink) = port { assert_eq!(sink.calls.load(Ordering::SeqCst), 1); }
+        assert_eq!(
+            report.daily.item_feedback().unlinked_v1_cards(),
+            Some(usize::from(stage == "UnlinkedV1"))
+        );
+        assert_eq!(
+            (
+                observed_counts(&report.daily).covered_samples,
+                observed_counts(&report.daily).rate
+            ),
+            (0, None)
+        );
+        assert_eq!(
+            tracker
+                .read_at_for_test(report_at(frozen.target_date()))
+                .unwrap(),
+            report
+        );
+        assert_eq!(
+            db.read_outcome_prediction_window(&[frozen.target_date().into()])
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap()),
+            durable_before
+        );
+        if let Some(sink) = port {
+            assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+        }
     }
 }
 
@@ -671,16 +854,23 @@ fn outcome_item_feedback_last_card_hook(
     id: i64,
 ) {
     let next = coordinator.clone();
-    coordinator.install_database_operation_test_hook(
-        DatabaseOperationTestPhase::AfterSqlBeforePostValidation, move || {
-            hits.fetch_add(1, Ordering::SeqCst);
-            if remaining == 1 {
-                Connection::open(path)?.execute("UPDATE prediction_tracker SET pred_score=81 WHERE id=?1", [id])?;
-            } else {
-                outcome_item_feedback_last_card_hook(next, remaining - 1, hits, path, id);
-            }
-            Ok(())
-        }).unwrap();
+    coordinator
+        .install_database_operation_test_hook(
+            DatabaseOperationTestPhase::AfterSqlBeforePostValidation,
+            move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+                if remaining == 1 {
+                    Connection::open(path)?.execute(
+                        "UPDATE prediction_tracker SET pred_score=81 WHERE id=?1",
+                        [id],
+                    )?;
+                } else {
+                    outcome_item_feedback_last_card_hook(next, remaining - 1, hits, path, id);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
 }
 
 #[test]
@@ -689,39 +879,124 @@ fn outcome_item_feedback_complete_tail_hidden_row_and_extent_precede_display_all
     let path = dir.path().join("TEST_CODE_OUTCOME_ITEM_DISPLAY.db");
     let db = DatabaseManager::open_isolated_for_test(path.clone()).unwrap();
     for index in 0..21 {
-        db.save_prediction_legacy("2026-10-08", "2026-10-09", None,
-            Some(&format!("TEST_CODE_ITEM_{index:02}")), "up", 80., None).unwrap();
+        db.save_prediction_legacy(
+            "2026-10-08",
+            "2026-10-09",
+            None,
+            Some(&format!("TEST_CODE_ITEM_{index:02}")),
+            "up",
+            80.,
+            None,
+        )
+        .unwrap();
     }
     let f = Fixture::new("OUTCOME_ITEM_FULL_TAIL");
     let tracker = OutcomeTracker::new(&db, Some(&f.coordinator));
-    let snapshot = db.read_outcome_prediction_window(&["2026-10-09".into()]).unwrap();
-    let durable_before = audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap());
+    let snapshot = db
+        .read_outcome_prediction_window(&["2026-10-09".into()])
+        .unwrap();
+    let durable_before =
+        audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap());
     let report = tracker.read_at_for_test(report_at("2026-10-09")).unwrap();
-    assert_eq!((report.weekly.item_feedback().displayed(), report.weekly.item_feedback().total()), (20, 21));
-    assert_eq!(report.weekly.item_feedback().items().map(|item| item.prediction_row_id()).collect::<Vec<_>>(),
-        snapshot.rows[..20].iter().map(|row| row.id).collect::<Vec<_>>());
-    assert_eq!(report.render().matches("[OutcomeTracker][周窗项]").count(), 20);
+    assert_eq!(
+        (
+            report.weekly.item_feedback().displayed(),
+            report.weekly.item_feedback().total()
+        ),
+        (20, 21)
+    );
+    assert_eq!(
+        report
+            .weekly
+            .item_feedback()
+            .items()
+            .map(|item| item.prediction_row_id())
+            .collect::<Vec<_>>(),
+        snapshot.rows[..20]
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        report.render().matches("[OutcomeTracker][周窗项]").count(),
+        20
+    );
     assert!(report.render().contains("显示20/总21"));
     let last = snapshot.rows[20].id;
     let conn = Connection::open(&path).unwrap();
     // Hidden row 21 still participates in the real recorded-result validation.
-    conn.execute("UPDATE prediction_tracker SET actual_change=1,hit=0 WHERE id=?1", [last]).unwrap();
-    assert_eq!(tracker.read_at_for_test(report_at("2026-10-09")).unwrap_err(), "outcome_recorded_hit_mismatch");
-    conn.execute("UPDATE prediction_tracker SET actual_change=NULL,hit=NULL WHERE id=?1", [last]).unwrap();
+    conn.execute(
+        "UPDATE prediction_tracker SET actual_change=1,hit=0 WHERE id=?1",
+        [last],
+    )
+    .unwrap();
+    assert_eq!(
+        tracker
+            .read_at_for_test(report_at("2026-10-09"))
+            .unwrap_err(),
+        "outcome_recorded_hit_mismatch"
+    );
+    conn.execute(
+        "UPDATE prediction_tracker SET actual_change=NULL,hit=NULL WHERE id=?1",
+        [last],
+    )
+    .unwrap();
     // Below the original SQL input budget; exceeds the new conservative escaped-render budget.
-    conn.execute("UPDATE prediction_tracker SET stock_code=CAST(zeroblob(?1) AS TEXT) WHERE id=?2",
-        params![crate::database::p05_prediction_freeze::OUTCOME_REPORT_MAX_BYTES / 6 + 1, last]).unwrap();
-    assert!(db.read_outcome_prediction_window(&["2026-10-09".into()]).is_ok());
-    assert_eq!(tracker.read_at_for_test(report_at("2026-10-09")).unwrap_err(), "outcome_feedback_extent_exceeded");
-    conn.execute("UPDATE prediction_tracker SET stock_code='TEST_CODE_ITEM_20' WHERE id=?1", [last]).unwrap();
+    conn.execute(
+        "UPDATE prediction_tracker SET stock_code=CAST(zeroblob(?1) AS TEXT) WHERE id=?2",
+        params![
+            crate::database::p05_prediction_freeze::OUTCOME_REPORT_MAX_BYTES / 6 + 1,
+            last
+        ],
+    )
+    .unwrap();
+    assert!(db
+        .read_outcome_prediction_window(&["2026-10-09".into()])
+        .is_ok());
+    assert_eq!(
+        tracker
+            .read_at_for_test(report_at("2026-10-09"))
+            .unwrap_err(),
+        "outcome_feedback_extent_exceeded"
+    );
+    conn.execute(
+        "UPDATE prediction_tracker SET stock_code='TEST_CODE_ITEM_20' WHERE id=?1",
+        [last],
+    )
+    .unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
-    outcome_item_feedback_last_card_hook(fixture_coordinator_arc(&f), 16, hits.clone(), path, snapshot.rows[0].id);
-    assert_eq!(tracker.read_at_for_test(report_at("2026-10-09")).unwrap_err(), "outcome_prediction_changed_at_tail");
+    outcome_item_feedback_last_card_hook(
+        fixture_coordinator_arc(&f),
+        16,
+        hits.clone(),
+        path,
+        snapshot.rows[0].id,
+    );
+    assert_eq!(
+        tracker
+            .read_at_for_test(report_at("2026-10-09"))
+            .unwrap_err(),
+        "outcome_prediction_changed_at_tail"
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 16);
-    conn.execute("UPDATE prediction_tracker SET pred_score=80 WHERE id=?1", [snapshot.rows[0].id]).unwrap();
-    assert_eq!(tracker.read_at_for_test(report_at("2026-10-09")).unwrap(), report);
-    assert_eq!(db.read_outcome_prediction_window(&["2026-10-09".into()]).unwrap(), snapshot);
-    assert_eq!(audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap()), durable_before);
+    conn.execute(
+        "UPDATE prediction_tracker SET pred_score=80 WHERE id=?1",
+        [snapshot.rows[0].id],
+    )
+    .unwrap();
+    assert_eq!(
+        tracker.read_at_for_test(report_at("2026-10-09")).unwrap(),
+        report
+    );
+    assert_eq!(
+        db.read_outcome_prediction_window(&["2026-10-09".into()])
+            .unwrap(),
+        snapshot
+    );
+    assert_eq!(
+        audit_v4_upgrade_database_snapshot(&Connection::open(&f.database_path).unwrap()),
+        durable_before
+    );
     assert_eq!(f.query_i64("SELECT COUNT(*) FROM sink_results"), 0);
     assert_eq!(f.query_i64("SELECT COUNT(*) FROM delivery_decisions"), 0);
 }

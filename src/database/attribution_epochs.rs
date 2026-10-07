@@ -28,19 +28,13 @@ use crate::performance::attribution_epoch::{
 };
 use crate::performance::economic_position::EconomicFillRow;
 use crate::trading::paper_lot_ledger::{
-    parse_paper_fill_timestamp,
-    parse_paper_fill_timestamp_body
-};
-use crate::trading::paper_replay_financial_work_v1::{
-    self as financial,
-    FinancialWork,
-    FinancialFailure,
-    FinancialSink,
-    HistoryText,
-    HistoryChrono,
-    HistorySort
+    parse_paper_fill_timestamp, parse_paper_fill_timestamp_body,
 };
 use crate::trading::paper_replay_codec_v1::HistoryOutput;
+use crate::trading::paper_replay_financial_work_v1::{
+    self as financial, FinancialFailure, FinancialSink, FinancialWork, HistoryChrono, HistorySort,
+    HistoryText,
+};
 
 const RECEIPT_GENESIS: &str = "BR255_ATTRIBUTION_EPOCH_RECEIPT_GENESIS_V1";
 const CARRY_GENESIS: &str = "BR255_ATTRIBUTION_LEGACY_CARRY_GENESIS_V1";
@@ -397,18 +391,25 @@ impl From<diesel::result::Error> for AttributionEpochStoreError {
     }
 }
 fn classify_database_detail(
-    detail: &str, lowercase: &str, work: &mut FinancialWork<'_, '_>,
+    detail: &str,
+    lowercase: &str,
+    work: &mut FinancialWork<'_, '_>,
 ) -> financial::Result<AttributionEpochStoreError> {
-    if lowercase.contains("database is locked") || lowercase.contains("database is busy")
-        || lowercase.contains("sqlite_busy") || lowercase.contains("sqlite_locked")
+    if lowercase.contains("database is locked")
+        || lowercase.contains("database is busy")
+        || lowercase.contains("sqlite_busy")
+        || lowercase.contains("sqlite_locked")
     {
         Ok(AttributionEpochStoreError::Unavailable {
-            reason_code: "attribution_epoch_storage_busy", retryable: true,
-            detail: work.history_text(HistoryText::Attribution(SourceText::DatabaseBusy(detail)))?,
+            reason_code: "attribution_epoch_storage_busy",
+            retryable: true,
+            detail: work
+                .history_text(HistoryText::Attribution(SourceText::DatabaseBusy(detail)))?,
         })
-    }
-    else {
-        Ok(failed_integrity(work.history_text(HistoryText::Attribution(SourceText::DatabaseSource(detail)))?))
+    } else {
+        Ok(failed_integrity(work.history_text(
+            HistoryText::Attribution(SourceText::DatabaseSource(detail)),
+        )?))
     }
 }
 
@@ -2072,7 +2073,10 @@ fn validate_paper_identity(code: &str) -> Result<(), AttributionEpochStoreError>
 fn validate_frozen_paper_row(
     row: &FrozenPaperFill,
 ) -> Result<chrono::NaiveDateTime, AttributionEpochStoreError> {
-    financial::historical_store(validate_frozen_paper_row_body(row, &mut FinancialWork::Historical))
+    financial::historical_store(validate_frozen_paper_row_body(
+        row,
+        &mut FinancialWork::Historical,
+    ))
 }
 
 fn validate_frozen_paper_row_body(
@@ -2087,8 +2091,7 @@ fn validate_frozen_paper_row_body(
     }
     if work.is_historical() {
         validate_paper_identity(&row.code)?;
-    }
-    else {
+    } else {
         // Stage4 must supply real source-bound identity context here. The lower
         // facts body below is not an alternative identity-qualified entry.
         work.history_identity_missing()?;
@@ -2106,16 +2109,25 @@ fn validate_frozen_paper_facts(
     if !row.requested_price.is_finite() || row.requested_price <= 0.0 {
         return Err(source_error(work, SourceText::Price(row))?);
     }
-    if u32::try_from(row.quantity).ok()
-        .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100)).is_none()
+    if u32::try_from(row.quantity)
+        .ok()
+        .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
+        .is_none()
     {
         return Err(source_error(work, SourceText::Quantity(row))?);
     }
-    let normalized_reason = row.not_fill_reason.as_deref().map(str::trim)
+    let normalized_reason = row
+        .not_fill_reason
+        .as_deref()
+        .map(str::trim)
         .filter(|reason| !reason.is_empty());
     match row.status.as_str() {
-        "Filled" if row.fill_price.is_none_or(|price| !price.is_finite() || price <= 0.0)
-            || normalized_reason.is_some() => {
+        "Filled"
+            if row
+                .fill_price
+                .is_none_or(|price| !price.is_finite() || price <= 0.0)
+                || normalized_reason.is_some() =>
+        {
             return Err(source_error(work, SourceText::FilledFacts(row))?);
         }
         "NotFilled" | "Invalidated" if row.fill_price.is_some() || normalized_reason.is_none() => {
@@ -2125,7 +2137,10 @@ fn validate_frozen_paper_facts(
         _ => return Err(source_error(work, SourceText::Status(row))?),
     }
     if row.virtual_reason.trim().is_empty()
-        || !matches!(row.account_mode.as_str(), "Normal" | "ReduceOnly" | "Frozen")
+        || !matches!(
+            row.account_mode.as_str(),
+            "Normal" | "ReduceOnly" | "Frozen"
+        )
         || !matches!(row.data_mode.as_str(), "Full" | "Degraded" | "Unsafe")
     {
         return Err(source_error(work, SourceText::Decision(row))?);
@@ -2168,7 +2183,10 @@ fn analyze_source_projection(
     reject_after_completed: bool,
 ) -> Result<FrozenSourceProjection, AttributionEpochStoreError> {
     financial::historical_store(analyze_source_projection_historical(
-        conn, completed_session, frozen_limits, reject_after_completed,
+        conn,
+        completed_session,
+        frozen_limits,
+        reject_after_completed,
     ))
 }
 
@@ -2181,43 +2199,72 @@ fn analyze_source_projection_historical(
     let work = &mut FinancialWork::Historical;
     let invalid_paper_ids =
         diesel::sql_query("SELECT COUNT(*) AS count FROM paper_trades WHERE id <= 0")
-            .get_result::<CountRow>(conn).map_err(AttributionEpochStoreError::from)?.count;
+            .get_result::<CountRow>(conn)
+            .map_err(AttributionEpochStoreError::from)?
+            .count;
     if invalid_paper_ids != 0 {
-        return Err(source_error(work, SourceText::Literal(SourceLiteral::NonPositiveIdentity))?);
+        return Err(source_error(
+            work,
+            SourceText::Literal(SourceLiteral::NonPositiveIdentity),
+        )?);
     }
-    let current_paper_high_water = load_paper_high_water(conn).map_err(AttributionEpochStoreError::from)?;
-    let paper_trade_high_water = frozen_limits.map(|limits| limits.0).unwrap_or(current_paper_high_water);
+    let current_paper_high_water =
+        load_paper_high_water(conn).map_err(AttributionEpochStoreError::from)?;
+    let paper_trade_high_water = frozen_limits
+        .map(|limits| limits.0)
+        .unwrap_or(current_paper_high_water);
     if current_paper_high_water < paper_trade_high_water {
-        return Err(source_error(work, SourceText::PaperWater {
-            current: current_paper_high_water, frozen: paper_trade_high_water,
-        })?);
+        return Err(source_error(
+            work,
+            SourceText::PaperWater {
+                current: current_paper_high_water,
+                frozen: paper_trade_high_water,
+            },
+        )?);
     }
-    let paper_rows = load_frozen_paper_rows(conn, paper_trade_high_water).map_err(AttributionEpochStoreError::from)?;
+    let paper_rows = load_frozen_paper_rows(conn, paper_trade_high_water)
+        .map_err(AttributionEpochStoreError::from)?;
     let mut paper_ids = work.history_set(paper_rows.len())?;
     let mut paper_plans = work.history_set(paper_rows.len())?;
     for (index, row) in paper_rows.iter().enumerate() {
         validate_source_row_index(&paper_rows, index, &mut paper_ids, &mut paper_plans, work)?;
         let occurred_at = validate_frozen_paper_row_body(row, work)?;
         if reject_after_completed && occurred_at.date() > completed_session {
-            return Err(source_error(work, SourceText::AfterCompleted {
-                id: row.id, date: completed_session
-            })?);
+            return Err(source_error(
+                work,
+                SourceText::AfterCompleted {
+                    id: row.id,
+                    date: completed_session,
+                },
+            )?);
         }
     }
     let projected = project_validated_source_rows(paper_rows, completed_session, work)?;
     let audits = load_order_audit_rows(conn).map_err(AttributionEpochStoreError::from)?;
     let chain = load_order_audit_chain_rows(conn).map_err(AttributionEpochStoreError::from)?;
-    finish_source_projection(paper_trade_high_water, frozen_limits, projected, &audits, &chain, work)
+    finish_source_projection(
+        paper_trade_high_water,
+        frozen_limits,
+        projected,
+        &audits,
+        &chain,
+        work,
+    )
 }
 
 fn validate_source_row_index<'a>(
-    rows: &'a [FrozenPaperFill], index: usize,
-    ids: &mut HashSet<i64>, plans: &mut HashSet<&'a str>,
+    rows: &'a [FrozenPaperFill],
+    index: usize,
+    ids: &mut HashSet<i64>,
+    plans: &mut HashSet<&'a str>,
     work: &mut FinancialWork<'_, '_>,
 ) -> financial::Result<()> {
     let row = &rows[index];
     if index > 0 && rows[index - 1].id >= row.id {
-        return Err(source_error(work, SourceText::Literal(SourceLiteral::PaperOrder))?);
+        return Err(source_error(
+            work,
+            SourceText::Literal(SourceLiteral::PaperOrder),
+        )?);
     }
     if !work.history_seen(ids, row.id)? {
         return Err(source_error(work, SourceText::DuplicateId(row.id))?);
@@ -2239,7 +2286,8 @@ struct ProjectedPaperRows {
 }
 
 fn project_validated_source_rows(
-    rows: Vec<FrozenPaperFill>, completed: NaiveDate,
+    rows: Vec<FrozenPaperFill>,
+    completed: NaiveDate,
     work: &mut FinancialWork<'_, '_>,
 ) -> financial::Result<ProjectedPaperRows> {
     let mut repudiated_plans = work.history_set(0)?;
@@ -2250,52 +2298,74 @@ fn project_validated_source_rows(
     let all_status_paper_manifest_hash = work.history_hash(HistoryOutput::FrozenAll(&rows))?;
     // This exact same-type, unadvanced IntoIter filter is the reviewed reuse
     // specialization. There is no backing request or owned clone here.
-    let mut fills = rows.into_iter().filter(|row| row.status == "Filled").collect::<Vec<_>>();
+    let mut fills = rows
+        .into_iter()
+        .filter(|row| row.status == "Filled")
+        .collect::<Vec<_>>();
     work.history_sort(financial::HistorySort::Frozen(&mut fills))?;
     let mut economic = work.history_vector(fills.len())?;
     for fill in &fills {
         let row = fill.economic_with_work(work)?;
         work.history_push(&mut economic, row)?;
     }
-    let carry_result = crate::performance::attribution_epoch::build_legacy_carry_body(&economic, completed, work);
+    let carry_result =
+        crate::performance::attribution_epoch::build_legacy_carry_body(&economic, completed, work);
     let carry = source_nested(carry_result, SourceNested::LegacyCarry, work)?;
     let legacy_filled_manifest_hash = work.history_hash(HistoryOutput::FrozenFilled(&fills))?;
     let position_projection_hash = work.history_hash(HistoryOutput::FrozenCarry(&carry))?;
     Ok(ProjectedPaperRows {
-        economic_fills: economic, repudiated_plans, all_status_paper_manifest_hash, fills, carry,
-        legacy_filled_manifest_hash, position_projection_hash,
+        economic_fills: economic,
+        repudiated_plans,
+        all_status_paper_manifest_hash,
+        fills,
+        carry,
+        legacy_filled_manifest_hash,
+        position_projection_hash,
     })
 }
 
 fn finish_source_projection(
-    paper_trade_high_water: i64, frozen_limits: Option<(i64, i64)>,
-    projected: ProjectedPaperRows, audits: &[CanonicalOrderAuditRow],
-    chain: &[CanonicalOrderAuditChainRow], work: &mut FinancialWork<'_, '_>,
+    paper_trade_high_water: i64,
+    frozen_limits: Option<(i64, i64)>,
+    projected: ProjectedPaperRows,
+    audits: &[CanonicalOrderAuditRow],
+    chain: &[CanonicalOrderAuditChainRow],
+    work: &mut FinancialWork<'_, '_>,
 ) -> financial::Result<FrozenSourceProjection> {
     let ProjectedPaperRows {
         economic_fills: _economic_fills,
         repudiated_plans,
         all_status_paper_manifest_hash,
-        fills, carry, legacy_filled_manifest_hash, position_projection_hash
-        }
-        = projected;
+        fills,
+        carry,
+        legacy_filled_manifest_hash,
+        position_projection_hash,
+    } = projected;
     if audits
         .iter()
         .enumerate()
         .any(|(index, row)| row.id <= 0 || index > 0 && audits[index - 1].id >= row.id)
     {
-        return Err(source_error(work, SourceText::Literal(SourceLiteral::AuditOrder))?);
+        return Err(source_error(
+            work,
+            SourceText::Literal(SourceLiteral::AuditOrder),
+        )?);
     }
-    let validated = crate::database::order_audit::validate_chain_rows_with_work(audits, chain, work);
+    let validated =
+        crate::database::order_audit::validate_chain_rows_with_work(audits, chain, work);
     source_nested(validated, SourceNested::AuditChain, work)?;
     let current_order_audit_high_water = audits.last().map_or(0, |row| row.id);
     let order_audit_high_water = frozen_limits
         .map(|limits| limits.1)
         .unwrap_or(current_order_audit_high_water);
     if current_order_audit_high_water < order_audit_high_water {
-        return Err(source_error(work, SourceText::AuditWater {
-            current: current_order_audit_high_water, frozen: order_audit_high_water
-        })?);
+        return Err(source_error(
+            work,
+            SourceText::AuditWater {
+                current: current_order_audit_high_water,
+                frozen: order_audit_high_water,
+            },
+        )?);
     }
     let mut prefix_audits = Vec::new();
     for row in audits.iter().filter(|row| row.id <= order_audit_high_water) {
@@ -2303,14 +2373,24 @@ fn finish_source_projection(
         work.history_push(&mut prefix_audits, row)?;
     }
     let mut prefix_chain = Vec::new();
-    for row in chain.iter().filter(|row| row.order_audit_id <= order_audit_high_water) {
+    for row in chain
+        .iter()
+        .filter(|row| row.order_audit_id <= order_audit_high_water)
+    {
         let row = crate::database::order_audit::copy_chain_row(row, work)?;
         work.history_push(&mut prefix_chain, row)?;
     }
-    let validated = crate::database::order_audit::validate_chain_rows_with_work(&prefix_audits, &prefix_chain, work);
+    let validated = crate::database::order_audit::validate_chain_rows_with_work(
+        &prefix_audits,
+        &prefix_chain,
+        work,
+    );
     let mut order_audit_tip_hash = source_nested(validated, SourceNested::FrozenAudit, work)?;
     if order_audit_high_water == 0 && order_audit_tip_hash != AUDIT_CHAIN_GENESIS {
-        return Err(source_error(work, SourceText::Literal(SourceLiteral::EmptyAuditTip))?);
+        return Err(source_error(
+            work,
+            SourceText::Literal(SourceLiteral::EmptyAuditTip),
+        )?);
     }
     if order_audit_high_water == 0 {
         let mut hasher = Sha256::new();
@@ -2321,14 +2401,21 @@ fn finish_source_projection(
 
     let mut chain_hashes = work.history_hash_map(prefix_chain.len())?;
     for row in &prefix_chain {
-        work.history_hash_insert(&mut chain_hashes, row.order_audit_id, row.record_hash.as_str())?;
+        work.history_hash_insert(
+            &mut chain_hashes,
+            row.order_audit_id,
+            row.record_hash.as_str(),
+        )?;
     }
     let mut paper_plans = work.history_set(fills.len())?;
     for row in &fills {
         work.history_seen(&mut paper_plans, row.plan_id.as_str())?;
     }
     let mut terminals = work.history_hash_map(0)?;
-    for audit in prefix_audits.iter().filter(|row| row.source == "PaperTrade" && row.outcome == "Filled") {
+    for audit in prefix_audits
+        .iter()
+        .filter(|row| row.source == "PaperTrade" && row.outcome == "Filled")
+    {
         if !paper_plans.contains(audit.business_order_id.as_str())
             && !repudiated_plans.contains(audit.business_order_id.as_str())
         {
@@ -2342,7 +2429,12 @@ fn finish_source_projection(
     }
     let shanghai = match FixedOffset::east_opt(8 * 60 * 60) {
         Some(value) => value,
-        None => return Err(source_error(work, SourceText::Literal(SourceLiteral::ShanghaiUnavailable))?),
+        None => {
+            return Err(source_error(
+                work,
+                SourceText::Literal(SourceLiteral::ShanghaiUnavailable),
+            )?)
+        }
     };
     let mut bindings = work.history_vector(fills.len())?;
     for paper in &fills {
@@ -2354,7 +2446,8 @@ fn finish_source_projection(
         let binding = bind_terminal_candidate(paper, &candidates, &chain_hashes, shanghai, work)?;
         work.history_push(&mut bindings, binding)?;
     }
-    let terminal_binding_manifest_hash = work.history_hash(HistoryOutput::TerminalBindings(&bindings))?;
+    let terminal_binding_manifest_hash =
+        work.history_hash(HistoryOutput::TerminalBindings(&bindings))?;
     Ok(FrozenSourceProjection {
         paper_trade_high_water,
         order_audit_high_water,
@@ -2918,14 +3011,23 @@ fn load_verified_epoch_fills_with_limits(
     };
     let source = analyze_source_projection(conn, completed, frozen_limits, false)?;
     financial::historical_store(finish_verified_epoch_fills(
-        source, to, effective, paper_high_water, audit_high_water, carry,
+        source,
+        to,
+        effective,
+        paper_high_water,
+        audit_high_water,
+        carry,
         &mut FinancialWork::Historical,
     ))
 }
 
 fn finish_verified_epoch_fills(
-    source: FrozenSourceProjection, to: NaiveDate, effective: Option<NaiveDate>,
-    paper_high_water: i64, audit_high_water: i64, carry: Vec<LegacyCarryPosition>,
+    source: FrozenSourceProjection,
+    to: NaiveDate,
+    effective: Option<NaiveDate>,
+    paper_high_water: i64,
+    audit_high_water: i64,
+    carry: Vec<LegacyCarryPosition>,
     work: &mut FinancialWork<'_, '_>,
 ) -> financial::Result<VerifiedEpochFillSet> {
     let mut bindings = work.history_hash_map(source.bindings.len())?;
@@ -2940,9 +3042,13 @@ fn finish_verified_epoch_fills(
                 continue;
             }
             if occurred_at.date() < effective_date {
-                return Err(source_error(work, SourceText::BeforeEffective {
-                    id: paper.id, date: effective_date
-                })?);
+                return Err(source_error(
+                    work,
+                    SourceText::BeforeEffective {
+                        id: paper.id,
+                        date: effective_date,
+                    },
+                )?);
             }
         }
         if occurred_at.date() > to {
@@ -2959,15 +3065,25 @@ fn finish_verified_epoch_fills(
             continue;
         };
         if effective.is_some() && binding.terminal_audit_id <= audit_high_water {
-            return Err(source_error(work, SourceText::FrozenAudit {
-                paper: paper.id, audit: binding.terminal_audit_id
-            })?);
+            return Err(source_error(
+                work,
+                SourceText::FrozenAudit {
+                    paper: paper.id,
+                    audit: binding.terminal_audit_id,
+                },
+            )?);
         }
         let terminal_time = match DateTime::parse_from_rfc3339(&binding.terminal_time) {
             Ok(time) => time,
-            Err(error) => return Err(source_error(work, SourceText::StoredTime {
-                id: paper.id, error
-            })?),
+            Err(error) => {
+                return Err(source_error(
+                    work,
+                    SourceText::StoredTime {
+                        id: paper.id,
+                        error,
+                    },
+                )?)
+            }
         };
         let fill = VerifiedEpochFill {
             fill: paper.economic_with_work(work)?,
@@ -2978,7 +3094,8 @@ fn finish_verified_epoch_fills(
         work.history_push(&mut fills, fill)?;
     }
     Ok(VerifiedEpochFillSet {
-        fills, carry,
+        fills,
+        carry,
         current_paper_trade_high_water: source.paper_trade_high_water,
         current_order_audit_high_water: source.order_audit_high_water,
         all_status_paper_manifest_hash: source.all_status_paper_manifest_hash,
@@ -8073,16 +8190,30 @@ mod tests {
 }
 
 pub(crate) fn sort_frozen_owner(fills: &mut [FrozenPaperFill]) {
-    fills.sort_by(|left, right| left.occurred_at.cmp(&right.occurred_at).then(left.id.cmp(&right.id)));
+    fills.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then(left.id.cmp(&right.id))
+    });
 }
 impl crate::trading::paper_replay_financial_work_v1::history_sealed::Element for FrozenPaperFill {}
 impl crate::trading::paper_replay_financial_work_v1::HistoryElement for FrozenPaperFill {}
-impl crate::trading::paper_replay_financial_work_v1::history_sealed::Element for TerminalBindingManifestItem {}
-impl crate::trading::paper_replay_financial_work_v1::HistoryElement for TerminalBindingManifestItem {}
+impl crate::trading::paper_replay_financial_work_v1::history_sealed::Element
+    for TerminalBindingManifestItem
+{
+}
+impl crate::trading::paper_replay_financial_work_v1::HistoryElement
+    for TerminalBindingManifestItem
+{
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum SourceLiteral {
-    NonPositiveIdentity, PaperOrder, AuditOrder, EmptyAuditTip, ShanghaiUnavailable,
+    NonPositiveIdentity,
+    PaperOrder,
+    AuditOrder,
+    EmptyAuditTip,
+    ShanghaiUnavailable,
 }
 #[derive(Clone, Copy)]
 pub(crate) enum SourceNested {
@@ -8090,65 +8221,84 @@ pub(crate) enum SourceNested {
     LegacyCarry,
     AuditChain,
     FrozenAudit,
-    CreatedAt(i64)
+    CreatedAt(i64),
 }
 pub(crate) enum SourceText<'a> {
     DatabaseBusy(&'a str),
     DatabaseSource(&'a str),
     Display(&'a AttributionEpochStoreError),
     Literal(SourceLiteral),
-    NonPositive(&'a FrozenPaperFill), Empty(&'a FrozenPaperFill), Direction(&'a FrozenPaperFill),
-    Price(&'a FrozenPaperFill), Quantity(&'a FrozenPaperFill), FilledFacts(&'a FrozenPaperFill),
-    TerminalFacts(&'a FrozenPaperFill), Status(&'a FrozenPaperFill), Decision(&'a FrozenPaperFill), UpdatedBefore(&'a FrozenPaperFill),
+    NonPositive(&'a FrozenPaperFill),
+    Empty(&'a FrozenPaperFill),
+    Direction(&'a FrozenPaperFill),
+    Price(&'a FrozenPaperFill),
+    Quantity(&'a FrozenPaperFill),
+    FilledFacts(&'a FrozenPaperFill),
+    TerminalFacts(&'a FrozenPaperFill),
+    Status(&'a FrozenPaperFill),
+    Decision(&'a FrozenPaperFill),
+    UpdatedBefore(&'a FrozenPaperFill),
     Nested {
         kind: SourceNested,
-        detail: &'a str
+        detail: &'a str,
     },
     PaperWater {
         current: i64,
-        frozen: i64
-    }, AuditWater {
+        frozen: i64,
+    },
+    AuditWater {
         current: i64,
-        frozen: i64
+        frozen: i64,
     },
-    DuplicateId(i64), DuplicatePlan(&'a str), AfterCompleted {
+    DuplicateId(i64),
+    DuplicatePlan(&'a str),
+    AfterCompleted {
         id: i64,
-        date: NaiveDate
+        date: NaiveDate,
     },
-    MissingPlan(&'a CanonicalOrderAuditRow), Candidates {
+    MissingPlan(&'a CanonicalOrderAuditRow),
+    Candidates {
         id: i64,
-        count: usize
+        count: usize,
     },
     Binding {
         paper: i64,
-        audit: i64
-    }, MissingPrice(i64), Prices {
-        paper: i64,
-        audit: i64
+        audit: i64,
     },
-    MissingQuote(i64), Quote {
+    MissingPrice(i64),
+    Prices {
+        paper: i64,
+        audit: i64,
+    },
+    MissingQuote(i64),
+    Quote {
         id: i64,
-        error: chrono::ParseError
-    }, QuoteFuture(i64), Stale {
+        error: chrono::ParseError,
+    },
+    QuoteFuture(i64),
+    Stale {
         id: i64,
-        age: i64
+        age: i64,
     },
     Business {
         paper: i64,
         paper_date: NaiveDate,
         audit: i64,
-        quote_date: NaiveDate
-    }, Persistence(i64), MissingHash(i64),
+        quote_date: NaiveDate,
+    },
+    Persistence(i64),
+    MissingHash(i64),
     StoredTime {
         id: i64,
-        error: chrono::ParseError
-    }, BeforeEffective {
+        error: chrono::ParseError,
+    },
+    BeforeEffective {
         id: i64,
-        date: NaiveDate
+        date: NaiveDate,
     },
     FrozenAudit {
         paper: i64,
-        audit: i64
+        audit: i64,
     },
 }
 impl SourceText<'_> {
@@ -8247,26 +8397,48 @@ impl SourceText<'_> {
         result.map_err(|_| ())
     }
 }
-fn source_error(work: &mut FinancialWork<'_, '_>, text: SourceText<'_>) -> financial::Result<FinancialFailure> {
-    Ok(FinancialFailure::Attribution(failed_integrity(work.history_text(HistoryText::Attribution(text))?)))
+fn source_error(
+    work: &mut FinancialWork<'_, '_>,
+    text: SourceText<'_>,
+) -> financial::Result<FinancialFailure> {
+    Ok(FinancialFailure::Attribution(failed_integrity(
+        work.history_text(HistoryText::Attribution(text))?,
+    )))
 }
-fn source_nested<T>(result: financial::Result<T>, kind: SourceNested, work: &mut FinancialWork<'_, '_>) -> financial::Result<T> {
+fn source_nested<T>(
+    result: financial::Result<T>,
+    kind: SourceNested,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<T> {
     match result {
-        Err(FinancialFailure::History(detail)) => Err(source_error(work, SourceText::Nested {
-            kind, detail: &detail
-        })?),
+        Err(FinancialFailure::History(detail)) => Err(source_error(
+            work,
+            SourceText::Nested {
+                kind,
+                detail: &detail,
+            },
+        )?),
         other => other,
     }
 }
-fn source_timestamp(id: i64, raw: &str, work: &mut FinancialWork<'_, '_>) -> financial::Result<chrono::NaiveDateTime> {
+fn source_timestamp(
+    id: i64,
+    raw: &str,
+    work: &mut FinancialWork<'_, '_>,
+) -> financial::Result<chrono::NaiveDateTime> {
     match parse_paper_fill_timestamp_body(id, raw, work) {
-        Err(FinancialFailure::History(detail)) => Err(FinancialFailure::Attribution(failed_integrity(detail))),
+        Err(FinancialFailure::History(detail)) => {
+            Err(FinancialFailure::Attribution(failed_integrity(detail)))
+        }
         other => other,
     }
 }
 
 impl FrozenPaperFill {
-    fn economic_with_work(&self, work: &mut FinancialWork<'_, '_>) -> financial::Result<EconomicFillRow> {
+    fn economic_with_work(
+        &self,
+        work: &mut FinancialWork<'_, '_>,
+    ) -> financial::Result<EconomicFillRow> {
         Ok(EconomicFillRow {
             id: self.id,
             plan_id: work.copy(&self.plan_id)?,
@@ -8291,8 +8463,12 @@ fn copy_terminal_candidates<'a>(
     };
     // Non-TrustedLen Vec collection obtains first before reserving the rest's
     // exact lower hint. Pointer elements use RawVec's minimum capacity four.
-    let count = iterator.size_hint().0.checked_add(1)
-        .ok_or_else(|| work.history_count_overflow())?.max(4);
+    let count = iterator
+        .size_hint()
+        .0
+        .checked_add(1)
+        .ok_or_else(|| work.history_count_overflow())?
+        .max(4);
     let mut result = work.history_vector(count)?;
     work.history_push(&mut result, first)?;
     for row in iterator {
@@ -8302,50 +8478,78 @@ fn copy_terminal_candidates<'a>(
 }
 
 fn bind_terminal_candidate(
-    paper: &FrozenPaperFill, candidates: &[&CanonicalOrderAuditRow],
-    chain_hashes: &HashMap<i64, &str>, shanghai: FixedOffset,
+    paper: &FrozenPaperFill,
+    candidates: &[&CanonicalOrderAuditRow],
+    chain_hashes: &HashMap<i64, &str>,
+    shanghai: FixedOffset,
     work: &mut FinancialWork<'_, '_>,
 ) -> financial::Result<TerminalBindingManifestItem> {
     if candidates.len() != 1 {
-        return Err(source_error(work, SourceText::Candidates {
-            id: paper.id, count: candidates.len()
-        })?);
+        return Err(source_error(
+            work,
+            SourceText::Candidates {
+                id: paper.id,
+                count: candidates.len(),
+            },
+        )?);
     }
     let terminal = candidates[0];
     let exact = terminal.source == "PaperTrade"
         && terminal.outcome == "Filled"
         && terminal.code == paper.code
-        && terminal.decision_basis.starts_with(paper.virtual_reason.as_str())
+        && terminal
+            .decision_basis
+            .starts_with(paper.virtual_reason.as_str())
         && terminal.side == paper.direction
         && terminal.requested_price.to_bits() == paper.requested_price.to_bits()
         && terminal.execution_price.map(f64::to_bits) == paper.fill_price.map(f64::to_bits)
         && terminal.quantity == paper.quantity
         && terminal.failure_reason.is_none();
     if !exact {
-        return Err(source_error(work, SourceText::Binding {
-            paper: paper.id, audit: terminal.id
-        })?);
+        return Err(source_error(
+            work,
+            SourceText::Binding {
+                paper: paper.id,
+                audit: terminal.id,
+            },
+        )?);
     }
     let execution_price = match terminal.execution_price {
         Some(price) => price,
         None => return Err(source_error(work, SourceText::MissingPrice(terminal.id))?),
     };
-    if !terminal.requested_price.is_finite() || terminal.requested_price <= 0.0
-        || !execution_price.is_finite() || execution_price <= 0.0
+    if !terminal.requested_price.is_finite()
+        || terminal.requested_price <= 0.0
+        || !execution_price.is_finite()
+        || execution_price <= 0.0
     {
-        return Err(source_error(work, SourceText::Prices {
-            paper: paper.id, audit: terminal.id
-        })?);
+        return Err(source_error(
+            work,
+            SourceText::Prices {
+                paper: paper.id,
+                audit: terminal.id,
+            },
+        )?);
     }
-    let quote = match terminal.quote_observed_at.as_deref().filter(|value| !value.trim().is_empty()) {
+    let quote = match terminal
+        .quote_observed_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         Some(value) => value,
         None => return Err(source_error(work, SourceText::MissingQuote(terminal.id))?),
     };
     let quote_observed_at = match DateTime::parse_from_rfc3339(quote) {
         Ok(value) => value,
-        Err(error) => return Err(source_error(work, SourceText::Quote {
-            id: terminal.id, error
-        })?),
+        Err(error) => {
+            return Err(source_error(
+                work,
+                SourceText::Quote {
+                    id: terminal.id,
+                    error,
+                },
+            )?)
+        }
     };
     let parsed = parse_paper_fill_timestamp_body(terminal.id, &terminal.created_at, work);
     let terminal_at = source_nested(parsed, SourceNested::CreatedAt(terminal.id), work)?.and_utc();
@@ -8353,20 +8557,31 @@ fn bind_terminal_candidate(
     if quote_observed_at_utc > terminal_at {
         return Err(source_error(work, SourceText::QuoteFuture(terminal.id))?);
     }
-    let quote_age = terminal_at.signed_duration_since(quote_observed_at_utc).num_milliseconds();
+    let quote_age = terminal_at
+        .signed_duration_since(quote_observed_at_utc)
+        .num_milliseconds();
     if quote_age > 5_000 {
-        return Err(source_error(work, SourceText::Stale {
-            id: terminal.id, age: quote_age
-        })?);
+        return Err(source_error(
+            work,
+            SourceText::Stale {
+                id: terminal.id,
+                age: quote_age,
+            },
+        )?);
     }
     let paper_created_at = source_timestamp(paper.id, &paper.occurred_at, work)?.and_utc();
     let paper_business_date = paper_created_at.date_naive();
     let quote_business_date = quote_observed_at.with_timezone(&shanghai).date_naive();
     if paper_business_date != quote_business_date {
-        return Err(source_error(work, SourceText::Business {
-            paper: paper.id, paper_date: paper_business_date,
-            audit: terminal.id, quote_date: quote_business_date
-            })?);
+        return Err(source_error(
+            work,
+            SourceText::Business {
+                paper: paper.id,
+                paper_date: paper_business_date,
+                audit: terminal.id,
+                quote_date: quote_business_date,
+            },
+        )?);
     }
     if paper_created_at + chrono::Duration::seconds(1) < quote_observed_at_utc {
         return Err(source_error(work, SourceText::Persistence(paper.id))?);
@@ -8392,15 +8607,22 @@ pub(crate) fn history_source_fixture(
     case: crate::trading::paper_replay_history_v1_tests::Case,
     work: &mut FinancialWork<'_, '_>,
 ) {
-    use crate::trading::paper_replay_history_v1_tests::{
-        self as test,
-        Case
-    };
+    use crate::trading::paper_replay_history_v1_tests::{self as test, Case};
     let row = FrozenPaperFill {
-        id: 1, plan_id: "TEST_CODE_HISTORY_PLAN".into(), code: "600001".into(), name: "真实字段".into(),
-        direction: "buy".into(), requested_price: 10.0, status: "Filled".into(), fill_price: Some(10.0),
-        not_fill_reason: None, quantity: 100, occurred_at: "2026-09-24 02:00:00".into(),
-        virtual_reason: "decision".into(), account_mode: "Normal".into(), data_mode: "Full".into(),
+        id: 1,
+        plan_id: "TEST_CODE_HISTORY_PLAN".into(),
+        code: "600001".into(),
+        name: "真实字段".into(),
+        direction: "buy".into(),
+        requested_price: 10.0,
+        status: "Filled".into(),
+        fill_price: Some(10.0),
+        not_fill_reason: None,
+        quantity: 100,
+        occurred_at: "2026-09-24 02:00:00".into(),
+        virtual_reason: "decision".into(),
+        account_mode: "Normal".into(),
+        data_mode: "Full".into(),
         updated_at: "2026-09-24 02:00:00.001".into(),
     };
     if matches!(case, Case::Identity) {
@@ -8415,7 +8637,9 @@ pub(crate) fn history_source_fixture(
         let again = validate_frozen_paper_row_body(&row, work).unwrap_err();
         assert!(matches!(again, FinancialFailure::Terminal(error) if error == first));
         assert_eq!(work.history_used(), used);
-        assert!(matches!(work.history_hash(HistoryOutput::FrozenAll(&[row])), Err(FinancialFailure::Terminal(error)) if error == first));
+        assert!(
+            matches!(work.history_hash(HistoryOutput::FrozenAll(&[row])), Err(FinancialFailure::Terminal(error)) if error == first)
+        );
         return;
     }
     if matches!(case, Case::HashDuplicates) {
@@ -8426,7 +8650,10 @@ pub(crate) fn history_source_fixture(
         }
         let before = work.history_used();
         assert!(!work.history_seen(&mut ids, 0).unwrap());
-        assert!(ids.capacity() > capacity, "full insert reserves before duplicate equality");
+        assert!(
+            ids.capacity() > capacity,
+            "full insert reserves before duplicate equality"
+        );
         assert!(work.history_used() > before);
         let mut audits = Vec::new();
         for id in 1..=3 {
@@ -8443,24 +8670,31 @@ pub(crate) fn history_source_fixture(
         work.history_terminal_index(&mut map, &audits[0]).unwrap();
         assert_eq!(map.capacity(), capacity);
         assert_eq!(map["plan-1"].len(), 2);
-        assert_eq!(work.history_used(), before, "occupied entry and spare nested capacity request zero");
+        assert_eq!(
+            work.history_used(),
+            before,
+            "occupied entry and spare nested capacity request zero"
+        );
         return;
     }
     if matches!(case, Case::SortBranches) {
         for count in [0, 1, 20, 21, 1000] {
-            let mut rows: Vec<_> = (0..count).rev().map(|id| {
-                let mut copy = row.clone();
-                copy.id = id;
-                copy
-            }).collect();
+            let mut rows: Vec<_> = (0..count)
+                .rev()
+                .map(|id| {
+                    let mut copy = row.clone();
+                    copy.id = id;
+                    copy
+                })
+                .collect();
             let original: Vec<_> = (0..count).collect();
             let before = work.history_used();
-            work.history_sort(financial::HistorySort::Frozen(&mut rows)).unwrap();
+            work.history_sort(financial::HistorySort::Frozen(&mut rows))
+                .unwrap();
             assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), original);
             if count < 2 {
                 assert_eq!(work.history_used(), before);
-            }
-            else {
+            } else {
                 assert!(work.history_used() > before);
             }
         }
@@ -8504,25 +8738,43 @@ pub(crate) fn history_source_fixture(
                 4 => changed.occurred_at = "now".into(),
                 _ => changed.updated_at = "2026-09-23 02:00:00".into(),
             }
-            let expected = validate_frozen_paper_facts(&changed, &mut FinancialWork::Historical).unwrap_err();
+            let expected =
+                validate_frozen_paper_facts(&changed, &mut FinancialWork::Historical).unwrap_err();
             let actual = validate_frozen_paper_facts(&changed, work).unwrap_err();
             assert_source_error_equal(actual, expected);
         }
         let mut audit = history_fixture_audit(&row);
         let hashes = HashMap::from([(audit.id, "chain-hash")]);
-        for quote in [None, Some("invalid"), Some("2026-09-24T02:00:01Z"), Some("2026-09-24T01:59:54.999Z")] {
+        for quote in [
+            None,
+            Some("invalid"),
+            Some("2026-09-24T02:00:01Z"),
+            Some("2026-09-24T01:59:54.999Z"),
+        ] {
             audit.quote_observed_at = quote.map(str::to_owned);
             let candidates = [&audit];
             let offset = FixedOffset::east_opt(28_800).unwrap();
-            let expected = bind_terminal_candidate(&row, &candidates, &hashes, offset, &mut FinancialWork::Historical).unwrap_err();
-            let actual = bind_terminal_candidate(&row, &candidates, &hashes, offset, work).unwrap_err();
+            let expected = bind_terminal_candidate(
+                &row,
+                &candidates,
+                &hashes,
+                offset,
+                &mut FinancialWork::Historical,
+            )
+            .unwrap_err();
+            let actual =
+                bind_terminal_candidate(&row, &candidates, &hashes, offset, work).unwrap_err();
             assert_source_error_equal(actual, expected);
         }
         return;
     }
     if matches!(case, Case::SourceBoundaries) {
-        let original = project_validated_source_rows(Vec::new(), test::date(), &mut FinancialWork::Historical).unwrap();
-        let original = finish_source_projection(0, None, original, &[], &[], &mut FinancialWork::Historical).unwrap();
+        let original =
+            project_validated_source_rows(Vec::new(), test::date(), &mut FinancialWork::Historical)
+                .unwrap();
+        let original =
+            finish_source_projection(0, None, original, &[], &[], &mut FinancialWork::Historical)
+                .unwrap();
         let empty = project_validated_source_rows(Vec::new(), test::date(), work).unwrap();
         let empty = finish_source_projection(0, None, empty, &[], &[], work).unwrap();
         assert!(empty.fills.is_empty());
@@ -8532,53 +8784,111 @@ pub(crate) fn history_source_fixture(
         let mut empty_tip = Sha256::new();
         empty_tip.update(EMPTY_ORDER_AUDIT_PREFIX_TIP_DOMAIN);
         empty_tip.update(AUDIT_CHAIN_GENESIS.as_bytes());
-        assert_eq!(empty.order_audit_tip_hash, hex::encode(empty_tip.finalize()));
+        assert_eq!(
+            empty.order_audit_tip_hash,
+            hex::encode(empty_tip.finalize())
+        );
         for ordered in [true, false] {
             let mut duplicate = row.clone();
-            duplicate.id = if ordered {
-                2
-            }
-            else {
-                1
-            };
+            duplicate.id = if ordered { 2 } else { 1 };
             let rows = vec![row.clone(), duplicate];
             let mut original_ids = HashSet::with_capacity(2);
             let mut original_plans = HashSet::with_capacity(2);
             let mut ids = work.history_set(2).unwrap();
             let mut plans = work.history_set(2).unwrap();
-            validate_source_row_index(&rows, 0, &mut original_ids, &mut original_plans, &mut FinancialWork::Historical).unwrap();
+            validate_source_row_index(
+                &rows,
+                0,
+                &mut original_ids,
+                &mut original_plans,
+                &mut FinancialWork::Historical,
+            )
+            .unwrap();
             validate_source_row_index(&rows, 0, &mut ids, &mut plans, work).unwrap();
-            let original = validate_source_row_index(&rows, 1, &mut original_ids, &mut original_plans, &mut FinancialWork::Historical).unwrap_err();
-            let actual = validate_source_row_index(&rows, 1, &mut ids, &mut plans, work).unwrap_err();
+            let original = validate_source_row_index(
+                &rows,
+                1,
+                &mut original_ids,
+                &mut original_plans,
+                &mut FinancialWork::Historical,
+            )
+            .unwrap_err();
+            let actual =
+                validate_source_row_index(&rows, 1, &mut ids, &mut plans, work).unwrap_err();
             assert_source_error_equal(actual, original);
         }
         let audit = history_fixture_audit(&row);
         let chain = CanonicalOrderAuditChainRow {
             order_audit_id: audit.id,
             previous_hash: AUDIT_CHAIN_GENESIS.into(),
-            record_hash: crate::database::order_audit::canonical_order_audit_record_hash(AUDIT_CHAIN_GENESIS, &audit).unwrap(),
+            record_hash: crate::database::order_audit::canonical_order_audit_record_hash(
+                AUDIT_CHAIN_GENESIS,
+                &audit,
+            )
+            .unwrap(),
         };
         let mut invalidated = row.clone();
         invalidated.status = "Invalidated".into();
         invalidated.fill_price = None;
         invalidated.not_fill_reason = Some("explicitly repudiated".into());
         validate_frozen_paper_facts(&invalidated, work).unwrap();
-        let original = project_validated_source_rows(vec![invalidated.clone()], test::date(), &mut FinancialWork::Historical).unwrap();
-        let original = finish_source_projection(1, None, original, &[audit.clone()], &[chain.clone()], &mut FinancialWork::Historical).unwrap();
-        let projected = project_validated_source_rows(vec![invalidated], test::date(), work).unwrap();
-        let actual = finish_source_projection(1, None, projected, &[audit.clone()], &[chain.clone()], work).unwrap();
+        let original = project_validated_source_rows(
+            vec![invalidated.clone()],
+            test::date(),
+            &mut FinancialWork::Historical,
+        )
+        .unwrap();
+        let original = finish_source_projection(
+            1,
+            None,
+            original,
+            &[audit.clone()],
+            &[chain.clone()],
+            &mut FinancialWork::Historical,
+        )
+        .unwrap();
+        let projected =
+            project_validated_source_rows(vec![invalidated], test::date(), work).unwrap();
+        let actual =
+            finish_source_projection(1, None, projected, &[audit.clone()], &[chain.clone()], work)
+                .unwrap();
         assert!(actual.fills.is_empty());
-        assert_eq!(actual.terminal_binding_manifest_hash, original.terminal_binding_manifest_hash);
+        assert_eq!(
+            actual.terminal_binding_manifest_hash,
+            original.terminal_binding_manifest_hash
+        );
         // The full chain is validated before the frozen high-water shortage.
         for broken_chain in [false, true] {
             let mut changed = chain.clone();
             if broken_chain {
                 changed.previous_hash = "bad-link".into();
             }
-            let original = project_validated_source_rows(vec![row.clone()], test::date(), &mut FinancialWork::Historical).unwrap();
-            let original = finish_source_projection(1, Some((1, 2)), original, &[audit.clone()], &[changed.clone()], &mut FinancialWork::Historical).unwrap_err();
-            let projected = project_validated_source_rows(vec![row.clone()], test::date(), work).unwrap();
-            let actual = finish_source_projection(1, Some((1, 2)), projected, &[audit.clone()], &[changed], work).unwrap_err();
+            let original = project_validated_source_rows(
+                vec![row.clone()],
+                test::date(),
+                &mut FinancialWork::Historical,
+            )
+            .unwrap();
+            let original = finish_source_projection(
+                1,
+                Some((1, 2)),
+                original,
+                &[audit.clone()],
+                &[changed.clone()],
+                &mut FinancialWork::Historical,
+            )
+            .unwrap_err();
+            let projected =
+                project_validated_source_rows(vec![row.clone()], test::date(), work).unwrap();
+            let actual = finish_source_projection(
+                1,
+                Some((1, 2)),
+                projected,
+                &[audit.clone()],
+                &[changed],
+                work,
+            )
+            .unwrap_err();
             assert_source_error_equal(actual, original);
         }
         return;
@@ -8595,10 +8905,24 @@ pub(crate) fn history_source_fixture(
     let chain = vec![CanonicalOrderAuditChainRow {
         order_audit_id: audits[0].id,
         previous_hash: AUDIT_CHAIN_GENESIS.into(),
-        record_hash: crate::database::order_audit::canonical_order_audit_record_hash(AUDIT_CHAIN_GENESIS, &audits[0]).unwrap(),
+        record_hash: crate::database::order_audit::canonical_order_audit_record_hash(
+            AUDIT_CHAIN_GENESIS,
+            &audits[0],
+        )
+        .unwrap(),
     }];
-    let expected_paper = project_validated_source_rows(rows.clone(), test::date(), &mut FinancialWork::Historical).unwrap();
-    let original = finish_source_projection(1, None, expected_paper, &audits, &chain, &mut FinancialWork::Historical).unwrap();
+    let expected_paper =
+        project_validated_source_rows(rows.clone(), test::date(), &mut FinancialWork::Historical)
+            .unwrap();
+    let original = finish_source_projection(
+        1,
+        None,
+        expected_paper,
+        &audits,
+        &chain,
+        &mut FinancialWork::Historical,
+    )
+    .unwrap();
     for pass in 0..2 {
         let used = work.history_used();
         let projected = project_validated_source_rows(rows.clone(), test::date(), work).unwrap();
@@ -8606,18 +8930,46 @@ pub(crate) fn history_source_fixture(
         assert_eq!(actual.bindings, original.bindings);
         assert_eq!(actual.carry, original.carry);
         assert_eq!(actual.carry[0].quantity, 100);
-        assert_eq!(actual.all_status_paper_manifest_hash, original.all_status_paper_manifest_hash);
-        assert_eq!(actual.legacy_filled_manifest_hash, original.legacy_filled_manifest_hash);
-        assert_eq!(actual.terminal_binding_manifest_hash, original.terminal_binding_manifest_hash);
-        assert_eq!(actual.position_projection_hash, original.position_projection_hash);
+        assert_eq!(
+            actual.all_status_paper_manifest_hash,
+            original.all_status_paper_manifest_hash
+        );
+        assert_eq!(
+            actual.legacy_filled_manifest_hash,
+            original.legacy_filled_manifest_hash
+        );
+        assert_eq!(
+            actual.terminal_binding_manifest_hash,
+            original.terminal_binding_manifest_hash
+        );
+        assert_eq!(
+            actual.position_projection_hash,
+            original.position_projection_hash
+        );
         assert_eq!(actual.order_audit_tip_hash, original.order_audit_tip_hash);
         // Independent retained original JSON/domain/length oracle, not the paid
         // output dispatcher's own digest implementation.
         for (domain, bytes, actual) in [
-            (b"BR255_ATTRIBUTION_ALL_STATUS_PAPER_MANIFEST_V1\0".as_slice(), serde_json::to_vec(&rows).unwrap(), &actual.all_status_paper_manifest_hash),
-            (b"BR255_ATTRIBUTION_LEGACY_FILLED_MANIFEST_V1\0".as_slice(), serde_json::to_vec(&actual.fills).unwrap(), &actual.legacy_filled_manifest_hash),
-            (b"BR255_ATTRIBUTION_POSITION_PROJECTION_V1\0".as_slice(), serde_json::to_vec(&actual.carry).unwrap(), &actual.position_projection_hash),
-            (b"BR255_ATTRIBUTION_TERMINAL_BINDING_MANIFEST_V1\0".as_slice(), serde_json::to_vec(&actual.bindings).unwrap(), &actual.terminal_binding_manifest_hash),
+            (
+                b"BR255_ATTRIBUTION_ALL_STATUS_PAPER_MANIFEST_V1\0".as_slice(),
+                serde_json::to_vec(&rows).unwrap(),
+                &actual.all_status_paper_manifest_hash,
+            ),
+            (
+                b"BR255_ATTRIBUTION_LEGACY_FILLED_MANIFEST_V1\0".as_slice(),
+                serde_json::to_vec(&actual.fills).unwrap(),
+                &actual.legacy_filled_manifest_hash,
+            ),
+            (
+                b"BR255_ATTRIBUTION_POSITION_PROJECTION_V1\0".as_slice(),
+                serde_json::to_vec(&actual.carry).unwrap(),
+                &actual.position_projection_hash,
+            ),
+            (
+                b"BR255_ATTRIBUTION_TERMINAL_BINDING_MANIFEST_V1\0".as_slice(),
+                serde_json::to_vec(&actual.bindings).unwrap(),
+                &actual.terminal_binding_manifest_hash,
+            ),
         ] {
             let mut hash = Sha256::new();
             hash.update(domain);
@@ -8625,21 +8977,37 @@ pub(crate) fn history_source_fixture(
             hash.update(bytes);
             assert_eq!(*actual, hex::encode(hash.finalize()));
         }
-        let verified = finish_verified_epoch_fills(actual, test::date(), None, 0, 0, Vec::new(), work).unwrap();
+        let verified =
+            finish_verified_epoch_fills(actual, test::date(), None, 0, 0, Vec::new(), work)
+                .unwrap();
         assert_eq!(verified.fills().len(), 1);
-        assert!(verified.carry().is_empty(), "Legacy drops computed carry and returns its original empty carry");
+        assert!(
+            verified.carry().is_empty(),
+            "Legacy drops computed carry and returns its original empty carry"
+        );
         assert_eq!(verified.fills()[0].terminal_audit_id(), Some(1));
-        assert!(work.history_used() > used, "owner pass {pass} must accumulate");
+        assert!(
+            work.history_used() > used,
+            "owner pass {pass} must accumulate"
+        );
     }
 }
 #[cfg(test)]
 fn history_fixture_audit(row: &FrozenPaperFill) -> CanonicalOrderAuditRow {
     CanonicalOrderAuditRow {
-        id: 1, business_order_id: row.plan_id.clone(), source: "PaperTrade".into(),
-        decision_basis: row.virtual_reason.clone(), side: row.direction.clone(), code: row.code.clone(),
-        requested_price: row.requested_price, execution_price: row.fill_price, quantity: row.quantity,
-        quote_observed_at: Some("2026-09-24T01:59:59.500Z".into()), outcome: "Filled".into(),
-        failure_reason: None, created_at: "2026-09-24 02:00:00".into(),
+        id: 1,
+        business_order_id: row.plan_id.clone(),
+        source: "PaperTrade".into(),
+        decision_basis: row.virtual_reason.clone(),
+        side: row.direction.clone(),
+        code: row.code.clone(),
+        requested_price: row.requested_price,
+        execution_price: row.fill_price,
+        quantity: row.quantity,
+        quote_observed_at: Some("2026-09-24T01:59:59.500Z".into()),
+        outcome: "Filled".into(),
+        failure_reason: None,
+        created_at: "2026-09-24 02:00:00".into(),
     }
 }
 #[cfg(test)]
@@ -8647,7 +9015,10 @@ fn assert_source_error_equal(actual: FinancialFailure, expected: FinancialFailur
     match (actual, expected) {
         (FinancialFailure::Attribution(actual), FinancialFailure::Attribution(expected)) => {
             assert_eq!(actual.to_string(), expected.to_string());
-            assert_eq!(std::mem::discriminant(&actual), std::mem::discriminant(&expected));
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
         }
         pair => panic!("unexpected source error classes: {pair:?}"),
     }
@@ -8676,14 +9047,26 @@ pub(crate) fn from_known_audit_error(
 #[cfg(test)]
 pub(crate) fn history_boundary_frozen_rows() -> Vec<FrozenPaperFill> {
     // Ordinary owned fixture input, not a paid SQL row or retained context.
-    (0..1000).rev().map(|id| FrozenPaperFill {
-        id, plan_id: "TEST_CODE_BOUNDARY".into(), code: "600001".into(),
-        name: "fixture".into(), direction: "buy".into(), requested_price: 10.0,
-        status: "Filled".into(), fill_price: Some(10.0), not_fill_reason: None,
-        quantity: 100, occurred_at: "2026-09-24 02:00:00".into(),
-        virtual_reason: "decision".into(), account_mode: "Normal".into(),
-        data_mode: "Full".into(), updated_at: "2026-09-24 02:00:00".into(),
-    }).collect()
+    (0..1000)
+        .rev()
+        .map(|id| FrozenPaperFill {
+            id,
+            plan_id: "TEST_CODE_BOUNDARY".into(),
+            code: "600001".into(),
+            name: "fixture".into(),
+            direction: "buy".into(),
+            requested_price: 10.0,
+            status: "Filled".into(),
+            fill_price: Some(10.0),
+            not_fill_reason: None,
+            quantity: 100,
+            occurred_at: "2026-09-24 02:00:00".into(),
+            virtual_reason: "decision".into(),
+            account_mode: "Normal".into(),
+            data_mode: "Full".into(),
+            updated_at: "2026-09-24 02:00:00".into(),
+        })
+        .collect()
 }
 #[cfg(test)]
 pub(crate) fn history_boundary_frozen_ids(rows: &[FrozenPaperFill]) -> Vec<i64> {

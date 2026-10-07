@@ -3,3 +3,6 @@ contracts/external_v1_current/*.proto -text whitespace=blank-at-eol,blank-at-eof
 contracts/external_v1_current/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 contracts/external_v1_history/20260928.2/*.proto -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 contracts/external_v1_history/20260928.2/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+# Frozen diagnostic request/descriptor inputs also preserve delivered CRLF.
+src/grpc_client/probe_profiles/windows-b7-20261002.17/*.proto -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+src/grpc_client/probe_profiles/windows-b7-20261002.17/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

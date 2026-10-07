@@ -1241,10 +1241,14 @@ impl AdditiveCatalog8Projection {
     pub(super) fn eof_queries(&self) -> [(&'static str, &'static str); 2] {
         let _ = &self.new_columns;
         [
-            ("candidate_scope_observations_v1",
-             "SELECT _rowid_ FROM main.\"candidate_scope_observations_v1\" ORDER BY _rowid_"),
-            ("investment_decisions_v1",
-             "SELECT _rowid_ FROM main.\"investment_decisions_v1\" ORDER BY _rowid_"),
+            (
+                "candidate_scope_observations_v1",
+                "SELECT _rowid_ FROM main.\"candidate_scope_observations_v1\" ORDER BY _rowid_",
+            ),
+            (
+                "investment_decisions_v1",
+                "SELECT _rowid_ FROM main.\"investment_decisions_v1\" ORDER BY _rowid_",
+            ),
         ]
     }
 }
@@ -1271,29 +1275,51 @@ impl ClosedAdditiveCatalog8Recipe {
             return Err(rows_catalog_error("additive target runtime/header differs"));
         }
         work.before_rows_classifier(&actual, references)?;
-        if !matches!(classify_database_half(&actual, references)?,
-            DatabaseHalfDiagnostic::AmendedDatabaseHalf(_))
-        {
-            return Err(rows_catalog_error("additive target is not amended Catalog8"));
+        if !matches!(
+            classify_database_half(&actual, references)?,
+            DatabaseHalfDiagnostic::AmendedDatabaseHalf(_)
+        ) {
+            return Err(rows_catalog_error(
+                "additive target is not amended Catalog8",
+            ));
         }
         // The actual classifier closes the entire fixed eight family, including
         // its new UNIQUE autoindexes. Preserve every old contract separately.
         let old = &original.expected;
         if old.objects.iter().any(|row| !actual.objects.contains(row))
-            || old.managed_index_geometry.iter().any(|g| !actual.managed_index_geometry.contains(g))
-            || old.foreign_keys.iter().any(|f| !actual.foreign_keys.contains(f))
-            || old.sqlite_owned_objects.iter().any(|o| !actual.sqlite_owned_objects.contains(o))
+            || old
+                .managed_index_geometry
+                .iter()
+                .any(|g| !actual.managed_index_geometry.contains(g))
+            || old
+                .foreign_keys
+                .iter()
+                .any(|f| !actual.foreign_keys.contains(f))
+            || old
+                .sqlite_owned_objects
+                .iter()
+                .any(|o| !actual.sqlite_owned_objects.contains(o))
             || actual.attached_schema_names != old.attached_schema_names
             || actual.legacy_row_counts != old.legacy_row_counts
             || actual.selection_row_counts != old.selection_row_counts
             || actual.selection_payload_schemas != old.selection_payload_schemas
         {
-            return Err(rows_catalog_error("additive old catalog/count contract differs"));
+            return Err(rows_catalog_error(
+                "additive old catalog/count contract differs",
+            ));
         }
-        let table_count = actual.objects.iter()
-            .filter(|r| r.identity.kind == CatalogObjectKind::Table).count()
-            .checked_add(actual.sqlite_owned_objects.iter()
-                .filter(|r| r.kind == CatalogObjectKind::Table).count())
+        let table_count = actual
+            .objects
+            .iter()
+            .filter(|r| r.identity.kind == CatalogObjectKind::Table)
+            .count()
+            .checked_add(
+                actual
+                    .sqlite_owned_objects
+                    .iter()
+                    .filter(|r| r.kind == CatalogObjectKind::Table)
+                    .count(),
+            )
             .ok_or_else(|| rows_catalog_error("additive table extent overflow"))?;
         if Some(table_count) != original.tables.len().checked_add(2)
             || table_count as u64 > work.tables
@@ -1308,7 +1334,9 @@ impl ClosedAdditiveCatalog8Recipe {
         work.charge(std::mem::size_of::<AdditiveCatalog8Projection>() as u64)?;
         let candidate = whole_rows_shape(connection, "candidate_scope_observations_v1", work)?;
         let investment = whole_rows_shape(connection, "investment_decisions_v1", work)?;
-        Ok(AdditiveCatalog8Projection { new_columns: [candidate, investment] })
+        Ok(AdditiveCatalog8Projection {
+            new_columns: [candidate, investment],
+        })
     }
 }
 
@@ -1357,7 +1385,10 @@ impl RowsSpecWork {
     // Preserve the historical assignment order: addition overflow leaves used
     // unchanged; a limit failure retains the successfully added attempted total.
     pub(super) fn try_charge(&mut self, amount: u64) -> Result<(), RowsSpecDebitFailure> {
-        self.used = self.used.checked_add(amount).ok_or(RowsSpecDebitFailure::Overflow)?;
+        self.used = self
+            .used
+            .checked_add(amount)
+            .ok_or(RowsSpecDebitFailure::Overflow)?;
         if self.used > self.limit {
             return Err(RowsSpecDebitFailure::Exceeded);
         }
@@ -4559,13 +4590,15 @@ pub(super) fn additive_catalog6_recipe_for_test() -> ClosedAdditiveCatalog8Recip
         .unwrap()
 }
 
-
 // Genuine SQLite-emitted catalogs and real old cells for the low-authority
 // projection core. Neither Connection is issued as a retained target reader.
 #[cfg(test)]
 pub(super) fn additive_projection_fixture_for_test() -> (
-    Connection, Connection, WholeRowsReadSpec,
-    SameRuntimeCatalogReferences, SelectionCatalogCaptureAuthority,
+    Connection,
+    Connection,
+    WholeRowsReadSpec,
+    SameRuntimeCatalogReferences,
+    SelectionCatalogCaptureAuthority,
 ) {
     let references = build_same_runtime_catalog_references(GlobalSchemaCatalogMode::Test).unwrap();
     let mut source = Connection::open_in_memory().unwrap();
@@ -4574,23 +4607,42 @@ pub(super) fn additive_projection_fixture_for_test() -> (
         (&source, &references.execution_v6.amended, 6),
         (&target, &references.investment_v8.amended, 8),
     ] {
-        for kind in [CatalogObjectKind::Table, CatalogObjectKind::Index,
-            CatalogObjectKind::Trigger, CatalogObjectKind::View]
-        {
-            for row in reference.objects.iter().filter(|row| row.identity.kind == kind) {
+        for kind in [
+            CatalogObjectKind::Table,
+            CatalogObjectKind::Index,
+            CatalogObjectKind::Trigger,
+            CatalogObjectKind::View,
+        ] {
+            for row in reference
+                .objects
+                .iter()
+                .filter(|row| row.identity.kind == kind)
+            {
                 connection.execute_batch(&row.exact_sql).unwrap();
             }
         }
-        connection.pragma_update(None, "application_id", STOCK_ANALYSIS_SQLITE_APPLICATION_ID).unwrap();
-        connection.pragma_update(None, "user_version", generation).unwrap();
+        connection
+            .pragma_update(None, "application_id", STOCK_ANALYSIS_SQLITE_APPLICATION_ID)
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", generation)
+            .unwrap();
         connection.execute_batch("INSERT INTO ledger(id,date,total_value,cash,market_value,daily_pnl,created_at) VALUES(-10,'2026-09-28',123.25,12.25,111,0,CAST(X'FF0041' AS TEXT)),(50,'2026-09-29',123.25000000000003,12.25,111,0,X'FF0041'); INSERT INTO sqlite_sequence(name,seq) VALUES('ledger',91),('TEST_CODE_UNKNOWN_COUNTER',X'3100FF')").unwrap();
         require_empty_temp_for_rows(connection).unwrap();
     }
     let authority = SelectionCatalogCaptureAuthority::for_test_code();
-    let transaction = source.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    let transaction = source
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
     let actual = capture_catalog_snapshot(&authority, &transaction, references.mode).unwrap();
-    let spec = capture_whole_rows_read_spec(&authority, &transaction, &actual,
-        &references, &mut RowsSpecWork::new(16 * 1024 * 1024, 4096, 1024)).unwrap();
+    let spec = capture_whole_rows_read_spec(
+        &authority,
+        &transaction,
+        &actual,
+        &references,
+        &mut RowsSpecWork::new(16 * 1024 * 1024, 4096, 1024),
+    )
+    .unwrap();
     transaction.commit().unwrap();
     (source, target, spec, references, authority)
 }
@@ -5786,21 +5838,41 @@ mod tests {
                 8 => &references.investment_v8.amended,
                 _ => panic!("fixture has no other family"),
             };
-            for kind in [CatalogObjectKind::Table, CatalogObjectKind::Index,
-                CatalogObjectKind::Trigger, CatalogObjectKind::View] {
-                for row in reference.objects.iter().filter(|row| row.identity.kind == kind) {
+            for kind in [
+                CatalogObjectKind::Table,
+                CatalogObjectKind::Index,
+                CatalogObjectKind::Trigger,
+                CatalogObjectKind::View,
+            ] {
+                for row in reference
+                    .objects
+                    .iter()
+                    .filter(|row| row.identity.kind == kind)
+                {
                     connection.execute_batch(&row.exact_sql).unwrap();
                 }
             }
-            connection.pragma_update(None, "application_id", STOCK_ANALYSIS_SQLITE_APPLICATION_ID).unwrap();
-            connection.pragma_update(None, "user_version", generation).unwrap();
+            connection
+                .pragma_update(None, "application_id", STOCK_ANALYSIS_SQLITE_APPLICATION_ID)
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", generation)
+                .unwrap();
         }
         let authority = SelectionCatalogCaptureAuthority::for_test_code();
-        let transaction = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         require_empty_temp_for_rows(&transaction).unwrap();
         let actual = capture_catalog_snapshot(&authority, &transaction, references.mode).unwrap();
-        capture_whole_rows_read_spec(&authority, &transaction, &actual, references,
-            &mut RowsSpecWork::new(16 * 1024 * 1024, 4096, 1024)).unwrap()
+        capture_whole_rows_read_spec(
+            &authority,
+            &transaction,
+            &actual,
+            references,
+            &mut RowsSpecWork::new(16 * 1024 * 1024, 4096, 1024),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5813,15 +5885,21 @@ mod tests {
         assert!(spec.select_exact_amended_catalog6().is_ok());
         for generation in [0, 7, 8] {
             let other = additive_spec_from_real_capture(&references, generation);
-            assert!(matches!(other.select_additive_catalog6_to8(&references),
-                Err(GlobalSchemaCatalogError::UnsupportedSchemaIdentity { .. })));
+            assert!(matches!(
+                other.select_additive_catalog6_to8(&references),
+                Err(GlobalSchemaCatalogError::UnsupportedSchemaIdentity { .. })
+            ));
         }
         let production = same_runtime_references(GlobalSchemaCatalogMode::Production);
-        assert!(matches!(spec.select_additive_catalog6_to8(&production),
-            Err(GlobalSchemaCatalogError::ModeMismatch { .. })));
+        assert!(matches!(
+            spec.select_additive_catalog6_to8(&production),
+            Err(GlobalSchemaCatalogError::ModeMismatch { .. })
+        ));
         let mut foreign_runtime = same_runtime_references(GlobalSchemaCatalogMode::Test);
         foreign_runtime.runtime.source_id.push_str("-foreign");
-        assert!(matches!(spec.select_additive_catalog6_to8(&foreign_runtime),
-            Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch)));
+        assert!(matches!(
+            spec.select_additive_catalog6_to8(&foreign_runtime),
+            Err(GlobalSchemaCatalogError::RuntimeIdentityMismatch)
+        ));
     }
 }

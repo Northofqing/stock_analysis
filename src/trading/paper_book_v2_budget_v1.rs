@@ -1,8 +1,10 @@
 //! Integer accounting rules, not an approval factory. These closed persisted
 //! records are observations; only the private issuer may approve their use.
 
-use crate::trading::paper_replay_financial_work_v1::{self as fw, FinancialWork, FinancialFailure, ClosedFinancialText as Txt};
 use super::paper_ledger::{LedgerError, Projection};
+use crate::trading::paper_replay_financial_work_v1::{
+    self as fw, ClosedFinancialText as Txt, FinancialFailure, FinancialWork,
+};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,9 +68,17 @@ fn add(total: &mut i128, value: i128) -> Result<(), LedgerError> {
 }
 
 pub(crate) fn notional(price: i64, quantity: u32) -> Result<i64, LedgerError> {
-    fw::historical(notional_with_work(price, quantity, &mut FinancialWork::Historical))
+    fw::historical(notional_with_work(
+        price,
+        quantity,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn notional_with_work(price: i64, quantity: u32, w: &mut FinancialWork<'_, '_>) -> fw::Result<i64> {
+pub(crate) fn notional_with_work(
+    price: i64,
+    quantity: u32,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<i64> {
     w.finish()?;
     if price <= 0 || quantity == 0 {
         return Err(w.error(Txt::Budget(fw::BudgetText::NonpositivePriceOrQuantity))?);
@@ -90,7 +100,12 @@ impl CashPartitions {
     }
     pub(crate) fn validate_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
         w.finish()?;
-        if self.account_cash < 0 || self.strategy_cash < 0 || self.unassigned_cash < 0 || checked(i128::from(self.strategy_cash) + i128::from(self.unassigned_cash))? != self.account_cash {
+        if self.account_cash < 0
+            || self.strategy_cash < 0
+            || self.unassigned_cash < 0
+            || checked(i128::from(self.strategy_cash) + i128::from(self.unassigned_cash))?
+                != self.account_cash
+        {
             return Err(w.error(Txt::Budget(fw::BudgetText::ExecutionCashPartitionsDiffer))?);
         }
         Ok(())
@@ -101,7 +116,11 @@ impl CashPartitions {
     pub(crate) fn apply_strategy_delta(&mut self, delta: i64) -> Result<(), LedgerError> {
         fw::historical(self.apply_strategy_delta_with_work(delta, &mut FinancialWork::Historical))
     }
-    pub(crate) fn apply_strategy_delta_with_work(&mut self, delta: i64, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+    pub(crate) fn apply_strategy_delta_with_work(
+        &mut self,
+        delta: i64,
+        w: &mut FinancialWork<'_, '_>,
+    ) -> fw::Result<()> {
         w.finish()?;
         self.validate_with_work(w)?;
         let next = Self {
@@ -121,19 +140,36 @@ impl BudgetRecord {
     }
     pub(crate) fn validate_shape_with_work(&self, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
         w.finish()?;
-        if self.version != POLICY_VERSION || !token(&self.family_id) || self.effective_from > self.effective_through || !token(&self.original_seed_reference) || !token(&self.review_reference) || self.authorized_budget_micro_cny <= 0 || self.initial_strategy_cash_micro_cny < 0 || !(1..=10_000).contains(&self.concentration_bps) || !(1..=10_000).contains(&self.chain_exposure_bps) || self.cash_floor_bps > 10_000 || self.max_order_exposure_micro_cny <= 0 || self.max_order_exposure_micro_cny > self.authorized_budget_micro_cny {
+        if self.version != POLICY_VERSION
+            || !token(&self.family_id)
+            || self.effective_from > self.effective_through
+            || !token(&self.original_seed_reference)
+            || !token(&self.review_reference)
+            || self.authorized_budget_micro_cny <= 0
+            || self.initial_strategy_cash_micro_cny < 0
+            || !(1..=10_000).contains(&self.concentration_bps)
+            || !(1..=10_000).contains(&self.chain_exposure_bps)
+            || self.cash_floor_bps > 10_000
+            || self.max_order_exposure_micro_cny <= 0
+            || self.max_order_exposure_micro_cny > self.authorized_budget_micro_cny
+        {
             return Err(w.error(Txt::Budget(fw::BudgetText::DescriptorIsInvalid))?);
         }
         let mut previous: Option<&str> = None;
         for allocation in &self.initial_lots {
-            if !token(&allocation.lot_id) || allocation.original_quantity == 0 || previous.is_some_and(|p| p >= allocation.lot_id.as_str()) || match allocation.disposition {
-                LotDisposition::AllocatedToStrategy => {
-                    !allocation.chain_id.as_deref().is_some_and(token)
+            if !token(&allocation.lot_id)
+                || allocation.original_quantity == 0
+                || previous.is_some_and(|p| p >= allocation.lot_id.as_str())
+                || match allocation.disposition {
+                    LotDisposition::AllocatedToStrategy => {
+                        !allocation.chain_id.as_deref().is_some_and(token)
+                    }
+                    LotDisposition::UnassignedReadOnly => allocation.chain_id.is_some(),
                 }
-                LotDisposition::UnassignedReadOnly => allocation.chain_id.is_some(),
-            }
             {
-                return Err(w.error(Txt::Budget(fw::BudgetText::CompleteOrderedLotAllocationIsInvalid))?);
+                return Err(w.error(Txt::Budget(
+                    fw::BudgetText::CompleteOrderedLotAllocationIsInvalid,
+                ))?);
             }
             previous = Some(&allocation.lot_id);
         }
@@ -145,10 +181,16 @@ impl BudgetRecord {
     pub(crate) fn initial_cash(&self, genesis: &Projection) -> Result<CashPartitions, LedgerError> {
         fw::historical(self.initial_cash_with_work(genesis, &mut FinancialWork::Historical))
     }
-    pub(crate) fn initial_cash_with_work(&self, genesis: &Projection, w: &mut FinancialWork<'_, '_>) -> fw::Result<CashPartitions> {
+    pub(crate) fn initial_cash_with_work(
+        &self,
+        genesis: &Projection,
+        w: &mut FinancialWork<'_, '_>,
+    ) -> fw::Result<CashPartitions> {
         w.finish()?;
         self.validate_shape_with_work(w)?;
-        if genesis.cash.micros() < self.initial_strategy_cash_micro_cny || self.initial_lots.len() != genesis.lots.len() {
+        if genesis.cash.micros() < self.initial_strategy_cash_micro_cny
+            || self.initial_lots.len() != genesis.lots.len()
+        {
             return Err(w.error(Txt::Budget(fw::BudgetText::AllocationDoesNotMatchGenesis))?);
         }
         let mut original = BTreeMap::new();
@@ -160,22 +202,39 @@ impl BudgetRecord {
         }
         let mut c0 = i128::from(self.initial_strategy_cash_micro_cny);
         for allocation in &self.initial_lots {
-            let lot = w.option(original.get(allocation.lot_id.as_str()), Txt::Budget(fw::BudgetText::UnknownGenesisLot))?;
+            let lot = w.option(
+                original.get(allocation.lot_id.as_str()),
+                Txt::Budget(fw::BudgetText::UnknownGenesisLot),
+            )?;
             if lot.quantity != allocation.original_quantity {
                 return Err(w.error(Txt::Budget(fw::BudgetText::GenesisQuantityChanged))?);
             }
             if allocation.disposition == LotDisposition::AllocatedToStrategy {
-                let mark = w.option(genesis.marks.get(&lot.code), Txt::Budget(fw::BudgetText::GenesisMarkAbsent))?;
-                c0 = c0 .checked_add(i128::from(notional_with_work(mark.price.micros(), lot.quantity, w)?)) .ok_or(LedgerError::Overflow)?;
+                let mark = w.option(
+                    genesis.marks.get(&lot.code),
+                    Txt::Budget(fw::BudgetText::GenesisMarkAbsent),
+                )?;
+                c0 = c0
+                    .checked_add(i128::from(notional_with_work(
+                        mark.price.micros(),
+                        lot.quantity,
+                        w,
+                    )?))
+                    .ok_or(LedgerError::Overflow)?;
             }
         }
         if c0 < 0 || checked(c0)? > self.authorized_budget_micro_cny {
-            return Err(w.error(Txt::Budget(fw::BudgetText::InitialAllocatedCapitalExceedsFixedBudget))?);
+            return Err(w.error(Txt::Budget(
+                fw::BudgetText::InitialAllocatedCapitalExceedsFixedBudget,
+            ))?);
         }
         let partitions = CashPartitions {
             account_cash: genesis.cash.micros(),
             strategy_cash: self.initial_strategy_cash_micro_cny,
-            unassigned_cash: checked( i128::from(genesis.cash.micros()) - i128::from(self.initial_strategy_cash_micro_cny), )?,
+            unassigned_cash: checked(
+                i128::from(genesis.cash.micros())
+                    - i128::from(self.initial_strategy_cash_micro_cny),
+            )?,
         };
         partitions.validate_with_work(w)?;
         Ok(partitions)
@@ -202,18 +261,36 @@ pub(crate) struct MarkedAllocation {
 
 /// Checks a new buy only. Actual valuation, recovery, sell, cancellation and
 /// existing reservations remain facts when market appreciation exceeds B.
-pub(crate) fn require_new_buy( policy: &BudgetRecord, cash: &CashPartitions, marked: &[MarkedAllocation], working: &[WorkingReservation], new: &WorkingReservation, ) -> Result<(), LedgerError> {
-    fw::historical(require_new_buy_with_work(policy, cash, marked, working, new, &mut FinancialWork::Historical))
+pub(crate) fn require_new_buy(
+    policy: &BudgetRecord,
+    cash: &CashPartitions,
+    marked: &[MarkedAllocation],
+    working: &[WorkingReservation],
+    new: &WorkingReservation,
+) -> Result<(), LedgerError> {
+    fw::historical(require_new_buy_with_work(
+        policy,
+        cash,
+        marked,
+        working,
+        new,
+        &mut FinancialWork::Historical,
+    ))
 }
-pub(crate) fn require_new_buy_with_work( policy: &BudgetRecord, cash: &CashPartitions, marked: &[MarkedAllocation], working: &[WorkingReservation], new: &WorkingReservation, w: &mut FinancialWork<'_, '_>) -> fw::Result<()> {
+pub(crate) fn require_new_buy_with_work(
+    policy: &BudgetRecord,
+    cash: &CashPartitions,
+    marked: &[MarkedAllocation],
+    working: &[WorkingReservation],
+    new: &WorkingReservation,
+    w: &mut FinancialWork<'_, '_>,
+) -> fw::Result<()> {
     w.finish()?;
     policy.validate_shape_with_work(w)?;
     cash.validate_with_work(w)?;
     let mut aggregate = 0_i128;
-    let mut per_code: BTreeMap<&str,
-    i128> = BTreeMap::new();
-    let mut per_chain: BTreeMap<&str,
-    i128> = BTreeMap::new();
+    let mut per_code: BTreeMap<&str, i128> = BTreeMap::new();
+    let mut per_chain: BTreeMap<&str, i128> = BTreeMap::new();
     let mut reserved_cash = 0_i128;
     let mut parents = BTreeSet::new();
     for holding in marked {
@@ -221,11 +298,27 @@ pub(crate) fn require_new_buy_with_work( policy: &BudgetRecord, cash: &CashParti
             return Err(w.error(Txt::Budget(fw::BudgetText::MarkedAllocationIsInvalid))?);
         }
         add(&mut aggregate, i128::from(holding.marked_value))?;
-        add( w.exposure(&mut per_code, &holding.code)?, i128::from(holding.marked_value), )?;
-        add( w.exposure(&mut per_chain, &holding.chain_id)?, i128::from(holding.marked_value), )?;
+        add(
+            w.exposure(&mut per_code, &holding.code)?,
+            i128::from(holding.marked_value),
+        )?;
+        add(
+            w.exposure(&mut per_chain, &holding.chain_id)?,
+            i128::from(holding.marked_value),
+        )?;
     }
     for reservation in working.iter().chain(std::iter::once(new)) {
-        if reservation.buy_max_notional < 0 || reservation.fee_reserve < 0 || reservation.cash_reserve < 0 || checked( i128::from(reservation.buy_max_notional) + i128::from(reservation.fee_reserve), )? != reservation.cash_reserve || !token(&reservation.parent_id) || !token(&reservation.code) || !token(&reservation.chain_id) || !w.set(&mut parents, reservation.parent_id.as_str())? {
+        if reservation.buy_max_notional < 0
+            || reservation.fee_reserve < 0
+            || reservation.cash_reserve < 0
+            || checked(
+                i128::from(reservation.buy_max_notional) + i128::from(reservation.fee_reserve),
+            )? != reservation.cash_reserve
+            || !token(&reservation.parent_id)
+            || !token(&reservation.code)
+            || !token(&reservation.chain_id)
+            || !w.set(&mut parents, reservation.parent_id.as_str())?
+        {
             return Err(w.error(Txt::Budget(fw::BudgetText::WorkingReservationIsInvalid))?);
         }
         let all_in = i128::from(reservation.buy_max_notional) + i128::from(reservation.fee_reserve);
@@ -236,10 +329,24 @@ pub(crate) fn require_new_buy_with_work( policy: &BudgetRecord, cash: &CashParti
     }
     let b = i128::from(policy.authorized_budget_micro_cny);
     let single = per_code.get(new.code.as_str()).copied().unwrap_or_default();
-    let chain = per_chain .get(new.chain_id.as_str()) .copied() .unwrap_or_default();
+    let chain = per_chain
+        .get(new.chain_id.as_str())
+        .copied()
+        .unwrap_or_default();
     let floor = (b * i128::from(policy.cash_floor_bps) + 9_999) / 10_000;
-    if aggregate > b || new.buy_max_notional <= 0 || i128::from(new.buy_max_notional) + i128::from(new.fee_reserve) > i128::from(policy.max_order_exposure_micro_cny) || single.checked_mul(10_000).ok_or(LedgerError::Overflow)? > b * i128::from(policy.concentration_bps) || chain.checked_mul(10_000).ok_or(LedgerError::Overflow)? > b * i128::from(policy.chain_exposure_bps) || i128::from(cash.strategy_cash) - reserved_cash < floor {
-        return Err(w.error(Txt::Budget(fw::BudgetText::NewBuyExceedsFixedAllInOrCashLimits))?);
+    if aggregate > b
+        || new.buy_max_notional <= 0
+        || i128::from(new.buy_max_notional) + i128::from(new.fee_reserve)
+            > i128::from(policy.max_order_exposure_micro_cny)
+        || single.checked_mul(10_000).ok_or(LedgerError::Overflow)?
+            > b * i128::from(policy.concentration_bps)
+        || chain.checked_mul(10_000).ok_or(LedgerError::Overflow)?
+            > b * i128::from(policy.chain_exposure_bps)
+        || i128::from(cash.strategy_cash) - reserved_cash < floor
+    {
+        return Err(w.error(Txt::Budget(
+            fw::BudgetText::NewBuyExceedsFixedAllInOrCashLimits,
+        ))?);
     }
     // Validate the representability of every aggregate before returning it as
     // a checked integer accounting proof; no f64 conversion is involved.
