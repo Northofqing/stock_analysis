@@ -134,9 +134,49 @@ r08_canonical_validator = function_body(
 envelope_builder = function_body(runtime, "fn envelope_from_binding(")
 r08_dependency = function_body(review, "pub fn dependency(self)")
 
-for body in callers + [dispatcher]:
+def validate_source_account_phases(body: str) -> None:
+    # BR-194: public source work completes before a banner read. The later
+    # account phase may dispatch R-03 only with the existing completeness gate.
+    marker = "let account_metrics_ok = crate::current_banner()"
+    assert body.count(marker) == 1, "account completeness boundary missing or duplicated"
+    boundary = body.find(marker)
+    before = body[:boundary]
+    for forbidden in ("BannerCtx", "current_banner()", "evaluate_account_mode_hook(true)"):
+        assert forbidden not in before, f"review pre-gate restored: {forbidden}"
+    followup = body.find("let registered_followup_outcomes")
+    assert 0 <= followup < boundary, "account read preceded source-only follow-up outcomes"
+    phase = body[boundary:]
+    account_outcomes = phase.find("let mut account_required_outcomes")
+    assert account_outcomes > 0
+    completeness = phase[:account_outcomes]
+    assert ".map(|banner| banner.account_metrics_complete)" in completeness
+    assert ".unwrap_or(false)" in completeness, "absent banner must reject account tasks"
+    loop = function_body(phase, "for task in &phases.account_required")
+    guarded = function_body(loop, "if account_metrics_ok && *task == ReviewTask::R03")
+    call = "dispatch_r03_industry_chain_outcome"
+    assert body.count(call) == 1 and call in guarded, "R-03 escaped completeness guard"
+    rejected = function_body(loop, "} else")
+    assert "ReviewTaskOutcome::account_metrics_incomplete" in rejected
+    for forbidden in ("dispatch_", "push_", "query_"):
+        assert forbidden not in rejected, "unavailable account branch has side effects"
+
+def validate_reopen_extension_catalogs(body: str) -> None:
+    for marker, catalog, rows in (
+        ("if current_version >= 12", "schema_g5b_cohort", "validate_g5b_cohort_rows"),
+        ("if current_version >= 13", "schema_p05_unit", "validate_p05_unit_rows"),
+        ("if current_version == 14", "schema_p05_unit_runtime", None),
+    ):
+        retained = function_body(body, marker)
+        assert f"{catalog}::verify_catalog(transaction)?;" in retained
+        if rows:
+            assert f"coordinator::{rows}(transaction)?;" in retained
+
+validate_reopen_extension_catalogs(schema)
+
+for body in callers:
     for forbidden in ("BannerCtx", "current_banner()", "evaluate_account_mode_hook(true)"):
         assert forbidden not in body, f"review pre-gate restored: {forbidden}"
+validate_source_account_phases(dispatcher)
 
 source_only_arm = r08_dependency.split("=> ReviewTaskDependency::SourceOnly", 1)[0]
 for source_only_task in (
@@ -188,8 +228,8 @@ for required in (
 account_phase = dispatcher.find("let mut account_required_outcomes")
 r03_dispatch = dispatcher.find("dispatch_r03_industry_chain_outcome")
 assert account_phase >= 0
-assert r03_dispatch == -1, (
-    "R-03 must not dispatch while BR-194 account metrics are incomplete"
+assert r03_dispatch > account_phase, (
+    "R-03 must remain in the guarded account phase"
 )
 assert "ReviewTaskOutcome::account_metrics_incomplete" in dispatcher[account_phase:]
 
@@ -320,7 +360,10 @@ for required in (
 ):
     assert required in schema, f"missing replay schema authority {required}"
 for required in (
-    "SCHEMA_VERSION: i64 = 9",
+    "SCHEMA_VERSION: i64 = 14",
+    "schema_g5b_cohort::verify_catalog(transaction)",
+    "schema_p05_unit::verify_catalog(transaction)",
+    "schema_p05_unit_runtime::verify_catalog(transaction)",
     "migrate_schema_v5_to_v6",
     "migrate_schema_v6_to_v7",
     "migrate_schema_v7_to_v8",
@@ -524,7 +567,7 @@ def validate_dispatcher(body: str) -> None:
     assert body.find("let mut account_required_outcomes") < body.rfind(
         "merge_review_task_outcomes"
     )
-    assert "dispatch_r03_industry_chain_outcome" not in body
+    validate_source_account_phases(body)
     account_phase = body.find("let mut account_required_outcomes")
     assert "ReviewTaskOutcome::account_metrics_incomplete" in body[account_phase:]
 
@@ -749,6 +792,7 @@ def validate_replay_classifier(body: str) -> None:
     assert "ScheduleHydrationState::Applied" in body
 
 def validate_schema(body: str) -> None:
+    validate_reopen_extension_catalogs(body)
     for required in (
         "FOREIGN KEY(attempt_identity,decision_identity)",
         "REFERENCES immutable_audit_outbox(audit_identity)",
@@ -763,7 +807,10 @@ def validate_schema(body: str) -> None:
     assert body.count("validate_review_terminal_replay_attempt_audit_insert") >= 2
     assert body.count("validate_review_terminal_replay_completion_audit_insert") >= 2
     for required in (
-        "SCHEMA_VERSION: i64 = 9",
+        "SCHEMA_VERSION: i64 = 14",
+        "schema_g5b_cohort::verify_catalog(transaction)",
+        "schema_p05_unit::verify_catalog(transaction)",
+        "schema_p05_unit_runtime::verify_catalog(transaction)",
         "migrate_schema_v5_to_v6",
         "migrate_schema_v6_to_v7",
         "migrate_schema_v7_to_v8",
@@ -868,6 +915,11 @@ mutations = [
     (dispatcher, "let preflight = review_preflight", "let preflight = preflight_removed", validate_dispatcher),
     (dispatcher, "merge_review_task_outcomes(", "merge_removed(", validate_dispatcher),
     (dispatcher, "let mut account_required_outcomes", "dispatch_r03_industry_chain_outcome(); let mut account_required_outcomes", validate_dispatcher),
+    (dispatcher, "let preflight = review_preflight", "let illicit = crate::current_banner(); let preflight = review_preflight", validate_dispatcher),
+    (dispatcher, ".map(|banner| banner.account_metrics_complete)", ".map(|banner| true)", validate_dispatcher),
+    (dispatcher, ".unwrap_or(false)", ".unwrap_or(true)", validate_dispatcher),
+    (dispatcher, "if account_metrics_ok && *task == ReviewTask::R03", "if *task == ReviewTask::R03", validate_dispatcher),
+    (dispatcher, "ReviewTaskOutcome::account_metrics_incomplete(observed_at)", "dispatch_r03_industry_chain_outcome(&date).await", validate_dispatcher),
     (dispatcher, "dispatch_r08_event_calendar_outcome", "r08_dispatch_removed", validate_dispatcher),
     (dispatcher, "dispatch_catalyst_review_daily_outcome", "a10_dispatch_removed", validate_dispatcher),
     (dispatcher, "dispatch_paper_review_daily_outcome", "a01_dispatch_removed", validate_dispatcher),
@@ -917,7 +969,10 @@ mutations = [
     (schema, "FOREIGN KEY(attempt_identity,decision_identity)", "FOREIGN KEY(attempt_identity)", validate_schema),
     (schema, "immutable_review_terminal_replay_attempt_update", "immutable_replay_update_REMOVED", validate_schema),
     (schema, "validate_review_terminal_replay_completion_audit_insert", "validate_replay_completion_REMOVED", validate_schema),
-    (schema, "SCHEMA_VERSION: i64 = 9", "SCHEMA_VERSION: i64 = 8", validate_schema),
+    (schema, "SCHEMA_VERSION: i64 = 14", "SCHEMA_VERSION: i64 = 8", validate_schema),
+    (schema, "super::schema_g5b_cohort::verify_catalog(transaction)?;", "schema12_verification_removed();", validate_schema),
+    (schema, "super::schema_p05_unit::verify_catalog(transaction)?;", "schema13_verification_removed();", validate_schema),
+    (schema, "super::schema_p05_unit_runtime::verify_catalog(transaction)?;", "schema14_verification_removed();", validate_schema),
     (schema, "FunctionFlags::SQLITE_INNOCUOUS", "FunctionFlags::SQLITE_DIRECTONLY", validate_schema),
     (schema, "FROM pragma_function_list", "FROM missing_function_catalog", validate_schema),
     (schema, "sha256_hex(NEW.start_canonical)=NEW.start_sha256", "NEW.start_sha256=NEW.start_sha256", validate_schema),

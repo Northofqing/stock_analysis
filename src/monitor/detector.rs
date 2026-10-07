@@ -127,8 +127,8 @@ pub struct StockSnapshot {
     pub name: String,
     pub price: f64,
     pub change_pct: f64,
-    pub volume_ratio: f64,
-    pub main_net_yi: f64, // 主力净流入（亿）
+    pub volume_ratio: Option<f64>,
+    pub main_net_yi: Option<f64>, // 主力净流入（亿），缺失不补值
     pub limit_up_price: Option<f64>,
     pub was_limit_up: bool, // 上一 tick 是否涨停
     pub t1_locked: bool,    // 是否 T+1 锁仓
@@ -200,13 +200,12 @@ pub struct Detector {
 
 impl Detector {
     pub fn new(config: DetectorConfig) -> Self {
-        // 0.0 哨兵契约 (盘中扫描 overlay fallback): 资金面/量比阈值必须 > 0,
-        // 否则缺失数据 (0.0) 会与阈值恒等误触发净流入/净流出/量比告警。
+        // 资金面/量比阈值要求为正；缺失观测由 Option 独立表示。
         debug_assert!(
             config.main_inflow_yi > 0.0
                 && config.main_outflow_yi > 0.0
                 && config.vol_ratio_threshold > 0.0,
-            "0.0 哨兵要求资金面阈值恒 > 0, 当前 inflow={} outflow={} vol={}",
+            "资金面和量比阈值必须为正, 当前 inflow={} outflow={} vol={}",
             config.main_inflow_yi,
             config.main_outflow_yi,
             config.vol_ratio_threshold
@@ -244,10 +243,11 @@ impl Detector {
     }
 
     pub fn check_main_outflow(&self, s: &StockSnapshot) -> Option<AlertEvent> {
-        if s.main_net_yi <= -self.config.main_outflow_yi {
+        let main_net_yi = s.main_net_yi?;
+        if main_net_yi <= -self.config.main_outflow_yi {
             // 修复 P1.9: 去掉死分支 (两分支都是 Important)
             // 量化分析师要求: 死代码删除, 真实分级 (未来可按 magnitude 分 Important/Warning)
-            let mut msg = format!("{} 主力净流出 {:.2}亿", s.name, -s.main_net_yi);
+            let mut msg = format!("{} 主力净流出 {:.2}亿", s.name, -main_net_yi);
             if s.t1_locked {
                 msg.push_str("（T+1锁仓中，观察收盘是否回补）");
             } else {
@@ -260,12 +260,13 @@ impl Detector {
     }
 
     pub fn check_main_inflow(&self, s: &StockSnapshot) -> Option<AlertEvent> {
-        if s.main_net_yi >= self.config.main_inflow_yi {
+        let main_net_yi = s.main_net_yi?;
+        if main_net_yi >= self.config.main_inflow_yi {
             Some(self.build(
                 s,
                 AlertCategory::MainInflow,
                 AlertLevel::Important,
-                format!("{} 主力净流入 {:.2}亿", s.name, s.main_net_yi),
+                format!("{} 主力净流入 {:.2}亿", s.name, main_net_yi),
             ))
         } else {
             None
@@ -273,7 +274,8 @@ impl Detector {
     }
 
     pub fn check_vol_burst(&self, s: &StockSnapshot) -> Option<AlertEvent> {
-        if s.volume_ratio >= self.config.vol_ratio_threshold
+        let volume_ratio = s.volume_ratio?;
+        if volume_ratio >= self.config.vol_ratio_threshold
             && s.change_pct >= self.config.vol_ratio_price_pct
         {
             Some(self.build(
@@ -282,7 +284,7 @@ impl Detector {
                 AlertLevel::Important,
                 format!(
                     "{} 量比 {:.1} 涨幅 {:.1}%",
-                    s.name, s.volume_ratio, s.change_pct
+                    s.name, volume_ratio, s.change_pct
                 ),
             ))
         } else {
@@ -477,8 +479,8 @@ impl Detector {
             detail: AlertDetail {
                 price: Some(s.price),
                 change_pct: Some(s.change_pct),
-                volume_ratio: Some(s.volume_ratio),
-                main_flow_yi: Some(s.main_net_yi),
+                volume_ratio: s.volume_ratio,
+                main_flow_yi: s.main_net_yi,
                 threshold: None,
                 news_title: None,
                 news_summary: None,
@@ -527,8 +529,8 @@ mod tests {
             name: name.into(),
             price: 10.0 * (1.0 + change / 100.0),
             change_pct: change,
-            volume_ratio: vol,
-            main_net_yi: flow,
+            volume_ratio: Some(vol),
+            main_net_yi: Some(flow),
             limit_up_price: Some(11.0),
             was_limit_up: false,
             t1_locked: false,

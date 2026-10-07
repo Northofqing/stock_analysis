@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use stock_analysis::durable_delivery::{
     AuthoritativeDeliveryRequest, AuthoritativeSink, AuthoritativeSinkPort,
@@ -2600,7 +2600,21 @@ fn durable_kind_and_sub_kind_with_override(
 
 fn owner_instance_identity() -> String {
     let now = Utc::now().timestamp_nanos_opt().unwrap_or_default();
-    sha256_hex(format!("{}:{now}", std::process::id()).as_bytes())
+    owner_instance_identity_at(now)
+}
+
+static OWNER_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn owner_instance_identity_at(now: i64) -> String {
+    // Wall-clock timestamps may repeat across concurrent owners. The opaque
+    // identity also binds a process-local sequence so those owners never
+    // compete for the same deterministic capability marker due to clock reuse.
+    let sequence = OWNER_INSTANCE_SEQUENCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("monitor owner instance sequence exhausted");
+    sha256_hex(format!("{}:{now}:{sequence}", std::process::id()).as_bytes())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -3069,6 +3083,37 @@ mod tests {
             queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
         });
         (namespace_dir, state)
+    }
+
+    #[test]
+    fn owner_instance_identity_is_unique_when_clock_repeats() {
+        let first = owner_instance_identity_at(1_791_342_000_000_000_000);
+        let second = owner_instance_identity_at(1_791_342_000_000_000_000);
+        assert!(is_sha256_hex(&first) && is_sha256_hex(&second));
+        assert_ne!(
+            first, second,
+            "separate owners cannot share a timestamp-derived identity"
+        );
+    }
+
+    #[test]
+    fn owner_instance_identity_is_unique_across_concurrent_owners_with_same_clock() {
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    owner_instance_identity_at(1_791_342_000_000_000_000)
+                })
+            })
+            .collect();
+        let identities: std::collections::BTreeSet<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(identities.len(), 8);
+        assert!(identities.iter().all(|identity| is_sha256_hex(identity)));
     }
 
     #[test]

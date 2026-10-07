@@ -24,7 +24,7 @@ fn candidate_triggered_fails_closed_until_durable_lifecycle_evidence_exists() {
     let candidate = function_body(
         source,
         "pub async fn push_candidate_triggered(",
-        "pub async fn push_candidate_invalidated(",
+        "/// v12 PR2-2.2: 数据模式变更编排器.",
     );
 
     for required in [

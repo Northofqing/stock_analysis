@@ -203,17 +203,6 @@ fn p05_unit_bin_retained_source_encodings_preserve_original_independent_times() 
 async fn p05_unit_bin_legacy_single_card_entries_cannot_open_generic_consumer() {
     assert!(!super::super::dispatch_auction_repush("09:20").await);
     assert!(!super::super::dispatch_candidate_board("2026-09-23").await);
-    assert!(
-        !super::super::push_candidate_invalidated(
-            "2026-09-23".parse().unwrap(),
-            "TEST_CODE_LEGACY",
-            "09:20",
-            "TEST_CODE_NAME",
-            "候选",
-            "移除"
-        )
-        .await
-    );
     use stock_analysis::durable_delivery::PushKind as Kind;
     assert_eq!(
         presentation_for_kind(Kind::AuctionRepush)

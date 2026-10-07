@@ -36,15 +36,10 @@ pub fn format_alert(event: &AlertEvent) -> String {
         lines.push(format!("  涨跌：{:+.2}%", pct));
     }
     if let Some(flow) = d.main_flow_yi {
-        if flow.abs() > 0.001 {
-            // 0 表示数据缺失，不显示
-            lines.push(format!("  主力净流入：{:+.2}亿", flow));
-        }
+        lines.push(format!("  主力净流入：{:+.2}亿", flow));
     }
     if let Some(vr) = d.volume_ratio {
-        if vr > 0.01 {
-            lines.push(format!("  量比：{:.1}", vr));
-        }
+        lines.push(format!("  量比：{:.1}", vr));
     }
     if let Some(summary) = &d.news_summary {
         lines.push(format!("  📋 摘要：{}", summary));
@@ -74,17 +69,19 @@ pub fn format_alert(event: &AlertEvent) -> String {
 
 /// 格式化 T+1 锁仓告警话术
 pub fn format_t1_alert(event: &AlertEvent, sell_date: &str) -> String {
-    let d = &event.detail;
+    let price_line = match event.detail.price {
+        Some(price) => format!("现价：{price:.2}（触发止损/风控）\n"),
+        None => String::new(),
+    };
     format!(
         "{} 【{}】{} ⚠️ T+1锁仓\n\
-          现价：{:.2}（触发止损/风控）\n\
-          状态：今日买入，不可当日卖出\n\
+          {}状态：今日买入，不可当日卖出\n\
           建议：{} 09:25 竞价挂卖单\n\
           连锁：已冻结同产业链新买入权限",
         event.level.emoji(),
         event.level.label(),
         event.message,
-        d.price.unwrap_or(0.0),
+        price_line,
         sell_date
     )
 }

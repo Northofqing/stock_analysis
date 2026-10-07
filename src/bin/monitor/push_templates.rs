@@ -17039,20 +17039,6 @@ pub async fn push_candidate_triggered(
     Err(CANDIDATE_COUNTED_BINDING_UNAVAILABLE.to_string())
 }
 
-/// MVP3-3.2 T-08 候选失效 (ℹ️参考, 复用 CandidateBoard).
-pub async fn push_candidate_invalidated(
-    business_date: chrono::NaiveDate,
-    code: &str,
-    hhmm: &str,
-    name: &str,
-    prev: &str,
-    reason: &str,
-) -> bool {
-    let _ = (business_date, code, hhmm, name, prev, reason);
-    log::warn!("[T-08] dispatch blocked reason=p05_shared_unit_required");
-    false
-}
-
 /// v12 PR2-2.2: 数据模式变更编排器.
 ///
 /// 完整链路: evaluate() → 计划状态变更 → 拼 T-02 → dispatch().

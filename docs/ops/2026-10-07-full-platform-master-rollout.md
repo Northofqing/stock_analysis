@@ -57,3 +57,39 @@
 - 纳管回填脚本缺失的共享 timeout helper。监护进程保持命令42退出、成功输出、monotonic截止，并在截止或自身取消时终止新建的自有进程组。四个真实边界测试通过：42、成功stdout、截止2且TERM-ignoring孙进程停止、监护进程SIGTERM取消143且孙进程停止；现有回填失败传播检查也通过。只在TEST_CODE临时目录运行，没有真实回填或生产库写入。
 
 剩余合规失败已有原件：移除的本地provider宿主/TDX路径仍被业务规则列为active；T08未引用logging-only壳；盘中overlay和量比的0.0哨兵与缺少必需回归；BR194静态检查的账户phase/schema版本与后继实现尚需逐项核对。处理时保留真实来源/未知/拒绝，不能删门禁、增加白名单或用数值替代缺失数据来通过检查。当前源码audit须更新调用链和内容证据，不能批量刷新哈希或直接晋级目录状态。
+
+## 第二批合规与盘中缺失字段修复
+
+第一批修复已提交并实际快进合入、推送 `master` 和开发分支：`2954abf6fe348e7c91a80e18f37aacfd776ed1cb`。新同 HEAD Rust CI `37564408930` 仍停在架构检查；compliance `37564408933` 中 BR174 与回填/timeout 已通过，另四域仍失败；coverage `37564408925` 已通过系统依赖安装并进入工作区编译，尚无 measured coverage。原日志保留。
+
+第二批按实际失败修复：
+
+- 盘中 `StockSnapshot` 的量比和主力净流由 `Option` 表示。主循环保持缺失，只跳过依赖该字段的规则，独立价格规则照常检测；真实零和负流保留，排名只包含有真实流量值的股票。
+- 原无生产 caller 的 `push_candidate_invalidated` 日志壳已移除；P05 shared owner、三个 kind 的真实 presentation 与既有恢复边界保留，更新受影响的原测试范围。
+- 业务规则限定 11 条 Code 列的 15 个失效 active 路径，按两次真实删除提交指向现在的 Gateway 调用、转换和纯校验。历史 Intent、来源与 pending 状态保留；新指针不证明上游宿主/RPC，亦不恢复已退役的 selection 管线。247 条规则检查通过，181 条既有/新指针引用警告真实保留。
+- BR194 静态检查按现行来源阶段/账户阶段分开：来源任务完成后才读 banner，缺失完整性保持 false，R03 只在账户完整且 exact task 条件内 dispatch，拒绝分支无 provider/sink。声明核到 schema14 并逐 reopening 分支检查三个扩展 catalog。原 70 项和新增 8 项破坏变异全部拒绝。旧 `verify_br194_review_join.py` 仍是 schema9-only，不能用它签发 schema14/v2 生产 join。
+- `bash tools/compliance/check.sh --policy pr` 实际退出0；这是离线检查，未签发生产 freshness 或上线资格。冻结 current-source 审计、RFC/WBS 状态与严格架构门仍开放，不能跳过 strict、批量刷新哈希或改 PROVISIONAL 标签取得绿。
+
+盘中回归先取得四项真实 PASS。审阅再发现格式化层仍把观察到的零当作缺失、T+1 卡会填缺失价格为0.00；后继修正只按 Option 呈现实际值，缺价格省略该行，并增加零值显示和真实/缺失 T+1 价格的行为验证。最终范围、回执与提交在本机持久计划续记，未据先前四项替代后继结果。
+
+本批直接复核了实际 diff、全部三个 StockSnapshot 构造边界、真实缺失/零/负流/量比与价格呈现、来源/账户调用顺序和扩展重开拒绝。当前没有另一名独立 reviewer 复核这份最终差分；原完整平台其他切片的独立报告仅在其对应范围有效。完整候选还需 normal release、同制品隔离 dry-run、必要独立复核及生产门禁。
+
+后继最终 `no_silent_fallback_test` 五项行为测试全部通过，包括真实零显示和缺失/真实 T+1 价格；原正常 monitor 与其余默认 bin 在该 Cargo 目标构建中通过编译。已有 warning 保留：lib 888 项、monitor 14 项；没有运行或声称 Strict Clippy/完整工作区测试通过。相关 overlay、P05 和原 detector/alert/integration 回归另按实际结果补充，不复跑无关目标。
+
+11:14 CST 再次只读核验：正式 monitor14998、bridge56417 仍是原 launchd；monitor、bridge、activation 三 SHA 与10:27原件一致，两库 dev/ino不变，durable schema9与995/3988/6/78计数不变。Health退出1，账户Frozen、数据Unsafe；本轮没有二进制安装、activation重发、重启或数据库写入。
+
+Windows完整源码已保留双方历史合入并推送其远端默认 `main`：`2b225b71148425d18c82a3dcc552f1444f3595cd`，树 `e25961a4e3887ff2697e59fe6a28616a20a3ec93`，远端完整OID独立回读吻合。新源码交接包141成员/2,720,976字节核验通过；Mac另从远端浅取同提交、核70个Git blob，52份原字节一致、18份仅working CRLF/Git LF差异，原件未改写，包外ACK已送达原Windows任务。该源码包原CI `37564892679` 的终态、95%关键覆盖、同版binary/descriptor/真实RPC未交付；现网仍旧版，不据源码合入签发 SDK 部署资格。
+
+### P05 锁失败与 owner 身份重复回归
+
+扩展 P05 原回归首次为8通过/1失败，错误在旧 durable-runtime 测试打开 coordinator 的 capability OFD marker，EAGAIN35。失败原log与回执保留；本次直接修改的shared-unit七项在该次已通过。独立 TEST_CODE 临时文件的原生OFD探针表明分离范围成功、相同范围返回35，未触碰生产或真实Cargo文件。
+
+随后发现 monitor owner 身份仅由PID与墙钟推导，重复时刻不保证唯一。先提取同语义私有时钟 seam，真实行为回归取得RED（两个身份相等）；加入进程内checked atomic序号后，重复时钟和八个并发同钟owner两项通过，原P05九项重新通过。没有改coordinator、锁范围、拒绝语义或测试线程数。原失败未记录owner绑定，不能断言它完全由这一因素造成；新代码及回归关闭的是可复现的身份重复缺陷。
+
+### 本批最终验证及上游最新终态
+
+最终锁定 offline 定向回归共51项通过、0失败：缺失字段/呈现5、CandidateTriggered绑定2、overlay6、P05原范围9、owner身份2、detector15、alert7、monitor integration5。最后三个库过滤目标分别执行，复用同一编译，没有重复追加 check/build/clippy。完整离线合规、78项BR194破坏变异、`cargo fmt --all -- --check` 和 `git diff --check` 均通过。库测试编译仍有152项 warning；普通库先前888项和monitor14项warning记录保留。未运行本批完整工作区/全部features、Strict Clippy、normal release或同制品dry-run，不将定向通过等同发布CI通过。
+
+Windows精确 `2b225b71148425d18c82a3dcc552f1444f3595cd` 的原CI `37564892679` 已终结：audit通过，overall `69340/81600=84.98%` 达80%，critical `35411/39819=88.93%` 未达95%，原检查器退出1。新终态包37成员/36,946,674字节已逐件核验，包外ACK范围为原件读取，原失败未改写；分母不变时还差2418个关键覆盖行，后续源码变动须重新实测。已成功通知原Windows任务继续真实handler/adapter行为测试与同HEAD原CI，合格后再交付新SDK source/binary/descriptor和真实RPC；旧服务不切换。
+
+11:14 CST快照中News已恢复，最新缺失集合是Quote、MoneyFlow、OrderBook；10:27四项缺失仍保留为历史观察。账户指标不完整、Frozen/Unsafe及78条Uncertain状态没有因此关闭。全面上线仍依赖严格架构源审计/RFC资格、完整CI、同版SDK与兼容回退、真实数据/资金/人工裁定以及新精确activation审阅和自然生产观察。

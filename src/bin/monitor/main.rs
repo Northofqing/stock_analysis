@@ -10103,17 +10103,12 @@ async fn fetch_flow_overlay(codes: Vec<String>) -> std::collections::HashMap<Str
     overlay
 }
 
-/// 资金面字段取值: MoneyFlows overlay 优先, 回退 TopStock 自带值, 双缺失 0.0 哨兵。
-/// 0.0 安全的前提是 detector 阈值恒 > 0 (debug_assert 见 Detector 构造), 不误触发。
+/// MoneyFlows overlay 优先，其次 TopStock 的真实值；双缺失保持 None。
 fn overlay_net_yi(
     overlay: &std::collections::HashMap<String, f64>,
     s: &stock_analysis::market_data::TopStock,
-) -> f64 {
-    overlay
-        .get(&s.code)
-        .copied()
-        .or(s.main_net_yi)
-        .unwrap_or(0.0)
+) -> Option<f64> {
+    overlay.get(&s.code).copied().or(s.main_net_yi)
 }
 
 async fn monitor_loop(paper_scans: &PaperScanSession) {
@@ -11955,18 +11950,15 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let mut ranked = limit_stocks.as_ref().map(|stocks| {
                             stocks
                                 .iter()
-                                .filter(|stock| {
-                                    stock.main_net_yi.is_some()
-                                        || flow_overlay.contains_key(&stock.code)
+                                .filter_map(|stock| {
+                                    overlay_net_yi(&flow_overlay, stock).map(|flow| (stock, flow))
                                 })
                                 .collect::<Vec<_>>()
                         });
 
                         if let Some(ranked) = ranked.as_mut() {
-                            ranked.sort_by(|a, b| {
-                                let av = overlay_net_yi(&flow_overlay, a);
-                                let bv = overlay_net_yi(&flow_overlay, b);
-                                bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+                            ranked.sort_by(|(_, av), (_, bv)| {
+                                bv.partial_cmp(av).unwrap_or(std::cmp::Ordering::Equal)
                             });
                         }
 
@@ -11991,7 +11983,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             };
                             let rank = ranked
                                 .as_ref()
-                                .and_then(|rows| rows.iter().position(|r| r.code == *code))
+                                .and_then(|rows| rows.iter().position(|(r, _)| r.code == *code))
                                 .map(|position| position + 1);
                             let checked = match scanner.validate_admitted_quote(quote) {
                                 Ok(checked) => checked,
@@ -12016,14 +12008,14 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             // (两数据源 limit_up.rs:186 / project_top_stock_batch 硬编码 None)。
                             // 缺失时不再 continue 整只股票 —— limit_up/limit_down/board_break
                             // 不依赖这两项, 照常检测。A2: 主力净流取 MoneyFlows overlay
-                            // (Eastmoney 实时), 缺失时 0.0 哨兵 (阈值恒 > 0, 不误触发)。
+                            // 的已接纳真实值，缺失保持 None 并只跳过依赖它的信号。
                             // volume_ratio 上游无实时视图 (RealtimeQuotes 5 字段 /
                             // ProviderTopNRankings 盘中不 admit), vol_burst 保持静默。
                             // 量比缺失是静态事实 (数据源硬编码 None) 而非事件, 打 debug 避免
                             // 每 tick × 每股刷屏; 主力净流缺失才是事件性 (overlay 失败),
                             // 保留 warn。
                             let main_net_yi = overlay_net_yi(&flow_overlay, &s);
-                            let volume_ratio = s.volume_ratio.unwrap_or(0.0);
+                            let volume_ratio = s.volume_ratio;
                             if s.volume_ratio.is_none() {
                                 log::debug!(
                                     "[盘中监控] {}({}) 缺少量比 (上游无实时视图), 量比信号静默跳过",
@@ -14284,26 +14276,42 @@ mod tests_flow_overlay {
     fn overlay_hit_wins_over_topstock_value() {
         let mut overlay = HashMap::new();
         overlay.insert("000001".into(), 3.2);
-        assert_eq!(overlay_net_yi(&overlay, &stock("000001", Some(0.5))), 3.2);
+        assert_eq!(
+            overlay_net_yi(&overlay, &stock("000001", Some(0.5))),
+            Some(3.2)
+        );
     }
 
     #[test]
     fn falls_back_to_topstock_when_overlay_misses() {
         let overlay = HashMap::new();
-        assert_eq!(overlay_net_yi(&overlay, &stock("000002", Some(1.4))), 1.4);
+        assert_eq!(
+            overlay_net_yi(&overlay, &stock("000002", Some(1.4))),
+            Some(1.4)
+        );
     }
 
     #[test]
-    fn zero_sentinel_when_both_missing() {
+    fn missing_flow_remains_absent() {
         let overlay = HashMap::new();
-        assert_eq!(overlay_net_yi(&overlay, &stock("000003", None)), 0.0);
+        assert_eq!(overlay_net_yi(&overlay, &stock("000003", None)), None);
     }
 
     #[test]
     fn negative_outflow_is_preserved_not_clamped() {
         let mut overlay = HashMap::new();
         overlay.insert("000004".into(), -2.7);
-        assert_eq!(overlay_net_yi(&overlay, &stock("000004", None)), -2.7);
+        assert_eq!(overlay_net_yi(&overlay, &stock("000004", None)), Some(-2.7));
+    }
+
+    #[test]
+    fn observed_zero_flow_is_preserved() {
+        let mut overlay = HashMap::new();
+        overlay.insert("TEST_CODE_ZERO".into(), 0.0);
+        assert_eq!(
+            overlay_net_yi(&overlay, &stock("TEST_CODE_ZERO", None)),
+            Some(0.0)
+        );
     }
 
     #[test]
