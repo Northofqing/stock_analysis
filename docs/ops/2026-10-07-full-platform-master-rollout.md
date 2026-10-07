@@ -93,3 +93,13 @@ Windows完整源码已保留双方历史合入并推送其远端默认 `main`：
 Windows精确 `2b225b71148425d18c82a3dcc552f1444f3595cd` 的原CI `37564892679` 已终结：audit通过，overall `69340/81600=84.98%` 达80%，critical `35411/39819=88.93%` 未达95%，原检查器退出1。新终态包37成员/36,946,674字节已逐件核验，包外ACK范围为原件读取，原失败未改写；分母不变时还差2418个关键覆盖行，后续源码变动须重新实测。已成功通知原Windows任务继续真实handler/adapter行为测试与同HEAD原CI，合格后再交付新SDK source/binary/descriptor和真实RPC；旧服务不切换。
 
 11:14 CST快照中News已恢复，最新缺失集合是Quote、MoneyFlow、OrderBook；10:27四项缺失仍保留为历史观察。账户指标不完整、Frozen/Unsafe及78条Uncertain状态没有因此关闭。全面上线仍依赖严格架构源审计/RFC资格、完整CI、同版SDK与兼容回退、真实数据/资金/人工裁定以及新精确activation审阅和自然生产观察。
+
+## bb725b05 原 CI 后继与失效集成入口
+
+第二批实际提交并同步两远端及干净主目录：`bb725b05e8c5716fe96751a29fcd699f8fb0e744`，树 `8f277506833bc946e45479b6b78ccf7b43f97a52`。原Linux compliance `37566852932` 已通过离线合规，后续 Cargo 在启动测试前退出101：`no test target named e2e`。该目标不存在于当前Cargo、主目录或仓库Git历史；不能将这一入口错误算作测试行为失败，亦不能从本机offline通过推断原run全通过。原Rust CI `37566852954` 仍停严格架构证据/PROVISIONAL，Coverage `37566852951` 尚未取得终态或实测阈值。
+
+后继保留原六个存在的关键集成回归和单线程design-contradiction范围，以仓库真实 `grpc_bridge_e2e`、`grpc_channel_e2e`、`durable_delivery_counted_cutover` 接替失效目标，另将 Cargo 锁定。新增范围使用既有fixture与隔离durable owner；不创建空test壳、忽略失败或跳过原预测/排序/freshness门禁。实际新增范围结果另录，工作区/完整原CI终态仍须回读。
+
+新增范围实际发现两类旧预期：桥接测试仍将刻意关闭的raw FuturesDelivery当成功、将已退役EconomicCalendar当invalid evidence；通道仍断言旧40项声明。按真实 `1cc28f425`/`419befbfa` 和 `df4202502` 合同变更修正既有断言，保持明确不可重试拒绝，并核当前41个唯一operation、MarketAnnouncements与BenchmarkBars必需声明。没有修改production Gateway、transport、准入或 fixture advertisement。
+
+当前三个目标合计18项通过（durable6、bridge2、channel10）；前两次各自真实失败及日志保留，只对后继修改的目标补验证。Cargo metadata确认workflow全部10个integration target存在、旧e2e缺失；YAML语法、两个测试文件rustfmt及diff-check通过。此为本机受控fixture/隔离owner证据，不是同版Windows真实业务RPC；原全部lib及其余原关键回归保持CI范围，新Linux完整step仍待实际运行。

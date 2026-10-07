@@ -88,14 +88,18 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
     assert_eq!(announcements.evidence().batch_id, "fixture-b1");
     assert_eq!(announcements.records()[0].code, test_code);
 
-    let futures_delivery = bridge.futures_delivery_async().await.unwrap();
-    assert_eq!(futures_delivery.records().len(), 1);
-    assert_eq!(futures_delivery.evidence().batch_id, "fixture-b1");
+    // The legacy fixture's raw v1 records cannot bypass the versioned planned
+    // calendar Gateway or qualify confirmed delivery for production.
+    let futures_error = bridge.futures_delivery_async().await.unwrap_err();
     assert_eq!(
-        futures_delivery.records()[0].contract_code,
-        "TEST_CODE_IF2608"
+        futures_error.reason_code(),
+        stock_analysis::data_gateway::futures_delivery::FUTURES_DELIVERY_CONTRACT_UNAVAILABLE_V1
     );
-    assert_eq!(futures_delivery.records()[0].product_code, "TEST_CODE_IF");
+    assert!(!futures_error.retryable());
+
+    let calendar_error = bridge.economic_calendar_async().await.unwrap_err();
+    assert_eq!(calendar_error.reason_code(), "operation_retired");
+    assert!(!calendar_error.retryable());
 
     let board_constituents = bridge.board_constituents_async(&test_code).await.unwrap();
     assert_eq!(board_constituents.records().len(), 1);
@@ -127,7 +131,6 @@ async fn bridge_all_hooked_ops_fixture_roundtrip() {
 
     for error in [
         bridge.foreign_exchange_async().await.unwrap_err(),
-        bridge.economic_calendar_async().await.unwrap_err(),
         bridge
             .market_statistics_async(std::slice::from_ref(&test_code))
             .await

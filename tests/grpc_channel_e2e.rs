@@ -172,9 +172,20 @@ async fn health_and_capabilities() {
     let caps = client.get_capabilities().await.unwrap();
     assert_eq!(
         caps.len(),
-        40,
-        "M1: 38 个生产 op + M4c ChainBatch + BR-251 BenchmarkBars 全部在 capability 表"
+        41,
+        "LocalBridge fixture 的41项合同声明必须完整（含 MarketAnnouncements 与 BenchmarkBars）"
     );
+    assert_eq!(
+        caps.iter()
+            .map(|capability| capability.operation)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        41,
+        "重复声明不能掩盖缺少的operation"
+    );
+    assert!(caps
+        .iter()
+        .any(|capability| capability.operation == Operation::MarketAnnouncements as i32));
     assert!(caps
         .iter()
         .any(|capability| capability.operation == Operation::BenchmarkBars as i32));
