@@ -1,8 +1,10 @@
 # stock_analysis 开发与上线交接
 
-更新日期：2026-10-07（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
+更新日期：2026-10-08（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
 
 **当前执行范围以 [2026-10-07 用户范围裁定](docs/handoffs/2026-10-07-active-scope.md) 为准：保留 H08、outcome 合并/回填/观测和 monitor 止损/情报推送稳定性；冻结 H01/H02/H03/H09/H10/H14/H17 平台工程；H04–H06 复用现有 paper，H16 改为周报复盘。以下完整平台路线及接续段保留为历史记录，不再自动执行。**
+
+当前首轮开发见 [2026-10-08 收敛范围开发](docs/handoffs/2026-10-08-active-scope-development.md)：paper 休市扫描、原候选历史观测日期接线及周报基线。后继验证和提交身份以该交接的实际回执为准，旧全平台下一项不再执行。
 
 最新整体余项和接续顺序见 [2026-10-06 整体设计剩余工作交接](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/docs/handoffs/2026-10-06-platform-remaining-work-handoff.md)：按 M0–M8 映射七组余项、H01–H17 任务卡、最近六项已推送源码及双端上线前置。初稿代码基线为 `9a71f6069`；第10节和本文件末节补充后继H02原审计内容哈希首片，新5＋相关6已通过。Windows问题同步另见[2026-10-06双端解决记录](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/docs/handoffs/2026-10-06-windows-sync-resolution.md)：新财报本地测试通过、原文档checker崩溃待定位、新源95%未量；Mac已补官方基准/窗口/最小issuer输入与具体消费者缺口。各运行结论带证据时间；以下历史记录保留。
 

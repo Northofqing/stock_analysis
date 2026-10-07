@@ -62,6 +62,17 @@ fn load_windows(
     after_code: Option<&str>,
     limit: i64,
 ) -> Result<Vec<Window>, String> {
+    load_matching_windows(db, through, scope, after_code, limit, None)
+}
+
+fn load_matching_windows(
+    db: &DatabaseManager,
+    through: NaiveDate,
+    scope: OutcomeDataScope,
+    after_code: Option<&str>,
+    limit: i64,
+    exact_code: Option<&str>,
+) -> Result<Vec<Window>, String> {
     if !(1..=50).contains(&limit) {
         return Err("outcome collection page must be 1..=50 instruments".into());
     }
@@ -76,10 +87,40 @@ fn load_windows(
         }
     };
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    diesel::sql_query("SELECT code,min(start) AS start FROM (SELECT code,substr(push_time,1,10) AS start FROM pushed_stocks WHERE substr(push_time,1,10)>=?1 AND substr(push_time,1,10)<=?2 UNION ALL SELECT stock_code AS code,pred_date AS start FROM prediction_tracker WHERE stock_code IS NOT NULL AND pred_date<=?2 AND (actual_change_t1 IS NULL OR hit_t1 IS NULL OR actual_change_t3 IS NULL OR hit_t3 IS NULL OR actual_change_t5 IS NULL OR hit_t5 IS NULL)) WHERE code>?3 GROUP BY code ORDER BY code LIMIT ?4")
+    diesel::sql_query("SELECT code,min(start) AS start FROM (SELECT code,substr(push_time,1,10) AS start FROM pushed_stocks WHERE substr(push_time,1,10)>=?1 AND substr(push_time,1,10)<=?2 UNION ALL SELECT stock_code AS code,pred_date AS start FROM prediction_tracker WHERE stock_code IS NOT NULL AND pred_date<=?2 AND (actual_change_t1 IS NULL OR hit_t1 IS NULL OR actual_change_t3 IS NULL OR hit_t3 IS NULL OR actual_change_t5 IS NULL OR hit_t5 IS NULL)) WHERE code>?3 AND (?5 IS NULL OR code=?5) GROUP BY code ORDER BY code LIMIT ?4")
         .bind::<diesel::sql_types::Text,_>(since).bind::<diesel::sql_types::Text,_>(through.to_string())
         .bind::<diesel::sql_types::Text,_>(after_code.unwrap_or(""))
-        .bind::<diesel::sql_types::BigInt,_>(limit).load(&mut conn).map_err(|e|e.to_string())
+        .bind::<diesel::sql_types::BigInt,_>(limit)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>,_>(exact_code)
+        .load(&mut conn).map_err(|e|e.to_string())
+}
+
+/// Start of one candidate's observed-history request, derived from original
+/// rows. This read does not certify delivery, market coverage or trading facts.
+pub fn candidate_observation_start(
+    db: &DatabaseManager,
+    code: &str,
+    through: NaiveDate,
+) -> Result<NaiveDate, String> {
+    let windows = load_matching_windows(
+        db,
+        through,
+        OutcomeDataScope::PendingHistory,
+        None,
+        1,
+        Some(code),
+    )?;
+    let window = windows.first().ok_or_else(|| {
+        format!("no original outcome candidate or pending prediction for {code} through {through}")
+    })?;
+    let dates = expected_dates(
+        NaiveDate::parse_from_str(&window.start, "%Y-%m-%d").map_err(|error| error.to_string())?,
+        through,
+    )?;
+    dates
+        .first()
+        .copied()
+        .ok_or("outcome window is empty".into())
 }
 
 /// Range is derived from original rows and the immutable calendar, never a
@@ -261,5 +302,48 @@ mod tests {
             51
         )
         .is_err());
+    }
+
+    #[test]
+    fn outcome_observation_start_uses_exact_candidate_and_earliest_pending_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::open_isolated_for_test(
+            dir.path().join("TEST_CODE_observed_window.db"),
+        )
+        .unwrap();
+        let mut conn = db.get_conn().unwrap();
+        for (code, date) in [
+            ("TEST_CODE_other", "2026-07-01"),
+            ("TEST_CODE_selected", "2026-07-03"),
+            ("TEST_CODE_selected", "2026-10-09"),
+        ] {
+            diesel::sql_query("INSERT INTO pushed_stocks(push_time,push_kind,code,name,push_price,metric_json,source) VALUES (?1,'D-01',?2,'TEST_CODE',10,'{}','TEST_CODE')")
+                .bind::<diesel::sql_types::Text,_>(date)
+                .bind::<diesel::sql_types::Text,_>(code).execute(&mut conn).unwrap();
+        }
+        assert_eq!(
+            candidate_observation_start(&db, "TEST_CODE_selected", day("2026-09-30")).unwrap(),
+            day("2026-07-03")
+        );
+        db.save_prediction_legacy(
+            "2026-07-02",
+            "2026-07-03",
+            None,
+            Some("TEST_CODE_selected"),
+            "up",
+            60.,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            candidate_observation_start(&db, "TEST_CODE_selected", day("2026-09-30")).unwrap(),
+            day("2026-07-02")
+        );
+        assert!(
+            candidate_observation_start(&db, "TEST_CODE_missing", day("2026-09-30"))
+                .unwrap_err()
+                .contains("no original outcome candidate")
+        );
+        assert!(candidate_observation_start(&db, "TEST_CODE_selected", day("2026-10-07")).is_err());
     }
 }

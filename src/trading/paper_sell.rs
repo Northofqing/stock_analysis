@@ -302,18 +302,21 @@ struct CountRow {
 }
 
 // ============================================================================
-// 盘中时间窗（北京时间 9:30-11:30 / 13:00-15:00，周一至五）
+// 盘中时间窗（已核验交易日，北京时间 9:30-11:30 / 13:00-15:00）
 // ============================================================================
 
 fn in_trading_session() -> bool {
-    use chrono::{Datelike, Timelike};
-    let now = chrono::Local::now();
-    match now.weekday() {
-        chrono::Weekday::Sat | chrono::Weekday::Sun => return false,
-        _ => {}
-    }
-    let minute = now.hour() * 60 + now.minute();
-    (9 * 60 + 30..=11 * 60 + 30).contains(&minute) || (13 * 60..=15 * 60).contains(&minute)
+    intraday_session_open_at(chrono::Utc::now())
+}
+
+/// Scheduling eligibility for both paper buy and sell scans.
+pub fn intraday_session_open_at(now: chrono::DateTime<chrono::Utc>) -> bool {
+    let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("Shanghai offset");
+    let now = now.with_timezone(&shanghai);
+    matches!(
+        crate::calendar::verified_a_share_trading_day(now.date_naive()),
+        Ok(true)
+    ) && crate::calendar::session_at(now.naive_local()).is_trading()
 }
 
 // ============================================================================
@@ -1117,15 +1120,31 @@ mod tests {
     }
 
     #[test]
-    fn trading_session_window_does_not_panic() {
-        use chrono::Datelike;
-        // 系统时钟不可冻结——验证窗口边界逻辑本身不崩溃；
-        // 若当前为周末，则确认必不在交易时段
-        let now = chrono::Local::now();
-        if matches!(now.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
-            assert!(!in_trading_session());
-        } else {
-            let _ = in_trading_session();
+    fn paper_intraday_session_uses_shanghai_continuous_hours() {
+        for (timestamp, open) in [
+            ("2026-09-30T01:29:59Z", false),
+            ("2026-09-30T01:30:00Z", true),
+            ("2026-09-30T03:29:59Z", true),
+            ("2026-09-30T03:30:00Z", false),
+            ("2026-09-30T04:59:59Z", false),
+            ("2026-09-30T05:00:00Z", true),
+            ("2026-09-30T06:59:59Z", true),
+            ("2026-09-30T07:00:00Z", false),
+            ("2026-09-19T02:00:00Z", false),
+            ("2027-01-04T02:00:00Z", false),
+        ] {
+            let instant = chrono::DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            assert_eq!(intraday_session_open_at(instant), open, "{timestamp}");
         }
+    }
+
+    #[test]
+    fn paper_intraday_scans_skip_exchange_holidays() {
+        let holiday = chrono::DateTime::parse_from_rfc3339("2026-10-02T10:00:00+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(!intraday_session_open_at(holiday));
     }
 }

@@ -152,6 +152,17 @@ impl IntradayMonitor {
     ///
     /// 独立模拟账户：只接受已显式 seed/cutover 的 epoch，不刷新用户账户快照。
     pub fn tick(&self, risk_context: PaperRiskContext) -> Result<usize, String> {
+        self.tick_at(risk_context, chrono::Utc::now())
+    }
+
+    fn tick_at(
+        &self,
+        risk_context: PaperRiskContext,
+        now: DateTime<chrono::Utc>,
+    ) -> Result<usize, String> {
+        if !crate::trading::paper_sell::intraday_session_open_at(now) {
+            return Ok(0);
+        }
         let binding = paper_ledger_runtime::active_binding()?;
         self.tick_with_executor(risk_context, &binding, |signal, quote| {
             paper_ledger_runtime::execute(
@@ -596,6 +607,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paper_intraday_tick_skips_closed_sessions_before_ledger_activation() {
+        for timestamp in [
+            "2026-10-02T10:00:00+08:00",
+            "2026-09-30T00:30:00+08:00",
+            "2026-09-30T12:00:00+08:00",
+            "2026-09-30T15:00:00+08:00",
+        ] {
+            let instant = DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            assert_eq!(IntradayMonitor.tick_at(test_risk_context(), instant), Ok(0));
+        }
+    }
 
     #[test]
     fn br134_paper_limit_flags_preserve_real_quote_boundaries() {

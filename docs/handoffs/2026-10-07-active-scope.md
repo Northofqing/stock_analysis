@@ -25,6 +25,7 @@ H07、H11、H12、H13、H15 仅处理支撑上述保留工作的必要部分；�
 
 ## 接续入口
 
+- [2026-10-08 收敛范围后的开发与验证](2026-10-08-active-scope-development.md)
 - [outcome 修复与原验证证据](2026-10-07-outcome-integrity-repair.md)
 - [原 H01–H17 任务卡与历史基线](2026-10-06-platform-remaining-work-handoff.md)
 - [主仓库合入及历史上线记录](../ops/2026-10-07-full-platform-master-rollout.md)
