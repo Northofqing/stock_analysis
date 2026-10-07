@@ -111,3 +111,13 @@ Windows精确 `2b225b71148425d18c82a3dcc552f1444f3595cd` 的原CI `37564892679` 
 完整原日志确认 `stable` action本轮安装Rust `1.99.0 b940084d7`；仓库BR-252合同、coverage原workflow和本机已验证Cargo均固定 `1.95.0 59807616e`。后继将Rust CI与compliance的compiler对齐现行固定合同，Rust CI显式安装rustfmt/clippy。没有改Cargo.lock、第三方源码、features、profile、覆盖阈值或strict检查范围。YAML语法和合同版本一致性另验；Linux依赖编译是否解除、完整测试与覆盖率仍由新HEAD原CI裁定。
 
 本机另外启动原 `cargo clippy --locked --offline --all-targets --all-features --message-format=json -- -D warnings`。首次全程尚无compiler JSON；进程采样固定在Cargo `PathSource`/`list_files_gix`/包输入fingerprint，而根目录有25GB未忽略的 `.replay-build-records` 生成原件。按完整PID/父进程/参数/cwd重验后只向本次Cargo发SIGINT，原driver退出255、两输出均空，记为主动中止、Clippy未执行，不是lint通过或lint失败。后继只把此生成目录加入.gitignore；原记录未移动/删除，源码、Cargo输入、合同及回执未改写。指纹阶段和真实严格诊断另据后继日志，不能仅由ignore声明声称性能或全部Clippy门已通过。
+
+### 严格 Clippy 实际终态与剩余发布工作
+
+生成目录忽略后约30秒已进入编译；后继严格命令实际退出101，原普通库报1222项、库测试报643项，共1865条error级诊断，按lint/信息/位置去重为1425条。这不是1425个已证实业务缺陷；存在同一根类型/未接线声明及重复目标的诊断。较大类别包含未使用声明/导入、error/enum布局、函数复杂度及可见性；async借用、锁文件打开语义等已按位置单列需复核，不能直接机械改状态或授权边界。没有新增allow、关闭`-D warnings`、删除必要测试或用批量cargo fix签发通过。日志SHA `36050e309c9c9f3d638d517704930c7c299e78c09b067bfe9a7bb6ee3b2e5962`，stderr SHA `f70650615ac31eb91986dcfb93fd2f22d5fbc52027577bb8c3960d67508f98a5`；本机remediation index保留逐项定位。由于库失败，不能声称其余所有targets的严格检查已执行完成。
+
+编译器/生成目录修复已经提交并同步 `master`：`ab936ec011c1eb1e774495f92b97678970b5f4c1`。原master push连接中断退出128，后继独立 `ls-remote` 证实两个远端均收到同一完整OID；没有重复push或重新派发CI。该提交只改两workflow、gitignore与本文，Cargo/Rust源与上述Clippy输入相同。
+
+全面上线的剩余次序：逐模块关闭实际源码质量与架构/RFC资格，核新HEAD原CI及完整测试/覆盖；完成H01–H08的真实资格和正式资金/决策/执行接线，取得Windows合格新SDK及真实RPC；准备Desktop外同版release、隔离dry-run、schema14/v2兼容迁移/回退及精确activation审阅；再逐项核单实例、真实数据、资金seed和78条Uncertain人工决策，切换并积累自然观察。资金口径B及是否包含当前持仓已向用户提出资料请求，不能默认为某个金额。H09–H17远端设施、52Unit/治理/研究与成熟窗口仍按原交接退出标准推进；源码合入不宣称这些阶段已完成。
+
+11:58 CST最终只读复核：monitor14998、bridge56417及三个runtime文件的字节/SHA/dev/ino与11:14原件一致，两库dev/ino、schema9及995/3988/6/78计数保持。banner/heartbeat仍新鲜，Health退出1、Frozen/Unsafe、账户不完整，最新仍缺Quote/MoneyFlow/OrderBook。本轮完整源码合入、CI修复与发布准备没有成为正式安装、重启或生产账本写入；当前没有已准备并获审的新完整activation候选。
