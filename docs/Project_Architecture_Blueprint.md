@@ -1753,7 +1753,7 @@ Data Contract Gate / DataHealthSnapshot
 | PR-2 BannerSnapshot | 单一结构化 health truth | 当前仍是 `Mutex<Option<BannerCtx>>`，缺失时 caller 记录字符串并跳过（`src/bin/monitor/main.rs:1666-1695`） | `PROPOSED`；不能把现有 BannerCtx 重命名后算完成 |
 | PR-3 ErrorCode | typed code/retryable/severity/retry_after | exact type 0 命中；当前大量 reason_code 仍分散 | `PROPOSED`；应与 §24 `ReasonCode`、readiness reason schema 合并设计，避免第二套错误 taxonomy |
 | PR-4 Log rotation | 日切、50MB、30 日、warn 分流 | 无 `src/log/rotate.rs`/tracing rotation 实现 | `PROPOSED`；保留期与 secrets/redaction policy 要先定 |
-| PR-5 `--health` | 1 秒内人读/JSON health | `src/bin/monitor/health_cmd.rs` 已提供 `--health [--json] [--test]`：只读固定根目录下由 live banner owner 原子写入的脱敏 AccountMode/DataMode 快照，并核对新鲜度、独占实例锁和启动身份；缺失、过期、旧进程或模式不健康返回非零 | `PARTIAL`；当前 `coverage=banner_account_data_only`，尚无统一 BannerSnapshot、错误聚合、per-source 状态或真实运行时 1 秒时延验收；CLI 不触发 provider 或业务 sink |
+| PR-5 `--health` | 1 秒内人读/JSON health | 无 health command/module；现有 opening readiness 通过日志暴露 | `PROPOSED`；应读取同一 snapshot，不触发 provider 或业务 sink |
 | PR-6 25+ metrics | operational metrics catalog | 当前 `MonitorMetrics` 明确只有 6 项（`src/bin/monitor/metrics.rs:1-67`） | `PARTIAL`；标签基数、单位和 authoritative/BestEffort 结果须与 §24 对齐 |
 | PR-7 per-source breaker | Closed/Open/HalfOpen + recovery | `BackoffState` 已有失败升级、CircuitBreak 和 half-open 检查（`src/monitor/rate_budget.rs:94-230`） | `PARTIAL`；尚未证明每个真实 source 都统一接线或进入 banner；原设计 threshold=5/10 自相矛盾，须先冻结 |
 | PR-8 recovery fields | 每源 last successful pull/失败时长 | 当前 BannerCtx 没有统一 per-source map | `PROPOSED`；source identity 应复用 Gateway evidence catalog |

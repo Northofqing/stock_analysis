@@ -48,4 +48,6 @@ if ! grep -q 'BR-009 timeout 或 cargo 失败 (exit 42)' <<<"$OUTPUT"; then
     exit 1
 fi
 
+python3 "$REPO_ROOT/tools/one_shot/test_timeout_lib.py"
+
 echo "[check_backfill_failure_propagation] PASS: Cargo failure remains exit=42"

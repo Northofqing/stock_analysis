@@ -44,3 +44,16 @@
 需要明确区分：全部已完成源码合入、发布制品验证、正式服务切换、全部能力验收。当前完成第一项；现网未执行本轮完整平台安装或重启。
 
 详细本机证据在 `.planning/2026-10-07-full-platform-rollout/`，原合入回执另存 `.planning/2026-10-07-news-dedup-rollout/validation/master-integration-receipt.json`；不提交私有配置、数据库、Token、证书或大包。
+
+## 原45a73caca CI终态与第一批修复
+
+恢复Actions并推送后，精确 `45a73caca4bbb11bb11f9465070c87f2c1ddedec` 的原三个run均失败：Rust CI `37562970073` 停架构检查；compliance `37562970126` 停离线检查；coverage `37562970290` 停 fontconfig 系统库构建。Rust全量测试和覆盖阈值执行尚未到达，不能将它们写作测试失败数或实测覆盖率。原日志、steps与摘要保留。
+
+第一批修复：
+
+- 三份原workflow补足 Linux fontconfig/freetype、SSL、SQLite、PAM、pkg-config、protoc、ripgrep；不改 features、profile、检查器或覆盖阈值。YAML语法通过，是否修复实际Linux构建由新同HEAD CI裁定。
+- 恢复八份冻结输入/来源目录中的两份被改写原件，真实Git blob精确匹配原SHA。后继健康和熔断说明完整保留在[设计输入恢复说明](../architecture/current/2026-10-07-frozen-design-input-recovery.md)和Git历史。`rfc_inputs_valid`、`source_catalog_valid` 实际通过；当前源码审计与PROVISIONAL等strict条件仍未关闭。
+- 纳管主目录原有但被忽略的 BR174 脚本，原字节复制；`--self-test` 与当前源码实际扫描都通过。
+- 纳管回填脚本缺失的共享 timeout helper。监护进程保持命令42退出、成功输出、monotonic截止，并在截止或自身取消时终止新建的自有进程组。四个真实边界测试通过：42、成功stdout、截止2且TERM-ignoring孙进程停止、监护进程SIGTERM取消143且孙进程停止；现有回填失败传播检查也通过。只在TEST_CODE临时目录运行，没有真实回填或生产库写入。
+
+剩余合规失败已有原件：移除的本地provider宿主/TDX路径仍被业务规则列为active；T08未引用logging-only壳；盘中overlay和量比的0.0哨兵与缺少必需回归；BR194静态检查的账户phase/schema版本与后继实现尚需逐项核对。处理时保留真实来源/未知/拒绝，不能删门禁、增加白名单或用数值替代缺失数据来通过检查。当前源码audit须更新调用链和内容证据，不能批量刷新哈希或直接晋级目录状态。
