@@ -131,10 +131,23 @@ gRPC 导入边界清理把两个仅测试使用的名字移入各自测试模块
 
 Windows 新源码 e1dc7ef1588bda8076067e86b540b07311146c21 已实际推至main；141成员/1,578,149字节全部核验、3源码 blob 独立 Git fetch 逐件完全匹配，包外 Mac ACK 范围是字节与源码读取。新增15项真实注册处理链测试及2105工作区通过是 Windows 原执行报告，Mac 没有代跑或据此签新SDK运行身份。精确新原CI37570852744已terminal FAIL：overall69654/81600=85.36%，critical35572/39819=89.33%<95；分母不变仍差2257关键覆盖行。原失败未改写或重试；结果和后继继续有意义行为测试/同版资格/RPC要求已成功发给原Windows chat。
 
-生产仍以11:58CST只读快照为最后已核证范围；本续行未安装二进制、重发activation、重启、迁移或写生产库，不能把旧快照写作新的现场核验。实际B/持仓口径请求仍待回复；正式资金/正向F2/paper issuer、受控Financial资格、完整CI、同版SDK、78逐项人工裁定及自然观察依旧未关闭。
+生产仍以11:58CST只读快照为当批最后已核证范围；本续行未安装二进制、重发activation、重启、迁移或写生产库，不能把旧快照写作新的现场核验。此前将持仓、现金一并列为待用户提供的判断已按下节数据库核验撤回；正式资金/正向F2/paper issuer、受控Financial资格、完整CI、同版SDK、78逐项人工裁定及自然观察依旧未关闭。
 
 ### 本批最终开发证据
 
 固定的9项Rust输入前后SHA一致：schema14库回归6、gateway77、候选partial decoder1、CLI链接/三类sidecar边界2，合计86次目标测试执行PASS，0FAIL。格式、完整offline合规及diff检查PASS。原gateway76/1和test API E0599失败原件保留。新普通库编译886项warning、库测试152项warning仍保留；没有声称最新Strict Clippy、全部工作区、正常release、同制品dry-run或真实WindowsRPC通过。
 
 本批直接源码复核覆盖只读/事务/临时遮蔽/目录内容校验、CLI稳定副本与声明边界，没有新的独立审查批准记录。公开返回类型是观察数据，没有发行任何运行能力。详细范围见新操作文档；完整BR19414外部join、真实迁移回退及其余H01–H17退出条件继续按计划。精确提交及两个远端OID以实际Git回执为准。
+
+## 已有持仓和账户资料核验更正（2026-10-07）
+
+用户指出持仓已经在数据库。13:16 CST 对正式主库 `/Users/zhangzhen/.local/share/stock-analysis-runtime/data/stock_analysis.db` 以 SQLite `mode=ro`、`query_only=ON` 和同一读事务核验，确认此前“还缺现金、持仓信息”的结论不准确：
+
+- `user_position_snapshot` 已有38条用户确认快照、明细表249条。按现有 accessor 的有效时间排序，最新为2026-09-28 18:15 CST的完整5只持仓；数量、成本、名称均存在，header的5项与实际明细相符，来源为 `user_confirmed_full_snapshot`。
+- `user_account_summary` 已有40条记录；最新现金、总资产、市值、仓位与当日盈亏均存在，来源为 `user_confirmed_screenshot`。其有效时间与上述持仓完全相同，满足现有账户/持仓时间绑定。
+- `real_account_snapshot` 的最新事实较早，不能仅因该表较旧就声称账户资料不存在；`stock_position` 是确认快照的本地投影，不能用它代替确认来源或合并成额外持仓。`position_adjustments` 当前0条。
+- 当前读取时快照年龄约211小时。生产原日志13:15:47明确记录 `BR-103 account summary is stale`；`compute_account_mode_metrics_blocking` 的现行96小时限制会在纸面账本指标计算之前拒绝该汇总。这里的账户不完整应归为既有事实的时效拒绝，不能写作缺持仓或从未提供现金。后继重新估值也不改变用户确认快照的时间。
+
+H04的接续先直接复用这些资料制作精确 seed/资金分配材料。真正剩余的是正式策略预算与持仓分配授权、完整Financial资格、唯一批准issuer及生产模拟账本接线；历史总资产记录本身不签发可花预算。已有资料整理和实现不再等待用户重复提供持仓/现金；只有具体方案仍需用户作出的选择，才在材料完成后提出。
+
+原始金额、逐仓明细及查询/日志回读保存于本机忽略目录 `.planning/2026-10-07-full-platform-rollout/existing-account-position-readback.json`，未纳入远端。此次只读核验及文档更正通过内容复核与 `git diff --check`，无行为修改，不运行Cargo；未更改快照时间、96小时门、生产库、activation或实例。

@@ -6,6 +6,7 @@
 > 2026-10-07 后继：V1 事件/存储投影内容校验与审计返回保全修复见 [最新开发接续](2026-10-07-v1-content-development.md)。初稿与第10节的旧测试身份保持历史范围，最终源码证据另列于该文档。
 > 2026-10-07 用户审计问题修复：去重日界、多窗口、日线/逐日状态事务、D01原投递反馈和独立paper价格防护见 [推送效果修复接续](2026-10-07-outcome-integrity-repair.md)。源码已交付，真实逐日来源、资金/Financial、存量裁定及生产部署仍分别验收。
 > 2026-10-07 H02 后继：同一 live reader 的历史 SeedManifest 规范化哈希、账户/epoch 与 seed 身份子片见 [清单内容接续](2026-10-07-v1-manifest-content-development.md)。普通内容校验和完整 Financial/native/provider 资格分别验收，实际验证身份列在接续文档。
+> 2026-10-07 账户资料更正：生产主库已有用户确认的完整持仓及现金/资产汇总，最新两者的有效时间均为 2026-09-28 18:15 CST。此前将这些字段列为待用户提供不准确；H04 复用已有资料，详见 [只读核验与剩余接线](../ops/2026-10-07-full-platform-master-rollout.md#已有持仓和账户资料核验更正2026-10-07)。
 
 ## 1. 结论与范围
 
@@ -101,7 +102,7 @@ H01/H02 是资金和真实执行的资格前置；普通材料、纯逻辑和必
 
 | ID / 优先级 | 剩余动作 | 前置与完成标准 | 入口 / owner |
 | --- | --- | --- | --- |
-| H04 / P1 | 取得真实总资金 B、现金/现有持仓是否计入、初始分配/风险预算、seed/cutover 材料；实现真正批准资金的唯一发行与持久版本 | 用户尚未提供 B；已异步询问总金额及是否含持仓。须先制作精确可审材料，再按资金合同批准；历史一致材料或默认金额不发行可花资金 | 用户提供资料/审阅；Mac：[funding review](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/trading/paper_funding_review_v1.rs)、[material store](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/trading/paper_funding_review_store_v1.rs) |
+| H04 / P1 | 复用已有用户确认持仓和账户汇总，制作总预算 B、持仓分配/风险预算及 seed/cutover 精确材料；实现批准资金的唯一发行与持久版本 | 持仓、数量、成本、可用现金和总资产均已有数据库记录，不能再列为缺资料。正式策略预算与分配的授权、唯一 issuer 和 seed 接线仍待完成；最新快照的时效另按账户门核验，不从历史资产自动发行可花资金 | Mac先复用资料、完成实现及可审材料；用户审阅具体资金方案：[funding review](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/trading/paper_funding_review_v1.rs)、[material store](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/trading/paper_funding_review_store_v1.rs) |
 | H05 / P1 | 完成正式正向 F2 的来源/风险/资金/人工裁定和唯一非序列化 intent 发行，保完整 universe disposition、成本/流动性及稳定关联 ID | Qualified 来源与实际 namespace、Financial、批准资金具备；缺失仍明确拒绝。保既有不可变负向记录；不将历史 DTO、推送成功或 cfg(test) issuer 转成批准 | Mac：[investment decision](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/decision/investment_decision_v1.rs)、[intent boundary](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/decision/approved_paper_intent_v1.rs) |
 | H06 / P1 | 把正式决策、资金与原 parent order/retained writer 接到 monitor 调度及原 paper owner，完成日对账/恢复 | 沿已通过的幂等提交和 sealed 回执恢复；同决策只产生一个父单，partial/no-fill/cancel/T+1/整手/停牌/涨跌停/费用/持仓投影闭环，故障恢复无双 owner | Mac：[execution](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/src/trading/paper_book_v2_execution.rs)、`src/bin/monitor/` |
 
