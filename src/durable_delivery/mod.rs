@@ -12,6 +12,9 @@ mod schema;
 mod schema_g5b_cohort;
 mod schema_p05_unit;
 mod schema_p05_unit_runtime;
+mod snapshot_check;
+
+pub use snapshot_check::{inspect_schema14_extensions, Schema14ExtensionObservation};
 
 pub use coordinator::{
     CandidateBoardCardObservationV1, CandidateBoardCardObservationV2, CandidateBoardCardTerminalV1,

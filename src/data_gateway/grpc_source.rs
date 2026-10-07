@@ -43,9 +43,7 @@ use crate::grpc_client::external_pb::magic::market::v1::{
     AdmissionState as ExternalAdmissionState, Capability as ExternalCapability,
     HealthResponse as ExternalHealthResponse, Operation as ExternalOperation,
 };
-use crate::grpc_client::pb::magic::market::v1::{
-    AdmissionState, Operation, QueryRequest, QueryResponse,
-};
+use crate::grpc_client::pb::magic::market::v1::{Operation, QueryRequest, QueryResponse};
 use crate::grpc_contract::methods::{ExternalMethod, MethodIdentity};
 use crate::market_domain::SecurityBar;
 use crate::market_domain::{
@@ -1231,7 +1229,6 @@ pub const HOOKED_OPS: &[&str] = &[
     "CorporateActions",
     "CurrentAuctionObservations",
     "DragonTiger",
-    "EconomicCalendar",
     "EconomicReleaseObservations",
     "EconomicReleaseSchedule",
     "FinancialStatements",
@@ -4432,6 +4429,7 @@ mod tests {
     use crate::grpc_client::client::external_query_wire_fixture::ExternalQueryWireFixture;
     use crate::grpc_client::errors::{ErrorDetail, GrpcError};
     use crate::grpc_client::pb::magic::market::v1 as pb;
+    use crate::grpc_client::pb::magic::market::v1::AdmissionState;
     use crate::market_domain::ProviderId;
     use chrono::TimeZone;
     use futures::FutureExt as _;
@@ -4441,6 +4439,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn retired_economic_calendar_does_not_initialize_transport() {
+        assert!(!HOOKED_OPS.contains(&"EconomicCalendar"));
         let source = GrpcSource {
             addr: "http://127.0.0.1:1".to_owned(),
             client: AsyncMutex::new(None),

@@ -7,8 +7,8 @@ use crate::grpc_client::external_decoder::ExternalDecoder;
 use crate::grpc_client::external_pb::magic::market::v1 as pb;
 use crate::grpc_client::external_query_transport::{
     admit_external_payload, ExternalFrameFailureV1, ExternalQueryCall, ExternalQueryMethod,
-    ExternalWireEvidenceV1, ExternalWireMaterialV1, EXTERNAL_QUERY_DECODE_LIMIT_BYTES,
-    EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
+    ExternalWireEvidenceV1, ExternalWireMaterialV1, EXTERNAL_QUERY_FRAMED_BODY_LIMIT_BYTES,
+    EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
 };
 use crate::grpc_contract::methods::{ContractProfile, ExternalMethod, MethodIdentity};
 use prost::Message;

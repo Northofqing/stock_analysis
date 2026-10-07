@@ -121,3 +121,20 @@ Windows精确 `2b225b71148425d18c82a3dcc552f1444f3595cd` 的原CI `37564892679` 
 全面上线的剩余次序：逐模块关闭实际源码质量与架构/RFC资格，核新HEAD原CI及完整测试/覆盖；完成H01–H08的真实资格和正式资金/决策/执行接线，取得Windows合格新SDK及真实RPC；准备Desktop外同版release、隔离dry-run、schema14/v2兼容迁移/回退及精确activation审阅；再逐项核单实例、真实数据、资金seed和78条Uncertain人工决策，切换并积累自然观察。资金口径B及是否包含当前持仓已向用户提出资料请求，不能默认为某个金额。H09–H17远端设施、52Unit/治理/研究与成熟窗口仍按原交接退出标准推进；源码合入不宣称这些阶段已完成。
 
 11:58 CST最终只读复核：monitor14998、bridge56417及三个runtime文件的字节/SHA/dev/ino与11:14原件一致，两库dev/ino、schema9及995/3988/6/78计数保持。banner/heartbeat仍新鲜，Health退出1、Frozen/Unsafe、账户不完整，最新仍缺Quote/MoneyFlow/OrderBook。本轮完整源码合入、CI修复与发布准备没有成为正式安装、重启或生产账本写入；当前没有已准备并获审的新完整activation候选。
+
+
+## 开发完成后上线：schema14 预检续行（2026-10-07）
+
+用户最新要求“开发完成 然后上线”。在最终375a基线上继续开发，完整上线退出条件保持。后继增加[隔离副本检查器](2026-10-07-schema14-snapshot-check.md)：复用原 schema12/13/14 目录及 G5b/P05 内容/owner/修订/完成校验，无生产 coordinator、迁移、provider/sink 或批准 issuer。完整 BR194 外部审计 join 仍待开发，schema9-only 原工具不变。首轮测试因当前 rusqlite 无 total_changes 方法退出101，仅测试夹具错误；后继查询 SQLite 的 SELECT total_changes()，原日志保留，实际最终结果后补。
+
+gRPC 导入边界清理把两个仅测试使用的名字移入各自测试模块。第一次实际 gateway 定向77项为76PASS/1FAIL；原扫描守卫发现退役 EconomicCalendar 仍在 HOOKED_OPS，启动 banner 误将其算作已接线。后继移除该名字并在现有退役用例断言不再声明；没有恢复退役能力或修改 LocalBridge fixture 的41项合同声明。该声明集合和实际接线集合分别验收，复验结果后补。
+
+Windows 新源码 e1dc7ef1588bda8076067e86b540b07311146c21 已实际推至main；141成员/1,578,149字节全部核验、3源码 blob 独立 Git fetch 逐件完全匹配，包外 Mac ACK 范围是字节与源码读取。新增15项真实注册处理链测试及2105工作区通过是 Windows 原执行报告，Mac 没有代跑或据此签新SDK运行身份。精确新原CI37570852744已terminal FAIL：overall69654/81600=85.36%，critical35572/39819=89.33%<95；分母不变仍差2257关键覆盖行。原失败未改写或重试；结果和后继继续有意义行为测试/同版资格/RPC要求已成功发给原Windows chat。
+
+生产仍以11:58CST只读快照为最后已核证范围；本续行未安装二进制、重发activation、重启、迁移或写生产库，不能把旧快照写作新的现场核验。实际B/持仓口径请求仍待回复；正式资金/正向F2/paper issuer、受控Financial资格、完整CI、同版SDK、78逐项人工裁定及自然观察依旧未关闭。
+
+### 本批最终开发证据
+
+固定的9项Rust输入前后SHA一致：schema14库回归6、gateway77、候选partial decoder1、CLI链接/三类sidecar边界2，合计86次目标测试执行PASS，0FAIL。格式、完整offline合规及diff检查PASS。原gateway76/1和test API E0599失败原件保留。新普通库编译886项warning、库测试152项warning仍保留；没有声称最新Strict Clippy、全部工作区、正常release、同制品dry-run或真实WindowsRPC通过。
+
+本批直接源码复核覆盖只读/事务/临时遮蔽/目录内容校验、CLI稳定副本与声明边界，没有新的独立审查批准记录。公开返回类型是观察数据，没有发行任何运行能力。详细范围见新操作文档；完整BR19414外部join、真实迁移回退及其余H01–H17退出条件继续按计划。精确提交及两个远端OID以实际Git回执为准。

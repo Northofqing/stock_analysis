@@ -3,6 +3,7 @@ use crate::grpc_client::client::external_control_loopback_fixture::{
     write_test_code_bundle, ExternalMtlsSwitch, TEST_CODE_MTLS_CA_CERT, TEST_CODE_MTLS_SERVER_CERT,
     TEST_CODE_MTLS_SERVER_KEY,
 };
+use crate::grpc_client::external_query_transport::EXTERNAL_QUERY_DECODE_LIMIT_BYTES;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};

@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 const DATE: &str = "2026-09-23";
+#[path = "p05_schema14_snapshot_tests.rs"]
+mod snapshot_tests;
 fn at(day: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
     shanghai_offset()
         .with_ymd_and_hms(2026, 9, day, h, m, s)

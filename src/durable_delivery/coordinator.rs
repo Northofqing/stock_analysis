@@ -10644,7 +10644,7 @@ fn require_single_cas_update(changed: usize, operation: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_current_schema_version(connection: &Connection) -> Result<()> {
+pub(super) fn require_current_schema_version(connection: &Connection) -> Result<()> {
     let schema_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if schema_version != SCHEMA_VERSION {
