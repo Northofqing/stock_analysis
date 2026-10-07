@@ -489,26 +489,39 @@ impl NewsMonitor {
             Ok(c) => c,
             Err(_) => return,
         };
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        // 恢复今天的 key
-        #[derive(QueryableByName, Debug)]
-        struct DedupKey {
-            #[diesel(sql_type = diesel::sql_types::Text)]
-            key: String,
+        let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("Shanghai offset");
+        let today = chrono::Utc::now().with_timezone(&shanghai).date_naive();
+        match restore_dedup_on(&mut conn, today) {
+            Ok(keys) => self.seen_titles.extend(keys),
+            Err(error) => log::warn!("[NewsMonitor] 持久去重恢复失败: {error}"),
         }
-        let sql = format!("SELECT key FROM news_dedup WHERE created_at >= '{}'", today);
-        if let Ok(rows) = diesel::sql_query(&sql).load::<DedupKey>(&mut *conn) {
-            for r in rows {
-                self.seen_titles.insert(r.key);
-            }
-        }
-        // 清理非今天的过期 key
-        let _ = diesel::sql_query(format!(
-            "DELETE FROM news_dedup WHERE created_at < '{}'",
-            today
-        ))
-        .execute(&mut *conn);
     }
+}
+
+/// Existing databases store SQLite `datetime('now')` in UTC. Compare both
+/// restoration and cleanup against the same Shanghai midnight in that format;
+/// changing CREATE IF NOT EXISTS would not migrate an existing table.
+fn restore_dedup_on(
+    conn: &mut diesel::SqliteConnection,
+    today: chrono::NaiveDate,
+) -> diesel::QueryResult<Vec<String>> {
+    #[derive(QueryableByName)]
+    struct DedupKey {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        key: String,
+    }
+    let cutoff = (today.and_hms_opt(0, 0, 0).expect("midnight") - chrono::Duration::hours(8))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    conn.transaction(|conn| {
+        let keys = diesel::sql_query("SELECT key FROM news_dedup WHERE created_at >= ?1")
+            .bind::<diesel::sql_types::Text, _>(&cutoff)
+            .load::<DedupKey>(conn)?;
+        diesel::sql_query("DELETE FROM news_dedup WHERE created_at < ?1")
+            .bind::<diesel::sql_types::Text, _>(&cutoff)
+            .execute(conn)?;
+        Ok(keys.into_iter().map(|row| row.key).collect())
+    })
 }
 
 /// L2 概念索引刷新（独立函数，在 blocking worker 中执行同步 Gateway 调用）。
@@ -678,6 +691,59 @@ pub async fn resolve_code_by_name(name: &str) -> anyhow::Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_shanghai_midnight_retains_utc_evening_and_restart_claim() {
+        let mut conn = diesel::SqliteConnection::establish(":memory:").unwrap();
+        diesel::sql_query("CREATE TABLE news_dedup (key TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT (datetime('now')))")
+            .execute(&mut conn).unwrap();
+        diesel::sql_query("INSERT INTO news_dedup VALUES ('old','2026-10-06 15:59:59'),('midnight','2026-10-06 16:00:00'),('early','2026-10-06 23:59:59'),('morning','2026-10-07 00:00:00')")
+            .execute(&mut conn).unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let restored: std::collections::BTreeSet<_> = restore_dedup_on(&mut conn, today)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            restored,
+            ["midnight", "early", "morning"].map(String::from).into()
+        );
+        for key in &restored {
+            assert_eq!(
+                diesel::sql_query("INSERT OR IGNORE INTO news_dedup(key) VALUES (?1)")
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .execute(&mut conn)
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(restore_dedup_on(&mut conn, today).unwrap().len(), 3);
+        assert!(restore_dedup_on(&mut conn, today.succ_opt().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn dedup_restore_cleanup_error_rolls_back_and_keeps_claims() {
+        let mut conn = diesel::SqliteConnection::establish(":memory:").unwrap();
+        diesel::sql_query("CREATE TABLE news_dedup (key TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT (datetime('now')))")
+            .execute(&mut conn).unwrap();
+        diesel::sql_query("INSERT INTO news_dedup VALUES ('old','2026-10-06 15:59:59'),('early','2026-10-06 23:00:00')")
+            .execute(&mut conn).unwrap();
+        diesel::sql_query("CREATE TRIGGER deny_dedup_delete BEFORE DELETE ON news_dedup BEGIN SELECT RAISE(ABORT,'TEST_CODE_cleanup_failure'); END")
+            .execute(&mut conn).unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        assert!(restore_dedup_on(&mut conn, today).is_err());
+        diesel::sql_query("DROP TRIGGER deny_dedup_delete")
+            .execute(&mut conn)
+            .unwrap();
+        assert_eq!(
+            restore_dedup_on(&mut conn, today.pred_opt().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     fn membership_batch(
         batch_id: &str,
