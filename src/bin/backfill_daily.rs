@@ -60,9 +60,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(2);
     }
 
-    // 2. 初始化 DB
+    // 2. 回填沿用已发布 monitor 的业务库范围，保持 prospective 平台表冻结。
     let db_path = env::var("STOCK_DB").ok().map(PathBuf::from);
-    DatabaseManager::init(db_path.clone())?;
+    DatabaseManager::init_retained_monitor(db_path.clone())?;
     let db = DatabaseManager::get();
 
     if outcome_mode {
