@@ -228,3 +228,66 @@ fn monitor_schema9_uncertain_survives_reopen_without_automatic_resend() {
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
     assert_eq!(catalog(&fixture), before);
 }
+
+#[test]
+fn monitor_schema9_retained_quote_provider_owner_survives_reopen_and_keeps_rolling_policy() {
+    let mut fixture = retained_fixture("SCHEMA9_RETAINED_QUOTES");
+    let before = catalog(&fixture);
+    let occurrence = "retained-quote-observation:2026-07-15:intraday:14:30";
+    let item = DeliveryEnvelope::new(
+        "2026-07-15",
+        PushKind::IntradayMarket,
+        DeliverySubKind::None,
+        "GLOBAL",
+        occurrence,
+        "TEST_CODE_ORIGINAL_QUOTE_HASH",
+        b"TEST_CODE_ORIGINAL_QUOTE_CANONICAL".to_vec(),
+        "TEST_CODE_QUOTE_SUBJECT",
+        b"TEST_CODE Frozen quote-only; no current position authority".to_vec(),
+        false,
+        None,
+    )
+    .unwrap()
+    .with_provider_evidence(
+        Some("2026-07-15T06:30:01Z".into()),
+        Some("2026-07-15".into()),
+        vec!["TEST_CODE_NATIVE_QUOTE_BATCH".into()],
+    )
+    .unwrap();
+    let append = MemoryAppendPort::default();
+    prepare_reserved(&fixture, &item, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&item.decision_identity, &sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &item.decision_identity,
+    );
+    drop(fixture.coordinator.take().unwrap());
+    fixture.coordinator = FixtureCoordinator(Some(Arc::new(
+        DurableDeliveryCoordinator::open_existing_monitor_schema9(config(&fixture)).unwrap(),
+    )));
+    let owner = fixture
+        .coordinator
+        .inspect_exact_occurrence_owner(
+            "2026-07-15",
+            PushKind::IntradayMarket,
+            DeliverySubKind::None,
+            "GLOBAL",
+            occurrence,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner.envelope, item);
+    assert_eq!(owner.state, DecisionState::Delivered);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.query_i64("SELECT base_cooldown_secs FROM delivery_policy_catalog WHERE push_kind='IntradayMarket'"), 900);
+    assert_eq!(fixture.query_i64("SELECT counts_against_daily_budget FROM delivery_policy_catalog WHERE push_kind='IntradayMarket'"), 1);
+    assert_eq!(catalog(&fixture), before);
+    assert_eq!(fixture.query_i64("PRAGMA user_version"), 9);
+}

@@ -509,6 +509,48 @@ pub fn v14_gate_counted_binding(
     })
 }
 
+/// Narrow quote-only capability: no default IntradayMarket/auction advice
+/// policy is relaxed. The opaque report owns sealed original quote records.
+pub(super) fn v14_gate_retained_observation(
+    report: &crate::retained_market_observation::PreparedObservation,
+) -> V14Gate {
+    if let Err(reason) = report.validate_for_use() {
+        return V14Gate::Denied(reason);
+    }
+    let kind = PushKind::IntradayMarket;
+    let binding = report.binding();
+    let (source, kind_str, severity) = map_push_kind(kind);
+    let mut event = SignalEvent::new(
+        source,
+        kind_str,
+        None,
+        Local::now(),
+        signal_payload_for_kind(kind),
+        severity,
+    );
+    event.event_id = stock_analysis::push_l1::make_source_fact_event_id(
+        kind_str,
+        binding.schedule_occurrence_identity(),
+    );
+    let profile = retained_observation_profile();
+    v14_gate_prepared(V14PreparedGate {
+        kind,
+        has_governance_identity: false,
+        sub_kind: None,
+        cooldown_override_secs: None,
+        event,
+        profile,
+        context_source: GovernanceContextSource::CountedSourceOnly,
+        context_override: None,
+    })
+}
+
+fn retained_observation_profile() -> TemplateMetadata {
+    let mut profile = counted_source_only_profile(PushKind::IntradayMarket);
+    profile.frozen_mode_respect = false;
+    profile
+}
+
 /// BR-194 narrow L5 gate for the canonical R-04 provider binding.
 pub fn v14_gate_counted_source_only_binding(
     kind: PushKind,
@@ -2060,6 +2102,18 @@ mod tests {
                 "{kind:?} 应保持 Down (C 方案 + 每日必达)"
             );
         }
+    }
+
+    #[test]
+    fn retained_observation_profile_exempts_only_quote_facts_and_keeps_advice_frozen() {
+        let observation = retained_observation_profile();
+        assert!(!observation.frozen_mode_respect);
+        assert_eq!(observation.data_mode_min, DataMode::Down);
+        assert_eq!(observation.cooldown_secs, 900);
+        assert!(default_profile_for_kind(PushKind::IntradayMarket).frozen_mode_respect);
+        assert!(default_profile_for_kind(PushKind::T0Advice).frozen_mode_respect);
+        assert!(default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
+        assert_eq!(default_profile_for_kind(PushKind::IntradayMarket).data_mode_min, DataMode::Degraded);
     }
 
     #[test]

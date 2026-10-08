@@ -554,6 +554,7 @@ fn audit_full_market_rankings_unavailable(owner: &str) {
 }
 
 mod intraday_market;
+mod retained_market_observation;
 
 mod durable_delivery_runtime;
 mod g5b_v2;
@@ -6671,7 +6672,8 @@ async fn main() {
                 p01::p01_scheduler_loop(),
                 monitor_loop(&paper_scans),
                 news_monitor_loop(selection_v2_enabled),
-                data_mode_monitor_loop()
+                data_mode_monitor_loop(),
+                retained_market_observation::run()
             );
         };
 

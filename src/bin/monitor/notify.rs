@@ -3288,6 +3288,40 @@ async fn push_counted_with_binding_inner(
     }
 }
 
+/// Quote-only retained monitoring uses the original kind, rolling cooldown,
+/// budget and terminal settlement; neither a raw text nor a generic binding
+/// can request the Frozen exemption.
+pub(super) async fn push_retained_market_observation(
+    report: crate::retained_market_observation::PreparedObservation,
+) -> PushOutcome {
+    let kind = PushKind::IntradayMarket;
+    let token = match crate::presentation_registry::acquire_token(
+        "I-01-intraday-market",
+        kind,
+        "intraday_market_dispatcher",
+        "render_intraday_market",
+    ) {
+        Ok(token) => token,
+        Err(reason) => return PushOutcome::Denied(reason),
+    };
+    if token.descriptor().push_kind != kind || !launch_gate_check(kind) {
+        return PushOutcome::Denied("launch_gate_stage".into());
+    }
+    match crate::v14_adapter::v14_gate_retained_observation(&report) {
+        crate::v14_adapter::V14Gate::Approved(_) => {}
+        crate::v14_adapter::V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
+        crate::v14_adapter::V14Gate::Deduped => {
+            return PushOutcome::Denied("counted_gate_returned_legacy_dedup".into())
+        }
+    }
+    // Recheck after governance work, immediately before the durable boundary.
+    if let Err(reason) = report.validate_for_use() {
+        return PushOutcome::Denied(reason);
+    }
+    let (text, binding) = report.into_parts();
+    crate::durable_delivery_runtime::deliver_counted_binding(binding, kind, text, None).await
+}
+
 /// BR-194 sole counted SourceOnly entry. The profile is derived from the
 /// canonical R-04 binding and cannot be selected by a caller.
 pub async fn push_counted_source_only_with_binding(

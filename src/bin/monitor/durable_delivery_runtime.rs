@@ -1130,6 +1130,16 @@ impl AuthoritativeSinkPort for MagiclawAuthoritativeSink {
                 current_namespace.label()
             ));
         }
+        if let Err(reason) = crate::retained_market_observation::validate_authoritative_request(
+            &self.namespace, request, Utc::now(),
+        ) {
+            return AuthoritativeSinkResult::Rejected(stock_analysis::durable_delivery::TypedRejection {
+                reason_code: "retained_observation_physical_guard_rejected".to_owned(),
+                evidence: reason.into_bytes(),
+                retry_authorized: false,
+                observed_at: Utc::now(),
+            });
+        }
         crate::notify::deliver_authoritative_blocking(
             &self.namespace,
             &self.push_log_writer,
@@ -1318,6 +1328,35 @@ fn p01_failure_audit_canonical(
         source_evidence_sha256,
     })
     .map_err(|error| format!("serialize BR-241 P-01 failure audit: {error}"))
+}
+
+/// Read-only inspection of the existing Schema9 occurrence owner. Any stored
+/// owner closes this ephemeral observation slot, including Uncertain/Rejected;
+/// this producer never replays an old rendered snapshot after restart.
+pub(super) fn retained_observation_occurrence_owned(
+    date: NaiveDate,
+    occurrence: &str,
+) -> Result<bool, String> {
+    if !occurrence.starts_with(&format!("retained-quote-observation:{date}:")) {
+        return Err("retained_observation_occurrence_invalid".into());
+    }
+    let state = runtime_state()?;
+    state
+        .coordinator
+        .inspect_exact_occurrence_owner(
+            &date.to_string(),
+            DurablePushKind::IntradayMarket,
+            DeliverySubKind::None,
+            "GLOBAL",
+            occurrence,
+        )
+        .map(|owner| {
+            if let Some(owner) = owner.as_ref() {
+                log::info!("[retained-observation] existing_owner occurrence={} state={:?}; no resend", occurrence, owner.state);
+            }
+            owner.is_some()
+        })
+        .map_err(|error| error.to_string())
 }
 
 pub fn pending_schedule_hydrations() -> Result<Vec<ScheduleHydration>, String> {

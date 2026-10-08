@@ -260,33 +260,70 @@ pub fn fetch_position_quotes() -> Result<Vec<stock_analysis::market_data::TopSto
 }
 
 fn current_position_quote_codes() -> Result<Vec<String>, String> {
-    // BR-227: 无券商时持仓代码来自 BR-226 用户确认快照 (24h 新鲜度),
-    // 行情经统一网关获取 (自带 source_at 证据); 持仓批次来源时间门
-    // 不再连坐行情获取 (BR-217 的券商批次要求由用户快照替代)。
-    match stock_analysis::database::user_position_snapshot::latest_user_position_snapshot() {
-        Ok(Some(snapshot))
-            if !snapshot.confirm_empty
-                && chrono::Local::now()
-                    .signed_duration_since(snapshot.effective_at.with_timezone(&chrono::Local))
-                    .num_hours()
-                    <= 24 =>
+    current_position_quote_scope().map(|scope| scope.0)
+}
+
+/// Quote-only observation provenance. An old local holding record may select
+/// an instrument, but never proves a current holding or grants trade authority.
+fn current_position_quote_scope() -> Result<(Vec<String>, String), String> {
+    let snapshot =
+        stock_analysis::database::user_position_snapshot::latest_user_position_snapshot()
+            .map_err(|error| format!("用户持仓快照读取失败: {error}"))?;
+    if let Some(snapshot) = snapshot.as_ref() {
+        let age = chrono::Utc::now().signed_duration_since(snapshot.effective_at);
+        if !snapshot.confirm_empty
+            && age >= chrono::Duration::zero()
+            && age <= chrono::Duration::hours(24)
         {
-            Ok(snapshot
-                .items
-                .iter()
-                .map(|item| item.code.clone())
-                .collect())
+            return Ok((
+                snapshot
+                    .items
+                    .iter()
+                    .map(|item| item.code.clone())
+                    .collect(),
+                format!(
+                    "观察名单来源: 用户快照 {}；仅报告报价，不推断今日仓位",
+                    snapshot
+                        .effective_at
+                        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                        .format("%Y-%m-%d %H:%M")
+                ),
+            ));
         }
-        Ok(Some(_)) | Ok(None) => {
-            // 快照缺失/过期: 回退本地持仓代码 (仅行情展示用途, 行情自带来源时间)
-            Ok(stock_analysis::portfolio::get_positions()
-                .map_err(|error| format!("持仓批次查询失败: {error}"))?
-                .into_iter()
-                .map(|position| position.code)
-                .collect())
-        }
-        Err(error) => Err(format!("用户持仓快照读取失败: {error}")),
     }
+    let (positions, source_at) = stock_analysis::portfolio::get_positions_with_source_time()
+        .map_err(|error| format!("持仓批次查询失败: {error}"))?;
+    let local_time = source_at
+        .map(|at| {
+            at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "来源日期缺失".to_owned());
+    let snapshot_note = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            format!(
+                "；最近用户快照 {}{}",
+                snapshot
+                    .effective_at
+                    .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+                    .format("%Y-%m-%d %H:%M"),
+                if snapshot.confirm_empty {
+                    "（确认空仓）"
+                } else {
+                    "（不作为当前仓位依据）"
+                }
+            )
+        })
+        .unwrap_or_else(|| "；用户快照缺失".to_owned());
+    Ok((
+        positions
+            .into_iter()
+            .map(|position| position.code)
+            .collect(),
+        format!("观察名单来源: 本地记录 {local_time}{snapshot_note}；不代表今日持仓"),
+    ))
 }
 
 /// A scanner route keeps the Gateway capability and original request together.
@@ -301,9 +338,27 @@ pub(super) enum ScannerPositionQuotes {
 pub(super) struct ScannerPositionQuoteBatch {
     requested: Vec<String>,
     admitted: stock_analysis::data_gateway::market_data::AdmittedRealtimeQuotes,
+    scope_note: String,
 }
 
 impl ScannerPositionQuotes {
+    #[cfg(test)]
+    pub(super) fn from_real_admitted_for_readback(
+        requested: Vec<String>,
+        admitted: stock_analysis::data_gateway::market_data::AdmittedRealtimeQuotes,
+        scope_note: String,
+    ) -> Result<Self, String> {
+        validate_scanner_quote_membership(&requested, admitted.quotes())?;
+        Ok(Self::Available(ScannerPositionQuoteBatch { requested, admitted, scope_note }))
+    }
+
+    pub(super) fn scope_note(&self) -> &str {
+        match self {
+            Self::NoPositions => "观察名单为空",
+            Self::Available(batch) => &batch.scope_note,
+        }
+    }
+
     pub(super) fn quotes(
         &self,
     ) -> &[stock_analysis::data_gateway::market_data::AdmittedRealtimeQuote] {
@@ -340,7 +395,7 @@ impl ScannerPositionQuotes {
 /// The single current-position acquisition used by an intraday scanner tick.
 /// Reuses the original position resolver; no per-row fetch or code guessing.
 pub(super) fn fetch_scanner_position_quotes() -> Result<ScannerPositionQuotes, String> {
-    let codes = current_position_quote_codes()?;
+    let (codes, scope_note) = current_position_quote_scope()?;
     if codes.is_empty() {
         return Ok(ScannerPositionQuotes::NoPositions);
     }
@@ -355,6 +410,7 @@ pub(super) fn fetch_scanner_position_quotes() -> Result<ScannerPositionQuotes, S
         ScannerPositionQuoteBatch {
             requested: codes,
             admitted,
+            scope_note,
         },
     ))
 }
