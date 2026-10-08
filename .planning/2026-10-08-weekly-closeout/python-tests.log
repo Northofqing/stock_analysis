@@ -1,0 +1,13 @@
+test_existing_backup_is_not_overwritten (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+test_missing_and_symlink_source_are_rejected_without_creating_a_database (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+test_missing_source_fails_before_child_and_preserves_failure_status (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+test_runtime_launcher_uses_only_injected_temporary_runtime_root (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+test_second_child_failure_preserves_json_and_original_nonzero (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+test_wal_backup_includes_committed_rows_and_preserves_source_inode_catalog_and_data (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+test_week_scope_is_shanghai_monday_sunday_including_holidays_and_close_boundary (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+test_weekly_formats_share_snapshot_clock_private_modes_and_keep_versions (test_weekly_outcome_snapshot.ReadOnlyWeeklySnapshotTests) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 3.163s
+
+OK

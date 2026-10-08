@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.stockanalysis.weekly-outcome-review</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/bin/run-weekly-outcome-review.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/zhangzhen/.local/share/stock-analysis-runtime</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key><string>Asia/Shanghai</string>
+    <key>STOCK_ANALYSIS_RUNTIME_ROOT</key><string>/Users/zhangzhen/.local/share/stock-analysis-runtime</string>
+  </dict>
+  <!-- launchd calendar uses the host's local zone; installation checks Shanghai. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>5</integer>
+    <key>Hour</key><integer>20</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>RunAtLoad</key><false/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/weekly-outcome-review.stdout.log</string>
+  <key>StandardErrorPath</key><string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/weekly-outcome-review.stderr.log</string>
+</dict>
+</plist>

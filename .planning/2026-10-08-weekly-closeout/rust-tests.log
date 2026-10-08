@@ -1,0 +1,17 @@
+
+running 13 tests
+test tests::weekly_cli_creates_machine_report_with_source_identity_and_unavailable_states ... ok
+test tests::weekly_cli_requires_explicit_scope_and_refuses_output_overwrite ... ok
+test tests::weekly_empty_paper_does_not_render_zero_return_or_zero_settlement_costs ... ok
+test tests::weekly_empty_week_retains_all_76_historical_pending_windows ... ok
+test tests::weekly_holiday_and_intraday_ranges_use_actual_completed_sessions ... ok
+test tests::weekly_later_qualified_snapshot_is_descriptive_and_never_historical_pit ... ok
+test tests::weekly_missing_middle_status_suspension_bad_result_and_future_evidence_are_distinct ... ok
+test tests::weekly_nonfill_terminal_time_and_bad_timestamp_do_not_invent_dates ... ok
+test tests::weekly_observed_only_prices_and_old_stored_returns_never_grant_qualification ... ok
+test tests::weekly_old_schema_is_reported_without_initialization_or_ddl ... ok
+test tests::weekly_paper_oversell_blocks_reliable_net_metrics_but_preserves_raw_counts ... ok
+test tests::weekly_ready_but_unrecorded_stays_null_and_invalid_original_dates_are_retained ... ok
+test tests::weekly_verified_paper_reports_existing_scenario_costs_and_closure_not_actual_fees ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
