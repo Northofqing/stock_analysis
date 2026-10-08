@@ -6,6 +6,8 @@
 
 当前首轮开发见 [2026-10-08 收敛范围开发](docs/handoffs/2026-10-08-active-scope-development.md)：paper 休市扫描、原候选历史观测日期接线及周报基线。后继验证和提交身份以该交接的实际回执为准，旧全平台下一项不再执行。
 
+08:38 CST 的 Mac 实际 RPC 与窄发布输入核查见 [保留范围晨间接续](docs/ops/2026-10-08-active-scope-readiness.md)。现有 localhost:50052 隧道成功返回旧 4e 服务的新闻和报价；报价源日仍为 9/30，生产仍 Frozen/Unsafe，不把抓取成功当作止损、回填或新 SDK 上线。
+
 最新整体余项和接续顺序见 [2026-10-06 整体设计剩余工作交接](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/docs/handoffs/2026-10-06-platform-remaining-work-handoff.md)：按 M0–M8 映射七组余项、H01–H17 任务卡、最近六项已推送源码及双端上线前置。初稿代码基线为 `9a71f6069`；第10节和本文件末节补充后继H02原审计内容哈希首片，新5＋相关6已通过。Windows问题同步另见[2026-10-06双端解决记录](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/docs/handoffs/2026-10-06-windows-sync-resolution.md)：新财报本地测试通过、原文档checker崩溃待定位、新源95%未量；Mac已补官方基准/窗口/最小issuer输入与具体消费者缺口。各运行结论带证据时间；以下历史记录保留。
 
 H02 最新源码切片与 Windows 后继进展见 [2026-10-07 V1 内容校验开发接续](/Users/zhangzhen/.codex/worktrees/platform-roadmap-implementation/stock_analysis/docs/handoffs/2026-10-07-v1-content-development.md)。
@@ -19,7 +21,7 @@ H02 最新源码切片与 Windows 后继进展见 [2026-10-07 V1 内容校验开
 - 常规源码、定向验证和当前 feature commit/push 可以继续执行。
 - 生产 activation、资金 B / allocation / seed / cutover、VM 监听 / Provider capture / 固定36真实RPC仍有各自精确门禁。开发授权不替代对应人审；已批准的 Wave0/Wave1 元组只适用于原精确候选，不适用于新制品。
 - 既有生产保持无真实券商接入。T-14/T-15 等依赖真实券商的入口保持原裁定。
-- 不修改或合并 master，不创建 PR，不重启生产，不自动重发或裁定 Uncertain。需要新发布时，先准备具体可审候选，再按对应门禁执行。
+- 当前范围内的源码按用户后续“全部合入主仓库”“代码全部提交”的授权核对后合入并非强制推送 master；原只保留 feature 的限制已被该授权替代。新生产发布仍先准备具体可审候选，按精确 activation 与动态门禁执行；不自动重发或裁定 Uncertain。
 
 ## 2. 工作目录与 Git
 
