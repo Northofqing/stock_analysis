@@ -81,14 +81,20 @@ fn monitor_schema9_delivery_reopen_and_exact_retry_keep_catalog_and_send_once() 
         "2026-07-15",
         false,
     );
-    fixture.coordinator.prepare(&item, 1, now()).unwrap();
+    let append = MemoryAppendPort::default();
+    prepare_reserved(&fixture, &item, &append);
     let sink = StaticSink::new(AuthoritativeSinkResult::Accepted(receipt(now())));
     let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
-    let append = MemoryAppendPort::default();
     fixture
         .coordinator
-        .resume_deliverable(&item.decision_identity, &sinks, &append, now())
+        .resume_deliverable(&item.decision_identity, &sinks, now())
         .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::Delivered,
+        &item.decision_identity,
+    );
     assert_eq!(
         fixture
             .coordinator
@@ -103,7 +109,7 @@ fn monitor_schema9_delivery_reopen_and_exact_retry_keep_catalog_and_send_once() 
     fixture.coordinator.prepare(&item, 1, now()).unwrap();
     fixture
         .coordinator
-        .resume_deliverable(&item.decision_identity, &sinks, &append, now())
+        .resume_deliverable(&item.decision_identity, &sinks, now())
         .unwrap();
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
     assert_eq!(catalog(&fixture), before);
@@ -182,4 +188,43 @@ fn monitor_schema9_runtime_drift_blocks_new_delivery_without_schema_repair() {
         0
     );
     assert_eq!(fixture.query_i64("PRAGMA user_version"), 9);
+}
+
+#[test]
+fn monitor_schema9_uncertain_survives_reopen_without_automatic_resend() {
+    let mut fixture = retained_fixture("SCHEMA9_UNCERTAIN");
+    let item = envelope(
+        "SCHEMA9_UNCERTAIN",
+        PushKind::DataMode,
+        DeliverySubKind::None,
+        "2026-07-15",
+        false,
+    );
+    let append = MemoryAppendPort::default();
+    prepare_reserved(&fixture, &item, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+    fixture
+        .coordinator
+        .resume_deliverable(&item.decision_identity, &sinks, now())
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::UncertainManualReview,
+        &item.decision_identity,
+    );
+    let before = catalog(&fixture);
+    drop(fixture.coordinator.take().unwrap());
+    fixture.coordinator = FixtureCoordinator(Some(Arc::new(
+        DurableDeliveryCoordinator::open_existing_monitor_schema9(config(&fixture)).unwrap(),
+    )));
+    let resumed = fixture
+        .coordinator
+        .resume_deliverable(&item.decision_identity, &sinks, now())
+        .unwrap();
+    assert_eq!(resumed.state, DecisionState::UncertainManualReview);
+    assert_eq!(resumed.sink_calls, 0);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(catalog(&fixture), before);
 }

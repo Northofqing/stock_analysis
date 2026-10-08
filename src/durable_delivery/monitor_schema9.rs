@@ -35,7 +35,7 @@ fn catalog(connection: &Connection) -> Result<Catalog> {
     let mut statement = connection.prepare(
         "SELECT type,name,tbl_name,sql FROM main.sqlite_master ORDER BY type,name,tbl_name",
     )?;
-    Ok(statement
+    let rows = statement
         .query_map([], |r| {
             let sql: Option<String> = r.get(3)?;
             Ok((
@@ -45,7 +45,8 @@ fn catalog(connection: &Connection) -> Result<Catalog> {
                 sql.map(|s| normalize_sql(&s)),
             ))
         })?
-        .collect::<rusqlite::Result<_>>()?)
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 // SQLite retains formatting from different creation/migration paths. Ignore
