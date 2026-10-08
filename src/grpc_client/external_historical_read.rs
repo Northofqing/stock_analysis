@@ -1,4 +1,5 @@
-//! One-shot ExternalV1 HistoricalBars observation; no production route uses it.
+//! One-shot ExternalV1 HistoricalBars reads. Day observations and the retained
+//! R12 Minute15 tail have separate closed request/capability gates.
 
 use super::*;
 use crate::grpc_client::connection_qualification::ConnectionIdentity;
@@ -60,7 +61,16 @@ impl ExternalHistoricalReadClient {
         query: ExternalHistoricalBarsQuery,
     ) -> Result<ExternalHistoricalObservation, GrpcError> {
         let mut retained = WindowTransportEvidence::default();
-        self.query_observed(query.into_request(), None, &mut retained)
+        self.query_observed(query.into_request(), None, &mut retained, false)
+            .await
+    }
+
+    pub(crate) async fn query_minute15(
+        &mut self,
+        query: crate::grpc_client::external_v1::ExternalMinute15TailQuery,
+        retained: &mut WindowTransportEvidence,
+    ) -> Result<ExternalHistoricalObservation, GrpcError> {
+        self.query_observed(query.into_request(), None, retained, true)
             .await
     }
 
@@ -70,7 +80,7 @@ impl ExternalHistoricalReadClient {
         profile: &crate::data_gateway::ordinary_daily_change_window_contract::CompiledWindowProfile,
         retained: &mut WindowTransportEvidence,
     ) -> Result<ExternalHistoricalObservation, GrpcError> {
-        self.query_observed(query.into_request(), Some(profile), retained)
+        self.query_observed(query.into_request(), Some(profile), retained, false)
             .await
     }
 
@@ -81,6 +91,7 @@ impl ExternalHistoricalReadClient {
             &crate::data_gateway::ordinary_daily_change_window_contract::CompiledWindowProfile,
         >,
         retained: &mut WindowTransportEvidence,
+        minute15: bool,
     ) -> Result<ExternalHistoricalObservation, GrpcError> {
         let operation = ExternalOperation::HistoricalBars;
         let method = ExternalQueryMethod::HistoricalBars;
@@ -90,7 +101,8 @@ impl ExternalHistoricalReadClient {
             });
         }
         retained.stage = "Health".into();
-        let (health, health_wire) = if profile.is_some() {
+        let retaining = profile.is_some() || minute15;
+        let (health, health_wire) = if retaining {
             self.client
                 .get_external_health_retaining()
                 .await
@@ -103,11 +115,11 @@ impl ExternalHistoricalReadClient {
         } else {
             self.client.get_external_health_observed().await?
         };
-        if profile.is_some() {
+        if retaining {
             retained.health_hex = Some(hex::encode(&health_wire));
         }
         let connection_identity = self.client.external_connection_identity()?;
-        if profile.is_some() {
+        if retaining {
             retained.connection_identity = Some(connection_identity.clone());
         }
         let server_build_identity = health
@@ -115,7 +127,7 @@ impl ExternalHistoricalReadClient {
             .clone()
             .ok_or_else(|| crate::grpc_client::connection_qualification::unqualified())?;
         retained.stage = "Capabilities".into();
-        let (capabilities_response, capabilities_wire) = if profile.is_some() {
+        let (capabilities_response, capabilities_wire) = if retaining {
             self.client
                 .get_external_capabilities_retaining()
                 .await
@@ -128,10 +140,13 @@ impl ExternalHistoricalReadClient {
         } else {
             self.client.get_external_capabilities_observed().await?
         };
-        if profile.is_some() {
+        if retaining {
             retained.capabilities_hex = Some(hex::encode(&capabilities_wire));
         }
         let capability = match profile {
+            None if minute15 => {
+                require_provider_historical_capability(&capabilities_response.capabilities, "Tdx")?
+            }
             None => require_historical_capability(&capabilities_response.capabilities)?,
             Some(profile) => {
                 require_window_capability(&capabilities_response.capabilities, profile)?
@@ -150,7 +165,7 @@ impl ExternalHistoricalReadClient {
             crate::grpc_client::errors::request_id_correlation(&request_id)
                 .ok_or_else(|| wire_error("external_request_context_missing"))?;
         let request_bytes = request.encode_to_vec();
-        if profile.is_some() {
+        if retaining {
             retained.request_hex = Some(hex::encode(&request_bytes));
         }
         retained.stage = "Authorization".into();
@@ -212,6 +227,7 @@ impl ExternalHistoricalReadClient {
                         .map_err(GrpcError::from)
                     })
                     .and_then(|result| match profile {
+                        None if minute15 => observe_provider_historical_envelope(result, "Tdx"),
                         None => observe_historical_envelope(result),
                         Some(profile) => {
                             if result.admission != QueryAdmission::Admitted
@@ -263,13 +279,13 @@ impl ExternalHistoricalReadClient {
             }
             ExternalQueryCall::LocalWireFailure { error, evidence } => (evidence, None, Err(error)),
         };
-        if profile.is_some() {
+        if retaining {
             retained.request_hex = Some(hex::encode(&request_bytes));
         }
-        if profile.is_some() {
+        if retaining {
             retained.wire = Some(wire.clone());
         }
-        if profile.is_some() {
+        if retaining {
             retained.status = status
                 .as_ref()
                 .map(|s| WindowStatusEvidence::capture(&s.raw_status));
@@ -306,9 +322,16 @@ fn historical_gate_error(code: &str, unavailable: bool) -> GrpcError {
 }
 
 fn require_historical_capability(capabilities: &[Capability]) -> Result<&Capability, GrpcError> {
+    require_provider_historical_capability(capabilities, "HithinkFinance")
+}
+
+fn require_provider_historical_capability<'a>(
+    capabilities: &'a [Capability],
+    provider: &str,
+) -> Result<&'a Capability, GrpcError> {
     let mut matching = capabilities.iter().filter(|capability| {
         capability.operation == ExternalOperation::HistoricalBars as i32
-            && capability.provider == "HithinkFinance"
+            && capability.provider == provider
     });
     let capability = matching
         .next()
@@ -341,6 +364,13 @@ fn require_historical_capability(capabilities: &[Capability]) -> Result<&Capabil
 }
 
 fn observe_historical_envelope(result: QueryResult) -> Result<QueryResult, GrpcError> {
+    observe_provider_historical_envelope(result, "HithinkFinance")
+}
+
+fn observe_provider_historical_envelope(
+    result: QueryResult,
+    provider: &str,
+) -> Result<QueryResult, GrpcError> {
     if result.admission != QueryAdmission::Admitted || !result.diagnostic_blocker.is_empty() {
         return Err(historical_gate_error(
             "external_historical_response_unadmitted",
@@ -353,7 +383,7 @@ fn observe_historical_envelope(result: QueryResult) -> Result<QueryResult, GrpcE
             false,
         ));
     }
-    if result.selected_provider != "HithinkFinance" {
+    if result.selected_provider != provider {
         return Err(historical_gate_error(
             "external_historical_provider_mismatch",
             false,
@@ -365,6 +395,28 @@ fn observe_historical_envelope(result: QueryResult) -> Result<QueryResult, GrpcE
 #[cfg(test)]
 #[path = "external_historical_read_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn r12_minute15_provider_capability_is_distinct_from_hithink_day() {
+    let tdx = Capability {
+        operation: ExternalOperation::HistoricalBars as i32,
+        provider: "Tdx".into(),
+        repository_admission: AdmissionState::Admitted as i32,
+        runtime_available: true,
+        ..Default::default()
+    };
+    assert!(require_provider_historical_capability(&[tdx.clone()], "Tdx").is_ok());
+    assert!(require_historical_capability(&[tdx.clone()]).is_err());
+    let mut hithink = tdx.clone();
+    hithink.provider = "HithinkFinance".into();
+    assert!(require_historical_capability(&[hithink.clone()]).is_ok());
+    assert!(require_provider_historical_capability(&[hithink], "Tdx").is_err());
+    assert!(require_provider_historical_capability(&[tdx.clone(), tdx.clone()], "Tdx").is_err());
+    let mut blocked = tdx;
+    blocked.blocker = "TEST_CODE_DIAGNOSTIC".into();
+    assert!(require_provider_historical_capability(&[blocked], "Tdx").is_err());
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct WindowTransportEvidence {

@@ -10,7 +10,6 @@
 //! estimated at this boundary.
 
 use crate::market_domain::ProviderId;
-use crate::market_domain::SecurityBar;
 
 use chrono::NaiveDate;
 
@@ -421,64 +420,18 @@ impl HistoricalBarsGateway {
         Self
     }
 
-    /// 15 分钟 K线（升序，旧→新）。R-12 盘后回测取数，覆盖虚拟仓全部
-    /// 历史信号（7/14 起，800 根约 50 个交易日）。使用远端 TechnicalBars
-    /// operation，不参与 daily-bars route（日 K 使用独立语义）。
-    ///
-    /// 失败/空 batch 显式返回 GatewayError, 不静默填零。
+    /// R12 原始 15 分钟端点与留存回执。只陈述实际尾部覆盖；800 是
+    /// 请求上限，不能证明完整研究窗口。使用独立 ExternalV1 HistoricalBars
+    /// Tdx/Minute15 合同，不经过 LocalBridge TechnicalBars 或日线资格链。
     pub fn fifteen_min_bars(
         &self,
         code: &str,
         count: usize,
-    ) -> Result<Vec<SecurityBar>, GatewayError> {
-        if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-            return Err(GatewayError::invalid_request(
-                CAPABILITY,
-                format!("fifteen_min_bars invalid code: {code}"),
-            ));
-        }
-        if count == 0 || count > 800 {
-            return Err(GatewayError::invalid_request(
-                CAPABILITY,
-                format!("fifteen_min_bars invalid count: {count} (1..=800)"),
-            ));
-        }
-        // P4 M3: gRPC 桥 (remote gRPC 时替换 transport; 本地无 audit,
-        // 桥路径亦不 audit — 与本地行为一致)。
-        match super::grpc_source::bridge_for("TechnicalBars") {
-            Ok(bridge) => {
-                let batch = bridge
-                    .technical_bars(&[code.to_string()], count as u32)
-                    .map_err(|error| {
-                        GatewayError::unavailable(
-                            CAPABILITY,
-                            None,
-                            true,
-                            format!("15min bars gRPC 桥失败 ({code}): {error}"),
-                        )
-                    })?;
-                let records: Vec<SecurityBar> = batch.records().to_vec();
-                if records.is_empty() {
-                    return Err(GatewayError::unavailable(
-                        CAPABILITY,
-                        None,
-                        false,
-                        format!("15min bars gRPC 空 for {code}"),
-                    ));
-                }
-                return Ok(records);
-            }
-            Err(error) => {
-                return Err(GatewayError::unavailable(
-                    CAPABILITY,
-                    None,
-                    true,
-                    error.to_string(),
-                ));
-            }
-        }
-        // no-feature (monitor 零 magic): library transport 不存在。
-        // 无 bridge 时显式失败 (fail-closed), 绝不静默回退。
+    ) -> Result<
+        super::external_minute15_bars::ReceivedMinute15Bars,
+        super::external_minute15_bars::Minute15Error,
+    > {
+        super::external_minute15_bars::receive_tail(code, count)
     }
 
     pub fn daily_bars(&self, code: &str, days: usize) -> Result<AdmittedDailyBars, GatewayError> {

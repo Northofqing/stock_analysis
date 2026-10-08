@@ -13,6 +13,7 @@
 //!
 //! 纯计算函数与网络/DB 薄壳分离: 单测不依赖网络。
 
+use crate::data_gateway::external_minute15_bars::{Minute15Error, Minute15Receipt};
 use crate::market_domain::SecurityBar;
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
@@ -45,6 +46,9 @@ impl SignalGroup {
 /// R-12 买入事件研究汇总结果。
 #[derive(Debug, Clone, Default)]
 pub struct R12BacktestResult {
+    /// Actual admitted tail batches, retained privately; not full-window/PIT proof.
+    pub minute15_sources: Vec<Minute15Receipt>,
+    pub research_window: Option<R12ResearchWindow>,
     pub effective_projection: Option<crate::trading::paper_ledger::EffectiveProjectionReceipt>,
     /// 虚拟仓买入事件按明确入场族分组（每族 × 窗口一个组）。
     pub virtual_buy: Vec<SignalGroup>,
@@ -56,6 +60,118 @@ pub struct R12BacktestResult {
     pub unaligned_signals: usize,
     /// 已对齐但未来 4/16 根窗口尚不完整的事件窗口数（右删失）。
     pub censored_windows: usize,
+}
+
+impl R12BacktestResult {
+    /// A result cannot enter R12 canonical binding with bar-derived facts but
+    /// no immutable received-source receipt. Receipt fields are crate-private
+    /// and have no deserializer or public reconstruction constructor.
+    pub fn validate_minute15_source_binding(&self) -> Result<(), String> {
+        let needs_bars = !self.virtual_buy.is_empty()
+            || !self.boll_macd.is_empty()
+            || self.unaligned_signals > 0
+            || self.censored_windows > 0;
+        if needs_bars && (self.minute15_sources.is_empty() || self.research_window.is_none()) {
+            return Err("R12 Minute15 retained source binding absent".into());
+        }
+        if self
+            .research_window
+            .as_ref()
+            .is_some_and(|w| w.start > w.end)
+        {
+            return Err("R12 research window invalid".into());
+        }
+        let mut codes = std::collections::BTreeSet::new();
+        for source in &self.minute15_sources {
+            source.validate_binding()?;
+            if !codes.insert(&source.code) {
+                return Err("R12 duplicate Minute15 source code".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct R12ResearchWindow {
+    pub start: NaiveDate,
+    pub end: NaiveDate,
+}
+impl R12ResearchWindow {
+    fn new(end: NaiveDate, days: usize) -> Result<Self, String> {
+        let lookback = days
+            .checked_sub(1)
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or("R12 window invalid")?;
+        let start = end
+            .checked_sub_signed(Duration::days(lookback))
+            .ok_or("R12 window underflow")?;
+        Ok(Self { start, end })
+    }
+    fn contains(&self, time: NaiveDateTime) -> bool {
+        self.start <= time.date() && time.date() <= self.end
+    }
+}
+
+#[derive(Debug)]
+pub struct R12BacktestFailure {
+    message: String,
+    source: Option<Minute15Error>,
+    ledger_error: Option<crate::trading::paper_ledger::LedgerError>,
+    retryable: bool,
+}
+impl R12BacktestFailure {
+    pub fn retryable(&self) -> bool {
+        self.source
+            .as_ref()
+            .map_or(self.retryable, Minute15Error::retryable)
+    }
+    fn ledger(error: crate::trading::paper_ledger::LedgerError) -> Self {
+        use crate::trading::paper_ledger::LedgerError;
+        let retryable = matches!(
+            error,
+            LedgerError::BusyRetryable
+                | LedgerError::Database(_)
+                | LedgerError::EvidenceUnavailable(_)
+                | LedgerError::VersionChanged
+                | LedgerError::Cancelled
+                | LedgerError::CommitOutcomeUnknown
+        );
+        Self {
+            message: error.to_string(),
+            source: None,
+            ledger_error: Some(error),
+            retryable,
+        }
+    }
+    pub fn ledger_error(&self) -> Option<&crate::trading::paper_ledger::LedgerError> {
+        self.ledger_error.as_ref()
+    }
+    fn paper(message: String) -> Self {
+        Self {
+            message,
+            source: None,
+            ledger_error: None,
+            retryable: false,
+        }
+    }
+}
+impl std::fmt::Display for R12BacktestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for R12BacktestFailure {}
+
+// Input integrity must finish before any network loader is invoked.
+fn after_verified_paper<T, R, F>(
+    read: Result<T, R12BacktestFailure>,
+    runner: F,
+) -> Result<R, R12BacktestFailure>
+where
+    F: FnOnce(T) -> Result<R, R12BacktestFailure>,
+{
+    runner(read?)
 }
 
 /// 已校验的虚拟仓买入事件（paper_trades Filled buy）。
@@ -464,14 +580,13 @@ fn parse_paper_signal_rows(
     Ok((entries, exit_rows_excluded))
 }
 
-/// 读取并严格校验纸面成交，再按显式评估日投影买入事件。卖出只计数，不评分。
-pub fn entries_from_effective(
+fn entries_from_effective_typed(
     effective: &crate::trading::paper_ledger::VerifiedEffectiveFillSet,
     days: usize,
-) -> Result<(Vec<SignalEntry>, usize), String> {
+) -> Result<(Vec<SignalEntry>, usize), R12BacktestFailure> {
     let rows = effective
         .rows()
-        .map_err(|e| e.to_string())?
+        .map_err(R12BacktestFailure::ledger)?
         .iter()
         .map(|row| {
             let local = crate::trading::paper_lot_ledger::parse_paper_fill_timestamp(
@@ -493,8 +608,18 @@ pub fn entries_from_effective(
                 virtual_reason: row.virtual_reason.clone(),
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(R12BacktestFailure::paper)?;
     parse_paper_signal_rows(rows, effective.receipt().request.as_of, days)
+        .map_err(R12BacktestFailure::paper)
+}
+
+/// 读取并严格校验纸面成交，再按显式评估日投影买入事件。卖出只计数，不评分。
+pub fn entries_from_effective(
+    effective: &crate::trading::paper_ledger::VerifiedEffectiveFillSet,
+    days: usize,
+) -> Result<(Vec<SignalEntry>, usize), String> {
+    entries_from_effective_typed(effective, days).map_err(|error| error.to_string())
 }
 
 /// 读取并严格校验纸面成交，再按显式评估日投影买入事件。卖出只计数，不评分。
@@ -509,9 +634,24 @@ pub fn read_paper_signal_entries(
     ),
     String,
 > {
+    read_paper_signal_entries_typed(as_of_date, days).map_err(|error| error.to_string())
+}
+
+fn read_paper_signal_entries_typed(
+    as_of_date: NaiveDate,
+    days: usize,
+) -> Result<
+    (
+        Vec<SignalEntry>,
+        usize,
+        crate::trading::paper_ledger::EffectiveProjectionReceipt,
+    ),
+    R12BacktestFailure,
+> {
     let effective =
-        crate::performance::economic_position::query_effective_fills_through(as_of_date)?;
-    let (entries, excluded) = entries_from_effective(&effective, days)?;
+        crate::performance::economic_position::query_effective_fills_through_typed(as_of_date)
+            .map_err(R12BacktestFailure::ledger)?;
+    let (entries, excluded) = entries_from_effective_typed(&effective, days)?;
     Ok((entries, excluded, effective.receipt().clone()))
 }
 
@@ -544,6 +684,7 @@ pub fn backtest_virtual_signals(
     let mut loader = |code: &str| {
         gateway
             .fifteen_min_bars(code, 800)
+            .map(|batch| batch.bars().to_vec())
             .map_err(|error| error.to_string())
     };
     let mut result = backtest_virtual_signals_with_entries_and_cache(
@@ -633,9 +774,10 @@ pub fn backtest_boll_macd_15min(codes: &[String]) -> Result<Vec<SignalGroup>, St
     let mut loader = |code: &str| {
         gateway
             .fifteen_min_bars(code, 800)
+            .map(|batch| batch.bars().to_vec())
             .map_err(|error| error.to_string())
     };
-    backtest_boll_macd_15min_with_cache(codes, &mut cache, &mut loader)
+    backtest_boll_macd_15min_with_cache(codes, &mut cache, &mut loader, None)
         .map(|(groups, _censored_windows)| groups)
 }
 
@@ -643,6 +785,7 @@ fn backtest_boll_macd_15min_with_cache<Loader>(
     codes: &[String],
     bars_by_code: &mut TechnicalBarsCache,
     loader: &mut Loader,
+    window: Option<&R12ResearchWindow>,
 ) -> Result<(Vec<SignalGroup>, usize), String>
 where
     Loader: FnMut(&str) -> Result<Vec<SecurityBar>, String>,
@@ -656,6 +799,11 @@ where
         let signals = scan_boll_macd_buys(bars)
             .map_err(|error| format!("R-12 boll_macd bars invalid for {code}: {error}"))?;
         for (index, action) in signals {
+            if window.is_some_and(|w| {
+                !security_bar_time(&bars[index], index).is_ok_and(|t| w.contains(t))
+            }) {
+                continue;
+            }
             let label = format!("{action:?}");
             let group = observations_by_action
                 .entry(label)
@@ -690,6 +838,29 @@ pub fn render_r12(result: &R12BacktestResult) -> String {
         "━━━━━━━━━━━━━━━━━━━━".to_string(),
         "ℹ️ 上涨比例仅描述入场后短期价格路径，不是买入→卖出扣成本策略胜率。".to_string(),
     ];
+    if let Some(window) = &result.research_window {
+        lines.push(format!(
+            "研究信号日期 {} 至 {}；数据覆盖按各证券实际尾部披露，不声明完整窗口或历史PIT资格。",
+            window.start, window.end
+        ));
+    }
+    for receipt in &result.minute15_sources {
+        let dates = receipt
+            .date_counts
+            .iter()
+            .map(|(d, n)| format!("{d}:{n}根"))
+            .collect::<Vec<_>>()
+            .join("、");
+        lines.push(format!(
+            "来源 {} {}；原边界 {} 至 {}；{}；原批次 {}",
+            receipt.code,
+            receipt.provider,
+            receipt.first_boundary,
+            receipt.last_boundary,
+            dates,
+            receipt.batch_id
+        ));
+    }
     if let Some(projection) = &result.effective_projection {
         lines.push(format!(
             "经济投影 {}；范围 {:?}；历史口径 {:?}",
@@ -785,22 +956,71 @@ fn signed_pct(rate: Option<f64>) -> String {
 }
 
 /// 供 dispatcher 用的组合入口：调用方必须传入同一复盘业务日。
-pub fn run_full_backtest(as_of_date: NaiveDate, days: usize) -> Result<R12BacktestResult, String> {
-    let (entries, exit_rows_excluded, projection) = read_paper_signal_entries(as_of_date, days)?;
-    let gateway = HistoricalBarsGateway::new();
-    let mut result =
-        run_full_backtest_with_entries_and_loader(&entries, exit_rows_excluded, |code| {
-            gateway
-                .fifteen_min_bars(code, 800)
-                .map_err(|error| error.to_string())
-        })?;
-    result.effective_projection = Some(projection);
-    Ok(result)
+pub fn run_full_backtest(
+    as_of_date: NaiveDate,
+    days: usize,
+) -> Result<R12BacktestResult, R12BacktestFailure> {
+    after_verified_paper(
+        read_paper_signal_entries_typed(as_of_date, days),
+        |(entries, excluded, projection)| {
+            let window =
+                R12ResearchWindow::new(as_of_date, days).map_err(R12BacktestFailure::paper)?;
+            let gateway = HistoricalBarsGateway::new();
+            let mut receipts = std::collections::BTreeMap::new();
+            let mut source_failure = None;
+            let evaluated =
+                run_full_backtest_in_window(&entries, excluded, Some(&window), |code| {
+                    match gateway.fifteen_min_bars(code, 800) {
+                        Ok(batch) => {
+                            batch.receipt().verify_bars(batch.bars())?;
+                            receipts.insert(code.to_owned(), batch.receipt().clone());
+                            // Preserve full raw tails as evidence and warmup, but an
+                            // historical business date cannot consume future prices.
+                            let mut bars = Vec::new();
+                            for (index, bar) in batch.bars().iter().enumerate() {
+                                if security_bar_time(bar, index)?.date() <= as_of_date {
+                                    bars.push(bar.clone());
+                                }
+                            }
+                            Ok(bars)
+                        }
+                        Err(error) => {
+                            let reason = error.to_string();
+                            source_failure = Some(error);
+                            Err(reason)
+                        }
+                    }
+                });
+            let mut result = evaluated.map_err(|message| R12BacktestFailure {
+                message,
+                source: source_failure,
+                ledger_error: None,
+                retryable: false,
+            })?;
+            result.effective_projection = Some(projection);
+            result.research_window = Some(window);
+            result.minute15_sources = receipts.into_values().collect();
+            Ok(result)
+        },
+    )
 }
 
+#[cfg(test)]
 fn run_full_backtest_with_entries_and_loader<Loader>(
     entries: &[SignalEntry],
+    excluded: usize,
+    loader: Loader,
+) -> Result<R12BacktestResult, String>
+where
+    Loader: FnMut(&str) -> Result<Vec<SecurityBar>, String>,
+{
+    run_full_backtest_in_window(entries, excluded, None, loader)
+}
+
+fn run_full_backtest_in_window<Loader>(
+    entries: &[SignalEntry],
     exit_rows_excluded: usize,
+    window: Option<&R12ResearchWindow>,
     mut loader: Loader,
 ) -> Result<R12BacktestResult, String>
 where
@@ -822,7 +1042,7 @@ where
         return Ok(result);
     }
     let (boll_macd, boll_censored_windows) =
-        backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader)?;
+        backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader, window)?;
     result.boll_macd = boll_macd;
     result.censored_windows = result
         .censored_windows
@@ -838,6 +1058,104 @@ where
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    #[test]
+    fn r12_minute15_paper_integrity_failure_precedes_every_provider_call() {
+        let calls = std::cell::Cell::new(0);
+        let reason = "paper ledger integrity failure: attribution_epoch_integrity_failed (failed_integrity): BR-255 legacy carry: attribution_epoch_cumulative_oversell";
+        let result = after_verified_paper::<(), (), _>(
+            Err(R12BacktestFailure::ledger(
+                crate::trading::paper_ledger::LedgerError::IntegrityFailure(
+                    reason
+                        .strip_prefix("paper ledger integrity failure: ")
+                        .unwrap()
+                        .into(),
+                ),
+            )),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(failure.to_string(), reason);
+        assert!(!failure.retryable());
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn r12_minute15_typed_paper_transient_failure_keeps_retry_without_provider_call() {
+        use crate::trading::paper_ledger::LedgerError;
+        for (error, retry) in [
+            (LedgerError::BusyRetryable, true),
+            (
+                LedgerError::Database("TEST_CODE_NOT_INITIALIZED".into()),
+                true,
+            ),
+            (
+                LedgerError::EvidenceUnavailable("TEST_CODE_SOURCE".into()),
+                true,
+            ),
+            (LedgerError::VersionChanged, true),
+            (LedgerError::Cancelled, true),
+            (LedgerError::CommitOutcomeUnknown, true),
+            (LedgerError::InvalidInput("TEST_CODE_INVALID".into()), false),
+            (LedgerError::NotSeeded, false),
+            (LedgerError::InactiveEpoch, false),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let failure =
+                after_verified_paper::<(), (), _>(Err(R12BacktestFailure::ledger(error)), |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert_eq!(failure.retryable(), retry);
+            assert!(failure.ledger_error().is_some());
+            assert_eq!(calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn r12_minute15_boll_signal_dates_use_research_window_with_prior_warmup() {
+        let mut bars = Vec::new();
+        for day in 3..=7 {
+            for old in sample_bars() {
+                let index = bars.len();
+                let close = if index < 50 {
+                    10.0 + index as f64 * 0.04
+                } else {
+                    12.0 - (index as f64 - 50.0) * 0.10
+                };
+                bars.push(bar((2026, 8, day), (old.hour, old.minute), close));
+            }
+        }
+        let codes = vec!["TEST_CODE_300274".into()];
+        let mut cache = TechnicalBarsCache::new();
+        let mut loader = |_: &str| Ok(bars.clone());
+        let (all, _) =
+            backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader, None).unwrap();
+        assert!(
+            !all.is_empty(),
+            "source tail has later real fixture buy signals"
+        );
+        let end = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+        let window = R12ResearchWindow::new(end, 1).unwrap();
+        let (earlier, censored) =
+            backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader, Some(&window))
+                .unwrap();
+        assert!(earlier.is_empty());
+        assert_eq!(censored, 0, "later tail events must not be counted");
+        let later =
+            R12ResearchWindow::new(NaiveDate::from_ymd_opt(2026, 8, 7).unwrap(), 2).unwrap();
+        let (included, _) =
+            backtest_boll_macd_15min_with_cache(&codes, &mut cache, &mut loader, Some(&later))
+                .unwrap();
+        assert_eq!(
+            all, included,
+            "pre-window source bars remain usable only as warmup"
+        );
+    }
 
     #[test]
     fn br239_failed_technical_bars_code_is_negative_cached() {

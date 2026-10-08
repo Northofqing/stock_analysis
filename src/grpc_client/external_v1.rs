@@ -27,6 +27,38 @@ pub enum ExternalContractError {
 /// reader. The Gateway fixes its limit from the verified trading-date vector.
 pub(crate) struct ExternalHistoricalBarsQuery(QueryRequest);
 
+/// The delivered Tdx contract is a bounded tail, with no date selectors.
+pub(crate) struct ExternalMinute15TailQuery(QueryRequest);
+
+impl ExternalMinute15TailQuery {
+    pub(crate) fn wire_bytes(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&self.0)
+    }
+    pub(crate) fn into_request(self) -> QueryRequest {
+        self.0
+    }
+}
+
+pub(crate) fn build_external_minute15_tail_request(
+    instrument: &InstrumentId,
+    limit: u32,
+) -> Result<ExternalMinute15TailQuery, ExternalContractError> {
+    if instrument.asset_class() != AssetClass::Equity
+        || !matches!(
+            instrument.exchange(),
+            crate::market_domain::Exchange::Shanghai | crate::market_domain::Exchange::Shenzhen
+        )
+        || instrument.code().len() != 6
+        || !instrument.code().bytes().all(|byte| byte.is_ascii_digit())
+        || !(1..=800).contains(&limit)
+    {
+        return Err(ExternalContractError::InvalidParameters);
+    }
+    assemble_request("magic.market.historical_bars.request", 1, "Tdx".to_owned(),
+        serde_json::json!({"instrument":instrument,"interval":"Minute15","start":null,"end":null,"limit":limit}))
+        .map(ExternalMinute15TailQuery)
+}
+
 impl ExternalHistoricalBarsQuery {
     pub(crate) fn wire_bytes(&self) -> Vec<u8> {
         prost::Message::encode_to_vec(&self.0)

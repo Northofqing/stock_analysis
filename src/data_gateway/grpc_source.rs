@@ -1256,7 +1256,6 @@ pub const HOOKED_OPS: &[&str] = &[
     "SemanticSearch",
     "StrongStockReasons",
     "T0Evidence",
-    "TechnicalBars",
     "UpperLimitPoolReview",
 ];
 

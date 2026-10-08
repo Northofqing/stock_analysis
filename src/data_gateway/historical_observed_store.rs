@@ -30,6 +30,16 @@ const PART_NAMES: [&str; 16] = [
     "request_binding_outcome",
 ];
 
+fn part_names(domain: &[u8]) -> Result<[&'static str; 16]> {
+    let mut names = PART_NAMES;
+    if domain == super::external_minute15_bars::CAPTURE_DOMAIN {
+        names[1] = "minute15_tail_request";
+    } else {
+        ensure!(domain == CAPTURE_MATERIAL, "invalid capture domain");
+    }
+    Ok(names)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObservedArtifactRef {
     capture_sha256: String,
@@ -69,7 +79,8 @@ impl StoredObservedEvidence {
     }
 
     pub(crate) fn raw_part(&self, name: &str) -> Option<&[u8]> {
-        PART_NAMES
+        part_names(&self.parts[0])
+            .ok()?
             .iter()
             .position(|candidate| *candidate == name)
             .map(|index| self.parts[index].as_slice())
@@ -114,7 +125,7 @@ fn is_digest(value: &str) -> bool {
 
 fn encode_parts(parts: &[Vec<u8>; 16], capture_sha256: &str) -> Result<Vec<u8>> {
     ensure!(is_digest(capture_sha256), "invalid capture hash");
-    ensure!(parts[0] == CAPTURE_MATERIAL, "invalid capture domain");
+    let names = part_names(&parts[0])?;
     ensure!(
         hash_capture_parts_v1(parts) == capture_sha256,
         "capture hash mismatch"
@@ -139,7 +150,7 @@ fn encode_parts(parts: &[Vec<u8>; 16], capture_sha256: &str) -> Result<Vec<u8>> 
         version: 1,
         scope: "ObservedOnly".to_owned(),
         capture_sha256: capture_sha256.to_owned(),
-        parts: PART_NAMES
+        parts: names
             .iter()
             .zip(parts)
             .map(|(name, bytes)| EvidencePart {
@@ -191,11 +202,14 @@ fn decode_checked(bytes: &[u8], artifact: &ObservedArtifactRef) -> Result<Stored
         "observed capture identity mismatch"
     );
     let mut parts: [Vec<u8>; 16] = std::array::from_fn(|_| Vec::new());
+    ensure!(
+        file.parts[0].byte_length <= 128 && file.parts[0].bytes_hex.len() <= 256,
+        "invalid capture domain length"
+    );
+    let domain = hex::decode(&file.parts[0].bytes_hex).context("invalid capture domain")?;
+    let names = part_names(&domain)?;
     for (index, part) in file.parts.into_iter().enumerate() {
-        ensure!(
-            part.name == PART_NAMES[index],
-            "observed part order mismatch"
-        );
+        ensure!(part.name == names[index], "observed part order mismatch");
         ensure!(
             part.byte_length <= MAX_PART_BYTES as u64
                 && part.bytes_hex.len() as u64 == part.byte_length * 2,
@@ -471,6 +485,16 @@ mod anchored {
                 .map_err(|_| anyhow::anyhow!("cannot encode observed capture parts"))?;
             let bytes = encode_parts(&parts, capture.capture_hash())?;
             self.publish_bytes(&bytes, &reference(capture.capture_hash(), &bytes))
+        }
+
+        /// Reuse anchored publication with a distinct ObservedOnly domain.
+        /// Stored bytes cannot reconstruct a current transport or admission.
+        pub(crate) fn persist_minute15(
+            &self,
+            capture: &super::super::external_minute15_bars::Minute15ObservationCapture,
+        ) -> Result<(ObservedArtifactRef, Publication)> {
+            let bytes = encode_parts(capture.parts(), capture.hash())?;
+            self.publish_bytes(&bytes, &reference(capture.hash(), &bytes))
         }
 
         fn publish_bytes(

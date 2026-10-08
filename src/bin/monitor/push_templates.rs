@@ -11559,8 +11559,19 @@ fn r12_source_binding_canonical(
     date: chrono::NaiveDate,
     result: &stock_analysis::review::backtest::R12BacktestResult,
 ) -> Result<Vec<u8>, String> {
+    result.validate_minute15_source_binding()?;
+    if result
+        .research_window
+        .as_ref()
+        .is_some_and(|window| window.end != date)
+    {
+        return Err("R12 research business date conflict".into());
+    }
     let binding = serde_json::json!({
         "date": date.format("%Y-%m-%d").to_string(),
+        "research_window":result.research_window,
+        "minute15_sources":result.minute15_sources,
+        "paper_effective_projection":result.effective_projection,
         "virtual_group_count": result.virtual_buy.len(),
         "virtual_event_count": r12_group_event_count(&result.virtual_buy, "virtual")?,
         "exit_rows_excluded": result.exit_rows_excluded,
@@ -11578,6 +11589,68 @@ mod tests_r12_review_audit {
     use super::{r12_has_auditable_result, r12_source_binding_canonical};
 
     #[test]
+    fn r12_minute15_existing_owner_states_remain_terminal() {
+        use crate::review_batch::{ReviewTask, ReviewTaskFailure, ReviewTaskOutcome};
+        use stock_analysis::durable_delivery::{
+            DecisionState, ScheduleHydration, ScheduleHydrationState,
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let task = crate::review_batch::review_task_identity(date, ReviewTask::R12);
+        let basis=serde_json::to_vec(&serde_json::json!({"task_identity":task,"business_date":"2026-10-08","task":"R-12","snapshot_size":1})).unwrap();
+        let evidence = crate::durable_delivery_runtime::DurableDispatchEvidence {
+            decision_identity: "TEST_CODE_R12_OWNER".into(),
+            state: DecisionState::Delivered,
+            schedule_hydration: Some(ScheduleHydration {
+                decision_identity: "TEST_CODE_R12_OWNER".into(),
+                task_identity: task,
+                transition_identity: "TEST_CODE_R12_TRANSITION".into(),
+                transition_canonical: vec![],
+                transition_sha256: "a".repeat(64),
+                transition_basis_sha256: super::r09_sha256(&basis),
+                transition_basis_canonical: basis,
+                immutable_audit_ref: "TEST_CODE_R12_AUDIT".into(),
+                hydration_state: ScheduleHydrationState::Pending,
+            }),
+        };
+        assert!(matches!(
+            super::review_outcome_from_existing_durable(evidence, date, ReviewTask::R12),
+            ReviewTaskOutcome::Delivered { count: 1 }
+        ));
+        for state in [
+            DecisionState::UncertainManualReview,
+            DecisionState::RejectedDurable,
+            DecisionState::ManualResolvedRejected,
+        ] {
+            let evidence = crate::durable_delivery_runtime::DurableDispatchEvidence {
+                decision_identity: "TEST_CODE_R12_OWNER".into(),
+                state,
+                schedule_hydration: None,
+            };
+            assert!(matches!(
+                super::review_outcome_from_existing_durable(evidence, date, ReviewTask::R12),
+                ReviewTaskOutcome::Failed {
+                    failure: ReviewTaskFailure::ExistingSourceFailure {
+                        retryable: false,
+                        ..
+                    }
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn r12_minute15_canonical_rejects_statistics_without_retained_source() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let result = stock_analysis::review::backtest::R12BacktestResult {
+            unaligned_signals: 1,
+            ..Default::default()
+        };
+        assert!(r12_source_binding_canonical(date, &result)
+            .unwrap_err()
+            .contains("Minute15 retained source"));
+    }
+
+    #[test]
     fn br247_censoring_counts_remain_auditable_without_statistical_groups() {
         assert!(!r12_has_auditable_result(
             &stock_analysis::review::backtest::R12BacktestResult::default()
@@ -11592,11 +11665,20 @@ mod tests_r12_review_audit {
         assert!(r12_has_auditable_result(&result));
 
         let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
-        let canonical = r12_source_binding_canonical(date, &result).expect("canonical binding");
+        assert!(
+            r12_source_binding_canonical(date, &result).is_err(),
+            "bar-derived counts need retained source evidence"
+        );
+        let result = stock_analysis::review::backtest::R12BacktestResult {
+            exit_rows_excluded: 1,
+            ..Default::default()
+        };
+        let canonical = r12_source_binding_canonical(date, &result)
+            .expect("exit-only paper facts need no minute provider");
         let value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
         assert_eq!(value["exit_rows_excluded"], 1);
-        assert_eq!(value["unaligned_signals"], 2);
-        assert_eq!(value["censored_windows"], 3);
+        assert_eq!(value["unaligned_signals"], 0);
+        assert_eq!(value["censored_windows"], 0);
     }
 }
 
@@ -11668,8 +11750,11 @@ async fn dispatch_r12_backtest_after_capability(
     {
         Ok(Ok(result)) => result,
         Ok(Err(reason)) => {
-            log_dispatcher_attempt("R-12", false, 0, &reason);
-            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+            log_dispatcher_attempt("R-12", false, 0, &reason.to_string());
+            return crate::review_batch::ReviewTaskOutcome::failed(
+                reason.retryable(),
+                reason.to_string(),
+            );
         }
         Err(error) => {
             let reason = format!("backtest join failed: {error}");
@@ -18804,6 +18889,8 @@ pub fn build_test_template_catalog(
         "R-12-backtest-review",
         stock_analysis::review::backtest::render_r12(
             &stock_analysis::review::backtest::R12BacktestResult {
+                minute15_sources: Vec::new(),
+                research_window: None,
                 effective_projection: None,
                 virtual_buy: vec![stock_analysis::review::backtest::SignalGroup {
                     reason: "TEST_CODE NewsCatalyst".to_string(),

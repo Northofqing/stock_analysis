@@ -975,9 +975,7 @@ pub fn select_economic_rows_through(
 pub fn query_effective_fills_through(
     as_of_date: NaiveDate,
 ) -> Result<crate::trading::paper_ledger::VerifiedEffectiveFillSet, String> {
-    let db = crate::database::DatabaseManager::try_get()
-        .ok_or_else(|| "economic-position database is not initialized".to_owned())?;
-    query_effective_fills_through_from_database(db, as_of_date)
+    query_effective_fills_through_typed(as_of_date).map_err(|error| error.to_string())
 }
 
 /// Same verified epoch/legacy selection as the runtime wrapper, using an
@@ -986,14 +984,43 @@ pub fn query_effective_fills_through_from_database(
     db: &crate::database::DatabaseManager,
     as_of_date: NaiveDate,
 ) -> Result<crate::trading::paper_ledger::VerifiedEffectiveFillSet, String> {
+    query_effective_fills_through_from_database_typed(db, as_of_date)
+        .map_err(|error| error.to_string())
+}
+
+/// Same verified read, retaining ledger classification for R12 retry decisions.
+/// This changes no epoch selection, facts, seed or activation behavior.
+pub fn query_effective_fills_through_typed(
+    as_of_date: NaiveDate,
+) -> Result<
+    crate::trading::paper_ledger::VerifiedEffectiveFillSet,
+    crate::trading::paper_ledger::LedgerError,
+> {
+    let db = crate::database::DatabaseManager::try_get().ok_or_else(|| {
+        crate::trading::paper_ledger::LedgerError::Database(
+            "economic-position database is not initialized".into(),
+        )
+    })?;
+    query_effective_fills_through_from_database_typed(db, as_of_date)
+}
+
+pub fn query_effective_fills_through_from_database_typed(
+    db: &crate::database::DatabaseManager,
+    as_of_date: NaiveDate,
+) -> Result<
+    crate::trading::paper_ledger::VerifiedEffectiveFillSet,
+    crate::trading::paper_ledger::LedgerError,
+> {
     use crate::trading::paper_ledger::{
         EffectiveFillRequest, EffectiveFillScope, EffectiveHistory, PaperLedger,
     };
     let (scope, history) = match std::env::var(crate::trading::paper_ledger_runtime::BINDING_ENV) {
         Ok(raw) => (
-            EffectiveFillScope::Epoch(
-                serde_json::from_str(&raw).map_err(|e| format!("invalid paper binding: {e}"))?,
-            ),
+            EffectiveFillScope::Epoch(serde_json::from_str(&raw).map_err(|e| {
+                crate::trading::paper_ledger::LedgerError::InvalidInput(format!(
+                    "invalid paper binding: {e}"
+                ))
+            })?),
             EffectiveHistory::RestatedLatest,
         ),
         Err(std::env::VarError::NotPresent) => (
@@ -1002,15 +1029,17 @@ pub fn query_effective_fills_through_from_database(
                 ledger_version: None,
             },
         ),
-        Err(error) => return Err(format!("invalid paper binding: {error}")),
+        Err(error) => {
+            return Err(crate::trading::paper_ledger::LedgerError::InvalidInput(
+                format!("invalid paper binding: {error}"),
+            ))
+        }
     };
-    PaperLedger::open(db, &chrono::Utc::now)
-        .verified_effective_fills(&EffectiveFillRequest {
-            scope,
-            history,
-            as_of: as_of_date,
-        })
-        .map_err(|e| e.to_string())
+    PaperLedger::open(db, &chrono::Utc::now).verified_effective_fills(&EffectiveFillRequest {
+        scope,
+        history,
+        as_of: as_of_date,
+    })
 }
 
 /// Financial rows and fees are obtained from one opaque frozen read capability.
