@@ -6695,7 +6695,7 @@ async fn main() {
                     match run_review_backfill().await {
                         Ok(summary) if summary.pushed > 0 || summary.valuation_backfilled > 0 => {
                             log::warn!(
-                                "[复盘补推] 启动补推完成 pushed={} already_delivered={} skipped={} no_data={} failed={} valuation_backfilled={} valuation_failed={}",
+                                "[复盘补推] 启动补推有进展 pushed={} already_delivered={} skipped={} no_data={} failed={} valuation_backfilled={} valuation_failed={}",
                                 summary.pushed,
                                 summary.already_delivered,
                                 summary.skipped,
@@ -6705,7 +6705,23 @@ async fn main() {
                                 summary.valuation_failed
                             )
                         }
-                        Ok(_) => log::info!("[复盘补推] 启动扫描无欠账"),
+                        Ok(summary) => {
+                            if summary.failed > 0
+                                || summary.no_data > 0
+                                || summary.skipped > 0
+                                || summary.valuation_failed > 0
+                            {
+                                log::warn!(
+                                    "[复盘补推] 启动扫描仍有未投递任务 failed={} no_data={} skipped={} valuation_failed={}；保留欠账，不记作完成",
+                                    summary.failed,
+                                    summary.no_data,
+                                    summary.skipped,
+                                    summary.valuation_failed
+                                );
+                            } else {
+                                log::info!("[复盘补推] 启动扫描无欠账");
+                            }
+                        }
                         Err(error) => log::warn!("[复盘补推] 启动补推失败: {error}"),
                     }
                     return;

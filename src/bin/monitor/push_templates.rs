@@ -10521,6 +10521,30 @@ async fn dispatch_tomorrow_watch_after_preflight(
     date: &str,
     backfill: bool,
 ) -> crate::review_batch::ReviewTaskOutcome {
+    dispatch_tomorrow_watch_after_preflight_with_lhb(date, backfill, |trading_date| async move {
+        stock_analysis::data_gateway::dragon_tiger::DragonTigerGateway::new()
+            .market_review(trading_date, 5, 5)
+            .await
+    })
+    .await
+}
+
+async fn dispatch_tomorrow_watch_after_preflight_with_lhb<Loader, Future>(
+    date: &str,
+    backfill: bool,
+    load_lhb: Loader,
+) -> crate::review_batch::ReviewTaskOutcome
+where
+    Loader: FnOnce(chrono::NaiveDate) -> Future,
+    Future: std::future::Future<
+        Output = Result<
+            stock_analysis::data_gateway::GatewayBatch<
+                stock_analysis::data_gateway::DragonTigerStockReview,
+            >,
+            stock_analysis::data_gateway::GatewayError,
+        >,
+    >,
+{
     use stock_analysis::opportunity::candidate_panel::EvidenceTier;
     use stock_analysis::review::tomorrow_watchlist::{
         dedup, WatchItem as OwnedWatchItem, WatchSource,
@@ -10532,6 +10556,18 @@ async fn dispatch_tomorrow_watch_after_preflight(
             let reason = format!("invalid review date {date}: {error}");
             log_dispatcher_attempt("R-07", false, 0, &reason);
             return crate::review_batch::ReviewTaskOutcome::failed(false, reason);
+        }
+    };
+
+    // R-07 requires this exact source for its counted binding. A failed
+    // acquisition is not a verified empty batch and must retain its original
+    // retry policy instead of sealing the day's task as NoData.
+    let lhb_batch = match load_lhb(trading_date).await {
+        Ok(batch) => batch,
+        Err(error) => {
+            log::warn!("[R-07][BR-140][BR-192] counted 龙虎榜源失败: {error}");
+            log_dispatcher_attempt("R-07", false, 0, &error.to_string());
+            return crate::review_batch::ReviewTaskOutcome::gateway_failed(&error);
         }
     };
 
@@ -10610,75 +10646,66 @@ async fn dispatch_tomorrow_watch_after_preflight(
     )
     .await
     .unwrap_or_default();
-    let mut lhb_evidence: Option<stock_analysis::data_gateway::BatchEvidence> = None;
-    let mut lhb_records: Vec<stock_analysis::data_gateway::DragonTigerStockReview> = Vec::new();
-    match stock_analysis::data_gateway::dragon_tiger::DragonTigerGateway::new()
-        .market_review(trading_date, 5, 5)
-        .await
+    let lhb_evidence = Some(lhb_batch.evidence().clone());
+    let lhb_records = lhb_batch.records().to_vec();
     {
-        Ok(batch) => {
-            lhb_evidence = Some(batch.evidence().clone());
-            lhb_records = batch.records().to_vec();
-            let mut strong: Vec<_> = batch
-                .records()
-                .iter()
-                .filter(|record| record.ranking_net_amount_yuan > 0.0)
-                .collect();
-            strong.sort_by(|a, b| {
-                b.ranking_net_amount_yuan
-                    .partial_cmp(&a.ranking_net_amount_yuan)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+        let batch = lhb_batch;
+        let mut strong: Vec<_> = batch
+            .records()
+            .iter()
+            .filter(|record| record.ranking_net_amount_yuan > 0.0)
+            .collect();
+        strong.sort_by(|a, b| {
+            b.ranking_net_amount_yuan
+                .partial_cmp(&a.ranking_net_amount_yuan)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
+        // 必然超龄, 5s 红线走 settled-close 准入: 收盘价+中文名)。
+        // 失败/缺失 → closes 视图兜底；仍缺失则排除 (fail-closed, 红线 2.2)。
+        let strong_codes: Vec<String> = strong
+            .iter()
+            .take(5)
+            .map(|record| record.code.clone())
+            .collect();
+        let strong_quotes = tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = strong_codes.iter().map(|code| code.as_str()).collect();
+            fetch_settled_close_batch_strict(&refs, trading_date)
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("R-07 龙虎榜收盘快照 join 失败: {error}")));
+        for record in strong.iter().take(5) {
+            let resolved = strong_quotes
+                .as_ref()
+                .ok()
+                .and_then(|quotes| quotes.get(&record.code))
+                .map(|quote| (quote.name.clone(), quote.price))
+                .or_else(|| {
+                    closes
+                        .get(&record.code)
+                        .map(|(name, close)| (name.clone(), *close))
+                })
+                .filter(|(_, price)| price.is_finite() && *price > 0.0);
+            let Some((name, base)) = resolved else {
+                log::warn!(
+                    "[R-07][BR-222] 龙虎榜 {} 缺少 {} 同日有限正收盘价, 排除该条目",
+                    record.code,
+                    trading_date
+                );
+                continue;
+            };
+            items.push(OwnedWatchItem {
+                code: record.code.clone(),
+                name,
+                topic: "龙虎榜强票".to_string(),
+                source: WatchSource::LhbStrong,
+                trigger: format!("净买入 {:.0} 万", record.ranking_net_amount_yuan / 10000.0),
+                lo_price: base * 0.98,
+                hi_price: base * 1.02,
+                stop: base * 0.95,
+                reason: format!("龙虎榜净买入为正; 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核"),
             });
-            // BR-233: 盘后收盘快照补名补价 (21:00 晚间最后成交时间
-            // 必然超龄, 5s 红线走 settled-close 准入: 收盘价+中文名)。
-            // 失败/缺失 → closes 视图兜底；仍缺失则排除 (fail-closed, 红线 2.2)。
-            let strong_codes: Vec<String> = strong
-                .iter()
-                .take(5)
-                .map(|record| record.code.clone())
-                .collect();
-            let strong_quotes = tokio::task::spawn_blocking(move || {
-                let refs: Vec<&str> = strong_codes.iter().map(|code| code.as_str()).collect();
-                fetch_settled_close_batch_strict(&refs, trading_date)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("R-07 龙虎榜收盘快照 join 失败: {error}")));
-            for record in strong.iter().take(5) {
-                let resolved = strong_quotes
-                    .as_ref()
-                    .ok()
-                    .and_then(|quotes| quotes.get(&record.code))
-                    .map(|quote| (quote.name.clone(), quote.price))
-                    .or_else(|| {
-                        closes
-                            .get(&record.code)
-                            .map(|(name, close)| (name.clone(), *close))
-                    })
-                    .filter(|(_, price)| price.is_finite() && *price > 0.0);
-                let Some((name, base)) = resolved else {
-                    log::warn!(
-                        "[R-07][BR-222] 龙虎榜 {} 缺少 {} 同日有限正收盘价, 排除该条目",
-                        record.code,
-                        trading_date
-                    );
-                    continue;
-                };
-                items.push(OwnedWatchItem {
-                    code: record.code.clone(),
-                    name,
-                    topic: "龙虎榜强票".to_string(),
-                    source: WatchSource::LhbStrong,
-                    trigger: format!("净买入 {:.0} 万", record.ranking_net_amount_yuan / 10000.0),
-                    lo_price: base * 0.98,
-                    hi_price: base * 1.02,
-                    stop: base * 0.95,
-                    reason: format!(
-                        "龙虎榜净买入为正; 以收盘价 {base:.2} 为基准, 竞价后按 T-11 复核"
-                    ),
-                });
-            }
         }
-        Err(error) => log::warn!("[R-07][BR-222] 龙虎榜源不可用, 跳过该来源: {error}"),
     }
 
     // 3. 涨停链龙头 (前 3 链 leader)
@@ -15644,6 +15671,83 @@ mod tests_r_dispatchers {
                     && reason.contains("unpublished")
                     && reason.contains("provider_calls=0")
         ));
+    }
+
+    #[tokio::test]
+    async fn r07_transient_lhb_failure_keeps_same_day_retry_and_original_cause() {
+        use crate::review_batch::{ReviewBatchOutcome, ReviewScheduleState, ReviewTask};
+        use stock_analysis::data_gateway::GatewayError;
+        use stock_analysis::market_domain::ProviderId;
+
+        let calls = std::cell::Cell::new(0);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let outcome = dispatch_tomorrow_watch_after_preflight_with_lhb(
+            "2026-09-30",
+            false,
+            |requested_date| {
+                calls.set(calls.get() + 1);
+                assert_eq!(requested_date, date);
+                std::future::ready(Err(GatewayError::unavailable(
+                    "DragonTiger",
+                    Some(ProviderId::Eastmoney),
+                    true,
+                    "TEST_CODE provider transport unavailable",
+                )))
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1);
+        let mut schedule = ReviewScheduleState::for_date(date);
+        let transitions = schedule.apply(
+            &ReviewBatchOutcome::new(vec![(ReviewTask::R07, outcome)]),
+            date.and_hms_opt(21, 0, 0).unwrap(),
+        );
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].status, "failed");
+        assert_eq!(
+            transitions[0].reason_code,
+            "gateway_DragonTiger_no_verified_batch"
+        );
+        assert!(transitions[0].retryable);
+        assert_eq!(
+            transitions[0].next_attempt.as_deref(),
+            Some("2026-09-30T21:01:00")
+        );
+        assert!(serde_json::to_string(&transitions[0])
+            .unwrap()
+            .contains("TEST_CODE provider transport unavailable"));
+        assert!(!schedule.is_due(ReviewTask::R07, date.and_hms_opt(21, 0, 59).unwrap()));
+        assert!(schedule.is_due(ReviewTask::R07, date.and_hms_opt(21, 1, 0).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn r07_permanent_lhb_failure_preserves_non_retryable_failure() {
+        use crate::review_batch::{ReviewBatchOutcome, ReviewScheduleState, ReviewTask};
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let outcome = dispatch_tomorrow_watch_after_preflight_with_lhb("2026-09-30", false, |_| {
+            std::future::ready(Err(
+                stock_analysis::data_gateway::GatewayError::unavailable(
+                    "DragonTiger",
+                    Some(stock_analysis::market_domain::ProviderId::Eastmoney),
+                    false,
+                    "TEST_CODE source contract unavailable",
+                ),
+            ))
+        })
+        .await;
+        let mut schedule = ReviewScheduleState::for_date(date);
+        let transitions = schedule.apply(
+            &ReviewBatchOutcome::new(vec![(ReviewTask::R07, outcome)]),
+            date.and_hms_opt(21, 0, 0).unwrap(),
+        );
+        assert_eq!(transitions[0].status, "failed");
+        assert_eq!(
+            transitions[0].reason_code,
+            "gateway_DragonTiger_no_verified_batch"
+        );
+        assert!(!transitions[0].retryable);
+        assert_eq!(transitions[0].next_attempt, None);
+        assert!(!schedule.is_due(ReviewTask::R07, date.and_hms_opt(21, 1, 0).unwrap()));
     }
 
     #[tokio::test]
