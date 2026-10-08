@@ -14,7 +14,9 @@ Desktop外候选目录冻结1717个Git输入，普通release（1.95.0/clang/SDK2
 
 发现每日任务调用 `runtime/bin/` 的旧工具，与上次正式 `target/release/` 制品不同。本次同时更新两个实际路径，SHA均与上述新制品一致；保留原日常脚本和21:17 plist，静态回退包含两套旧工具。21:50旧monitor64021、bridge63046、每日job81270及子81280全部退出后安装，不覆盖数据库、凭据或业务原件。
 
-future activation `2026-10-08T13:54:29.391860Z`（21:54:29 CST），expected_config_hash `5df52cda549244764d8897ea92f61f87c3b05b215c293d3108348170b824b8a8`。桥接原二进制保持；bridge85637于21:55:32实际init/18082就绪，monitor86378于21:56:22启动。monitor86378于21:57:25实际初始化完成，同秒fixed point为progress0/resumed_sink_calls0/foreign0/manual79/hydrate17。21:58:50回读全部5091旧决策字段/envelope精确、79Uncertain精确、原Schema9/catalog49政策/主库catalog及两个原DB inode精确；账户summary41/snapshot39/明细254全部历史记录精确。实际launchctl进程中的证据目录env和0700根身份保持。21:58:58原日常job重新注册并恢复被切换中断的原任务，PID86715，脚本/plist保持、新工具两目录SHA精确；任务业务结果待自然完成，不以注册或PID冒称回填完成。
+future activation `2026-10-08T13:54:29.391860Z`（21:54:29 CST），expected_config_hash `5df52cda549244764d8897ea92f61f87c3b05b215c293d3108348170b824b8a8`。桥接原二进制保持；bridge85637于21:55:32实际init/18082就绪，monitor86378于21:56:22启动。monitor86378于21:57:25实际初始化完成，同秒fixed point为progress0/resumed_sink_calls0/foreign0/manual79/hydrate17。21:58:50回读全部5091旧决策字段/envelope精确、79Uncertain精确、原Schema9/catalog49政策/主库catalog及两个原DB inode精确；账户summary41/snapshot39/明细254全部历史记录精确。实际launchctl进程中的证据目录env和0700根身份保持。21:58:58原日常job重新注册并恢复被切换中断的原任务，PID86715，脚本/plist保持、新工具两目录SHA精确。
+
+原日常任务于22:07:15结束。新版日线工具10只股票全部成功，每只写入10条，共100次写入；最新日期2026-10-08，stock_daily总行数12361（比任务前净增50行，其余为更新）。新版预测工具仍退出非零：13项deferred、24个窗口deferred、verified0，预测37–40仍因7/11或7/12周末起始而报错，错误行保持pending。外层脚本记录子进程失败后仍正常退出，launchd的exit0不能代表预测回填成功；真实日志与退出分类保留在私有证据中。日线补取成立，历史资格和预测结果完整回填不成立。
 
 切换前共5091决策、79Uncertain。原第79条DataMode在19:41发生，晚于前次19:15验收而早于本次发布；没有平台message id，仍需人工裁定。全部既有记录保持，不自动重发/裁定。新来源/旧paper累计超卖及4条周末预测并不因重构建恢复；H08/outcome/monitor范围保持，冻结平台及正式资金seed/cutover不启用。
 
