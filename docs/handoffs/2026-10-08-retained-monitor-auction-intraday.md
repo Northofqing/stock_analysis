@@ -1,6 +1,6 @@
 # 保留 monitor 的竞价与盘内报价观察
 
-用户范围：保留 H08 / outcome / monitor；冻结平台工程。Windows 841 gRPC 保持，正式资金链/P05 Unit/G5b v2 不恢复。本变更尚未部署；发布、激活、launchd 切换由根任务统一协调。
+用户范围：保留 H08 / outcome / monitor；冻结平台工程。Windows 841 gRPC 保持，正式资金链/P05 Unit/G5b v2 不恢复。根任务已统一发布行为提交 `fd07f1546` 并于15:15:17按正式launchd切换；15:16:21到达fixed point，resumed_sink_calls=0。详见 [回填与正式发布回验](2026-10-08-outcome-backfill-and-monitor-push.md)。
 
 ## 已核实的缺推原因
 
@@ -36,4 +36,4 @@
 - 第四份原库 copy 的最终真实物理 guard canary 1/1 通过（15.57 秒）：实际 Tencent source_at 14:31:49、observed_at 14:31:53.273194 CST，14:31:53.285379 以真实 `Utc::now` 对原 canonical 正向通过；Provider 原准入后成为 Reserved，等待 6 秒后 14:32:02.583737 仍在同一 14:30 槽，经真实 `MagiclawAuthoritativeSink` 在外部调用前拒绝为 `retained_observation_original_quote_expired` / retry=false，并原底层结算 RejectedDurable。新 fingerprint `9e5fcb2471ac6517a1a17548ff0eda040a446a490ced8a93fec4ba4ead93c347`；`physical-guard-readback-receipt.json` 核对原 5,083 决定和 78 Uncertain、catalog、49 policy、Schema9 全保留；飞书调用 0。Test transport 保护无外部副作用，source origin 仍是原 Provider，没有伪时刻。
 - 真实 readback 初次的 raw decimal 格式误判与随后一批原报价陈旧 9.526821 秒均留有 `failed-native-time-*` / `failed-stale-native-*` 失败证据；都在 prepare 前失败，原第四 copy 无新 Reserved，新取真实 fresh 原件完成上述验证，不是重发。
 - 默认 Frozen 门的证据来自具体 metadata 检查，不用 canary 对泛型账户 gate 做无证据断言。新入口没有修原 Scanner 的 MoneyFlows 前置延迟或 BR-192 无绑定 alert；止损与交易建议依旧需要真实账户/报价资格。
-- 正式上线还需普通 release、activation、同库/同 inode 单实例切换及自然盘中回执；下个真实竞价窗口才能观察线上竞价。
+- 正常release、61项同产物CLI/shadow、future activation和同库/同inode单实例切换均完成；切换已过今日盘内窗口，竞价/盘内报价实投及人客户端接收仍待真实窗口。旧624实例15:01的正常聚合已在Stock私聊平台回读，不能代替新quote卡实投证据。
