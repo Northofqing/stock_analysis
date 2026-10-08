@@ -30,6 +30,12 @@ async fn main() -> anyhow::Result<()> {
         stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)))
             .map_err(|e| anyhow::anyhow!("DatabaseManager::init({db_path}) 失败: {e}"))?;
         log::info!("[grpc_market_server] 数据库已初始化: {db_path} (A-10 链 delegate 依赖)");
+        // DatabaseManager::init validates both persisted NewsAI audit chains.
+        // The provider host must understand the codec written by the monitor,
+        // even when their LocalBridgeV1 wire contract is unchanged.
+        log::info!(
+            "[grpc_market_server] NewsAI legacy/V3 审计校验通过 (reader=eea99a71b)"
+        );
         // M4c: build_for_date 的 BR-160 聚类合同来自 config/chain.toml
         // (config::load_chain_combined, monitor 启动时经 config::load_all() 加载)。
         // 服务端不加载 → get_chain_intelligence_config()=None → op 61 必失败

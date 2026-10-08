@@ -18,7 +18,7 @@ use crate::magic_compat::SourceEvidence;
 use crate::news::aggregator::AdmittedGlobalNewsBatch;
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -32,7 +32,10 @@ const REALTIME_MAX_AGE_SECONDS: i64 = 5;
 const DATA_EVIDENCE_FUTURE_TOLERANCE_SECONDS: i64 = 90;
 const REQUIRED_DAILY_HISTORY: usize = 20;
 const MODEL_CALL_TIMEOUT_SECONDS: u64 = 45;
-pub const NEWS_AI_ANALYSIS_VERSION: &str = "news_ai_v1";
+// BR-249 (2026-08-31): v2 加入产业链上下文（normalized_prompt chain_context 块 +
+// 证据哈希纳入链字段）。assessment identity 含 version，切 v2 后历史 v1 记录
+// 不命中 dedup，已评估快讯会以 v2 重评（per-tick 5 条限速，非风暴）。
+pub const NEWS_AI_ANALYSIS_VERSION: &str = "news_ai_v2";
 pub const NEWS_AI_SYSTEM_PROMPT_V1: &str = concat!(
     "You are an evidence-bound A-share news analyst. ",
     "Use only the supplied normalized evidence. ",
@@ -103,6 +106,105 @@ enum AdmittedNewsSourceRecord {
     Sina(SinaInstrumentNewsRecord),
 }
 
+const NEWS_FACT_RECOVERY_SNAPSHOT_VERSION: u8 = 1;
+const NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES: usize = 512 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverySourceEvidence {
+    provider: ProviderId,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+}
+
+impl RecoverySourceEvidence {
+    fn from_source(value: &SourceEvidence) -> Self {
+        Self {
+            provider: value.provider(),
+            source_at: value.source_at().map(str::to_owned),
+            observed_at: value.observed_at().to_owned(),
+            batch_id: value.batch_id().to_owned(),
+        }
+    }
+
+    fn into_source(self) -> Result<SourceEvidence, NewsAiError> {
+        let evidence = SourceEvidence::new(self.provider, self.observed_at, self.batch_id)
+            .map_err(|error| NewsAiError::AnalysisAuditFailed(error.to_string()))?;
+        match self.source_at {
+            Some(source_at) => evidence
+                .with_source_at(source_at)
+                .map_err(|error| NewsAiError::AnalysisAuditFailed(error.to_string())),
+            None => Ok(evidence),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryBatchEvidence {
+    provider: ProviderId,
+    source: String,
+    source_at: Option<String>,
+    observed_at: String,
+    batch_id: String,
+}
+
+impl RecoveryBatchEvidence {
+    fn from_batch(value: &BatchEvidence) -> Self {
+        Self {
+            provider: value.provider,
+            source: value.source.clone(),
+            source_at: value.source_at.clone(),
+            observed_at: value.observed_at.clone(),
+            batch_id: value.batch_id.clone(),
+        }
+    }
+
+    fn into_batch(self) -> BatchEvidence {
+        BatchEvidence {
+            provider: self.provider,
+            source: self.source,
+            source_at: self.source_at,
+            observed_at: self.observed_at,
+            batch_id: self.batch_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RecoveryNewsRecord {
+    Global {
+        item_id: String,
+        title: String,
+        summary: Option<String>,
+        content: Option<String>,
+        publisher: String,
+        canonical_url: String,
+        published_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        instruments: Vec<String>,
+        topics: Vec<String>,
+        language: String,
+        evidence: RecoverySourceEvidence,
+    },
+    Sina {
+        item: crate::data_provider::news_item::NewsItem,
+        evidence: RecoverySourceEvidence,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewsFactRecoverySnapshot {
+    schema_version: u8,
+    record: RecoveryNewsRecord,
+    batch: RecoveryBatchEvidence,
+    target_code: String,
+    target_name: Option<String>,
+}
+
 /// A source record that remains inseparable from its original batch evidence
 /// and exact target instrument.
 #[derive(Debug, Clone)]
@@ -110,9 +212,123 @@ pub struct AdmittedNewsFact {
     record: AdmittedNewsSourceRecord,
     batch: BatchEvidence,
     target_code: String,
+    /// BR-250: 仅卡片渲染用证券名称 (display-only)。不进 identity/证据哈希/
+    /// prompt/DB——同 code 恒同 name, 不会改变 dedup 幂等。实时路径由
+    /// news_ai_shadow 经证券身份统一 Gateway 解析注入; 持久化重建路径无
+    /// 来源, 保持 None, 渲染如实降级为仅代码。
+    target_name: Option<String>,
 }
 
 impl AdmittedNewsFact {
+    pub(crate) fn recovery_snapshot_canonical(&self) -> Result<Vec<u8>, NewsAiError> {
+        let record = match &self.record {
+            AdmittedNewsSourceRecord::Global(record) => RecoveryNewsRecord::Global {
+                item_id: record.item_id.clone(),
+                title: record.title.clone(),
+                summary: record.summary.clone(),
+                content: record.content.clone(),
+                publisher: record.publisher.clone(),
+                canonical_url: record.canonical_url.clone(),
+                published_at: record.published_at,
+                observed_at: record.observed_at,
+                instruments: record.instruments.clone(),
+                topics: record.topics.clone(),
+                language: record.language.clone(),
+                evidence: RecoverySourceEvidence::from_source(&record.evidence),
+            },
+            AdmittedNewsSourceRecord::Sina(record) => RecoveryNewsRecord::Sina {
+                item: record.persistence_item().clone(),
+                evidence: RecoverySourceEvidence::from_source(record.evidence()),
+            },
+        };
+        let snapshot = NewsFactRecoverySnapshot {
+            schema_version: NEWS_FACT_RECOVERY_SNAPSHOT_VERSION,
+            record,
+            batch: RecoveryBatchEvidence::from_batch(&self.batch),
+            target_code: self.target_code.clone(),
+            target_name: self.target_name.clone(),
+        };
+        let bytes = serde_json::to_vec(&snapshot).map_err(|error| {
+            NewsAiError::AnalysisAuditFailed(format!(
+                "NewsAI recovery snapshot serialization failed: {error}"
+            ))
+        })?;
+        if bytes.len() > NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES {
+            return Err(NewsAiError::AnalysisAuditFailed(format!(
+                "NewsAI recovery snapshot exceeds {NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn from_recovery_snapshot(bytes: &[u8]) -> Result<Self, NewsAiError> {
+        if bytes.is_empty() || bytes.len() > NEWS_FACT_RECOVERY_SNAPSHOT_MAX_BYTES {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "NewsAI recovery snapshot size is invalid".to_owned(),
+            ));
+        }
+        let snapshot: NewsFactRecoverySnapshot =
+            serde_json::from_slice(bytes).map_err(|error| {
+                NewsAiError::AnalysisAuditFailed(format!(
+                    "NewsAI recovery snapshot parse failed: {error}"
+                ))
+            })?;
+        if snapshot.schema_version != NEWS_FACT_RECOVERY_SNAPSHOT_VERSION
+            || serde_json::to_vec(&snapshot).map_err(|error| {
+                NewsAiError::AnalysisAuditFailed(format!(
+                    "NewsAI recovery snapshot canonicalization failed: {error}"
+                ))
+            })? != bytes
+        {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "NewsAI recovery snapshot is not canonical v1".to_owned(),
+            ));
+        }
+        let batch = snapshot.batch.into_batch();
+        let mut fact = match snapshot.record {
+            RecoveryNewsRecord::Global {
+                item_id,
+                title,
+                summary,
+                content,
+                publisher,
+                canonical_url,
+                published_at,
+                observed_at,
+                instruments,
+                topics,
+                language,
+                evidence,
+            } => Self::from_global_parts(
+                &GlobalNewsRecord {
+                    item_id,
+                    title,
+                    summary,
+                    content,
+                    publisher,
+                    canonical_url,
+                    published_at,
+                    observed_at,
+                    instruments,
+                    topics,
+                    language,
+                    evidence: evidence.into_source()?,
+                },
+                &batch,
+                &snapshot.target_code,
+            )?,
+            RecoveryNewsRecord::Sina { item, evidence } => Self::from_sina(
+                &SinaInstrumentNewsRecord::new(item, evidence.into_source()?),
+                &batch,
+                &snapshot.target_code,
+            )?,
+        };
+        if let Some(target_name) = snapshot.target_name {
+            fact = fact.with_target_name(target_name);
+        }
+        Ok(fact)
+    }
+
     pub fn from_admitted_global(
         admitted: &AdmittedGlobalNewsBatch,
         record_index: usize,
@@ -198,6 +414,7 @@ impl AdmittedNewsFact {
             record: AdmittedNewsSourceRecord::Global(record.clone()),
             batch: batch.clone(),
             target_code: target_code.to_owned(),
+            target_name: None,
         })
     }
 
@@ -263,7 +480,20 @@ impl AdmittedNewsFact {
             record: AdmittedNewsSourceRecord::Sina(record.clone()),
             batch: batch.clone(),
             target_code: target_code.to_owned(),
+            target_name: None,
         })
+    }
+
+    /// BR-250: 注入证券名称 (display-only, 仅渲染用)。调用方须只以统一证券
+    /// 身份来源填充; 不参与 identity/哈希, 幂等不受影响。
+    /// 库公开: bin/monitor (news_ai_shadow) 是独立 crate, 需经此注入。
+    pub fn with_target_name(mut self, name: String) -> Self {
+        self.target_name = Some(name);
+        self
+    }
+
+    pub fn target_name(&self) -> Option<&str> {
+        self.target_name.as_deref()
     }
 
     pub fn provider(&self) -> ProviderId {
@@ -561,14 +791,218 @@ pub struct OptionalNewsMetric {
     pub status: EvidenceStatus<f64>,
 }
 
+/// 2026-08-31 (BR-249): NewsAI 产业链上下文——目标股所在涨停主线（chain_daily，
+/// 断点 A 落库）与 BR-170 官方板块归属。数据缺失时保持 None，评估不阻塞。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewsAiChainContext {
+    /// 目标股所在最近涨停主线名（chain_daily.concept）
+    pub mainline_concept: Option<String>,
+    /// 主线簇内涨停股数
+    pub mainline_cluster_size: Option<usize>,
+    /// 主线证据日期（chain_daily.date）
+    pub mainline_date: Option<String>,
+    /// 近 10 自然日该主线上榜天数
+    pub mainline_streak_days: Option<i64>,
+    /// BR-170 持仓产业链板块名
+    pub board_name: Option<String>,
+}
+
+/// Calling configuration, qualified before acquisition/model work. Actual
+/// upstream model names belong to ModelCallReceipt, never this profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsAiAnalysisProfile {
+    analysis_version: String,
+    prompt_contract: String,
+    system_sha256: String,
+    model_provider: String,
+    configured_model: String,
+    model_profile_revision: String,
+    data_contract_version: String,
+}
+
+impl NewsAiAnalysisProfile {
+    pub fn for_configured_model(provider: &str, model: &str) -> Result<Self, NewsAiError> {
+        let profile = Self {
+            analysis_version: NEWS_AI_ANALYSIS_VERSION.to_owned(),
+            prompt_contract: "news_ai_normalized_prompt_v2_strict_output_v1".to_owned(),
+            system_sha256: sha256_hex(NEWS_AI_SYSTEM_PROMPT_V1.as_bytes()),
+            model_provider: provider.to_owned(),
+            configured_model: model.to_owned(),
+            model_profile_revision: "receipt_bearing_json_v1".to_owned(),
+            data_contract_version: "br172_admitted_news_market_v1".to_owned(),
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    fn validate(&self) -> Result<(), NewsAiError> {
+        for value in [
+            &self.analysis_version,
+            &self.prompt_contract,
+            &self.model_provider,
+            &self.configured_model,
+            &self.model_profile_revision,
+            &self.data_contract_version,
+        ] {
+            if value.is_empty() || value.trim() != value || value.contains('\0') {
+                return Err(NewsAiError::AnalysisAuditFailed(
+                    "invalid qualified analysis profile".to_owned(),
+                ));
+            }
+        }
+        if self.system_sha256 != sha256_hex(NEWS_AI_SYSTEM_PROMPT_V1.as_bytes()) {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "unsupported prompt system contract".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One canonical business-identity seam shared by candidate selection, lookup,
+/// request, persistence and recovery. No live evidence or response is an input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsAiIdentityV3 {
+    identity_version: u8,
+    codec: String,
+    provider: String,
+    item_id: String,
+    content_revision: String,
+    target: String,
+    profile: NewsAiAnalysisProfile,
+}
+
+pub(crate) const NEWS_AI_V3_STORAGE_PREFIX: &str = "news_ai_identity_v3/";
+
+impl NewsAiIdentityV3 {
+    pub fn from_fact(
+        fact: &AdmittedNewsFact,
+        profile: &NewsAiAnalysisProfile,
+    ) -> Result<Self, NewsAiError> {
+        profile.validate()?;
+        validate_code(fact.target_code())?;
+        // Option markers and exact bytes are significant. In particular a
+        // present empty summary is not an absent summary. Sina supplies a
+        // nonoptional summary string; preserve it rather than trimming it.
+        let (title, summary, content) = match &fact.record {
+            AdmittedNewsSourceRecord::Global(record) => (
+                record.title.as_str(),
+                record.summary.as_deref(),
+                record.content.as_deref(),
+            ),
+            AdmittedNewsSourceRecord::Sina(record) => {
+                let item = record.persistence_item();
+                (item.title.as_str(), Some(item.summary.as_str()), None)
+            }
+        };
+        let mut revision = Sha256::new();
+        revision.update(b"BR172_NEWS_TEXT_REVISION_V1\0");
+        for value in [Some(title), summary, content] {
+            revision.update([u8::from(value.is_some())]);
+            if let Some(value) = value {
+                hash_field(&mut revision, value);
+            }
+        }
+        Ok(Self {
+            identity_version: 3,
+            codec: "br172_news_ai_business_identity".to_owned(),
+            provider: provider_tag(fact.provider()).to_owned(),
+            item_id: fact.item_id().to_owned(),
+            content_revision: hex::encode(revision.finalize()),
+            target: normalized_code(fact.target_code()).to_owned(),
+            profile: profile.clone(),
+        })
+    }
+
+    pub fn digest(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"BR172_NEWS_AI_IDENTITY_V3\0");
+        hash.update(self.canonical_bytes());
+        hex::encode(hash.finalize())
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("fixed identity DTO is infallibly serializable")
+    }
+
+    pub(crate) fn storage_analysis_version(&self) -> String {
+        format!(
+            "{NEWS_AI_V3_STORAGE_PREFIX}{}",
+            self.profile.analysis_version
+        )
+    }
+
+    pub(crate) fn analysis_version(&self) -> &str {
+        &self.profile.analysis_version
+    }
+
+    pub(crate) fn validate_fact(&self, fact: &AdmittedNewsFact) -> Result<(), NewsAiError> {
+        if &Self::from_fact(fact, &self.profile)? != self {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "v3 identity is unknown or detached from original fact".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn encode_recovery(&self, fact: &AdmittedNewsFact) -> Result<Vec<u8>, NewsAiError> {
+        self.validate_fact(fact)?;
+        let envelope = NewsAiRecoveryEnvelopeV3 {
+            identity_version: 3,
+            codec: "br172_news_ai_recovery_v3".to_owned(),
+            identity: self.clone(),
+            // Preserve the legacy fact codec as an opaque exact UTF-8 string.
+            fact_snapshot: String::from_utf8(fact.recovery_snapshot_canonical()?)
+                .map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))?,
+        };
+        serde_json::to_vec(&envelope).map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))
+    }
+
+    pub(crate) fn decode_recovery(bytes: &[u8]) -> Result<(Self, AdmittedNewsFact), NewsAiError> {
+        if bytes.len() > 2 * 512 * 1024 {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "v3 recovery envelope too large".to_owned(),
+            ));
+        }
+        let envelope: NewsAiRecoveryEnvelopeV3 = serde_json::from_slice(bytes)
+            .map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))?;
+        if envelope.identity_version != 3
+            || envelope.codec != "br172_news_ai_recovery_v3"
+            || serde_json::to_vec(&envelope)
+                .map_err(|e| NewsAiError::AnalysisAuditFailed(e.to_string()))?
+                != bytes
+        {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "noncanonical or unsupported v3 recovery envelope".to_owned(),
+            ));
+        }
+        let fact = AdmittedNewsFact::from_recovery_snapshot(envelope.fact_snapshot.as_bytes())?;
+        envelope.identity.validate_fact(&fact)?;
+        Ok((envelope.identity, fact))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewsAiRecoveryEnvelopeV3 {
+    identity_version: u8,
+    codec: String,
+    identity: NewsAiIdentityV3,
+    fact_snapshot: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewsAiRequest {
     fact: AdmittedNewsFact,
     market: NewsMarketSnapshot,
     optional_metrics: Vec<OptionalNewsMetric>,
     analysis_version: String,
+    chain: NewsAiChainContext,
     evidence_hash: String,
     normalized_prompt: String,
+    business_identity: Option<NewsAiIdentityV3>,
 }
 
 impl NewsAiRequest {
@@ -577,6 +1011,7 @@ impl NewsAiRequest {
         market: NewsMarketSnapshot,
         mut optional_metrics: Vec<OptionalNewsMetric>,
         analysis_version: &str,
+        chain: NewsAiChainContext,
     ) -> Result<Self, NewsAiError> {
         if analysis_version.trim().is_empty() {
             return Err(market_error("analysis version is empty"));
@@ -590,17 +1025,42 @@ impl NewsAiRequest {
         }
         validate_optional_metrics(&mut optional_metrics, market.as_of)?;
         let evidence_hash =
-            hash_request_evidence(&fact, &market, &optional_metrics, analysis_version);
+            hash_request_evidence(&fact, &market, &optional_metrics, analysis_version, &chain);
         let normalized_prompt =
-            build_normalized_prompt(&fact, &market, &optional_metrics, analysis_version)?;
+            build_normalized_prompt(&fact, &market, &optional_metrics, analysis_version, &chain)?;
         Ok(Self {
             fact,
             market,
             optional_metrics,
             analysis_version: analysis_version.to_owned(),
+            chain,
             evidence_hash,
             normalized_prompt,
+            business_identity: None,
         })
+    }
+
+    pub fn try_new_v3(
+        fact: AdmittedNewsFact,
+        market: NewsMarketSnapshot,
+        optional_metrics: Vec<OptionalNewsMetric>,
+        identity: NewsAiIdentityV3,
+        chain: NewsAiChainContext,
+    ) -> Result<Self, NewsAiError> {
+        identity.validate_fact(&fact)?;
+        let mut request = Self::try_new(
+            fact,
+            market,
+            optional_metrics,
+            identity.analysis_version(),
+            chain,
+        )?;
+        request.business_identity = Some(identity);
+        Ok(request)
+    }
+
+    pub(crate) fn business_identity(&self) -> Option<&NewsAiIdentityV3> {
+        self.business_identity.as_ref()
     }
 
     pub fn fact(&self) -> &AdmittedNewsFact {
@@ -617,6 +1077,10 @@ impl NewsAiRequest {
 
     pub fn analysis_version(&self) -> &str {
         &self.analysis_version
+    }
+
+    pub fn chain(&self) -> &NewsAiChainContext {
+        &self.chain
     }
 
     pub fn evidence_hash(&self) -> &str {
@@ -1059,7 +1523,9 @@ impl AuditedNewsAiAssessment {
         }
         let fact = request.fact().clone();
         let analysis_version = request.analysis_version().to_owned();
-        let identity = NewsAiDeliveryIdentity::from_fact(&fact, &analysis_version);
+        let mut identity = NewsAiDeliveryIdentity::from_fact(&fact, &analysis_version);
+        identity.sha256 = expected_assessment_id;
+        let chain = Some(request.chain().clone());
         Ok(Self {
             delivery: GovernedNewsAiDelivery {
                 fact,
@@ -1067,6 +1533,8 @@ impl AuditedNewsAiAssessment {
                 assessment,
                 assessment_audit_record_sha256: assessment_audit_record_sha256.to_owned(),
                 identity,
+                chain,
+                rendered_card: None,
             },
         })
     }
@@ -1077,6 +1545,22 @@ impl AuditedNewsAiAssessment {
         assessment: PersistedNewsAiAssessment,
         assessment_audit_record_sha256: &str,
     ) -> Result<Self, NewsAiError> {
+        Self::try_from_persisted_identity_audit(
+            fact,
+            analysis_version,
+            None,
+            assessment,
+            assessment_audit_record_sha256,
+        )
+    }
+
+    pub(crate) fn try_from_persisted_identity_audit(
+        fact: AdmittedNewsFact,
+        analysis_version: &str,
+        business_identity: Option<&NewsAiIdentityV3>,
+        assessment: PersistedNewsAiAssessment,
+        assessment_audit_record_sha256: &str,
+    ) -> Result<Self, NewsAiError> {
         if analysis_version.trim().is_empty() {
             return Err(NewsAiError::AnalysisAuditFailed(
                 "persisted assessment analysis version is empty".to_owned(),
@@ -1084,13 +1568,24 @@ impl AuditedNewsAiAssessment {
         }
         validate_sha256("assessment audit record", assessment_audit_record_sha256)?;
         let assessment = NewsAiAssessment::try_from_persisted(assessment)?;
-        let expected_assessment_id = assessment_identity_for_fact(&fact, analysis_version);
+        let expected_assessment_id = if let Some(identity) = business_identity {
+            identity.validate_fact(&fact)?;
+            if identity.analysis_version() != analysis_version {
+                return Err(NewsAiError::AnalysisAuditFailed(
+                    "persisted v3 analysis version mismatch".to_owned(),
+                ));
+            }
+            identity.digest()
+        } else {
+            assessment_identity_for_fact(&fact, analysis_version)
+        };
         if assessment.assessment_id() != expected_assessment_id {
             return Err(NewsAiError::AnalysisAuditFailed(
                 "persisted assessment identity differs from admitted source fact".to_owned(),
             ));
         }
-        let identity = NewsAiDeliveryIdentity::from_fact(&fact, analysis_version);
+        let mut identity = NewsAiDeliveryIdentity::from_fact(&fact, analysis_version);
+        identity.sha256 = expected_assessment_id;
         Ok(Self {
             delivery: GovernedNewsAiDelivery {
                 fact,
@@ -1098,12 +1593,28 @@ impl AuditedNewsAiAssessment {
                 assessment,
                 assessment_audit_record_sha256: assessment_audit_record_sha256.to_owned(),
                 identity,
+                // BR-249: 持久化重建路径无链快照；渲染卡如实标注。
+                chain: None,
+                rendered_card: None,
             },
         })
     }
 
     pub fn delivery(&self) -> &GovernedNewsAiDelivery {
         &self.delivery
+    }
+
+    pub(crate) fn with_frozen_card(mut self, card: String) -> Result<Self, NewsAiError> {
+        if card.trim().is_empty()
+            || !card.contains(self.delivery.identity.sha256())
+            || !card.contains(&self.delivery.assessment_audit_record_sha256)
+        {
+            return Err(NewsAiError::AnalysisAuditFailed(
+                "persisted delivery card is empty or detached from its audited identity".to_owned(),
+            ));
+        }
+        self.delivery.rendered_card = Some(card);
+        Ok(self)
     }
 }
 
@@ -1115,6 +1626,10 @@ pub struct GovernedNewsAiDelivery {
     assessment: NewsAiAssessment,
     assessment_audit_record_sha256: String,
     identity: NewsAiDeliveryIdentity,
+    /// BR-249: 评估时的产业链上下文快照。DB 重建路径（恢复推送）为 None。
+    chain: Option<NewsAiChainContext>,
+    /// First rendered card, frozen with its audited assessment before delivery.
+    rendered_card: Option<String>,
 }
 
 impl GovernedNewsAiDelivery {
@@ -1138,9 +1653,22 @@ impl GovernedNewsAiDelivery {
         &self.identity
     }
 
+    pub fn business_date(&self) -> chrono::NaiveDate {
+        let market_timezone =
+            chrono::FixedOffset::east_opt(8 * 3600).expect("Asia/Shanghai UTC offset is valid");
+        self.assessment
+            .receipt()
+            .completed_at()
+            .with_timezone(&market_timezone)
+            .date_naive()
+    }
+
     /// Render only immutable source/model/audit evidence. This card does not
     /// infer holdings, prices or trading actions and has no default values.
     pub fn render_card(&self) -> String {
+        if let Some(card) = &self.rendered_card {
+            return card.clone();
+        }
         let impact = match self.assessment.impact() {
             NewsImpact::MajorNegative => "重大负面",
             NewsImpact::Negative => "负面",
@@ -1148,9 +1676,48 @@ impl GovernedNewsAiDelivery {
             NewsImpact::Positive => "正面",
             NewsImpact::MajorPositive => "重大正面",
         };
+        let chain_line = match &self.chain {
+            // BR-249: 评估期链快照。命中主线后 date/size/streak 可能解析失败为
+            // None（如 streak 查询失败），缺失字段以「—」占位，不因此断言
+            // 「不在主线中」；链上下文整体缺失时如实标注「未检出」，不做否定断言。
+            Some(chain) => match chain.mainline_concept.as_deref() {
+                Some(concept) => {
+                    let date = chain.mainline_date.as_deref().unwrap_or("—");
+                    let size = chain
+                        .mainline_cluster_size
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".to_owned());
+                    let streak = chain
+                        .mainline_streak_days
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".to_owned());
+                    match chain.board_name.as_deref() {
+                        Some(board) => format!(
+                            "所属主线「{concept}」（{date} 簇内 {size} 只，近10日上榜 {streak} 天）；板块：{board}"
+                        ),
+                        None => format!(
+                            "所属主线「{concept}」（{date} 簇内 {size} 只，近10日上榜 {streak} 天）"
+                        ),
+                    }
+                }
+                None => match chain.board_name.as_deref() {
+                    Some(board) => format!("板块：{board}；未检出所属主线"),
+                    None => "（未检出所属主线）".to_owned(),
+                },
+            },
+            // BR-249: DB 重建的恢复推送没有评估期链快照，如实标注而非推断。
+            None => "（恢复推送，无链快照）".to_owned(),
+        };
+        // BR-250: 标的名称仅渲染用。实时路径已注入「名称（代码）」; 名称缺失
+        // (持久化恢复推送) 如实降级为仅代码, 不做本地合成。
+        let target_line = match self.fact.target_name() {
+            Some(name) => format!("{}（{}）", name, self.fact.target_code()),
+            None => self.fact.target_code().to_owned(),
+        };
         format!(
             "🧠 AI 新闻证据分析\n\
              标的：{}\n\
+             产业链：{}\n\
              标题：{}\n\
              来源：{} / {:?}\n\
              发布时间：{}\n\
@@ -1163,7 +1730,8 @@ impl GovernedNewsAiDelivery {
              评估审计：{}\n\
              投递身份：{}\n\
              ⚠️ 仅为来源绑定的模型分析，不构成交易建议。",
-            self.fact.target_code(),
+            target_line,
+            chain_line,
             self.fact.title(),
             self.fact.source(),
             self.fact.provider(),
@@ -1283,10 +1851,11 @@ pub enum NewsAiPhysicalPushOutcome {
     Pushed(NewsAiDeliveryAuditReceipt),
     Deduped,
     Denied(String),
-    /// Definitive failure before the physical sink was attempted.
+    /// No confirmed delivery: preparation failed or the sink authoritatively
+    /// rejected the attempt. The reservation can be rolled back.
     SinkError(String),
-    /// Sink was attempted or accepted, so retry is forbidden even when the
-    /// post-sink audit could not be completed.
+    /// Counted delivery may already be accepted. Recovery may repeat audit
+    /// work for the same frozen card, but counted owns physical idempotence.
     PostSinkFailure {
         delivery_audit_event_id: Option<String>,
         reason: String,
@@ -1402,10 +1971,15 @@ pub trait NewsAiGovernedDeliveryPort: Send + Sync {
         delivery_audit: &NewsAiDeliveryAuditReceipt,
     ) -> Result<NewsAiPredictionLinkReceipt, String>;
 
+    /// Release a reservation whose card never reached the sink. `reason` is
+    /// the port-side denial/failure text that explains the release, so the
+    /// BR-172 `rolled_back` row can record *why*; an empty string means the
+    /// caller has no specific reason to add.
     async fn rollback(
         &self,
         delivery: &GovernedNewsAiDelivery,
         reservation: &NewsAiDeliveryReservation,
+        reason: &str,
     ) -> Result<(), String>;
 }
 
@@ -1524,7 +2098,9 @@ where
         }
         NewsAiPhysicalPushOutcome::Denied(reason) => {
             let original = format!("denied:{reason}");
-            match port.rollback(delivery, &reservation).await {
+            // F5a: the ledger must show *why* the reservation was released,
+            // so the real denial reason travels into the rollback row.
+            match port.rollback(delivery, &reservation, &reason).await {
                 Ok(()) => NewsAiGovernedDeliveryOutcome::Denied {
                     delivery_identity_sha256: identity,
                     reason,
@@ -1538,7 +2114,9 @@ where
         }
         NewsAiPhysicalPushOutcome::SinkError(reason) => {
             let original = format!("sink_error:{reason}");
-            match port.rollback(delivery, &reservation).await {
+            // Preserve the counted transport reason in the BR-172 rollback
+            // row; a retryable sink fault is not a strategy denial.
+            match port.rollback(delivery, &reservation, &reason).await {
                 Ok(()) => NewsAiGovernedDeliveryOutcome::SinkError {
                     delivery_identity_sha256: identity,
                     reason,
@@ -1571,7 +2149,7 @@ async fn rollback_or_failure<P>(
 where
     P: NewsAiGovernedDeliveryPort + ?Sized,
 {
-    match port.rollback(delivery, reservation).await {
+    match port.rollback(delivery, reservation, "").await {
         Ok(()) => NewsAiGovernedDeliveryOutcome::Deduped {
             delivery_identity_sha256: identity,
         },
@@ -1613,7 +2191,47 @@ impl NewsAIAnalyzer {
         Self { provider }
     }
 
+    pub fn identity_profile(&self) -> Result<NewsAiAnalysisProfile, NewsAiError> {
+        NewsAiAnalysisProfile::for_configured_model(self.provider.name(), self.provider.model())
+    }
+
+    /// Pre-call barrier: retained identity skips both market acquisition and
+    /// the model. The repository callback must validate the retained audit;
+    /// lookup failure is not a cache miss. All phases receive the same identity.
+    pub async fn assess_if_absent<L, LF, P, PF>(
+        &self,
+        identity: NewsAiIdentityV3,
+        lookup: L,
+        prepare: P,
+    ) -> Result<Option<(NewsAiRequest, NewsAiAssessment)>, String>
+    where
+        L: FnOnce(NewsAiIdentityV3) -> LF,
+        LF: std::future::Future<Output = Result<bool, String>>,
+        P: FnOnce(NewsAiIdentityV3) -> PF,
+        PF: std::future::Future<Output = Result<NewsAiRequest, String>>,
+    {
+        if identity.profile != self.identity_profile().map_err(|e| e.to_string())? {
+            return Err("candidate profile differs from configured provider".to_owned());
+        }
+        if lookup(identity.clone()).await? {
+            return Ok(None);
+        }
+        let request = prepare(identity.clone()).await?;
+        if request.business_identity() != Some(&identity) {
+            return Err("prepared request changed the pre-call identity".to_owned());
+        }
+        let assessment = self.assess(&request).await.map_err(|e| e.to_string())?;
+        Ok(Some((request, assessment)))
+    }
+
     pub async fn assess(&self, request: &NewsAiRequest) -> Result<NewsAiAssessment, NewsAiError> {
+        if let Some(identity) = request.business_identity() {
+            if identity.profile != self.identity_profile()? {
+                return Err(NewsAiError::ModelUnavailable(
+                    "request profile differs from qualified configured provider".to_owned(),
+                ));
+            }
+        }
         let completed = tokio::time::timeout(
             std::time::Duration::from_secs(MODEL_CALL_TIMEOUT_SECONDS),
             self.provider
@@ -2006,6 +2624,7 @@ fn build_normalized_prompt(
     market: &NewsMarketSnapshot,
     metrics: &[OptionalNewsMetric],
     analysis_version: &str,
+    chain: &NewsAiChainContext,
 ) -> Result<String, NewsAiError> {
     let mut available = BTreeMap::new();
     let mut unavailable = BTreeMap::new();
@@ -2058,6 +2677,15 @@ fn build_normalized_prompt(
             "average_volume_20d": market.metrics.average_volume_20d,
             "quote": quote,
         },
+        "chain_context": {
+            "mainline_concept": chain.mainline_concept,
+            "mainline_cluster_size": chain.mainline_cluster_size,
+            "mainline_date": chain.mainline_date,
+            "mainline_streak_days": chain.mainline_streak_days,
+            "board_name": chain.board_name,
+            "note": "target's latest limit-up mainline cluster and official board \
+                     affiliation, when available; missing fields must not be inferred"
+        },
         "available_optional_metrics": available,
         "unavailable_optional_metrics": unavailable,
         "required_output_schema": {
@@ -2081,6 +2709,7 @@ fn hash_request_evidence(
     market: &NewsMarketSnapshot,
     metrics: &[OptionalNewsMetric],
     analysis_version: &str,
+    chain: &NewsAiChainContext,
 ) -> String {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, fact.target_code());
@@ -2185,11 +2814,30 @@ fn hash_request_evidence(
             }
         }
     }
+    // BR-249: 产业链上下文进入证据哈希（审计完整性），但不进 assessment
+    // identity（dedup key 保持稳定，链数据变化不触发同快讯重评）。
+    // ⚠️ 时效性说明：该哈希是评估时刻的链状态快照（评估后 chain_daily
+    // 更新不会重算），input_evidence_sha256/normalized_prompt_sha256 不能从
+    // 当前链状态重算；持久化重建路径不重验哈希（chain: None 如实标注）。
+    hash_field(&mut hasher, chain.mainline_concept.as_deref().unwrap_or(""));
+    hash_field(
+        &mut hasher,
+        &chain.mainline_cluster_size.unwrap_or(0).to_string(),
+    );
+    hash_field(&mut hasher, chain.mainline_date.as_deref().unwrap_or(""));
+    hash_field(
+        &mut hasher,
+        &chain.mainline_streak_days.unwrap_or(0).to_string(),
+    );
+    hash_field(&mut hasher, chain.board_name.as_deref().unwrap_or(""));
     format!("{:x}", hasher.finalize())
 }
 
 fn assessment_identity(request: &NewsAiRequest) -> String {
-    assessment_identity_for_fact(request.fact(), request.analysis_version())
+    request
+        .business_identity()
+        .map(NewsAiIdentityV3::digest)
+        .unwrap_or_else(|| assessment_identity_for_fact(request.fact(), request.analysis_version()))
 }
 
 fn assessment_identity_for_fact(fact: &AdmittedNewsFact, analysis_version: &str) -> String {
@@ -2286,7 +2934,6 @@ fn nonempty_optional(value: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-#[cfg(feature = "magic-gateway")]
 mod tests {
     use super::*;
     use crate::data_gateway::historical_bars::AdmittedDailyBars;
@@ -2704,8 +3351,126 @@ mod tests {
                 },
             }],
             "TEST_CODE_news_ai_v1",
+            NewsAiChainContext::default(),
         )
         .expect("TEST_CODE request")
+    }
+
+    #[test]
+    fn v3_business_identity_is_independent_of_batch_evidence() {
+        let first = request();
+        let mut next = first.clone();
+        next.fact.batch.batch_id = "TEST_CODE_NEW_BATCH".to_owned();
+        next.fact = next
+            .fact
+            .with_target_name("TEST_CODE display only".to_owned());
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        assert_eq!(
+            NewsAiIdentityV3::from_fact(first.fact(), &profile)
+                .unwrap()
+                .digest(),
+            NewsAiIdentityV3::from_fact(next.fact(), &profile)
+                .unwrap()
+                .digest()
+        );
+    }
+
+    #[test]
+    fn v3_identity_distinguishes_raw_text_and_each_contract_version() {
+        let original = request();
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        let base = NewsAiIdentityV3::from_fact(original.fact(), &profile).unwrap();
+        for field in ["title", "summary", "content"] {
+            let mut fact = original.fact().clone();
+            let AdmittedNewsSourceRecord::Global(record) = &mut fact.record else {
+                unreachable!()
+            };
+            match field {
+                "title" => record.title.push(' '),
+                "summary" => record.summary = Some("TEST_CODE revised summary".to_owned()),
+                _ => record.content = Some(String::new()), // absent != present empty
+            }
+            assert_ne!(
+                base.digest(),
+                NewsAiIdentityV3::from_fact(&fact, &profile)
+                    .unwrap()
+                    .digest(),
+                "{field}"
+            );
+        }
+        for field in ["analysis", "prompt", "model", "profile", "data"] {
+            let mut changed = profile.clone();
+            match field {
+                "analysis" => changed.analysis_version.push_str("_next"),
+                "prompt" => changed.prompt_contract.push_str("_next"),
+                "model" => changed.configured_model.push_str("_next"),
+                "profile" => changed.model_profile_revision.push_str("_next"),
+                _ => changed.data_contract_version.push_str("_next"),
+            }
+            assert_ne!(
+                base.digest(),
+                NewsAiIdentityV3::from_fact(original.fact(), &changed)
+                    .unwrap()
+                    .digest(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_recovery_codec_is_canonical_versioned_and_source_bound() {
+        let original = request();
+        let profile =
+            NewsAiAnalysisProfile::for_configured_model("TEST_CODE_provider", "TEST_CODE_model")
+                .unwrap();
+        let identity = NewsAiIdentityV3::from_fact(original.fact(), &profile).unwrap();
+        let encoded = identity.encode_recovery(original.fact()).unwrap();
+        let (decoded, fact) = NewsAiIdentityV3::decode_recovery(&encoded).unwrap();
+        assert_eq!(decoded, identity);
+        assert_eq!(
+            fact.recovery_snapshot_canonical().unwrap(),
+            original.fact().recovery_snapshot_canonical().unwrap()
+        );
+        let mut envelope: NewsAiRecoveryEnvelopeV3 = serde_json::from_slice(&encoded).unwrap();
+        envelope.identity_version = 4;
+        assert!(
+            NewsAiIdentityV3::decode_recovery(&serde_json::to_vec(&envelope).unwrap()).is_err()
+        );
+        envelope.identity_version = 3;
+        envelope.identity.item_id.push_str("_other");
+        assert!(
+            NewsAiIdentityV3::decode_recovery(&serde_json::to_vec(&envelope).unwrap()).is_err()
+        );
+        assert!(NewsAiIdentityV3::decode_recovery(&[encoded, b" ".to_vec()].concat()).is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_configured_profile_is_not_replaced_by_actual_response_model() {
+        let analyzer = NewsAIAnalyzer::new(Arc::new(ReceiptProvider {
+            raw_response: r#"{"impact":"positive","confidence":82,"uncertainty":"TEST_CODE uncertainty","core_logic":"TEST_CODE evidence"}"#.to_owned(),
+        }));
+        let old = request();
+        let identity =
+            NewsAiIdentityV3::from_fact(old.fact(), &analyzer.identity_profile().unwrap()).unwrap();
+        let request = NewsAiRequest::try_new_v3(
+            old.fact().clone(),
+            old.market().clone(),
+            vec![],
+            identity.clone(),
+            NewsAiChainContext::default(),
+        )
+        .unwrap();
+        let assessment = analyzer.assess(&request).await.unwrap();
+        assert_eq!(assessment.assessment_id(), identity.digest());
+        assert_eq!(
+            identity.profile.configured_model,
+            "TEST_CODE_configured_model"
+        );
+        assert_eq!(assessment.receipt().model(), "TEST_CODE_upstream_model");
     }
 
     #[test]
@@ -2720,6 +3485,138 @@ mod tests {
         assert_eq!(fact.item_id(), "TEST_CODE_NEWS_ITEM");
         assert_eq!(fact.source_batch_id(), "TEST_CODE_NEWS_BATCH");
         assert_eq!(fact.target_code(), "TEST_CODE_600519");
+        assert_eq!(fact.target_name(), None, "BR-250 构造缺省无名称");
+    }
+
+    #[test]
+    fn br172_recovery_snapshot_reconstructs_fact_without_live_batch() {
+        let observed_at = instant("2026-07-27T01:00:03Z");
+        let fact = AdmittedNewsFact::from_global(
+            &global_record(observed_at),
+            &news_batch(observed_at),
+            "TEST_CODE_600519",
+        )
+        .expect("exact evidence must be admitted")
+        .with_target_name("TEST_CODE_名称".to_owned());
+
+        let snapshot = fact
+            .recovery_snapshot_canonical()
+            .expect("freeze admitted fact for recovery");
+        let recovered = AdmittedNewsFact::from_recovery_snapshot(&snapshot)
+            .expect("reconstruct admitted fact without a live provider batch");
+
+        assert_eq!(recovered.provider(), fact.provider());
+        assert_eq!(recovered.source(), fact.source());
+        assert_eq!(recovered.source_batch_id(), fact.source_batch_id());
+        assert_eq!(recovered.item_id(), fact.item_id());
+        assert_eq!(recovered.target_code(), fact.target_code());
+        assert_eq!(recovered.target_name(), fact.target_name());
+        assert_eq!(recovered.title(), fact.title());
+        assert_eq!(recovered.summary(), fact.summary());
+        assert_eq!(recovered.content(), fact.content());
+        assert_eq!(recovered.published_at(), fact.published_at());
+        assert_eq!(recovered.observed_at(), fact.observed_at());
+        assert_eq!(
+            recovered
+                .recovery_snapshot_canonical()
+                .expect("re-freeze recovered fact"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn br250_target_name_is_display_only_and_does_not_change_identity() {
+        let observed_at = instant("2026-07-27T01:00:03Z");
+        let fact = AdmittedNewsFact::from_global(
+            &global_record(observed_at),
+            &news_batch(observed_at),
+            "TEST_CODE_600519",
+        )
+        .expect("exact evidence must be admitted");
+        let named = fact.clone().with_target_name("TEST_CODE_名称".to_owned());
+        assert_eq!(named.target_name(), Some("TEST_CODE_名称"));
+        // BR-250 幂等红线: 名称仅渲染用, 不得进入投递身份哈希。
+        assert_eq!(
+            NewsAiDeliveryIdentity::from_fact(&fact, "TEST_CODE_news_ai_v1").sha256(),
+            NewsAiDeliveryIdentity::from_fact(&named, "TEST_CODE_news_ai_v1").sha256(),
+            "target_name 改变投递身份 = dedup 幂等被破坏"
+        );
+    }
+
+    #[test]
+    fn br250_target_name_renders_name_with_code_and_absent_falls_back_to_code_only() {
+        let observed_at = instant("2026-07-27T01:00:03Z");
+        let as_of = observed_at;
+        let named_request = NewsAiRequest::try_new(
+            AdmittedNewsFact::from_global(
+                &global_record(observed_at),
+                &news_batch(observed_at),
+                "TEST_CODE_600519",
+            )
+            .expect("TEST_CODE admitted fact")
+            .with_target_name("TEST_CODE_名称".to_owned()),
+            post_close_snapshot(as_of),
+            vec![],
+            "TEST_CODE_news_ai_v1",
+            NewsAiChainContext::default(),
+        )
+        .expect("TEST_CODE named request");
+        let response = r#"{
+            "impact":"positive",
+            "confidence":70,
+            "uncertainty":"TEST_CODE 尚需核对",
+            "core_logic":"TEST_CODE 合同可能提升收入"
+        }"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            named_request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&named_request, response, Some(receipt)).unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            named_request,
+            assessment,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let card = audited.delivery().render_card();
+        assert!(
+            card.contains("标的：TEST_CODE_名称（TEST_CODE_600519）"),
+            "BR-250 注入名称后卡片应为「名称（代码）」, 实际: {card}"
+        );
+
+        // 持久化恢复路径: 名称缺省 None → 降级仅代码。
+        let bare_request = request();
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            bare_request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&bare_request, response, Some(receipt)).unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            bare_request,
+            assessment,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        let bare_card = audited.delivery().render_card();
+        assert!(
+            bare_card.contains("标的：TEST_CODE_600519"),
+            "BR-250 名称缺失应降级为仅代码, 实际: {bare_card}"
+        );
+        assert!(!bare_card.contains("（TEST_CODE_600519）"));
     }
 
     #[test]
@@ -3051,6 +3948,7 @@ mod tests {
             &self,
             _delivery: &GovernedNewsAiDelivery,
             _reservation: &NewsAiDeliveryReservation,
+            _reason: &str,
         ) -> Result<(), String> {
             self.actions.lock().unwrap().push("rollback");
             Ok(())
@@ -3178,6 +4076,7 @@ mod tests {
             &self,
             _delivery: &GovernedNewsAiDelivery,
             _reservation: &NewsAiDeliveryReservation,
+            _reason: &str,
         ) -> Result<(), String> {
             Err("TEST_CODE_LINK_RECOVERY_MUST_NOT_ROLLBACK".to_owned())
         }
@@ -3224,6 +4123,152 @@ mod tests {
         assert_eq!(
             port.commit_calls.load(std::sync::atomic::Ordering::SeqCst),
             2
+        );
+    }
+
+    /// 2026-09-22: counted 准入拒绝时 BR-172 必须正确收口。
+    ///
+    /// NewsAI 分析卡接入 counted 准入层后, 预算满 / 冷却头 / launch gate
+    /// 拒绝会以 `NewsAiPhysicalPushOutcome::Denied` 从 port 返回 (见
+    /// `ProductionNewsAiDeliveryPort::push` 对
+    /// `NewsAiNotifyOutcome::AdmissionDenied` 的映射)。BR-172 仍处于
+    /// Reserved，深状态机必须 rollback 收口，也不得 commit 预测链。
+    /// 卡片从未交给 sink, 因此也没有重发资格问题。
+    #[tokio::test]
+    async fn br172_counted_admission_denial_rolls_back_and_never_commits() {
+        struct AdmissionDeniedPort {
+            actions: std::sync::Mutex<Vec<&'static str>>,
+            rollback_reason: std::sync::Mutex<Option<String>>,
+            push_outcome: NewsAiPhysicalPushOutcome,
+        }
+
+        impl AdmissionDeniedPort {
+            fn new(push_outcome: NewsAiPhysicalPushOutcome) -> Self {
+                Self {
+                    actions: std::sync::Mutex::new(Vec::new()),
+                    rollback_reason: std::sync::Mutex::new(None),
+                    push_outcome,
+                }
+            }
+        }
+
+        #[async_trait]
+        impl NewsAiGovernedDeliveryPort for AdmissionDeniedPort {
+            async fn reserve(
+                &self,
+                delivery: &GovernedNewsAiDelivery,
+            ) -> Result<NewsAiReserveOutcome, String> {
+                self.actions.lock().unwrap().push("reserve");
+                Ok(NewsAiReserveOutcome::Reserved(
+                    NewsAiDeliveryReservation::try_new(
+                        delivery.identity().sha256(),
+                        "TEST_CODE_RESERVATION_001",
+                    )
+                    .unwrap(),
+                ))
+            }
+
+            async fn push(
+                &self,
+                _delivery: &GovernedNewsAiDelivery,
+                _reservation: &NewsAiDeliveryReservation,
+            ) -> NewsAiPhysicalPushOutcome {
+                self.actions.lock().unwrap().push("push");
+                self.push_outcome.clone()
+            }
+
+            async fn commit(
+                &self,
+                _delivery: &GovernedNewsAiDelivery,
+                _reservation: &NewsAiDeliveryReservation,
+                _delivery_audit: &NewsAiDeliveryAuditReceipt,
+            ) -> Result<NewsAiPredictionLinkReceipt, String> {
+                self.actions.lock().unwrap().push("commit");
+                Err("TEST_CODE_ADMISSION_DENIED_MUST_NOT_COMMIT".to_owned())
+            }
+
+            async fn rollback(
+                &self,
+                _delivery: &GovernedNewsAiDelivery,
+                _reservation: &NewsAiDeliveryReservation,
+                reason: &str,
+            ) -> Result<(), String> {
+                self.actions.lock().unwrap().push("rollback");
+                // F5a: the denial reason must reach the rollback row.
+                self.rollback_reason
+                    .lock()
+                    .unwrap()
+                    .replace(reason.to_owned());
+                Ok(())
+            }
+        }
+
+        let request = request();
+        let response = r#"{
+            "impact":"positive",
+            "confidence":70,
+            "uncertainty":"TEST_CODE 尚需核对",
+            "core_logic":"TEST_CODE 合同可能提升收入"
+        }"#;
+        let receipt = ModelCallReceipt::try_new(
+            "TEST_CODE_model_provider",
+            "TEST_CODE_model",
+            Some("TEST_CODE_request_id"),
+            request.normalized_prompt(),
+            response,
+            instant("2026-07-27T01:00:04Z"),
+            instant("2026-07-27T01:00:05Z"),
+        )
+        .unwrap();
+        let assessment =
+            NewsAiAssessment::from_model_response(&request, response, Some(receipt)).unwrap();
+        let audited = AuditedNewsAiAssessment::try_from_assessment_audit(
+            request,
+            assessment,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let port = AdmissionDeniedPort::new(NewsAiPhysicalPushOutcome::Denied(
+            "daily_budget_full".to_owned(),
+        ));
+
+        let outcome = deliver_governed_news_ai(&audited, &port).await;
+        assert!(
+            matches!(
+                outcome,
+                NewsAiGovernedDeliveryOutcome::Denied { ref reason, .. } if reason == "daily_budget_full"
+            ),
+            "counted 准入拒绝必须收敛为 Denied, got {outcome:?}"
+        );
+        assert_eq!(
+            *port.actions.lock().unwrap(),
+            vec!["reserve", "push", "rollback"],
+            "准入拒绝必须 rollback 收口且绝不 commit 预测链"
+        );
+        // F5a: 深状态机必须把真实拒绝原因交给 rollback (而不是只留一个
+        // 无语义的常量), 否则账本无法回答"为什么被拒"。
+        assert_eq!(
+            port.rollback_reason.lock().unwrap().as_deref(),
+            Some("daily_budget_full"),
+            "rollback 必须携带真实 Denied reason"
+        );
+
+        let port = AdmissionDeniedPort::new(NewsAiPhysicalPushOutcome::SinkError(
+            "presentation_token_unavailable".to_owned(),
+        ));
+        let outcome = deliver_governed_news_ai(&audited, &port).await;
+        assert!(matches!(
+            outcome,
+            NewsAiGovernedDeliveryOutcome::SinkError { ref reason, .. }
+                if reason == "presentation_token_unavailable"
+        ));
+        assert_eq!(
+            *port.actions.lock().unwrap(),
+            vec!["reserve", "push", "rollback"]
+        );
+        assert_eq!(
+            port.rollback_reason.lock().unwrap().as_deref(),
+            Some("presentation_token_unavailable")
         );
     }
 
