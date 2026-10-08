@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stockanalysis.prediction-verify</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/bin/daily_prediction_verify.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>21</integer>
+        <key>Minute</key><integer>17</integer>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/prediction-verify.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/prediction-verify.stderr.log</string>
+</dict>
+</plist>
