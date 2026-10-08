@@ -20,7 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[backfill] days={days} 已弃用：本次扫描所有 target_date 不晚于最近已完成上海交易日的 pending 行，不受 7/14 日窗口限制");
     }
     let path = std::env::var("STOCK_DB").ok().map(std::path::PathBuf::from);
-    DatabaseManager::init(path)?;
+    // 与生产 monitor 同一 retained 作用域：全量 init 会对数百万行审计链重算哈希，
+    // 预测回填只写业务表，不需要 platform Unit 存储资格。
+    DatabaseManager::init_retained_monitor(path)?;
     let report = run_on_at(DatabaseManager::get(), prediction::shanghai_now())?;
     println!("[backfill] 已完成交易日到期验证: {report:?}");
     if !report.errors.is_empty() {
