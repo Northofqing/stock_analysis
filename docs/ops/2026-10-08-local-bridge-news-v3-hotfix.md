@@ -34,3 +34,15 @@ Desktop 外构建根 `/Users/zhangzhen/.local/share/stock-analysis-bridge-v3-hot
 11:02:08 对上线前原始键集合逐行回读：评估 1,357、评估链 1,357、投递事件 3,861、投递事件链 3,861、投递卡片 417、恢复快照 174 条，六表原有行及精确行哈希全部保持一致；允许运行期间正常追加新审计记录。正式 monitor PID、源码/配置输入、制品、activation 与两库文件身份再次保持原版。最终回执为证据根的 `final-deployment-receipt.json`。
 
 证据根：`/Users/zhangzhen/.local/share/stock-analysis-bridge-v3-hotfix-20261008`。后续发布即使 LocalBridge 协议未改，也需针对现有数据库 codec 验证独立桥接制品的启动兼容性。
+
+## 用户反馈未收到飞书：后续核对
+
+前文 11:02 回读仅为当时的桥接及行情接纳证据，没有验证用户客户端收消息。用户随后明确反馈飞书未收到信息。11:41 健康回读已为 `Frozen/Unsafe`，缺 Quote、Kline、MoneyFlow、News、OrderBook；不能沿用前一快照宣称持续恢复。
+
+通过真实飞书 OpenAPI 只读回读，11:05:49 的 DataMode 与 11:31:18 的 NewsFlashAggregated 消息均存在、未删除，目标匹配现配置的 Stock 机器人私聊。DataMode 三条当日 counted 记录的远端正文与原始 UTF-8 envelope 字节完全一致；反复打印同一 Delivered observer 是历史终态读回，不能算新发送。最新模式通知及聚合消息均查询到一名已读用户，但这不等同于当前用户客户端收到提醒，也不证明此会话符合其预期。没有改收件人、手动发送测试消息或重放旧投递。
+
+独立真实 mTLS/Bearer Health 在 11:47:53 确认：生产 endpoint `127.0.0.1:50052` 与 Windows `10.211.55.3:50051` 均返回新版本 source `841e4ae7a9df62be0c4536fa9009c66089d282bf`、descriptor `abf28a3e0028488a7579da4d961e1a7c1408482bdc0500122c1956d225e480cf`、binary `7407a03b744dc4a0040257c5c8de4cef49ec283d5ddc3529fe4506ef04832a4f`。现 Mac monitor 的编译信任仍为原 `4e4995f8`/`0c448554…`/`517e0b4c…`，新 ExternalV1 新闻和证券身份请求被 `external_connection_unqualified` 拒绝；独立 fresh probe 也拒绝不匹配的 Health。50052 可实际转发，不因 lsof 无本地监听而推断端点离线。
+
+读取另一 Windows 任务“评估项目数据准确性”的直接用户请求“用最新代码 编译重启”，确认新版上游升级得到用户授权。故障是两端版本未协调，不能称为未经授权的候选抢占。Windows 任务“R08 FuturesDelivery 上游合同与部署”已收到精确元组与更正上下文，正在提供新版公开合同及精确绑定。用户随后明确要求保留最新 Windows gRPC 服务，并在 Mac 最新主线修改接收端；后续开发按该方向推进，不回退 Windows。本节核对时尚未变更正式服务、编译信任或 activation。SDK 的原 CI 关键覆盖率 89.40%/95% 缺口仍保留，不以 Health 或本机测试代替原门禁通过。
+
+后续只读证据根 `/Users/zhangzhen/.local/share/stock-analysis-feishu-readback-20261008`，包含 `feishu-platform-readback.json`、`endpoint-diagnosis.json` 和 fresh probe 日志。源数据资格、跨端兼容及用户预期会话仍待闭合。
