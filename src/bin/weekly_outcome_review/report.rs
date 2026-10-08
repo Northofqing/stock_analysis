@@ -303,12 +303,14 @@ fn classify(
     };
     let result = (|| -> Result<(String, Option<f64>, Option<bool>), String> {
         let start = canonical_date(&row.pred_date)?;
+        // Attribution follows the valid original prediction date even when
+        // another original field is bad. Such rows remain weekly invalids.
+        window.weekly_origin = period.includes(start);
         let frozen = canonical_date(&row.target_date)?;
         if row.id <= 0 || frozen < start {
             return Err("invalid original row identity/target".into());
         }
         expected_hit(&row.direction, 0.)?;
-        window.weekly_origin = period.includes(start);
         let mut dates = vec![start];
         for _ in 0..n {
             dates.push(verified_next_a_share_trading_day(*dates.last().unwrap())?);
@@ -565,6 +567,11 @@ pub struct RawExit {
     pub terminal_at_shanghai: NaiveDateTime,
 }
 #[derive(Debug, Serialize)]
+pub struct FutureTimestamp {
+    pub row_id: i64,
+    pub recorded_at_shanghai: NaiveDateTime,
+}
+#[derive(Debug, Serialize)]
 pub struct RawPaper {
     pub historical_filled_rows: usize,
     pub latest_filled_utc: Option<String>,
@@ -572,6 +579,8 @@ pub struct RawPaper {
     pub weekly_not_filled_reasons: BTreeMap<String, usize>,
     pub weekly_sell_rows: Vec<RawExit>,
     pub malformed_timestamp_rows: usize,
+    pub future_timestamp_rows: usize,
+    pub future_timestamps: Vec<FutureTimestamp>,
     pub meaning: &'static str,
 }
 fn raw_paper(db: &DatabaseManager, period: &Period) -> Result<RawPaper, String> {
@@ -579,8 +588,8 @@ fn raw_paper(db: &DatabaseManager, period: &Period) -> Result<RawPaper, String> 
     bounded(&mut conn, "paper_trades", MAX_ROWS)?;
     let rows=diesel::sql_query("SELECT id,code,direction,status,not_fill_reason,virtual_reason,CAST(ts AS TEXT) AS ts,CAST(updated_at AS TEXT) AS updated_at FROM paper_trades ORDER BY id")
         .load::<PaperRow>(&mut conn).map_err(|e|e.to_string())?;
-    let mut result=RawPaper { historical_filled_rows:0,latest_filled_utc:None,weekly_states:BTreeMap::new(),weekly_not_filled_reasons:BTreeMap::new(),weekly_sell_rows:Vec::new(),malformed_timestamp_rows:0,
-        meaning:"raw row diagnostics only; Filled is not verified execution, net return, physical delivery, or a win-rate denominator" };
+    let mut result=RawPaper { historical_filled_rows:0,latest_filled_utc:None,weekly_states:BTreeMap::new(),weekly_not_filled_reasons:BTreeMap::new(),weekly_sell_rows:Vec::new(),malformed_timestamp_rows:0,future_timestamp_rows:0,future_timestamps:Vec::new(),
+        meaning:"whole-input-snapshot raw Filled/latest diagnostics include future rows and are not as of observed_at; weekly facts exclude future timestamps; Filled is not verified execution, net return, physical delivery, or a win-rate denominator" };
     for row in rows {
         if row.status == "Filled" {
             result.historical_filled_rows += 1;
@@ -607,6 +616,14 @@ fn raw_paper(db: &DatabaseManager, period: &Period) -> Result<RawPaper, String> 
                 continue;
             }
         };
+        if at > period.observed_at.naive_local() {
+            result.future_timestamp_rows += 1;
+            result.future_timestamps.push(FutureTimestamp {
+                row_id: row.id,
+                recorded_at_shanghai: at,
+            });
+            continue;
+        }
         if !period.includes(at.date()) {
             continue;
         }
@@ -636,6 +653,8 @@ fn raw_paper(db: &DatabaseManager, period: &Period) -> Result<RawPaper, String> 
 }
 #[derive(QueryableByName)]
 struct AuditRow {
+    #[diesel(sql_type=BigInt)]
+    id: i64,
     #[diesel(sql_type=Text)]
     source: String,
     #[diesel(sql_type=Text)]
@@ -652,11 +671,13 @@ pub struct OrderAttempts {
     pub source_side_outcomes: BTreeMap<String, usize>,
     pub failure_reasons: BTreeMap<String, usize>,
     pub malformed_timestamp_rows: usize,
+    pub future_timestamp_rows: usize,
+    pub future_timestamps: Vec<FutureTimestamp>,
 }
 fn attempts(db: &DatabaseManager, period: &Period) -> Result<OrderAttempts, String> {
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     bounded(&mut conn, "order_audit", MAX_ROWS)?;
-    let rows=diesel::sql_query("SELECT source,side,outcome,failure_reason,CAST(created_at AS TEXT) AS created_at FROM order_audit ORDER BY id")
+    let rows=diesel::sql_query("SELECT id,source,side,outcome,failure_reason,CAST(created_at AS TEXT) AS created_at FROM order_audit ORDER BY id")
         .load::<AuditRow>(&mut conn).map_err(|e|e.to_string())?;
     let mut result = OrderAttempts::default();
     for row in rows {
@@ -667,6 +688,14 @@ fn attempts(db: &DatabaseManager, period: &Period) -> Result<OrderAttempts, Stri
                 continue;
             }
         };
+        if at > period.observed_at.naive_local() {
+            result.future_timestamp_rows += 1;
+            result.future_timestamps.push(FutureTimestamp {
+                row_id: row.id,
+                recorded_at_shanghai: at,
+            });
+            continue;
+        }
         if !period.includes(at.date()) {
             continue;
         }
@@ -717,17 +746,21 @@ fn verified_paper(db: &DatabaseManager, period: &Period) -> Result<VerifiedPaper
         query_effective_fills_through_from_database_typed(db, period.period_completed_through)
             .map_err(|e| e.to_string())?;
     let rows = effective.rows().map_err(|e| e.to_string())?;
-    let costs = effective.costs().map_err(|e| e.to_string())?;
-    let economics = report_from_effective(&effective)?;
     let mut period_ids = BTreeSet::new();
     for row in rows {
-        let date = NaiveDateTime::parse_from_str(&row.occurred_at, "%Y-%m-%d %H:%M:%S%.f")
-            .map_err(|e| e.to_string())?
-            .date();
-        if period.includes(date) {
+        let at = NaiveDateTime::parse_from_str(&row.occurred_at, "%Y-%m-%d %H:%M:%S%.f")
+            .map_err(|e| e.to_string())?;
+        // The existing effective capability is day-granularity and verifies the
+        // full ledger. Never manufacture an intraday subset of economic facts.
+        if at > period.observed_at.naive_local() {
+            return Err(format!("future_effective_fill row={} occurred_at_shanghai={} exceeds observed_at={}; reliable paper unavailable, day-granularity effective ledger is not truncated", row.id, at, period.observed_at));
+        }
+        if period.includes(at.date()) {
             period_ids.insert(row.id);
         }
     }
+    let costs = effective.costs().map_err(|e| e.to_string())?;
+    let economics = report_from_effective(&effective)?;
     let mut exits = Vec::new();
     for position in economics
         .closed_positions
@@ -783,6 +816,7 @@ pub struct Review {
     pub report_version: &'static str,
     pub input_source: Option<InputSource>,
     pub period: Period,
+    pub source_extent_boundary: &'static str,
     pub daily_bars: ReadState<SourceExtent>,
     pub independent_daily_status: ReadState<SourceExtent>,
     pub predictions: ReadState<Predictions>,
@@ -821,7 +855,9 @@ pub fn read(db: &DatabaseManager, period: Period) -> Review {
     }
     actions.push("Monitor：在已完成交易日核对真实接纳/失败/恢复及原未成交/退出原因；休市无新增原行不能证明恢复。".into());
     actions.push("根据描述性原事实复核下周动作；不自动调整策略、预算、实验或投递。".into());
-    Review {report_version:"H16-descriptive-weekly-v1",input_source:None,period,daily_bars,independent_daily_status,predictions,raw_paper,original_order_attempts,verified_paper,
+    Review {report_version:"H16-descriptive-weekly-v1",input_source:None,period,
+        source_extent_boundary:"Raw table row counts and readability do not establish independent qualification; kline-inferred status and OHLC cannot certify lifecycle, historical availability or PIT.",
+        daily_bars,independent_daily_status,predictions,raw_paper,original_order_attempts,verified_paper,
         physical_delivery:ReadState::unavailable("no independent durable database/card-to-row receipt read supplied; candidate rows, raw outcomes and paper fills are not physical message delivery denominators"),
         next_week_actions:actions,interpretation:"Descriptive snapshot review, not preregistration, causal validation, strategy promotion, historical PIT certification, funding authority or a delivery completion receipt."}
 }
@@ -848,10 +884,10 @@ impl Review {
                 text.push_str(&format!("\n原来源标签（wrapper/操作人提供）：`{}`；CLI 不另行打开原来源，不据此签发资格。\n",escape(label)));
             }
         }
-        text.push_str("\n## 事实与资格\n\n| 项目 | 观察 |\n| --- | --- |\n");
+        text.push_str("\n## 事实与资格\n\n以下仅为原表行数/可读性，不等于独立资格；从日线推断的状态与 OHLC 不能证实生命周期或历史可用时刻/PIT。\n\n| 项目 | 原表观察（未核验资格） |\n| --- | --- |\n");
         for (name, section) in [
-            ("日线", &self.daily_bars),
-            ("独立逐日状态", &self.independent_daily_status),
+            ("日线表原始行", &self.daily_bars),
+            ("状态表原始行（未核验资格）", &self.independent_daily_status),
         ] {
             let value = section
                 .value
@@ -934,7 +970,7 @@ impl Review {
         }
         text.push_str("\n## Paper 原记录、未成交与退出\n");
         if let Some(raw) = &self.raw_paper.value {
-            text.push_str(&format!("\n历史原 Filled：{}行；最后 UTC 时间 {}。原 Filled 总数不能作可靠胜率或可成交净收益分母。\n\n本期状态原行：{:?}；未成交原因：{:?}；无法归入日期的坏时间原行：{}。无本期记录时执行率/收益不可用，不归因于用户未执行。\n",raw.historical_filled_rows,raw.latest_filled_utc.as_deref().unwrap_or("无合格时间原行"),raw.weekly_states,raw.weekly_not_filled_reasons,raw.malformed_timestamp_rows));
+            text.push_str(&format!("\n快照全量原 Filled：{}行；全量最后 UTC 时间 {}（含未来原行，非截至观察时刻）。原 Filled 总数不能作可靠胜率或可成交净收益分母。\n\n本期状态原行：{:?}；未成交原因：{:?}；无法归入日期的坏时间原行：{}；快照全量未来时间原行：{}（原 row ID/上海时间见 JSON，不进入本期状态或退出）。无本期记录时执行率/收益不可用，不归因于用户未执行。\n",raw.historical_filled_rows,raw.latest_filled_utc.as_deref().unwrap_or("无合格时间原行"),raw.weekly_states,raw.weekly_not_filled_reasons,raw.malformed_timestamp_rows,raw.future_timestamp_rows));
             for exit in &raw.weekly_sell_rows {
                 text.push_str(&format!(
                     "\n卖出原行 {} / {} / {} / {} / {}（尚非结算证明）。\n",
@@ -952,7 +988,7 @@ impl Review {
             ));
         }
         if let Some(attempts) = &self.original_order_attempts.value {
-            text.push_str(&format!("\n原 order_audit 尝试（来源 / 方向 / 终态）：{:?}；原失败原因：{:?}；坏时间行：{}。仅报告原审计行，不替代账本/费用校验。\n",attempts.source_side_outcomes,attempts.failure_reasons,attempts.malformed_timestamp_rows));
+            text.push_str(&format!("\n原 order_audit 尝试（来源 / 方向 / 终态）：{:?}；原失败原因：{:?}；坏时间行：{}；快照全量未来时间原行：{}（原 row ID/上海时间见 JSON，不进入本期尝试）。仅报告原审计行，不替代账本/费用校验。\n",attempts.source_side_outcomes,attempts.failure_reasons,attempts.malformed_timestamp_rows,attempts.future_timestamp_rows));
         } else {
             text.push_str(&format!(
                 "\n原尝试审计不可用：{}。\n",

@@ -1,0 +1,12 @@
+{
+  "rust_source_set_sha256": "0a8530b7f969b9738759a6e9671b32bc915e7959b70e44cbaf64a3c8a1d7c0e2",
+  "recipe": "SHA256 of ordered UTF-8 path + NUL + file bytes + NUL for the listed rust files",
+  "rust_file_sha256": {
+    "src/bin/weekly_outcome_review.rs": "3c017072adeae96f421c9b5747a2a2c7d14938d1120f8c42f377170a8a00c055",
+    "src/bin/weekly_outcome_review/report.rs": "3418edcd46552467efd7e8036353137313e7d73d125855e626c1497458d45635",
+    "src/bin/weekly_outcome_review/tests.rs": "05cc187762ee33c4d7717889eeea13c15c2ccd7f36119070b446ffd573802bf8"
+  },
+  "shared_source_baseline": "55d9eca9cca7e5581ee3362661dedc2659349b53 (unchanged in this worktree)",
+  "result": "15 passed, 0 failed, 0.39 seconds; --bin weekly_outcome_review, offline, jobs=2",
+  "python_evidence": "Reuse unchanged wrapper/launcher from 084cf26e0a96ed1c9e63f6a31f7ce94c38feff81; /usr/bin/python3 3.9.6, 8 passed"
+}

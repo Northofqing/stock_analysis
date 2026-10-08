@@ -23,7 +23,7 @@ bash -n scripts/run-weekly-outcome-review.sh
 git diff --cached --check
 ```
 
-结果：CLI 13/13 通过（0.29 秒）；系统 Python 8/8 通过（3.163 秒）；plist、shell 语法及 staged diff 检查通过。保存干净结果 `rust-tests.log` 与 `python-tests.log`。系统解释器为 `/usr/bin/python3` 3.9.6，链接 SQLite 3.51.0；测试通过实际 launcher 调用该解释器和临时 runtime 根，不访问正式 runtime。全部 Cargo 构建限定 bin、offline、jobs=2；仅一次 clone 主 target 到独占 candidate test target，从未原地编译主 target。
+结果：首次 CLI 13/13 通过，独立复审两项 P2 修复后最终 **15/15 通过（0.39 秒）**，详见 `p2-validation.md` 与 `p2-tested-source.json`；系统 Python 8/8 通过（3.163 秒），脚本未变并复用原证据；plist、shell 语法及 staged diff 检查通过。保存干净最终结果 `rust-tests.log` 与原 `python-tests.log`。系统解释器为 `/usr/bin/python3` 3.9.6，链接 SQLite 3.51.0；测试通过实际 launcher 调用该解释器和临时 runtime 根，不访问正式 runtime。全部 Cargo 构建限定 bin、offline、jobs=2；仅一次 clone 主 target 到独占 candidate test target，从未原地编译主 target。
 
 覆盖真实完成日、周初/周末/休市/15:00、76 条旧待验原件、旧 schema 缺列、ObservedOnly、后来缓存独立状态、中间日缺状态、明确停牌、未来/坏证据、原结果矛盾、未记录结果、坏日期/UTC 时间、原未成交原因、累计超卖、现有情景费用、空周期 null、输出拒绝覆盖及 0600。WAL backup 用临时 live DB 验证来源 inode、catalog、main/WAL 字节和原数据保持不变，完整副本包含已提交 WAL 数据。
 

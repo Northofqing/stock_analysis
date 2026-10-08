@@ -110,6 +110,9 @@ fn weekly_later_qualified_snapshot_is_descriptive_and_never_historical_pit() {
     assert_eq!(pred.reliable_prediction_samples.value, None);
     assert!(review.markdown().contains("不能授予历史可用时刻/PIT"));
     let markdown = review.markdown();
+    assert!(markdown.contains("日线表原始行"));
+    assert!(markdown.contains("状态表原始行（未核验资格）"));
+    assert!(markdown.contains("不等于独立资格"));
     assert!(
         markdown.find("| T+5 / 截至本期历史").unwrap()
             < markdown.find("T+1 本周成熟描述性观察").unwrap(),
@@ -161,6 +164,31 @@ fn weekly_ready_but_unrecorded_stays_null_and_invalid_original_dates_are_retaine
             .count(),
         3
     );
+}
+
+#[test]
+fn weekly_invalid_target_direction_or_id_remain_in_original_week() {
+    let review = snapshot(
+        "INSERT INTO prediction_tracker VALUES(1,'2026-09-28','bad-target','TEST_CODE_000001','up',NULL,NULL,NULL,NULL,NULL,NULL); INSERT INTO prediction_tracker VALUES(2,'2026-09-29','2026-09-30','TEST_CODE_000002','bad-direction',NULL,NULL,NULL,NULL,NULL,NULL); INSERT INTO prediction_tracker VALUES(0,'2026-09-30','2026-09-30','TEST_CODE_000003','up',NULL,NULL,NULL,NULL,NULL,NULL);",
+        standard_period(),
+    );
+    let pred = review.predictions.value.unwrap();
+    for horizon in &pred.horizons {
+        assert_eq!(horizon.weekly_origins.rows, 3);
+        assert_eq!(horizon.weekly_origins.invalid, 3);
+        assert_eq!(horizon.history_through_period.invalid, 3);
+    }
+    assert!(pred
+        .windows
+        .iter()
+        .all(|w| w.weekly_origin && w.status == "invalid"));
+    let bad_target = pred
+        .windows
+        .iter()
+        .find(|w| w.prediction_row_id == 1)
+        .unwrap();
+    assert_eq!(bad_target.original_pred_date, "2026-09-28");
+    assert_eq!(bad_target.original_target_date, "bad-target");
 }
 
 #[test]
@@ -277,6 +305,73 @@ fn weekly_nonfill_terminal_time_and_bad_timestamp_do_not_invent_dates() {
 }
 
 #[test]
+fn weekly_same_day_future_paper_and_audit_are_diagnostic_and_block_verified_metrics() {
+    let future_fills = BUY.to_owned() + &SELL.replace("2026-09-29 02:00:00", "2026-09-29 10:00:00");
+    let sql = future_fills.clone()
+        + "INSERT INTO paper_trades VALUES(3,'future-rejection','TEST_CODE_000002','fixture','sell',10,100,'NotFilled',NULL,'future denial','StopLoss','ReduceOnly','Full','2026-09-28 02:00:00','2026-09-29 10:01:00'); INSERT INTO order_audit VALUES(1,'past','PaperTrade','StopLoss','sell','TEST_CODE_000001',10,NULL,100,NULL,'Rejected','past denial','2026-09-29 07:59:00'); INSERT INTO order_audit VALUES(2,'future','PaperTrade','StopLoss','sell','TEST_CODE_000001',10,NULL,100,NULL,'Rejected','future denial','2026-09-29 10:00:00');";
+    let review = snapshot(&sql, period("2026-09-29T16:00:00+08:00"));
+    let raw = review.raw_paper.value.as_ref().unwrap();
+    assert_eq!(raw.weekly_states.get("Filled"), Some(&1));
+    assert!(!raw.weekly_states.contains_key("NotFilled"));
+    assert!(raw.weekly_not_filled_reasons.is_empty());
+    assert!(raw.weekly_sell_rows.is_empty());
+    // Whole-snapshot diagnostics retain originals, including future rows.
+    assert_eq!(raw.historical_filled_rows, 2);
+    assert_eq!(
+        raw.latest_filled_utc.as_deref(),
+        Some("2026-09-29 10:00:00")
+    );
+    let attempts = review.original_order_attempts.value.as_ref().unwrap();
+    assert_eq!(
+        attempts
+            .source_side_outcomes
+            .get("PaperTrade / sell / Rejected"),
+        Some(&1)
+    );
+    assert_eq!(attempts.failure_reasons.get("past denial"), Some(&1));
+    assert!(!attempts.failure_reasons.contains_key("future denial"));
+    let json = serde_json::to_value(&review).unwrap();
+    assert_eq!(json["raw_paper"]["value"]["future_timestamp_rows"], 2);
+    assert_eq!(
+        json["raw_paper"]["value"]["future_timestamps"][0]["row_id"],
+        2
+    );
+    assert_eq!(
+        json["original_order_attempts"]["value"]["future_timestamp_rows"],
+        1
+    );
+    assert_eq!(
+        json["original_order_attempts"]["value"]["future_timestamps"][0]["row_id"],
+        2
+    );
+    // Raw audit diagnostics do not fabricate a valid audit chain. Check the
+    // future effective boundary separately with a valid LegacyNoTerminal set.
+    let paper_review = snapshot(&future_fills, period("2026-09-29T16:00:00+08:00"));
+    assert_eq!(paper_review.verified_paper.status, "unavailable");
+    assert!(
+        paper_review.verified_paper.value.is_none(),
+        "no cost/net metrics from a future effective fact"
+    );
+    assert!(
+        paper_review
+            .verified_paper
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("future_effective_fill"),
+        "{:?}",
+        paper_review.verified_paper.reason
+    );
+    let markdown = review.markdown();
+    assert!(markdown.contains("非截至观察时刻"));
+    assert!(markdown.contains("未来时间原行：2"));
+    assert!(markdown.contains("未来时间原行：1"));
+    assert!(paper_review
+        .markdown()
+        .contains("可靠 paper 样本、费用和净收益保持不可用"));
+}
+
+#[test]
 fn weekly_cli_requires_explicit_scope_and_refuses_output_overwrite() {
     assert!(Args::try_parse_from([
         "weekly",
@@ -389,6 +484,14 @@ fn weekly_cli_creates_machine_report_with_source_identity_and_unavailable_states
         );
     }
     assert_eq!(json["physical_delivery"]["status"], "unavailable");
+    assert!(json["source_extent_boundary"]
+        .as_str()
+        .unwrap()
+        .contains("do not establish independent qualification"));
+    assert!(json["source_extent_boundary"]
+        .as_str()
+        .unwrap()
+        .contains("kline-inferred status and OHLC"));
     assert_eq!(
         json["predictions"]["value"]["reliable_prediction_samples"]["value"],
         serde_json::Value::Null

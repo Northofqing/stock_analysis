@@ -49,14 +49,15 @@ wrapper 的 `--weekly-output-root` 模式按同一上海观察时刻取得当前
 
 | 读段 | 事实与限制 |
 | --- | --- |
+| 原表 extent | 日线表/状态表的全量原始行数与可读性，不等于独立资格。JSON source_extent_boundary 明示从日线推断的状态和 OHLC 不能证实生命周期、历史可用时刻或 PIT；资格仍由逐窗口核验，不将表原行数当合格数 |
 | 交易日 | 使用仓库核验日历及上海 15:00 完成边界，列出实际完成交易日；无交易日不证明恢复 |
-| T+1/3/5 | 保留原 pred_date/target_date，另外计算日历成熟日；分列本周原预测、本周成熟与截至本期历史积压，避免休市周掩盖旧欠数 |
+| T+1/3/5 | 保留原 pred_date/target_date，另外计算日历成熟日；分列本周原预测、本周成熟与截至本期历史积压，避免休市周掩盖旧欠数。有效原 pred_date 决定本周归属，其他坏 target/id/direction 仍计本周 invalid |
 | 原结果对 | 仅为原 `actual_change_tN/hit_tN` 数值对计数，不直接采用旧缓存胜率；半缺、方向矛盾、非有限数或与当前端点不同的记录进入坏记录 |
 | 重新核对观察 | 所有预期交易日均需独立逐日状态，且两端有效日线 close 与原结果一致。缺状态、明示停牌、缺价、未成熟、可核对但尚未记录分别列出，保持 NULL，不回填 |
 | 完整预测资格 | 当前 legacy 读端缺完整窗口、历史 available_at/PIT 等资格，可靠预测样本保持 unavailable/null；后来缓存的状态不授予完整资格。重新核对仅作描述性收盘涨跌观察 |
-| paper 原记录 | 历史原 Filled 总量、本期状态、原未成交原因与卖出原行独立呈现；原 Filled 不作可靠胜率、执行率或可成交净收益分母。Filled 沿原经济读端 ts，NotFilled/Invalidated 使用原终态 updated_at；规范 UTC 转上海，坏时间不补造日期 |
-| 原 order_audit | 按实际 source / side / outcome 分组原尝试与原失败原因；不将缺原记录归因于用户未执行，不以这一原行统计替代审计链/成交校验 |
-| paper effective | 复用现有显式绑定/LegacyRaw 的 effective 与 economic-position 读端，先验证整个原账本。累计超卖等失败让可靠 paper 样本、费用及净收益不可用，保留原原因。无绑定不会制造资金资格；账户摘要不是 scope/seed |
+| paper 原记录 | 快照全量原 Filled 总量/最新时间、本期状态、原未成交原因与卖出原行独立呈现；全量诊断包含未来行，非截至观察时刻。原 Filled 不作可靠胜率、执行率或可成交净收益分母。Filled 沿原经济读端 ts，NotFilled/Invalidated 使用原终态 updated_at；规范 UTC 转上海，坏时间不补造日期。完整上海时间晚于 observed_at 的原行在 future_timestamp_rows/future_timestamps 单列，不进入本期状态/未成交/退出 |
+| 原 order_audit | 按实际 source / side / outcome 分组本期原尝试与原失败原因；完整上海时间晚于 observed_at 的原行在未来诊断单列，不进入本期尝试。未来诊断保留原 row ID/上海时间，Markdown 显示计数。不将缺原记录归因于用户未执行，不以这一原行统计替代审计链/成交校验 |
+| paper effective | 复用现有显式绑定/LegacyRaw 的 effective 与 economic-position 读端，先验证整个原账本。累计超卖等失败让可靠 paper 样本、费用及净收益不可用，保留原原因。现有能力按日截止；任何返回的有效成交时间晚于 observed_at 时，整个可靠 paper unavailable，不在周报中另裁剪经济账本。无绑定不会制造资金资格；账户摘要不是 scope/seed |
 | paper 退出 | 通过完整性检查时，只列本期闭合的完整生命周期，开放周期右删失；有原时间、fill IDs 与退出原因，legacy 缺 terminal 行数单列 |
 | 费用 | 现有 `lot-rates-v1` 最低佣金/印花税情景估算分为本期 fill 成本与本期闭合周期的全部成本。实际结算费用、可成交净收益保持独立 unavailable；无 fill/闭合周期时金额为 null，不能写零收益 |
 | 物理送达 | 本入口未读取独立 durable/card-to-row 回执，物理送达分母始终 unavailable；预测、观察涨幅和 paper 分母不能代替它 |
