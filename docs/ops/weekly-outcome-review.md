@@ -43,7 +43,7 @@ wrapper 的 `--weekly-output-root` 模式按同一上海观察时刻取得当前
 
 读取、CLI 或输出失败保持真实非零，并保存已经完成的原件与 `run-status.json` 的完成列表/失败阶段/退出码；例如 JSON 已完成、Markdown 子程序 exit 23，JSON 保持且周报任务返回 23。失败不会冒称业务恢复，也不会发送消息。完整副本仍在临时目录清理；成功/失败的本地报告版本不清理。30 秒 backup 上限适用于真实库；超时要保留失败并评估，不能跳过边界或改用生产初始化。
 
-最终操作人统一构建并安装普通 CLI 产物；本次开发只验证了限定 CLI 测试目标，尚未验证普通 binary 或正式 runtime。此开发交付不安装 plist、不改正式 runtime、不发送飞书或新建自动化 kind。launcher 显式使用已存在的 `/usr/bin/python3`（本机 3.9.6）；wrapper 保持标准库 3.9 兼容。
+开发切片最初只验证了限定 CLI 测试目标。2026-10-08 后续已统一构建并安装普通 CLI、wrapper 和周五 20:30 plist，正式 runtime 实际只读周报运行一次 exit0，详见 [最终实际发布记录](../handoffs/2026-10-08-retained-scope-closeout-release.md)。周报不发送飞书或增加消息 kind；生产报告成功不证明资格、paper 账本或客户端投递恢复。launcher 显式使用已存在的 `/usr/bin/python3`（本机 3.9.6）；wrapper 保持标准库 3.9 兼容。
 
 ## 口径
 
