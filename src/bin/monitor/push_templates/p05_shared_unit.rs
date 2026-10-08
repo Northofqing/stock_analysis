@@ -20,6 +20,10 @@ use stock_analysis::p05_auction_unit::{
 };
 
 pub(super) async fn initialize_before_window() {
+    if !crate::durable_delivery_runtime::frozen_platform_features_enabled() {
+        log::info!("[P05 Unit] disabled reason=user_scope_frozen; provider/sql/file operations=0");
+        return;
+    }
     if let Err(e) = crate::durable_delivery_runtime::initialize_p05_family_before_window().await {
         log::warn!("[P05 Unit] prospective initialization unavailable: {e}");
     }
@@ -28,6 +32,9 @@ pub(super) async fn initialize_before_window() {
 /// Saved recovery is deliberately independent of the current auction window,
 /// source availability and the market-active waiting loop.
 pub(super) async fn tick(allow_fresh: bool) -> Result<(), String> {
+    if !crate::durable_delivery_runtime::frozen_platform_features_enabled() {
+        return Ok(());
+    }
     let runtime = crate::durable_delivery_runtime::inspect_unfinished_p05_units().await?;
     let restored_dates = recover_saved_with(
         runtime

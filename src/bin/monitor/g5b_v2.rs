@@ -5,6 +5,9 @@ use stock_analysis::monitor::g5b_analysis_v2::G5bAnalysisClaimV2;
 
 /// Returns true only to request the existing no-provider tick backoff.
 pub(crate) async fn run_tick(date: NaiveDate, fresh_window: bool) -> Result<bool, String> {
+    if !runtime::frozen_platform_features_enabled() {
+        return Ok(false);
+    }
     // Current Empty inspection remains first. Its completed/pending route must
     // not hide another real saved NonEmpty date requiring passive recovery.
     let empty = runtime::inspect_g5b_empty_tick_v2(date).await;
@@ -119,6 +122,10 @@ where
 /// Empty initialization failure cannot disable ordinary scanners or NonEmpty
 /// recovery. A legacy head without its original receipt stays Unknown.
 pub(crate) async fn initialize_before_input_writers() {
+    if !runtime::frozen_platform_features_enabled() {
+        log::info!("[g5b] v2 disabled reason=user_scope_frozen; provider/sql/file operations=0");
+        return;
+    }
     match runtime::initialize_g5b_empty_before_input_writers().await {
         Ok(Some(date)) => log::info!("[g5b] prospective zero input observed for {date}"),
         Ok(None) => {}

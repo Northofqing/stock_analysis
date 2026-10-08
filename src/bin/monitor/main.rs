@@ -4456,8 +4456,12 @@ fn install_mode_owned_core_database(test_mode: bool) -> Result<std::path::PathBu
     {
         std::env::set_var("MAGICLAW_DB_PATH", &database_path);
     }
-    stock_analysis::database::DatabaseManager::init(Some(database_path.clone()))
-        .map_err(|error| format!("initialize mode-owned core database: {error}"))?;
+    let initialized = if test_mode {
+        stock_analysis::database::DatabaseManager::init(Some(database_path.clone()))
+    } else {
+        stock_analysis::database::DatabaseManager::init_retained_monitor(Some(database_path.clone()))
+    };
+    initialized.map_err(|error| format!("initialize mode-owned core database: {error}"))?;
     Ok(database_path)
 }
 

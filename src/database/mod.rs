@@ -2843,6 +2843,16 @@ impl DatabaseManager {
     ///
     /// * `db_path` - 数据库文件路径（如果为None，默认使用 "./data/stock.db"）
     pub fn init(db_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+        Self::init_with_scope(db_path, false)
+    }
+
+    /// Existing production monitor keeps the original business store while
+    /// prospective platform Unit storage remains outside the released scope.
+    pub fn init_retained_monitor(db_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+        Self::init_with_scope(db_path, true)
+    }
+
+    fn init_with_scope(db_path: Option<PathBuf>, retained_monitor: bool) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(test)]
         let _init_guard = unit_test_init_lock()
             .lock()
@@ -2873,7 +2883,7 @@ impl DatabaseManager {
             p
         });
 
-        let db = Self::open_at_path(path)?;
+        let db = Self::open_at_path_with_scope(path, retained_monitor)?;
         DB_INSTANCE.set(db).map_err(|_| "数据库已经初始化")?;
         info!("数据库初始化完成");
 
@@ -2984,6 +2994,10 @@ impl DatabaseManager {
     }
 
     fn open_at_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::open_at_path_with_scope(path, false)
+    }
+
+    fn open_at_path_with_scope(path: PathBuf, retained_monitor: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let database_url = path.to_string_lossy().to_string();
         info!("初始化数据库: {}", database_url);
         let phase_started = std::time::Instant::now();
@@ -3034,7 +3048,7 @@ impl DatabaseManager {
             phase_started.elapsed().as_millis()
         );
         let phase_started = std::time::Instant::now();
-        Self::run_migrations(&mut conn)?;
+        Self::run_migrations_with_scope(&mut conn, retained_monitor)?;
         info!(
             "[DB init][timing] phase=migrations elapsed_ms={}",
             phase_started.elapsed().as_millis()
@@ -3560,6 +3574,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
     }
 
     fn run_migrations(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+        Self::run_migrations_with_scope(conn, false)
+    }
+
+    fn run_migrations_with_scope(conn: &mut SqliteConnection, retained_monitor: bool) -> Result<(), Box<dyn std::error::Error>> {
         user_position_snapshot::create_schema(conn).map_err(std::io::Error::other)?;
         user_account_summary::create_schema(conn).map_err(std::io::Error::other)?;
         closing_valuation::create_schema(conn).map_err(std::io::Error::other)?;
@@ -4028,7 +4046,9 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             "CREATE INDEX IF NOT EXISTS ix_pred_date ON prediction_tracker(pred_date)",
         )
         .execute(&mut *conn)?;
-        p05_prediction_freeze::create_schema(conn).map_err(std::io::Error::other)?;
+        if !retained_monitor {
+            p05_prediction_freeze::create_schema(conn).map_err(std::io::Error::other)?;
+        }
 
         // 2026-08-07 BR-192 收尾 (T-07): P-03 候选触发选中决策持久化 —
         // counted binding 的真实证据 (见 record_candidate_trigger 文档)。
@@ -5252,6 +5272,31 @@ mod tests {
     use super::*;
     use crate::models::StockPosition;
     use chrono::NaiveDate;
+
+    #[test]
+    fn retained_monitor_scope_keeps_original_business_tables_without_p05_storage() {
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        for retained in [true, false] {
+            let mut connection = SqliteConnection::establish(":memory:").unwrap();
+            DatabaseManager::run_migrations_with_scope(&mut connection, retained).unwrap();
+            for table in ["paper_trades", "prediction_tracker"] {
+                let count = diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?",
+                ).bind::<diesel::sql_types::Text, _>(table).get_result::<Count>(&mut connection).unwrap().count;
+                assert_eq!(count, 1, "{table}");
+            }
+            for table in ["candidate_board_prediction_freeze_v2", "candidate_board_prediction_member_v2"] {
+                let count = diesel::sql_query(
+                    "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?",
+                ).bind::<diesel::sql_types::Text, _>(table).get_result::<Count>(&mut connection).unwrap().count;
+                assert_eq!(count, i64::from(!retained), "{table}");
+            }
+        }
+    }
 
     #[test]
     fn descriptor_connection_error_classification_is_typed() {

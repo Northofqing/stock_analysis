@@ -20,13 +20,17 @@ fn main() {
     let database_path =
         std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
     std::env::set_var("MAGICLAW_DB_PATH", &database_path);
-    if let Err(error) = stock_analysis::database::DatabaseManager::init(Some(
-        std::path::PathBuf::from(&database_path),
-    )) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = Some(std::path::PathBuf::from(&database_path));
+    let initialized = if args.first().map(String::as_str) == Some("print-activation") {
+        stock_analysis::database::DatabaseManager::init_retained_monitor(path)
+    } else {
+        stock_analysis::database::DatabaseManager::init(path)
+    };
+    if let Err(error) = initialized {
         eprintln!("core 数据库初始化失败 ({database_path}): {error}");
         std::process::exit(1);
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("seal-board") => cmd_seal_board(&args[1..]),
         Some("print-activation") => cmd_print_activation(&args[1..]),

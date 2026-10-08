@@ -145,6 +145,10 @@ pub(super) enum RuntimeNamespace {
 }
 
 impl RuntimeNamespace {
+    pub(super) fn platform_features_enabled(&self) -> bool {
+        matches!(self, Self::Test { .. })
+    }
+
     pub(super) fn label(&self) -> String {
         match self {
             Self::Production => "production".to_owned(),
@@ -1182,6 +1186,12 @@ pub fn validate_runtime_delivery_mode() -> Result<Option<String>, String> {
 
 pub(super) fn current_runtime_namespace() -> Result<RuntimeNamespace, String> {
     resolve_runtime_namespace()
+}
+
+/// No runtime flag can enable frozen platform work in the production store.
+/// Existing isolated platform regressions retain their own Test namespace.
+pub(super) fn frozen_platform_features_enabled() -> bool {
+    current_runtime_namespace().is_ok_and(|namespace| namespace.platform_features_enabled())
 }
 
 fn resolve_runtime_namespace() -> Result<RuntimeNamespace, String> {
@@ -3089,6 +3099,19 @@ mod tests {
             queued_schedule_hydration_ids: Mutex::new(std::collections::BTreeSet::new()),
         });
         (namespace_dir, state)
+    }
+
+    #[test]
+    fn retained_monitor_scope_startup_skips_missing_platform_owner_storage() {
+        let test_code = format!("TEST_CODE_RETAINED_SCOPE_{}", Utc::now().timestamp_nanos_opt().unwrap());
+        let (anchor, state) = replay_state(&test_code);
+        let mut state = Arc::try_unwrap(state).ok().expect("sole isolated state owner");
+        state.namespace = RuntimeNamespace::Production;
+        let connection = rusqlite::Connection::open(anchor.root.join("durable_delivery.sqlite3")).unwrap();
+        connection.execute_batch("DROP TABLE p05_s2_child_owners").unwrap();
+        assert_eq!(p05_unit::resume_owned_p05_at_startup(&state, "TEST_CODE_ORIGINAL_PENDING").unwrap(), None);
+        assert!(!state.namespace.platform_features_enabled());
+        assert!(RuntimeNamespace::Test { test_code }.platform_features_enabled());
     }
 
     #[test]

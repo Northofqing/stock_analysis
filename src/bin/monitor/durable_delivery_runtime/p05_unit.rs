@@ -221,6 +221,9 @@ pub(super) fn resume_owned_p05_at_startup(
     state: &RuntimeState,
     decision_identity: &str,
 ) -> Result<Option<usize>, String> {
+    if !state.namespace.platform_features_enabled() {
+        return Ok(None);
+    }
     let Some(view) =
         P05AuctionUnit::inspect_owned_child(Arc::clone(&state.coordinator), decision_identity)
             .map_err(|e| format!("inspect startup P05 contextual owner: {e}"))?
