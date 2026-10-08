@@ -66,14 +66,14 @@ fn candidate_b7_probe_compiled_policy_public_bytes_null_and_both_descriptor_scop
     .unwrap();
     assert!(formal["deployment_build_identity"].is_null());
     let current = crate::grpc_client::build_identity::compiled_public_inputs().unwrap();
-    assert_eq!(current.bundle_version, "2026-10-01.3");
+    assert_eq!(current.bundle_version, "2026-10-08.1");
     assert_eq!(
         current.policy_sha256,
-        "a7bf22f2693e768349f8e53ec5180bf88128f88992966264377c69ec288c2fa8"
+        "a35bb3a02fcc9d20564cdcfa8a1916ce41549195d237841896e5db6a59803075"
     );
     assert_eq!(
         current.raw_metadata_sha256,
-        "010cfd26409b486ffa655111f27e7847a4b7ae4d844231ca79997d6308d2d36b"
+        "ec307e5f115f9c7772bd8d66e899751fe8480ef6ffd191c152ba3293786f3d93"
     );
 }
 

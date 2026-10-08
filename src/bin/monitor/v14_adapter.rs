@@ -992,6 +992,15 @@ pub fn commit_dedup_for_event(
             "BR-192 counted PushKind::{kind:?} cannot use legacy dedup commit"
         ));
     }
+    commit_dedup_inner(event, kind, sub_kind, cooldown_override_secs)
+}
+
+fn commit_dedup_inner(
+    event: &SignalEvent,
+    kind: PushKind,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
+) -> Result<(), String> {
     let stack = v14_stack()?;
     let source_fact = is_source_fact_signal(kind, event);
     let cooldown = dedup_cooldown(
@@ -1021,6 +1030,15 @@ pub fn rollback_dedup_for_event(
             "BR-192 counted PushKind::{kind:?} cannot use legacy dedup rollback"
         ));
     }
+    rollback_dedup_inner(event, kind, sub_kind, cooldown_override_secs)
+}
+
+fn rollback_dedup_inner(
+    event: &SignalEvent,
+    kind: PushKind,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
+) -> Result<(), String> {
     let stack = v14_stack()?;
     let source_fact = is_source_fact_signal(kind, event);
     let cooldown = dedup_cooldown(
@@ -1031,6 +1049,28 @@ pub fn rollback_dedup_for_event(
     );
     lock_dispatcher(stack)?.rollback(event, cooldown, sub_kind);
     Ok(())
+}
+
+/// Dedicated BR-244 uses its source reservation and immutable terminal owner.
+/// Generic counted callers still cannot enter the legacy settlement API.
+pub(crate) fn settle_news_flash_dedup(
+    event: &SignalEvent,
+    reservation: &crate::news_aggregator_init::FlashReservation,
+    suppress: bool,
+) -> Result<(), String> {
+    let kind = match reservation.decision() {
+        crate::news_aggregator_init::FlashDecision::Critical { .. } => PushKind::NewsFlashCritical,
+        crate::news_aggregator_init::FlashDecision::Aggregated { .. } => PushKind::NewsFlashAggregated,
+    };
+    let (_, expected_kind, _) = map_push_kind(kind);
+    if event.event_id != reservation.reservation_identity_sha256() || event.kind != expected_kind {
+        return Err("news_flash_dedup_reservation_mismatch".into());
+    }
+    if suppress {
+        commit_dedup_inner(event, kind, None, None)
+    } else {
+        rollback_dedup_inner(event, kind, None, None)
+    }
 }
 
 fn lock_store(

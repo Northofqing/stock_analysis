@@ -19,6 +19,8 @@ const PUBLIC_BUNDLE_PROTO: &[u8] =
     include_bytes!("../../contracts/external_v1_current/market.proto");
 const ARCHIVED_20260928_METADATA: &str =
     include_str!("../../contracts/external_v1_history/20260928.2/bundle-metadata.json");
+const ARCHIVED_20261001_METADATA: &str =
+    include_str!("../../contracts/external_v1_history/20261001.3/bundle-metadata.json");
 // V1-V3 recorded no expected-policy receipt. Their explicit legacy policy is
 // this frozen public release, never the current bundle or a response's claim.
 const HISTORICAL_V3_METADATA: &str =
@@ -51,6 +53,7 @@ pub(crate) struct BuildIdentityTrust {
     current: ExpectedBuildIdentity,
     historical_v3: ExpectedBuildIdentity,
     archived_20260928: ExpectedBuildIdentity,
+    archived_20261001: ExpectedBuildIdentity,
     current_descriptor: &'static str,
 }
 
@@ -95,6 +98,11 @@ impl BuildIdentityTrust {
         {
             return Some(self.archived_20260928.clone());
         }
+        if super::archived_external_20261001::accepts_descriptor(descriptor)
+            && digest == policy_sha256(&self.archived_20261001, descriptor)
+        {
+            return Some(self.archived_20261001.clone());
+        }
         // Explicit compiled test release, never learned from response/env. This
         // only verifies a recorded receipt; it does not change live A's pin.
         #[cfg(test)]
@@ -113,6 +121,7 @@ impl BuildIdentityTrust {
             current: expected_identity()?,
             historical_v3: parse_expected_identity(HISTORICAL_V3_METADATA)?,
             archived_20260928: parse_expected_identity(ARCHIVED_20260928_METADATA)?,
+            archived_20261001: parse_expected_identity(ARCHIVED_20261001_METADATA)?,
             current_descriptor:
                 super::external_query_transport::EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256,
         })
@@ -464,14 +473,14 @@ mod tests {
     fn compiled_public_inputs_receipt_binds_exact_current_release_bytes() {
         let receipt = compiled_public_inputs().unwrap();
         assert_eq!(receipt.version, 1);
-        assert_eq!(receipt.bundle_version, "2026-10-01.3");
+        assert_eq!(receipt.bundle_version, "2026-10-08.1");
         assert_eq!(
             receipt.raw_proto_sha256,
             "39694bb9650ee54b18cb44e4dbd27b42dbca4f3f797572ee86f5d15601d2ab6d"
         );
         assert_eq!(
             receipt.raw_metadata_sha256,
-            "010cfd26409b486ffa655111f27e7847a4b7ae4d844231ca79997d6308d2d36b"
+            "ec307e5f115f9c7772bd8d66e899751fe8480ef6ffd191c152ba3293786f3d93"
         );
         assert_eq!(
             receipt.compiled_descriptor_sha256,
@@ -487,6 +496,27 @@ mod tests {
             receipt.compiled_descriptor_sha256,
             expected().contract_sha256
         );
+    }
+
+    #[test]
+    fn oct1_history_retains_its_policy_but_cannot_qualify_latest_windows_live() {
+        let trust = BuildIdentityTrust::bundled().unwrap();
+        let descriptor = super::super::archived_external_20261001::DESCRIPTOR_SHA256;
+        let policy = "a7bf22f2693e768349f8e53ec5180bf88128f88992966264377c69ec288c2fa8";
+        assert_eq!(policy_sha256(&trust.archived_20261001, descriptor), policy);
+        let history = HealthResponse {
+            request_id: "TEST_CODE_OCT1_HISTORY".into(),
+            live: true,
+            ready: true,
+            build_identity: Some(actual(&trust.archived_20261001)),
+            ..Default::default()
+        };
+        assert_eq!(trust.recorded_health(policy, descriptor, &history), Ok(()));
+        assert_eq!(trust.current_health(&history), Err(BuildIdentityError::Mismatch("source_revision")));
+        let live = HealthResponse { build_identity: Some(test_public_build_identity()), ..history };
+        assert_eq!(qualify_public_health(&live), Ok(()));
+        assert!(trust.recorded_health(policy, descriptor, &live).is_err());
+        assert_eq!(live.build_identity.unwrap().source_revision, "841e4ae7a9df62be0c4536fa9009c66089d282bf");
     }
 
     #[test]

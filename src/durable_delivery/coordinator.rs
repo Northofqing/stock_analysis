@@ -231,6 +231,7 @@ pub struct DurableDeliveryCoordinator {
     connection: Option<Arc<Mutex<Connection>>>,
     database_binding: Option<PinnedDatabaseBinding>,
     config: CoordinatorConfig,
+    monitor_schema9: bool,
     g5b_input_log: AlertLog,
     #[cfg(test)]
     database_operation_test_hook: Mutex<Option<DatabaseOperationTestHook>>,
@@ -2626,7 +2627,29 @@ impl DurableDeliveryCoordinator {
         Self::open_at_repository_root(config, root)
     }
 
+    /// Reopen the retained monitor store without DDL, policy seeding or platform
+    /// migration. Only the exact frozen Schema9 catalog is accepted.
+    pub fn open_existing_monitor_schema9(config: CoordinatorConfig) -> Result<Self> {
+        config.validate()?;
+        let root = crate::production_root::root_for_mode(matches!(
+            &config.environment, super::model::StoreEnvironment::Test { .. }
+        ));
+        Self::open_with_schema_scope(config, root, true)
+    }
+
+    fn require_runtime_schema(&self, connection: &Connection) -> Result<()> {
+        if self.monitor_schema9 {
+            super::monitor_schema9::verify(connection)
+        } else {
+            require_current_schema_version(connection)
+        }
+    }
+
     fn open_at_repository_root(config: CoordinatorConfig, repository_root: &Path) -> Result<Self> {
+        Self::open_with_schema_scope(config, repository_root, false)
+    }
+
+    fn open_with_schema_scope(config: CoordinatorConfig, repository_root: &Path, monitor_schema9: bool) -> Result<Self> {
         ensure_supported_attestation_target()?;
         let database_path = config.repository_relative_database_path()?;
         probe_precreation_attestation_capabilities(
@@ -2725,6 +2748,7 @@ impl DurableDeliveryCoordinator {
             connection: Some(connection),
             database_binding: Some(database_binding),
             config,
+            monitor_schema9,
             g5b_input_log,
             #[cfg(test)]
             database_operation_test_hook: Mutex::new(None),
@@ -2744,7 +2768,11 @@ impl DurableDeliveryCoordinator {
         coordinator.with_immediate_transaction_for_schema_policy(
             SchemaVersionPolicy::Bootstrap,
             |transaction| {
-                initialize_schema(transaction)?;
+                if coordinator.monitor_schema9 {
+                    super::monitor_schema9::verify(transaction)?;
+                } else {
+                    initialize_schema(transaction)?;
+                }
                 #[cfg(test)]
                 run_database_bootstrap_test_hook(
                     DatabaseBootstrapTestPhase::AfterSchemaSqlBeforeCommitValidation,
@@ -2772,7 +2800,7 @@ impl DurableDeliveryCoordinator {
             )
         })?;
         verify_connection_configuration(&connection_guard)?;
-        let schema_validation = require_current_schema_version(&connection_guard);
+        let schema_validation = coordinator.require_runtime_schema(&connection_guard);
         let final_post_connection_lifetime = database_binding.validate_under_open_lock();
         drop(connection_guard);
         drop(final_lease);
@@ -3261,6 +3289,20 @@ impl DurableDeliveryCoordinator {
         self.run_database_operation_test_hook(
             DatabaseOperationTestPhase::AfterMutationRoutingBeforeDateFence,
         )?;
+        if self.monitor_schema9 {
+            if consumer.is_some() {
+                return Err(DurableDeliveryError::InvalidConfiguration(
+                    "P05 Unit mutation requires the frozen platform migration".into(),
+                ));
+            }
+            let dependencies = p05_unit::runtime::SqlDependencies::default();
+            return self.with_immediate_transaction(|tx| {
+                route.validate(tx)?;
+                operation(tx, &dependencies).map(|effect| match effect {
+                    MutationEffect::NoChange(value) | MutationEffect::Changed(value) => value,
+                })
+            });
+        }
         let fence: Option<G5bDateFence> = route
             .g5b_date
             .map(|date| self.g5b_input_log.acquire_date_writer_fence(date))
@@ -3408,6 +3450,9 @@ impl DurableDeliveryCoordinator {
         transaction: &Transaction<'_>,
         route: &DecisionMutationRoute,
     ) -> Result<()> {
+        if self.monitor_schema9 {
+            return Ok(());
+        }
         p05_unit::runtime::require_business_open(transaction, route)?;
         if let Some(date) = route.g5b_date {
             let sealed: bool = transaction.query_row(
@@ -3431,6 +3476,7 @@ impl DurableDeliveryCoordinator {
         dependencies: &p05_unit::runtime::SqlDependencies,
     ) -> Result<()> {
         self.require_g5b_business_open_tx(transaction, route)?;
+        if self.monitor_schema9 { return Ok(()); }
         dependencies.require_business_open(transaction, route)
     }
 
@@ -3629,8 +3675,17 @@ impl DurableDeliveryCoordinator {
             ));
         }
 
-        g5b_v2::validate_new_prepare_tx(transaction, envelope, g5b_admission)?;
-        p05_unit::runtime::validate_new_prepare(transaction, envelope, p05_admission)?;
+        if self.monitor_schema9 {
+            if origin_observation.is_some() || g5b_admission.is_some() || p05_admission.is_some()
+                || crate::monitor::g5b_analysis_v2::source_is_v2(&envelope.source_binding_canonical) {
+                return Err(DurableDeliveryError::InvalidConfiguration(
+                    "platform origin or Unit admission requires the frozen platform migration".into(),
+                ));
+            }
+        } else {
+            g5b_v2::validate_new_prepare_tx(transaction, envelope, g5b_admission)?;
+            p05_unit::runtime::validate_new_prepare(transaction, envelope, p05_admission)?;
+        }
         self.require_g5b_business_open_tx(transaction, route)?;
         envelope.validate()?;
         if envelope.push_kind == PushKind::CandidateBoard {
@@ -5537,7 +5592,7 @@ impl DurableDeliveryCoordinator {
         let outcome = match pre_sql_hook {
             Ok(()) => match schema_policy {
                 SchemaVersionPolicy::Bootstrap => operation(&mut connection),
-                SchemaVersionPolicy::Runtime => match require_current_schema_version(&connection) {
+                SchemaVersionPolicy::Runtime => match self.require_runtime_schema(&connection) {
                     Ok(()) => operation(&mut connection),
                     Err(error) => Err(error),
                 },
@@ -5563,7 +5618,7 @@ impl DurableDeliveryCoordinator {
             .map(|_| match schema_policy {
                 SchemaVersionPolicy::Bootstrap => Ok(()),
                 SchemaVersionPolicy::Runtime => {
-                    require_current_schema_version(&connection)?;
+                    self.require_runtime_schema(&connection)?;
                     validate_persisted_immutable_references(&connection)
                 }
             })
@@ -5643,7 +5698,7 @@ impl DurableDeliveryCoordinator {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if matches!(schema_policy, SchemaVersionPolicy::Runtime) {
-                if let Err(primary) = require_current_schema_version(&transaction) {
+                if let Err(primary) = self.require_runtime_schema(&transaction) {
                     return Err(self.rollback_transaction_with_evidence(
                         &transaction,
                         "schema validation after BEGIN IMMEDIATE",
@@ -5700,7 +5755,7 @@ impl DurableDeliveryCoordinator {
                     return Err(self.rollback_transaction_with_evidence(&transaction,"after-post-sql exact revision test fault",primary));
                 }
             }
-            if let Err(primary) = require_current_schema_version(&transaction) {
+            if let Err(primary) = self.require_runtime_schema(&transaction) {
                 return Err(self.rollback_transaction_with_evidence(
                     &transaction,
                     "schema validation before commit",
@@ -10669,11 +10724,12 @@ pub(super) fn validate_p05_unit_rows(connection: &Connection) -> Result<()> {
 fn validate_persisted_immutable_references(connection: &Connection) -> Result<()> {
     let schema_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if schema_version != SCHEMA_VERSION {
+    if schema_version != SCHEMA_VERSION && schema_version != 9 {
         return Ok(());
     }
-
-    validate_p05_unit_rows(connection)?;
+    if schema_version == SCHEMA_VERSION {
+        validate_p05_unit_rows(connection)?;
+    }
 
     const INVALID_REFERENCE_QUERIES: [(&str, &str); 6] = [
         (

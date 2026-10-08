@@ -85,6 +85,21 @@ fn main() {
         )
         .expect("compile frozen Sep28 External contract");
     println!("cargo:rerun-if-changed={archived_source}");
+    // The prior current Oct1 contract stays messages-only for immutable replay.
+    let oct1_source = "contracts/external_v1_history/20261001.3/market.proto";
+    let oct1_dir = out_dir.join("external_history_20261001");
+    std::fs::create_dir_all(&oct1_dir).expect("create Oct1 archived External output");
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(false)
+        .out_dir(&oct1_dir)
+        .file_descriptor_set_path(oct1_dir.join("descriptor.bin"))
+        .compile_protos(
+            &[Path::new(oct1_source)],
+            &[Path::new("contracts/external_v1_history/20261001.3")],
+        )
+        .expect("compile frozen Oct1 External contract");
+    println!("cargo:rerun-if-changed={oct1_source}");
     // An explicit additive TEST_CODE release, compiled independently from A.
     // Only cfg(test) modules include these messages; never a runtime registry.
     let upgrade_dir = out_dir.join("external_test_upgrade_b");

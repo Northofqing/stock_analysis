@@ -2861,7 +2861,7 @@ pub(super) async fn push_news_flash_v3(
         V14Gate::Denied(reason) => return NewsFlashNotifyOutcome::RejectedBeforeSink(reason),
     };
     if event.event_id != reservation.reservation_identity_sha256() {
-        if let Err(error) = v14_adapter::rollback_dedup_for_event(&event, kind, None, None) {
+        if let Err(error) = v14_adapter::settle_news_flash_dedup(&event, reservation, false) {
             log::error!(
                 "[NewsFlash][BR-244] rollback after governance binding mismatch failed: {error}"
             );
@@ -2886,7 +2886,7 @@ pub(super) async fn push_news_flash_v3(
             boolean_only_sink_enabled,
         )
     {
-        if let Err(error) = v14_adapter::rollback_dedup_for_event(&event, kind, None, None) {
+        if let Err(error) = v14_adapter::settle_news_flash_dedup(&event, reservation, false) {
             log::error!(
                 "[NewsFlash][BR-244] rollback after physical preflight rejection failed: {error}"
             );
@@ -2939,7 +2939,7 @@ pub(super) async fn push_news_flash_v3(
             // Another process has already created this canonical attempt. Keep
             // the weaker process-local identity suppressed and let the next
             // fresh authority snapshot recover its open/terminal state.
-            if let Err(commit_error) = v14_adapter::commit_dedup_for_event(&event, kind, None, None)
+            if let Err(commit_error) = v14_adapter::settle_news_flash_dedup(&event, reservation, true)
             {
                 reason.push_str(&format!("; legacy_l4_commit_failed:{commit_error}"));
             }
@@ -2948,7 +2948,7 @@ pub(super) async fn push_news_flash_v3(
         Err(error) => {
             let mut reason = format!("news_flash_sink_attempt_audit_failed:{error}");
             if let Err(rollback_error) =
-                v14_adapter::rollback_dedup_for_event(&event, kind, None, None)
+                v14_adapter::settle_news_flash_dedup(&event, reservation, false)
             {
                 reason.push_str(&format!("; legacy_l4_rollback_failed:{rollback_error}"));
             }
@@ -2995,7 +2995,7 @@ pub(super) async fn push_news_flash_v3(
     ) {
         Ok(terminal) => terminal,
         Err(error) => {
-            if let Err(commit_error) = v14_adapter::commit_dedup_for_event(&event, kind, None, None)
+            if let Err(commit_error) = v14_adapter::settle_news_flash_dedup(&event, reservation, true)
             {
                 log::error!(
                     "[NewsFlash][BR-244] terminal audit failed and legacy L4 suppression failed: {commit_error}"
@@ -3008,11 +3008,11 @@ pub(super) async fn push_news_flash_v3(
     };
     let legacy_settle_result = match &terminal {
         stock_analysis::event::NewsFlashTerminalReceipt::DefinitivelyRejected(_) => {
-            v14_adapter::rollback_dedup_for_event(&event, kind, None, None)
+            v14_adapter::settle_news_flash_dedup(&event, reservation, false)
         }
         stock_analysis::event::NewsFlashTerminalReceipt::Accepted(_)
         | stock_analysis::event::NewsFlashTerminalReceipt::Uncertain(_) => {
-            v14_adapter::commit_dedup_for_event(&event, kind, None, None)
+            v14_adapter::settle_news_flash_dedup(&event, reservation, true)
         }
     };
     if let Err(error) = legacy_settle_result {

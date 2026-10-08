@@ -2502,6 +2502,30 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br244_dedup_settlement_accepts_exact_source_reservation_without_generic_counted_bypass() {
+        crate::v14_adapter::_reset_dedup_for_test();
+        let (reservation, _, _) = n02_legacy_identity_reservation("DEDUP_SETTLEMENT");
+        let kind = crate::notify::PushKind::NewsFlashAggregated;
+        let mut event = stock_analysis::push_l1::SignalEvent::new(
+            stock_analysis::push_l1::SignalSource::NewsCatalyst,
+            "news_flash_aggregated", None, chrono::Local::now(),
+            stock_analysis::push_l1::SignalPayload::NewsCatalyst(
+                stock_analysis::push_l1::NewsCatalystPayload {
+                    code: None, headline: Some("TEST_CODE_NEWS".into()),
+                    source: Some("TEST_CODE_SOURCE".into()), published_on: None,
+                }
+            ), stock_analysis::push_l1::Severity::Normal,
+        );
+        event.event_id = reservation.reservation_identity_sha256().to_owned();
+        assert!(crate::v14_adapter::commit_dedup_for_event(&event, kind, None, None).is_err());
+        assert!(crate::v14_adapter::settle_news_flash_dedup(&event, &reservation, true).is_ok());
+        event.event_id = "TEST_CODE_DIFFERENT_RESERVATION".into();
+        assert!(crate::v14_adapter::settle_news_flash_dedup(&event, &reservation, true).is_err());
+        crate::v14_adapter::_reset_dedup_for_test();
+    }
+
+    #[test]
     fn n02_foundation_binding_preserves_real_reservation_and_bytes() {
         let (reservation, _, _) = n02_legacy_identity_reservation("A");
         let text = match reservation.decision() {

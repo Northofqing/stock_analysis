@@ -2066,7 +2066,7 @@ pub fn run_production_audited_terminal_replay(
     }
     let task_identity = crate::review_batch::review_task_identity(business_date, task);
     let coordinator =
-        DurableDeliveryCoordinator::open(CoordinatorConfig::production(owner_instance_identity()))
+        DurableDeliveryCoordinator::open_existing_monitor_schema9(CoordinatorConfig::production(owner_instance_identity()))
             .map_err(|error| format!("terminal replay coordinator open failed: {error}"))?;
     let append = DurableDeliveryImmutableAppend::for_production()
         .map_err(|error| format!("terminal replay audit binding failed: {error}"))?;
@@ -2174,7 +2174,10 @@ fn build_runtime_state(namespace: &RuntimeNamespace) -> Result<Arc<RuntimeState>
         }
     };
     let sink = MagiclawAuthoritativeSink::bind(namespace.clone())?;
-    let coordinator = DurableDeliveryCoordinator::open(config)
+    let coordinator = match namespace {
+        RuntimeNamespace::Production => DurableDeliveryCoordinator::open_existing_monitor_schema9(config),
+        RuntimeNamespace::Test { .. } => DurableDeliveryCoordinator::open(config),
+    }
         .map_err(|error| format!("open durable delivery coordinator: {error}"))?;
     Ok(Arc::new(RuntimeState {
         namespace: namespace.clone(),
@@ -2320,6 +2323,9 @@ fn deliver_envelope_blocking_with_p01_origin(
     }
 
     let decision_identity = envelope.decision_identity.clone();
+    // Correlation storage belongs to the frozen platform migration. Retained
+    // production P01 still uses its original envelope and counted authority.
+    let origin = if state.namespace == RuntimeNamespace::Production { None } else { origin };
     let preparation = match origin {
         Some(producer) => state
             .coordinator

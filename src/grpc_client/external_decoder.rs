@@ -3,7 +3,7 @@
 use super::external_query_transport::{wire_error, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256};
 use super::{
     archived_external_20260928, errors::GrpcError, external_pb::magic::market::v1 as current,
-    historical_external,
+    historical_external, archived_external_20261001,
 };
 use prost::Message;
 
@@ -12,6 +12,7 @@ pub(crate) enum ExternalDecoder {
     Current,
     ArchivedA,
     Archived20260928,
+    Archived20261001,
     #[cfg(test)]
     TestB,
 }
@@ -34,6 +35,9 @@ impl ExternalDecoder {
         if archived_external_20260928::accepts_descriptor(descriptor) {
             return Ok(Self::Archived20260928);
         }
+        if archived_external_20261001::accepts_descriptor(descriptor) {
+            return Ok(Self::Archived20261001);
+        }
         #[cfg(test)]
         if descriptor == test_b::descriptor() {
             return Ok(Self::TestB);
@@ -51,6 +55,9 @@ impl ExternalDecoder {
         }
         if matches!(self, Self::Archived20260928) {
             return archived_external_20260928::request_context(health, bytes);
+        }
+        if matches!(self, Self::Archived20261001) {
+            return archived_external_20261001::request_context(health, bytes);
         }
         #[cfg(test)]
         if matches!(self, Self::TestB) {
@@ -80,6 +87,9 @@ impl ExternalDecoder {
         if matches!(self, Self::Archived20260928) {
             return archived_external_20260928::query_request(bytes);
         }
+        if matches!(self, Self::Archived20261001) {
+            return archived_external_20261001::query_request(bytes);
+        }
         // A→B continuation is supported only for the identical canonical
         // GlobalNews request shape. Frozen plan validation checks its identity;
         // this verifies current decoder compatibility without rewriting bytes.
@@ -96,6 +106,7 @@ impl ExternalDecoder {
         match self {
             Self::ArchivedA => historical_external::health(bytes),
             Self::Archived20260928 => archived_external_20260928::health(bytes),
+            Self::Archived20261001 => archived_external_20261001::health(bytes),
             Self::Current => canonical(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -111,6 +122,7 @@ impl ExternalDecoder {
         match self {
             Self::ArchivedA => historical_external::capabilities(bytes),
             Self::Archived20260928 => archived_external_20260928::capabilities(bytes),
+            Self::Archived20261001 => archived_external_20261001::capabilities(bytes),
             Self::Current => canonical(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -125,6 +137,7 @@ impl ExternalDecoder {
         match self {
             Self::ArchivedA => historical_external::query(bytes),
             Self::Archived20260928 => archived_external_20260928::query(bytes),
+            Self::Archived20261001 => archived_external_20261001::query(bytes),
             Self::Current => decode(bytes),
             #[cfg(test)]
             Self::TestB => {
@@ -137,6 +150,7 @@ impl ExternalDecoder {
         match self {
             Self::ArchivedA => historical_external::error_detail(bytes),
             Self::Archived20260928 => archived_external_20260928::error_detail(bytes),
+            Self::Archived20261001 => archived_external_20261001::error_detail(bytes),
             Self::Current => current::ErrorDetail::decode(bytes).ok(),
             #[cfg(test)]
             Self::TestB => {

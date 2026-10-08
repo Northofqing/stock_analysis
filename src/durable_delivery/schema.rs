@@ -1550,8 +1550,13 @@ fn seed_and_verify_policy_catalog(transaction: &Transaction<'_>) -> Result<()> {
             ],
         )?;
     }
+    verify_existing_policy_catalog(transaction)
+}
+
+pub(super) fn verify_existing_policy_catalog(connection: &Connection) -> Result<()> {
+    let expected = compiled_policy_catalog();
     let rows = {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             "SELECT push_kind,sub_kind,cooldown_scope,base_cooldown_secs,
                     override_cooldown_secs,window_mode,counts_against_daily_budget,policy_version
              FROM delivery_policy_catalog ORDER BY push_kind,sub_kind",

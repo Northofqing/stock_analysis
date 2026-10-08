@@ -8,6 +8,7 @@
 mod coordinator;
 mod correlation;
 mod model;
+mod monitor_schema9;
 mod schema;
 mod schema_g5b_cohort;
 mod schema_p05_unit;

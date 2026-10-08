@@ -1,5 +1,6 @@
 //! gRPC 客户端网络层 (合同: grpc/grpc-external-api.md)。
 pub(crate) mod archived_external_20260928;
+pub(crate) mod archived_external_20261001;
 pub mod auth;
 pub mod build_identity;
 pub mod bundle;

@@ -1931,6 +1931,11 @@ impl DurableDeliveryCoordinator {
         check: Option<&ActualP05ConsumerCheck>,
         operation: impl FnOnce(&Transaction<'_>, &SqlDependencies) -> Result<MutationEffect<T>>,
     ) -> Result<T> {
+        if self.monitor_schema9 {
+            if check.is_some() { return Err(invalid("P05 consumer requires platform migration")); }
+            let dependencies = SqlDependencies::default();
+            return self.with_pre_sink_mutation_transaction(route, |tx| operation(tx, &dependencies));
+        }
         let p05 = self
             .with_mutation_routing_connection(|c| mutation_date(c, route))?
             .is_some();
