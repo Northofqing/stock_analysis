@@ -11939,15 +11939,35 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
 
-                        // Only the original sealed position quote supplies
-                        // realtime price/change. The date-level pool remains
-                        // membership/rank data and cannot replace that price.
+                        // 主力排名（仅在真实涨停池可用时排序）
 
-                        let mut stock_map: std::collections::HashMap<
-                            String,
-                            &stock_analysis::data_gateway::market_data::AdmittedRealtimeQuote,
-                        > = std::collections::HashMap::new();
-
+                        // A2 (2026-08-31): 盘中批量资金流 overlay — 上游 RealtimeQuotes
+                        // 视图无主力净流字段 (delegate 5 字段), ProviderTopNRankings 盘中
+                        // 不 admit; MoneyFlows op (Eastmoney 实时) 批量携带 main_net,
+                        // 按 code 覆盖两路硬编码 None 的数据源, 恢复主力排名 + 资金面 check。
+                        // volume_ratio 上游无实时视图, vol_burst 保持 A1 哨兵静默。
+                        let flow_codes = scanner_position_quotes
+                            .as_ref()
+                            .map(|observation| observation.requested().to_vec())
+                            .unwrap_or_default();
+                        // Early quotes remain display inputs. Scanner acquires
+                        // one complete original batch after all preceding awaits.
+                        let (flow_overlay, fresh_scanner_quotes) =
+                            intraday_market::acquire_scanner_quotes_after_overlay(
+                                fetch_flow_overlay(flow_codes),
+                                move || intraday_market::scanner_window_open_at(chrono::Utc::now(), limit_pool_date),
+                                market_data::fetch_scanner_position_quotes,
+                            ).await;
+                        let scanner_position_quotes = match fresh_scanner_quotes {
+                            Ok(quotes) => Some(quotes),
+                            Err(error) => {
+                                log::warn!("[盘中监控][Scanner] consumer_unavailable=scanner_quote_refresh_failed; 持仓价格检测暂停: {error}");
+                                None
+                            }
+                        };
+                        // Only this fresh sealed quote supplies realtime
+                        // price/change; date-level pools cannot replace it.
+                        let mut stock_map = std::collections::HashMap::new();
                         if let Some(observation) = scanner_position_quotes.as_ref() {
                             log::debug!(
                                 "[盘中监控][Scanner] requested_positions={} admitted_quotes={}",
@@ -11958,16 +11978,6 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 stock_map.insert(quote.code().to_owned(), quote);
                             }
                         }
-
-                        // 主力排名（仅在真实涨停池可用时排序）
-
-                        // A2 (2026-08-31): 盘中批量资金流 overlay — 上游 RealtimeQuotes
-                        // 视图无主力净流字段 (delegate 5 字段), ProviderTopNRankings 盘中
-                        // 不 admit; MoneyFlows op (Eastmoney 实时) 批量携带 main_net,
-                        // 按 code 覆盖两路硬编码 None 的数据源, 恢复主力排名 + 资金面 check。
-                        // volume_ratio 上游无实时视图, vol_burst 保持 A1 哨兵静默。
-                        let flow_overlay =
-                            fetch_flow_overlay(stock_map.keys().cloned().collect()).await;
 
                         let mut ranked = limit_stocks.as_ref().map(|stocks| {
                             stocks
@@ -11990,7 +12000,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
                         for (code, quote) in &stock_map {
                             // Read-only work can also take time. The UTC check
-                            // occurs after this lookup and the flow await,
+                            // occurs after this lookup and the quote refresh,
                             // immediately before any transition or Detector use.
                             let t1_locked = match stock_analysis::portfolio::is_t1_locked(code) {
                                 Ok(v) => v,
@@ -12007,6 +12017,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 .as_ref()
                                 .and_then(|rows| rows.iter().position(|(r, _)| r.code == *code))
                                 .map(|position| position + 1);
+                            if !intraday_market::scanner_window_open_at(chrono::Utc::now(), limit_pool_date) {
+                                log::warn!("[盘中监控][Scanner] consumer_unavailable=scanner_continuous_session_closed; 本轮持仓价格检测暂停");
+                                break;
+                            }
                             let checked = match scanner.validate_admitted_quote(quote) {
                                 Ok(checked) => checked,
                                 Err(reason) => {

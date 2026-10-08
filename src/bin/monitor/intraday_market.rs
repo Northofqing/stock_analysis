@@ -80,10 +80,176 @@ pub fn resolve_intraday_market_inputs<Limit, Position>(
     }
 }
 
+/// Refresh the complete original quote batch after the slower overlay has
+/// finished. No retry or fallback to an earlier quote is allowed here.
+pub async fn acquire_scanner_quotes_after_overlay<
+    OverlayFuture,
+    Position,
+    WindowCheck,
+    PositionFetch,
+>(
+    overlay: OverlayFuture,
+    mut window_open: WindowCheck,
+    position_fetch: PositionFetch,
+) -> (OverlayFuture::Output, Result<Position, String>)
+where
+    OverlayFuture: std::future::Future,
+    Position: Send + 'static,
+    WindowCheck: FnMut() -> bool + Send + 'static,
+    PositionFetch: FnOnce() -> Result<Position, String> + Send + 'static,
+{
+    let overlay = overlay.await;
+    let position_quotes = tokio::task::spawn_blocking(move || {
+        if !window_open() {
+            return Err("scanner_continuous_session_closed".into());
+        }
+        let quotes = position_fetch()?;
+        if !window_open() {
+            return Err("scanner_continuous_session_closed".into());
+        }
+        Ok(quotes)
+    })
+    .await
+    .map_err(|error| format!("scanner_quote_acquisition_task_failed:{error}"))
+    .and_then(|result| result);
+    (overlay, position_quotes)
+}
+
+pub fn scanner_window_open_at(
+    now: chrono::DateTime<chrono::Utc>,
+    tick_date: chrono::NaiveDate,
+) -> bool {
+    let shanghai = chrono::FixedOffset::east_opt(8 * 3600).expect("Shanghai offset");
+    now.with_timezone(&shanghai).date_naive() == tick_date
+        && stock_analysis::trading::paper_sell::intraday_session_open_at(now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_refresh_waits_for_delayed_overlay_before_acquiring_original_quote() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        let overlay_finished = Arc::new(AtomicBool::new(false));
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let started = tokio::time::Instant::now();
+        let overlay_flag = overlay_finished.clone();
+        let quote_flag = overlay_finished.clone();
+        let quote_counter = quote_calls.clone();
+        let (overlay, quote) = acquire_scanner_quotes_after_overlay(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+                overlay_flag.store(true, Ordering::SeqCst);
+                "TEST_CODE_original_flow"
+            },
+            || true,
+            move || {
+                quote_counter.fetch_add(1, Ordering::SeqCst);
+                assert!(quote_flag.load(Ordering::SeqCst));
+                Ok(("TEST_CODE_original_quote", tokio::time::Instant::now()))
+            },
+        )
+        .await;
+        let (source, acquired_at) = quote.expect("fresh original quote");
+        assert_eq!(overlay, "TEST_CODE_original_flow");
+        assert_eq!(source, "TEST_CODE_original_quote");
+        assert!(acquired_at >= started + std::time::Duration::from_secs(12));
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_refresh_source_failure_is_preserved_without_retry_or_old_quote() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let quote_counter = quote_calls.clone();
+        let (overlay, quote): (_, Result<&str, String>) = acquire_scanner_quotes_after_overlay(
+            async { "TEST_CODE_original_flow" },
+            || true,
+            move || {
+                quote_counter.fetch_add(1, Ordering::SeqCst);
+                Err("TEST_CODE_original_quote_unavailable".into())
+            },
+        )
+        .await;
+        assert_eq!(overlay, "TEST_CODE_original_flow");
+        assert_eq!(quote.unwrap_err(), "TEST_CODE_original_quote_unavailable");
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_refresh_missing_overlay_keeps_missing_flow_and_acquires_quote_once() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let quote_calls = Arc::new(AtomicUsize::new(0));
+        let quote_counter = quote_calls.clone();
+        let (overlay, quote) = acquire_scanner_quotes_after_overlay(
+            async { std::collections::HashMap::<String, f64>::new() },
+            || true,
+            move || {
+                quote_counter.fetch_add(1, Ordering::SeqCst);
+                Ok("TEST_CODE_original_quote_without_flow")
+            },
+        )
+        .await;
+        assert!(overlay.is_empty());
+        assert_eq!(quote.unwrap(), "TEST_CODE_original_quote_without_flow");
+        assert_eq!(quote_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_refresh_closed_or_crossed_session_discards_even_fresh_quote() {
+        use std::sync::{
+            atomic::{AtomicI64, AtomicUsize, Ordering},
+            Arc,
+        };
+        let tick_date = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        for (started, returned, expected_calls) in [
+            ("2026-10-08T03:29:59Z", "2026-10-08T03:30:02Z", 1),
+            ("2026-10-08T06:59:59Z", "2026-10-08T07:00:02Z", 1),
+            ("2026-10-08T04:00:00Z", "2026-10-08T04:00:02Z", 0),
+            ("2026-10-09T01:30:00Z", "2026-10-09T01:30:02Z", 0),
+        ] {
+            let started = chrono::DateTime::parse_from_rfc3339(started)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let returned = chrono::DateTime::parse_from_rfc3339(returned)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let clock = Arc::new(AtomicI64::new(started.timestamp()));
+            let window_clock = clock.clone();
+            let source_clock = clock.clone();
+            let quote_calls = Arc::new(AtomicUsize::new(0));
+            let quote_counter = quote_calls.clone();
+            let (_, quote) = acquire_scanner_quotes_after_overlay(
+                async { () },
+                move || {
+                    scanner_window_open_at(
+                        chrono::DateTime::from_timestamp(window_clock.load(Ordering::SeqCst), 0)
+                            .unwrap(),
+                        tick_date,
+                    )
+                },
+                move || {
+                    quote_counter.fetch_add(1, Ordering::SeqCst);
+                    source_clock.store(returned.timestamp(), Ordering::SeqCst);
+                    Ok(returned)
+                },
+            )
+            .await;
+            assert_eq!(quote.unwrap_err(), "scanner_continuous_session_closed");
+            assert_eq!(quote_calls.load(Ordering::SeqCst), expected_calls);
+        }
+    }
 
     fn test_stock(code: &str) -> stock_analysis::market_data::TopStock {
         stock_analysis::market_data::TopStock {
