@@ -1,6 +1,8 @@
 //! A single immutable read capability for all paper economic consumers.
 use super::*;
 use crate::performance::economic_position::{EconomicFillRow, FillCostLedger};
+#[path = "paper_legacy_price_disputes.rs"]
+mod legacy_price_disputes;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectiveFillScope {
@@ -71,8 +73,39 @@ pub struct VerifiedEffectiveFillSet {
     period_lineage: Vec<FillLineage>,
     pub(super) unavailable: Option<String>,
     pub(super) seed_lots: Vec<Lot>,
+    // Only populated from CorrectionDeclared actions after verified ledger
+    // replay and historical dependency validation. A ruling_hash is provenance,
+    // never a caller-supplied price qualification capability.
+    verified_price_corrections: std::collections::BTreeSet<i64>,
 }
 impl VerifiedEffectiveFillSet {
+    pub(crate) fn unresolved_legacy_price_fill_ids(&self) -> std::collections::BTreeSet<i64> {
+        let included = self
+            .rows
+            .iter()
+            .map(|row| row.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.lineage
+            .iter()
+            .filter(|proof| {
+                included.contains(&proof.fill_id)
+                    && legacy_price_disputes::is_disputed_original(&proof.raw_hash)
+                    && !self.verified_price_corrections.contains(&proof.fill_id)
+            })
+            .map(|proof| proof.fill_id)
+            .collect()
+    }
+
+    pub(crate) fn require_economic_price_authority(&self) -> Result<(), LedgerError> {
+        if self.unresolved_legacy_price_fill_ids().is_empty() {
+            Ok(())
+        } else {
+            Err(LedgerError::EvidenceUnavailable(
+                "original legacy price dispute is unresolved; complete dependent lifecycle net/account amounts are unavailable".into(),
+            ))
+        }
+    }
+
     pub(super) fn snapshot_input_hash(&self) -> Result<String, LedgerError> {
         Ok(digest(&encode(&(
             "PaperSnapshotPeriodInputV1",
@@ -247,6 +280,7 @@ pub(super) fn verified_on(
     let mut period_lineage = Vec::new();
     let mut raw_manifest = Vec::new();
     let mut high_water = 0;
+    let mut verified_price_corrections = std::collections::BTreeSet::new();
     for event in &events {
         let Fact::Order(order) = decode(&event.payload)? else {
             continue;
@@ -273,6 +307,7 @@ pub(super) fn verified_on(
             ruling_hash: None,
             quarantined: false,
         };
+        legacy_price_disputes::verify_original_codec(conn, id, &proof.raw_hash)?;
         if let Some((action, hash)) = rulings.get(&id) {
             proof.ruling_hash = Some(hash.clone());
             match action {
@@ -282,6 +317,7 @@ pub(super) fn verified_on(
                     quantity,
                     fact_at,
                 } => {
+                    verified_price_corrections.insert(id);
                     row.fill_price = Some(price.cny());
                     row.quantity = i64::from(*quantity);
                     row.occurred_at = fact_at
@@ -323,7 +359,8 @@ pub(super) fn verified_on(
         adjudication_head,
         cutover_at: Some(manifest.cutover_at),
         cutover_raw_high_water: Some(legacy_high_water_id),
-        rule_version: "PaperEffectiveV1/micro-cny-half-up-v1/lot-rates-v1".into(),
+        rule_version: "PaperEffectiveV1/micro-cny-half-up-v1/lot-rates-v1/source-price-disputes-v1"
+            .into(),
         projection_hash: String::new(),
         catalog_generation: catalog.0,
         catalog_objects_hash: catalog.1,
@@ -337,6 +374,7 @@ pub(super) fn verified_on(
         period_lineage,
         unavailable,
         seed_lots,
+        verified_price_corrections,
     })
 }
 
@@ -566,6 +604,7 @@ fn historical_rows(
         let pending = fw::historical(begin_legacy_fill(fill.fill(), &mut work))?;
         let raw = adjudication::raw_bytes(conn, pending.id)?;
         let hash = fw::historical(work.raw_hash(raw.as_bytes()))?;
+        legacy_price_disputes::verify_original_codec(conn, pending.id, &hash)?;
         drop(raw);
         let (row, proof) = fw::historical(finish_legacy_fill(
             pending,
@@ -815,6 +854,19 @@ fn legacy_verified_on(
     };
     let (mut rows, lineage, unavailable) =
         historical_rows(conn, &source, &event_rows, None, cutover)?;
+    // load/replay_through above verified every event's binding, original source
+    // fingerprint, predecessor and recomputed historical projection. Do not
+    // infer this capability from a nonempty lineage.ruling_hash.
+    let verified_price_corrections = fw::historical(collect_legacy_actions(
+        &event_rows,
+        None,
+        &mut FinancialWork::Historical,
+    ))?
+    .into_iter()
+    .filter_map(|(id, (action, _))| {
+        matches!(action, AdjudicationAction::CorrectionDeclared { .. }).then_some(id)
+    })
+    .collect();
     filter_date(&mut rows, request.as_of)?;
     let mut period_ids = rows
         .iter()
@@ -855,7 +907,8 @@ fn legacy_verified_on(
         adjudication_head,
         cutover_at: cutover,
         cutover_raw_high_water: cutover.map(|_| source.current_paper_trade_high_water()),
-        rule_version: "PaperEffectiveV1/LegacyNoCashAuthority/lot-rates-v1".into(),
+        rule_version:
+            "PaperEffectiveV1/LegacyNoCashAuthority/lot-rates-v1/source-price-disputes-v1".into(),
         projection_hash: String::new(),
         catalog_generation: catalog.0,
         catalog_objects_hash: catalog.1,
@@ -868,6 +921,7 @@ fn legacy_verified_on(
         period_lineage,
         unavailable,
         seed_lots: Vec::new(),
+        verified_price_corrections,
     })
 }
 

@@ -1047,7 +1047,7 @@ pub fn report_from_effective(
     effective: &crate::trading::paper_ledger::VerifiedEffectiveFillSet,
 ) -> Result<EconomicPositionReport, String> {
     let sample = effective
-        .opening_inventory_sample()
+        .opening_inventory_sample_for_diagnostics()
         .map_err(|e| e.to_string())?;
     let mut report = rebuild_economic_positions(
         &sample.strategy_rows,
@@ -1055,7 +1055,28 @@ pub fn report_from_effective(
         Some(&sample.strategy_costs),
     )?;
     report.effective_projection = Some(effective.receipt().clone());
-    report.opening_inventory = Some(sample);
+    let disputed = effective.unresolved_legacy_price_fill_ids();
+    if disputed.is_empty() {
+        report.opening_inventory = Some(sample);
+    } else {
+        let reason = "original legacy price dispute is unresolved; complete dependent lifecycle net/account amounts are unavailable".to_owned();
+        for cycle in &mut report.closed_positions {
+            if cycle.source_fill_ids.iter().any(|id| disputed.contains(id)) {
+                cycle.net = NetMetrics::Unavailable {
+                    reason: reason.clone(),
+                };
+            }
+        }
+        // Open disputed lifecycles also invalidate the account/economic anchor.
+        // Never remove their buys or dependent sells to make FIFO look valid.
+        report.net_summary = NetSummary::Unavailable {
+            reason: reason.clone(),
+        };
+        report.validation_status = ValidationStatus::NetUnavailable { reason };
+        // The diagnostic sample carries raw-price exit PnLs and lot basis;
+        // expose it only after the same original-price authority guard passes.
+        report.opening_inventory = None;
+    }
     Ok(report)
 }
 

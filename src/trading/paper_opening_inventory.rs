@@ -89,6 +89,15 @@ fn portion(amount: Money, part: u32, total: u32) -> Result<Money, LedgerError> {
 }
 impl VerifiedEffectiveFillSet {
     pub fn opening_inventory_sample(&self) -> Result<OpeningInventorySample, LedgerError> {
+        self.require_economic_price_authority()?;
+        self.opening_inventory_sample_for_diagnostics()
+    }
+
+    // Keep complete FIFO facts for diagnostic economic lifecycle reconstruction;
+    // this sample must not escape as qualified account or settlement amounts.
+    pub(crate) fn opening_inventory_sample_for_diagnostics(
+        &self,
+    ) -> Result<OpeningInventorySample, LedgerError> {
         let mut lots = self
             .seed_lots
             .iter()

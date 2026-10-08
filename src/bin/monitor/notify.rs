@@ -25,6 +25,13 @@ use serde::Deserialize;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 
+#[path = "magiclaw_feishu_delivery_json.rs"]
+mod magiclaw_feishu_delivery_json;
+
+#[cfg(test)]
+#[path = "magiclaw_feishu_delivery_json_tests.rs"]
+mod magiclaw_feishu_delivery_json_tests;
+
 use crate::{
     ApiTokenSource, CachedApiToken, DaemonReadySource, MessageSendTransport, MessageSendType,
     DEFAULT_MAGICLAW_API_ADDR, DEFAULT_MAGICLAW_CLIENT_NAME, DEFAULT_MAGICLAW_PROJECT_ID,
@@ -4646,6 +4653,18 @@ fn push_via_magiclaw_cli_receipt_blocking(
                 }
             })?),
         };
+    let feishu_invocation = if matches!(send_type, MessageSendType::Feishu) {
+        magiclaw_feishu_delivery_json::Invocation::prepare(
+            to.as_deref().expect("Feishu target was validated"),
+            text,
+        )
+        .map_err(|reason_code| BlockingCliDeliveryFailure::Rejected {
+            reason_code: reason_code.to_owned(),
+            evidence: reason_code.as_bytes().to_vec(),
+        })?
+    } else {
+        None
+    };
     let magiclaw_bin = resolve_magiclaw_bin();
     let mut command = std::process::Command::new(&magiclaw_bin);
     command
@@ -4677,11 +4696,61 @@ fn push_via_magiclaw_cli_receipt_blocking(
             command.env("MAGICLAW_DB_PATH", absolute);
         }
     }
-    if let Ok(receive_id_type) = std::env::var("FEISHU_RECEIVE_ID_TYPE") {
+    if let Some(invocation) = &feishu_invocation {
+        invocation.append_args(&mut command);
+    } else if let Ok(receive_id_type) = std::env::var("FEISHU_RECEIVE_ID_TYPE") {
         let receive_id_type = receive_id_type.trim();
         if !receive_id_type.is_empty() {
             command.arg("--receive-id-type").arg(receive_id_type);
         }
+    }
+
+    if let Some(invocation) = feishu_invocation {
+        // Once spawn succeeds, a wait/read failure cannot prove that the child
+        // stayed before its message request. Never retry with legacy flags.
+        let child = command
+            .spawn()
+            .map_err(|error| BlockingCliDeliveryFailure::Rejected {
+                reason_code: "magiclaw_cli_spawn_failed".to_owned(),
+                evidence: error.to_string().into_bytes(),
+            })?;
+        let output =
+            child
+                .wait_with_output()
+                .map_err(|error| BlockingCliDeliveryFailure::Uncertain {
+                    reason_code: "magiclaw_cli_wait_failed_after_spawn".to_owned(),
+                    evidence: format!(
+                        "invocation_id={} error_kind={:?}",
+                        invocation.invocation_id,
+                        error.kind()
+                    )
+                    .into_bytes(),
+                })?;
+        return match invocation.classify(&output.stdout, output.status.code()) {
+            Ok(magiclaw_feishu_delivery_json::DeliveryOutcome::Accepted {
+                message_id,
+                platform_message_id,
+            }) => Ok(CliDeliveryReceipt {
+                message_id,
+                platform_msg_id: platform_message_id,
+            }),
+            Ok(magiclaw_feishu_delivery_json::DeliveryOutcome::RejectedBeforeMessage) => {
+                Err(BlockingCliDeliveryFailure::Rejected {
+                    reason_code: "feishu_auth_failed_before_message".to_owned(),
+                    evidence: output.stdout,
+                })
+            }
+            Ok(magiclaw_feishu_delivery_json::DeliveryOutcome::Uncertain { reason_code }) => {
+                Err(BlockingCliDeliveryFailure::Uncertain {
+                    reason_code: reason_code.to_owned(),
+                    evidence: output.stdout,
+                })
+            }
+            Err(reason_code) => Err(BlockingCliDeliveryFailure::Uncertain {
+                reason_code: reason_code.to_owned(),
+                evidence: invocation.invalid_output_evidence(&output),
+            }),
+        };
     }
 
     let output = command

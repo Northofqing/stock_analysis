@@ -28,6 +28,7 @@ impl PaperLedger<'_> {
             require_v1_owner_on(conn, binding)?;
             let effective = effective::verified_on(conn, request)?;
             effective.rows()?;
+            effective.require_economic_price_authority()?;
             let command = command(&effective)?;
             if let Some(original) = find(conn, binding, &command)? {
                 return Ok(original);
@@ -85,6 +86,7 @@ impl PaperLedger<'_> {
         conn.transaction(|conn| {
             let effective = effective::verified_on(conn, request)?;
             effective.rows()?;
+            effective.require_economic_price_authority()?;
             find(conn, binding, &command(&effective)?)
         })
     }

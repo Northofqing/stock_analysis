@@ -3047,6 +3047,17 @@ fn account_mode_net_pnl(
     }
 }
 
+fn require_account_mode_net_summary(
+    summary: &stock_analysis::performance::economic_position::NetSummary,
+) -> Result<(), String> {
+    match summary {
+        stock_analysis::performance::economic_position::NetSummary::Unavailable { reason } => {
+            Err(format!("BR-103 paper ledger anchor unavailable: {reason}"))
+        }
+        stock_analysis::performance::economic_position::NetSummary::Available { .. } => Ok(()),
+    }
+}
+
 fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, String> {
     let observed_at = chrono::Local::now().fixed_offset();
     let summary = stock_analysis::database::user_account_summary::latest()
@@ -3088,6 +3099,9 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
     let report =
         stock_analysis::performance::economic_position::compute_economic_position_report(as_of)
             .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?;
+    // An unresolved original price in an open lifecycle also invalidates the
+    // anchor, even when every previously closed lifecycle has usable net PnL.
+    require_account_mode_net_summary(&report.net_summary)?;
     let realized: Vec<(chrono::NaiveDateTime, String, f64)> = report
         .closed_positions
         .iter()
@@ -3158,6 +3172,16 @@ mod account_mode_metric_tests {
         CostBasisKind, NetMetrics, NetOutcomeClass,
     };
     use stock_analysis::risk::action_gate::AccountMode;
+
+    #[test]
+    fn br103_open_price_dispute_refuses_the_account_anchor() {
+        let summary = stock_analysis::performance::economic_position::NetSummary::Unavailable {
+            reason: "original legacy price dispute is unresolved".into(),
+        };
+        assert!(require_account_mode_net_summary(&summary)
+            .unwrap_err()
+            .contains("price dispute"));
+    }
 
     #[test]
     fn br103_consecutive_losses_use_net_pnl_even_when_gross_is_positive() {

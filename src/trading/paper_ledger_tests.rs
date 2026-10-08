@@ -2459,6 +2459,225 @@ fn legacy_buy(db: &DatabaseManager) -> i64 {
         .value
 }
 
+fn legacy_price_dispute_buy(db: &DatabaseManager) -> i64 {
+    let mut conn = db.get_conn().unwrap();
+    diesel::sql_query("INSERT INTO paper_trades(id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts,updated_at) VALUES (1,'TEST_CODE_price_dispute','TEST_CODE_000001','fixture','buy',0.07,100,'Filled',0.07,'NewsCatalyst','Normal','Full','2026-07-10 10:00:00','2026-07-10 10:00:00')").execute(&mut conn).unwrap();
+    1
+}
+
+fn legacy_price_dispute_read(ledger: &PaperLedger<'_>) -> VerifiedEffectiveFillSet {
+    ledger
+        .verified_effective_fills(&EffectiveFillRequest {
+            scope: EffectiveFillScope::LegacyRaw,
+            history: EffectiveHistory::AsKnown {
+                ledger_version: None,
+            },
+            as_of: day(instant()),
+        })
+        .unwrap()
+}
+
+#[test]
+fn legacy_price_dispute_preserves_complete_lifecycle_but_refuses_net_authority() {
+    use crate::performance::economic_position::{report_from_effective, NetMetrics, NetSummary};
+    let dir = tempfile::tempdir().unwrap();
+    let db =
+        DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_dispute.db")).unwrap();
+    declare_test_catalog_v2(&db);
+    legacy_price_dispute_buy(&db);
+    diesel::sql_query("INSERT INTO paper_trades(id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts,updated_at) VALUES (2,'TEST_CODE_dependent_sell','TEST_CODE_000001','fixture','sell',11,100,'Filled',11,'TEST_CODE_legacy','Normal','Full','2026-07-13 02:00:00','2026-07-13 02:00:00')").execute(&mut db.get_conn().unwrap()).unwrap();
+    diesel::sql_query("INSERT INTO paper_trades(id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts,updated_at) VALUES (3,'TEST_CODE_unrelated_buy','TEST_CODE_000002','fixture','buy',10,100,'Filled',10,'NewsCatalyst','Normal','Full','2026-07-10 11:00:00','2026-07-10 11:00:00'),(4,'TEST_CODE_unrelated_sell','TEST_CODE_000002','fixture','sell',11,100,'Filled',11,'TEST_CODE_legacy','Normal','Full','2026-07-13 03:00:00','2026-07-13 03:00:00')").execute(&mut db.get_conn().unwrap()).unwrap();
+    let ledger = PaperLedger::open(&db, &instant);
+    let effective = legacy_price_dispute_read(&ledger);
+    assert_eq!(
+        effective.lineage()[0].raw_hash,
+        "11d992553a4f5baf1203199efe770ae46f13b3078aa3a3a9a6a17eb8f2c76d27"
+    );
+    // This is the old failure: a complete fee model gave the disputed lifecycle
+    // an apparently usable profit. FIFO itself must still consume both facts.
+    let arithmetic = crate::performance::economic_position::rebuild_economic_positions(
+        effective.rows().unwrap(),
+        day(instant()),
+        Some(&effective.costs().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(arithmetic.closed_positions[0].gross_pnl, 1093.0);
+    assert!(matches!(
+        arithmetic.closed_positions[0].net,
+        NetMetrics::Available { .. }
+    ));
+    let report = report_from_effective(&effective).unwrap();
+    assert_eq!(report.source_fill_ids, vec![1, 3, 2, 4]);
+    assert_eq!(report.closed_positions[0].source_fill_ids, vec![1, 2]);
+    assert_eq!(report.closed_positions[0].sell_fill_ids, vec![2]);
+    assert!(matches!(
+        report.closed_positions[0].net,
+        NetMetrics::Unavailable { .. }
+    ));
+    assert!(
+        matches!(report.closed_positions[1].net, NetMetrics::Available { .. }),
+        "unrelated original lifecycle retains its existing scenario arithmetic"
+    );
+    assert!(matches!(report.net_summary, NetSummary::Unavailable { .. }));
+    assert!(report.opening_inventory.is_none());
+    assert!(matches!(
+        effective.opening_inventory_sample(),
+        Err(LedgerError::EvidenceUnavailable(_))
+    ));
+    assert_eq!(
+        legacy_price_dispute_read(&ledger),
+        effective,
+        "economic read must preserve source history"
+    );
+    let mut forged = effective.clone();
+    forged.lineage[0].ruling_hash = Some("a".repeat(64));
+    assert!(
+        matches!(
+            report_from_effective(&forged).unwrap().closed_positions[0].net,
+            NetMetrics::Unavailable { .. }
+        ),
+        "an arbitrary nonempty ruling hash is not a verified correction"
+    );
+}
+
+#[test]
+fn legacy_price_dispute_open_cycle_refuses_summary_and_account_amounts() {
+    use crate::performance::economic_position::{
+        report_from_effective, NetSummary, ValidationStatus,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_open_dispute.db"))
+        .unwrap();
+    declare_test_catalog_v2(&db);
+    legacy_price_dispute_buy(&db);
+    let ledger = PaperLedger::open(&db, &instant);
+    let effective = legacy_price_dispute_read(&ledger);
+    let report = report_from_effective(&effective).unwrap();
+    assert!(report.closed_positions.is_empty());
+    assert_eq!(report.open_positions[0].source_fill_ids, vec![1]);
+    assert_eq!(report.open_positions[0].remaining_quantity, 100);
+    assert!(matches!(report.net_summary, NetSummary::Unavailable { .. }));
+    assert!(matches!(
+        report.validation_status,
+        ValidationStatus::NetUnavailable { .. }
+    ));
+    assert!(report.opening_inventory.is_none());
+    assert!(effective.opening_inventory_sample().is_err());
+}
+
+#[test]
+fn legacy_price_dispute_is_source_bound_and_does_not_impose_a_price_floor() {
+    use crate::performance::economic_position::{report_from_effective, NetMetrics, NetSummary};
+    let dir = tempfile::tempdir().unwrap();
+    let db =
+        DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_valid_low_price.db"))
+            .unwrap();
+    declare_test_catalog_v2(&db);
+    legacy_price_dispute_buy(&db);
+    diesel::sql_query("UPDATE paper_trades SET plan_id='TEST_CODE_other_original' WHERE id=1")
+        .execute(&mut db.get_conn().unwrap())
+        .unwrap();
+    diesel::sql_query("INSERT INTO paper_trades(id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts,updated_at) VALUES (2,'TEST_CODE_normal_sell','TEST_CODE_000001','fixture','sell',11,100,'Filled',11,'TEST_CODE_legacy','Normal','Full','2026-07-13 02:00:00','2026-07-13 02:00:00')").execute(&mut db.get_conn().unwrap()).unwrap();
+    let ledger = PaperLedger::open(&db, &instant);
+    let effective = legacy_price_dispute_read(&ledger);
+    let report = report_from_effective(&effective).unwrap();
+    assert_eq!(effective.rows().unwrap()[0].fill_price, Some(0.07));
+    assert!(matches!(
+        report.closed_positions[0].net,
+        NetMetrics::Available {
+            kind: crate::performance::economic_position::CostBasisKind::Scenario,
+            ..
+        }
+    ));
+    assert!(matches!(report.net_summary, NetSummary::Available { .. }));
+    assert!(report.opening_inventory.is_some());
+    assert!(effective.opening_inventory_sample().is_ok());
+}
+
+#[test]
+fn legacy_price_dispute_only_verified_correction_resolves_without_rewriting_raw_history() {
+    use crate::performance::economic_position::{
+        report_from_effective, CostBasisKind, NetMetrics, NetSummary,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db =
+        DatabaseManager::open_isolated_for_test(dir.path().join("TEST_CODE_dispute_correction.db"))
+            .unwrap();
+    declare_test_catalog_v2(&db);
+    let id = legacy_price_dispute_buy(&db);
+    diesel::sql_query("INSERT INTO paper_trades(id,plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts,updated_at) VALUES (2,'TEST_CODE_correction_sell','TEST_CODE_000001','fixture','sell',11,100,'Filled',11,'TEST_CODE_legacy','Normal','Full','2026-07-13 02:00:00','2026-07-13 02:00:00')").execute(&mut db.get_conn().unwrap()).unwrap();
+    let ledger = PaperLedger::open(&db, &instant);
+    let binding = manifest().binding().unwrap();
+    let seeded = ledger.apply(PaperCommand::Seed(manifest())).unwrap();
+    let account_before = ledger.read(&binding).unwrap();
+    let before_request = EffectiveFillRequest {
+        scope: EffectiveFillScope::LegacyBeforeCutover(binding.clone()),
+        history: EffectiveHistory::AsKnown {
+            ledger_version: Some(seeded.version),
+        },
+        as_of: day(instant()),
+    };
+    let old = ledger.verified_effective_fills(&before_request).unwrap();
+    assert!(matches!(
+        report_from_effective(&old).unwrap().net_summary,
+        NetSummary::Unavailable { .. }
+    ));
+    let mut ruling = ruling_for(&ledger, &binding, id, "TEST_CODE_dispute_correction");
+    ruling.action = AdjudicationAction::CorrectionDeclared {
+        price: Money::from_cny(9.0).unwrap(),
+        quantity: 100,
+        fact_at: ruling.original.fact_at,
+    };
+    let original = ruling.original.clone();
+    let mut forged = ruling.clone();
+    forged.original.raw_trade_hash = "b".repeat(64);
+    assert!(matches!(
+        ledger.adjudicate(forged),
+        Err(LedgerError::IntegrityFailure(_))
+    ));
+    ledger.adjudicate(ruling).unwrap();
+    let current = ledger
+        .verified_effective_fills(&EffectiveFillRequest {
+            history: EffectiveHistory::RestatedLatest,
+            ..before_request.clone()
+        })
+        .unwrap();
+    let report = report_from_effective(&current).unwrap();
+    assert_eq!(current.rows().unwrap()[0].fill_price, Some(9.0));
+    assert!(matches!(
+        report.closed_positions[0].net,
+        NetMetrics::Available {
+            kind: CostBasisKind::Scenario,
+            ..
+        }
+    ));
+    assert!(matches!(
+        report.net_summary,
+        NetSummary::Available {
+            kind: CostBasisKind::Scenario,
+            ..
+        }
+    ));
+    assert!(current.opening_inventory_sample().is_ok());
+    assert_eq!(
+        ledger.verified_effective_fills(&before_request).unwrap(),
+        old
+    );
+    assert_eq!(ledger.fill_fingerprint(&binding, id).unwrap(), original);
+    assert_eq!(
+        ledger.read(&binding).unwrap().projection,
+        account_before.projection
+    );
+    assert!(matches!(
+        ledger.current_snapshot(&before_request),
+        Err(LedgerError::EvidenceUnavailable(_))
+    ));
+    assert!(matches!(
+        ledger.settle_snapshot(&before_request),
+        Err(LedgerError::EvidenceUnavailable(_))
+    ));
+}
+
 #[test]
 fn effective_fill_legacy_raw_is_explicit_as_known_and_cannot_authorize_adjudication() {
     let dir = tempfile::tempdir().unwrap();

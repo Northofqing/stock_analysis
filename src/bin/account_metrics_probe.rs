@@ -44,6 +44,17 @@ fn available_net_pnl(
     }
 }
 
+fn require_net_summary(
+    summary: &stock_analysis::performance::economic_position::NetSummary,
+) -> Result<(), String> {
+    match summary {
+        stock_analysis::performance::economic_position::NetSummary::Unavailable { reason } => {
+            Err(format!("paper ledger anchor: {reason}"))
+        }
+        stock_analysis::performance::economic_position::NetSummary::Available { .. } => Ok(()),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "Inspect confirmed account and holdings in a private read-only snapshot")]
 struct Args {
@@ -171,6 +182,7 @@ fn run_probe(
         .map_err(|error| format!("paper ledger anchor: {error}"))?;
     let report = stock_analysis::performance::economic_position::report_from_effective(&effective)
         .map_err(|error| format!("paper ledger anchor: {error}"))?;
+    require_net_summary(&report.net_summary)?;
     println!(
         "ledger: closed_positions={} open_positions={} (费率逐笔成本净口径)",
         report.closed_positions.len(),
@@ -234,6 +246,16 @@ mod tests {
     use super::*;
     use diesel::{Connection, RunQueryDsl};
     use stock_analysis::performance::economic_position::NetMetrics;
+
+    #[test]
+    fn account_net_summary_rejects_open_price_dispute_before_counting_closed_cycles() {
+        let summary = stock_analysis::performance::economic_position::NetSummary::Unavailable {
+            reason: "original legacy price dispute is unresolved".into(),
+        };
+        assert!(require_net_summary(&summary)
+            .unwrap_err()
+            .contains("price dispute"));
+    }
 
     fn at(value: &str) -> chrono::DateTime<chrono::FixedOffset> {
         chrono::DateTime::parse_from_rfc3339(value).unwrap()
