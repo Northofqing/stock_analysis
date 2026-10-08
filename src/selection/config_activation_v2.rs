@@ -51,7 +51,7 @@ const CONFIG_ACTIVATION_PAYLOAD_SCHEMA: &str = "config-activation-stage-v1";
 
 // Exact public inputs compiled by build.rs or include_str!. Runtime credential
 // directories are deliberately outside this closed input set.
-const COMPILED_PUBLIC_CONTRACT_INPUTS: [&str; 7] = [
+const COMPILED_PUBLIC_CONTRACT_INPUTS: [&str; 10] = [
     "contracts/local_bridge_v1/market.proto",
     "contracts/external_v1_current/market.proto",
     "contracts/external_v1_current/bundle-metadata.json",
@@ -59,6 +59,9 @@ const COMPILED_PUBLIC_CONTRACT_INPUTS: [&str; 7] = [
     "contracts/external_v1_history/bundle-20260917.1.json",
     "contracts/external_v1_history/20260928.2/market.proto",
     "contracts/external_v1_history/20260928.2/bundle-metadata.json",
+    "contracts/external_v1_history/20261001.3/market.proto",
+    "contracts/external_v1_history/20261001.3/bundle-metadata.json",
+    "contracts/durable_monitor_v9/schema.sql",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1695,6 +1698,25 @@ mod tests {
         .expect("write extra config");
         let third = compute_executable_revision(&fixture.root).expect("third revision");
         assert_ne!(second.hash, third.hash);
+    }
+
+    #[test]
+    fn retained_monitor_contract_changes_and_missing_files_invalidate_activation() {
+        for relative in [
+            "contracts/external_v1_history/20261001.3/market.proto",
+            "contracts/external_v1_history/20261001.3/bundle-metadata.json",
+            "contracts/durable_monitor_v9/schema.sql",
+        ] {
+            let fixture = TestFixture::new();
+            fixture.install_verified_config();
+            let first = compute_executable_revision(&fixture.root).unwrap();
+            let path = fixture.root.join(relative);
+            fs::write(&path, b"TEST_CODE_CHANGED_COMPILED_CONTRACT\n").unwrap();
+            let changed = compute_executable_revision(&fixture.root).unwrap();
+            assert_ne!(first.hash, changed.hash, "{relative}");
+            fs::remove_file(path).unwrap();
+            assert!(compute_executable_revision(&fixture.root).is_err(), "{relative}");
+        }
     }
 
     #[derive(Serialize)]
