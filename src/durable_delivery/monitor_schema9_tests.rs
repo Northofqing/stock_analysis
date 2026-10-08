@@ -1,6 +1,6 @@
 use super::*;
 
-fn retained_fixture(label: &str) -> Fixture {
+pub(in crate::durable_delivery) fn retained_fixture(label: &str) -> Fixture {
     let mut fixture = Fixture::new(label);
     drop(fixture.coordinator.take().unwrap());
     let connection = Connection::open(&fixture.database_path).unwrap();
@@ -227,6 +227,223 @@ fn monitor_schema9_uncertain_survives_reopen_without_automatic_resend() {
     assert_eq!(resumed.sink_calls, 0);
     assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
     assert_eq!(catalog(&fixture), before);
+}
+
+#[test]
+fn monitor_schema9_manual_rejected_finalizes_and_retries_without_resend_or_catalog_change() {
+    for task_bound in [false, true] {
+        let mut fixture = retained_fixture("SCHEMA9_MANUAL_REJECTED");
+        let before = catalog(&fixture);
+        let item = envelope(
+            "SCHEMA9_MANUAL_REJECTED",
+            PushKind::CloseCall,
+            DeliverySubKind::None,
+            "2026-07-30",
+            task_bound,
+        );
+        let append = MemoryAppendPort::default();
+        prepare_reserved(&fixture, &item, &append);
+        let sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+        let sinks: Vec<AuthoritativeSink> = vec![sink.clone()];
+        fixture
+            .coordinator
+            .resume_deliverable(&item.decision_identity, &sinks, now())
+            .unwrap();
+        reconcile_terminal(
+            &fixture,
+            &append,
+            DecisionState::UncertainManualReview,
+            &item.decision_identity,
+        );
+        let original_result: Vec<u8> = Connection::open(&fixture.database_path)
+            .unwrap()
+            .query_row("SELECT result_canonical FROM sink_results", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let original_disposition: (String, Vec<u8>) = Connection::open(&fixture.database_path)
+        .unwrap()
+        .query_row(
+            "SELECT disposition_identity,disposition_canonical FROM delivery_disposition_payloads",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+        let command = ManualResolutionCommand {
+            decision_identity: item.decision_identity.clone(),
+            disposition: ManualDisposition::Rejected,
+            operator_identity: "TEST_CODE_SCHEMA9_MANUAL_OPERATOR".to_owned(),
+            reason: "TEST_CODE_cancel_with_historical_delivery_unknown".to_owned(),
+            external_evidence: b"TEST_CODE_exact_manual_authorization_bytes\n".to_vec(),
+            resolved_at: now(),
+        };
+        assert_eq!(
+            fixture
+                .coordinator
+                .resolve_uncertain(&command, &append)
+                .unwrap(),
+            DecisionState::ManualRejectedAuditPending
+        );
+        assert_eq!(
+            fixture.query_i64("SELECT count(*) FROM cooldown_reservations WHERE state='Released'"),
+            1
+        );
+        assert_eq!(
+            fixture
+                .query_i64("SELECT count(*) FROM daily_budget_reservations WHERE state='Released'"),
+            1
+        );
+        assert_eq!(
+            fixture.query_i64("SELECT retry_authorized FROM delivery_decisions"),
+            0
+        );
+        drop(fixture.coordinator.take().unwrap());
+        fixture.coordinator = FixtureCoordinator(Some(Arc::new(
+            DurableDeliveryCoordinator::open_existing_monitor_schema9(config(&fixture)).unwrap(),
+        )));
+        let evidence: Vec<u8> = Connection::open(&fixture.database_path)
+            .unwrap()
+            .query_row(
+                "SELECT evidence_canonical FROM manual_resolutions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence, command.external_evidence);
+        // An authorized retry continues the pending finalizer; it does not resolve or send again.
+        reconcile_terminal(
+            &fixture,
+            &append,
+            DecisionState::ManualResolvedRejected,
+            &item.decision_identity,
+        );
+        assert_eq!(fixture.query_i64("SELECT count(*) FROM delivery_state_events WHERE to_state='ManualRejectedTaskTransitionPending'"), i64::from(task_bound));
+        if task_bound {
+            let c = Connection::open(&fixture.database_path).unwrap();
+            let (identity, canonical, hash, immutable_ref): (String, Vec<u8>, String, String) = c.query_row(
+            "SELECT t.transition_identity,t.transition_canonical,t.transition_sha256,t.immutable_audit_ref FROM task_transition_payloads t JOIN delivery_disposition_payloads d USING(disposition_identity) WHERE d.disposition='ManualRejected' AND t.append_state='Appended' AND t.hydration_state='Pending'", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+        ).unwrap();
+            let records = append.records.lock().unwrap();
+            let record = records.get(&identity).unwrap();
+            assert_eq!(record.record_kind, "BR-140TaskTransition");
+            assert_eq!(record.canonical_bytes, canonical);
+            assert_eq!(record.sha256, hash);
+            assert_eq!(record.immutable_ref, immutable_ref);
+        } else {
+            assert_eq!(
+                fixture.query_i64("SELECT count(*) FROM task_transition_payloads"),
+                0
+            );
+        }
+        let events = fixture.query_i64("SELECT count(*) FROM delivery_state_events");
+        let records = append.records.lock().unwrap().clone();
+        reconcile_terminal(
+            &fixture,
+            &append,
+            DecisionState::ManualResolvedRejected,
+            &item.decision_identity,
+        );
+        let resumed = fixture
+            .coordinator
+            .resume_deliverable(&item.decision_identity, &sinks, now())
+            .unwrap();
+        assert_eq!(resumed.state, DecisionState::ManualResolvedRejected);
+        assert_eq!(resumed.sink_calls, 0);
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            fixture.coordinator.resolve_uncertain(&command, &append),
+            Err(DurableDeliveryError::InvalidManualResolution(_))
+        ));
+        assert_eq!(
+            fixture.query_i64("SELECT count(*) FROM delivery_state_events"),
+            events
+        );
+        assert_eq!(
+            fixture.query_i64("SELECT count(*) FROM manual_resolutions"),
+            1
+        );
+        assert_eq!(*append.records.lock().unwrap(), records);
+        let c = Connection::open(&fixture.database_path).unwrap();
+        assert_eq!(
+            c.query_row("SELECT result_canonical FROM sink_results", [], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            original_result
+        );
+        assert_eq!(c.query_row("SELECT disposition_canonical FROM delivery_disposition_payloads WHERE disposition_identity=?1", [&original_disposition.0], |r| r.get::<_, Vec<u8>>(0)).unwrap(), original_disposition.1);
+        assert_eq!(catalog(&fixture), before);
+        assert_eq!(fixture.query_i64("PRAGMA user_version"), 9);
+    }
+}
+
+#[test]
+fn monitor_schema9_manual_resolution_keeps_accepted_and_foundation_guards() {
+    for foundation in [false, true] {
+        let fixture = retained_fixture("SCHEMA9_MANUAL_GUARD");
+        let before = catalog(&fixture);
+        let item = if foundation {
+            w12_foundation_envelope("SCHEMA9_FOUNDATION_GUARD")
+        } else {
+            envelope(
+                "SCHEMA9_ACCEPTED_GUARD",
+                PushKind::DataMode,
+                DeliverySubKind::None,
+                "2026-07-30",
+                false,
+            )
+        };
+        let append = MemoryAppendPort::default();
+        prepare_reserved(&fixture, &item, &append);
+        let sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+        fixture
+            .coordinator
+            .resume_deliverable(&item.decision_identity, &[sink], now())
+            .unwrap();
+        reconcile_terminal(
+            &fixture,
+            &append,
+            DecisionState::UncertainManualReview,
+            &item.decision_identity,
+        );
+        let uncertain_cooldowns = fixture.query_i64(
+            "SELECT count(*) FROM cooldown_reservations WHERE state='Uncertain'",
+        );
+        let command = ManualResolutionCommand {
+            decision_identity: item.decision_identity.clone(),
+            disposition: if foundation {
+                ManualDisposition::Rejected
+            } else {
+                ManualDisposition::Accepted {
+                    receipt: Some(receipt(now())),
+                }
+            },
+            operator_identity: "TEST_CODE_SCHEMA9_GUARD_OPERATOR".to_owned(),
+            reason: "TEST_CODE_ROUTE_MUST_NOT_BYPASS_PLATFORM_GUARD".to_owned(),
+            external_evidence: b"TEST_CODE_MANUAL_GUARD_AUTH".to_vec(),
+            resolved_at: now(),
+        };
+        assert!(matches!(
+            fixture.coordinator.resolve_uncertain(&command, &append),
+            Err(DurableDeliveryError::InvalidConfiguration(_))
+        ));
+        assert_eq!(
+            fixture
+                .coordinator
+                .decision_state(&item.decision_identity)
+                .unwrap(),
+            DecisionState::UncertainManualReview
+        );
+        assert_eq!(
+            fixture.query_i64("SELECT count(*) FROM manual_resolutions"),
+            0
+        );
+        assert_eq!(
+            fixture.query_i64("SELECT count(*) FROM cooldown_reservations WHERE state='Uncertain'"),
+            uncertain_cooldowns
+        );
+        assert_eq!(catalog(&fixture), before);
+    }
 }
 
 #[test]

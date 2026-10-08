@@ -6,6 +6,69 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 const DATE: &str = "2026-09-23";
+
+#[test]
+fn monitor_schema9_manual_rejected_explicit_p05_check_cannot_bypass_platform_guard() {
+    use crate::durable_delivery::DeliverySubKind;
+    use crate::durable_delivery::tests::{
+        envelope, monitor_schema9_tests::retained_fixture, now, prepare_reserved,
+        reconcile_terminal, uncertainty, MemoryAppendPort, StaticSink,
+    };
+    let fixture = retained_fixture("SCHEMA9_EXPLICIT_P05_MANUAL_GUARD");
+    let item = envelope(
+        "SCHEMA9_EXPLICIT_P05_MANUAL_GUARD",
+        PushKind::CloseCall,
+        DeliverySubKind::None,
+        "2026-07-30",
+        false,
+    );
+    let append = MemoryAppendPort::default();
+    prepare_reserved(&fixture, &item, &append);
+    let sink = StaticSink::new(AuthoritativeSinkResult::Uncertain(uncertainty(now())));
+    fixture
+        .coordinator
+        .resume_deliverable(&item.decision_identity, &[sink], now())
+        .unwrap();
+    reconcile_terminal(
+        &fixture,
+        &append,
+        DecisionState::UncertainManualReview,
+        &item.decision_identity,
+    );
+    let command = crate::durable_delivery::ManualResolutionCommand {
+        decision_identity: item.decision_identity.clone(),
+        disposition: crate::durable_delivery::ManualDisposition::Rejected,
+        operator_identity: "TEST_CODE_EXPLICIT_P05_MANUAL_OPERATOR".into(),
+        reason: "TEST_CODE_EXPLICIT_P05_REQUIRES_PLATFORM".into(),
+        external_evidence: b"TEST_CODE_EXPLICIT_P05_AUTH".to_vec(),
+        resolved_at: now(),
+    };
+    // Even an explicit Unowned check is a platform route, not ordinary legacy authority.
+    let check = ActualP05ConsumerCheck::Unowned;
+    assert!(matches!(
+        fixture
+            .coordinator
+            .resolve_uncertain_with_p05_check(&command, &append, Some(&check)),
+        Err(DurableDeliveryError::InvalidConfiguration(_))
+    ));
+    assert_eq!(
+        fixture
+            .coordinator
+            .decision_state(&item.decision_identity)
+            .unwrap(),
+        DecisionState::UncertainManualReview
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT count(*) FROM manual_resolutions"),
+        0
+    );
+    assert_eq!(
+        fixture.query_i64("SELECT count(*) FROM cooldown_reservations WHERE state='Uncertain'"),
+        1
+    );
+    assert_eq!(fixture.query_i64("PRAGMA user_version"), 9);
+}
+
 #[path = "p05_schema14_snapshot_tests.rs"]
 mod snapshot_tests;
 fn at(day: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {

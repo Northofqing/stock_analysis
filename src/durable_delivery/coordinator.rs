@@ -5140,7 +5140,25 @@ impl DurableDeliveryCoordinator {
         )?;
 
         let route = self.decision_mutation_route(&command.decision_identity)?;
-        self.with_p05_business_mutation_transaction(&route, check, |transaction, dependencies| {
+        // The retained monitor owns ordinary legacy cancellation without a P05
+        // capability. Keep Accepted, explicit P05 and foundation routes guarded.
+        // The declared transaction revalidates these exact immutable envelope bytes.
+        let ordinary_schema9_rejection = if self.monitor_schema9
+            && check.is_none()
+            && matches!(&command.disposition, ManualDisposition::Rejected)
+        {
+            let (canonical, _) = route.expected_envelope.as_ref().ok_or_else(|| {
+                DurableDeliveryError::PolicyMismatch(
+                    "manual rejection requires an existing immutable envelope".to_owned(),
+                )
+            })?;
+            let envelope = parse_envelope(canonical)?;
+            envelope.foundation_binding().is_none() && envelope.canonical_bytes()? == *canonical
+        } else {
+            false
+        };
+        let operation = |transaction: &Transaction<'_>,
+                         dependencies: &p05_unit::runtime::SqlDependencies| {
             let stored =
                 load_decision(transaction, &command.decision_identity)?.ok_or_else(|| {
                     DurableDeliveryError::DecisionNotFound(command.decision_identity.clone())
@@ -5291,7 +5309,12 @@ impl DurableDeliveryCoordinator {
                 }
             }
             Ok(MutationEffect::Changed(()))
-        })?;
+        };
+        if ordinary_schema9_rejection {
+            self.with_mutation_transaction_declared(&route, operation)?;
+        } else {
+            self.with_p05_business_mutation_transaction(&route, check, operation)?;
+        }
         self.with_connection(|connection| {
             load_decision(connection, &command.decision_identity)?
                 .map(|stored| stored.state)

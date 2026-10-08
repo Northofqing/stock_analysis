@@ -47,7 +47,7 @@ static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(1);
 #[path = "delivery_status_tests.rs"]
 mod delivery_status_tests;
 #[path = "monitor_schema9_tests.rs"]
-mod monitor_schema9_tests;
+pub(super) mod monitor_schema9_tests;
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
