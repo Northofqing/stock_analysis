@@ -53,3 +53,5 @@ HTML --draft/render和--draft --check均exit1 `file_set_mismatch pair=current`�
 默认installer的已跑plan命令为 `/usr/bin/python3 -B <上述bundle>/scripts/prepare_goal_first_delivery.py --bundle <上述bundle>`，只hash/check/输出plan；显式install仅原子发布version，job持久安装/加载仍独立步骤，见RUNBOOK。无重复weekly、RunAtLoad=false、无初始catchup；新watchdog60s/RunAtLoad=false使用已有早期只读health路径。
 
 Losslessarchive实际保存并全member复核：117members / 12873491 raw bytes；archive 3584946bytes / SHA-256 `d426bf8304a44f279cdf351850b28e364fe1a572b80fd5cd6c53ef99555a4eb5`。逐memberlength/SHA与原路径在该root/review-evidence-manifest.json。原plan26216bytes/SHA `a0185c672e2f7932c963c0c9820de9f2601f3c442a982956ca331e5b5184c702` 与original-plan private copy/archive member核对一致。
+
+最终收尾时，由主任务追加保存 Task 6 后续审查、全分支最终审查与本地集成证明：[最终补充归档](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/late-review-evidence.tar.gz)及[逐文件长度与哈希清单](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/late-review-evidence-manifest.json)。这些文件将在最终收尾时写入并核验，最终结果以其中记录为准；此处不表示全分支审查或集成已经完成。既有不可变归档继续保留。
