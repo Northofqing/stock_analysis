@@ -515,21 +515,33 @@ fn scorecard_json(mut review: Review) -> serde_json::Value {
 #[test]
 fn registry_rejects_duplicate_missing_unknown_and_invalid_contracts() {
     let original = registry::DEFAULT_REGISTRY;
-    assert_eq!(
-        registry::Registry::parse(original).unwrap().signals.len(),
-        6
-    );
+    assert_eq!(registry::Registry::parse(original).unwrap().signal.len(), 6);
     for bad in [
         original.replace("id = \"main_net_inflow\"", "id = \"news_catalyst\""),
         original.replace("name = \"MainNetInflow\"", "name = \"NewsCatalyst\""),
         original.replace("name = \"MainNetInflow\"", "name = \"Unknown\""),
-        original.replace("action = \"observe\"", "action = \"promote_live\""),
-        original.replace("status = \"evidence_pending\"", "status = \"live\""),
-        original.replace("windows = [1, 3, 5]", "windows = [0, 3, 5]"),
-        original.replace("windows = [1, 3, 5]", "windows = [1, 1]"),
-        original.replace("windows = [1, 3, 5]", "windows = []"),
-        original.replace("cost_version = \"lot-rates-v1\"", "cost_version = \"\""),
-        original.replace("exit_version = \"existing-paper-exits-review-v0\"\n", ""),
+        original.replace("action = \"info_only\"", "action = \"promote_live\""),
+        original.replace("status = \"watch\"", "status = \"live\""),
+        original.replace(
+            "observation_window = [\"t1\", \"t3\", \"t5\"]",
+            "observation_window = [\"t0\", \"t3\", \"t5\"]",
+        ),
+        original.replace(
+            "observation_window = [\"t1\", \"t3\", \"t5\"]",
+            "observation_window = [\"t1\", \"t1\"]",
+        ),
+        original.replace(
+            "observation_window = [\"t1\", \"t3\", \"t5\"]",
+            "observation_window = []",
+        ),
+        original.replace(
+            "cost_model_version = \"lot-rates-v1\"",
+            "cost_model_version = \"\"",
+        ),
+        original.replace(
+            "exit_rule_version = \"existing-paper-exits-review-v0\"\n",
+            "",
+        ),
         original.replace("signal_version = \"news-catalyst-review-v0\"\n", ""),
         original.replace("schema_version = 1", "schema_version = 2"),
     ] {
@@ -622,7 +634,9 @@ fn cli_formats_and_manifest_share_exact_snapshot_clock_registry_and_reader_ident
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(
         &registry_path,
-        registry::DEFAULT_REGISTRY.replace("action = \"observe\"", "action = \"pause\""),
+        registry::DEFAULT_REGISTRY
+            .replace("action = \"info_only\"", "action = \"disabled\"")
+            .replace("status = \"watch\"", "status = \"active\""),
     )
     .unwrap();
     let manifest_path = dir.path().join("evidence-manifest.json");
@@ -659,7 +673,7 @@ fn cli_formats_and_manifest_share_exact_snapshot_clock_registry_and_reader_ident
     assert!(markdown.contains(std::str::from_utf8(&manifest_bytes).unwrap().trim_end()));
     assert_eq!(
         json["scorecard"]["pooled_descriptive_evidence"]["price_observation"][0]["value"], 1,
-        "manual pause does not change reader observations"
+        "manual disabled action does not change reader observations"
     );
     for evidence in manifest["metric_scopes"].as_object().unwrap().values() {
         assert_eq!(evidence["input_snapshot_sha256"], bytes_sha256(&original));
@@ -721,4 +735,127 @@ fn cli_invalid_registry_and_nonempty_wal_fail_without_report_or_source_writes() 
         .contains("nonempty WAL"));
     assert!(!output.exists());
     assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn binding_plan_shaped_registry_accepts_prescribed_enums_and_independent_eligibility() {
+    let families = [
+        "NewsCatalyst",
+        "MainNetInflow",
+        "VolumeSurge",
+        "PostCloseFundInflow",
+        "StreakLeader",
+        "ThemePrediction",
+    ];
+    let actions = ["paper_buy", "info_only", "disabled"];
+    let statuses = ["active", "watch", "demoted"];
+    // Exactly the §3.1 minimum per-family shape: no optional ID or envelope.
+    let input = families
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            format!(
+                r#"
+[[signal]]
+name = "{name}"
+signal_version = "v1"
+exit_rule_version = "BR-234.v1"
+cost_model_version = "cost.v1"
+source_module = "monitor.news"
+action = "{}"
+eligibility_price_observation = "close_available"
+eligibility_simulated_fill = "paper_fill_valid"
+eligibility_net_return = "cost_model_complete"
+entry_assumption = "close_t0"
+observation_window = ["t1", "t3", "t5"]
+status = "{}"
+"#,
+                actions[i % 3],
+                statuses[i % 3]
+            )
+        })
+        .collect::<String>();
+    let parsed = registry::Registry::parse(&input).unwrap();
+    assert_eq!(parsed.schema_version, 1);
+    assert_eq!(parsed.registry_version, "signal-registry-v0");
+    assert_eq!(parsed.signal[0].id, "news_catalyst");
+    assert_eq!(parsed.signal[5].id, "theme_prediction");
+    let encoded = serde_json::to_value(parsed).unwrap();
+    for (index, signal) in encoded["signal"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(signal["action"], actions[index % 3]);
+        assert_eq!(signal["status"], statuses[index % 3]);
+        assert_eq!(signal["eligibility_price_observation"], "close_available");
+        assert_eq!(signal["eligibility_simulated_fill"], "paper_fill_valid");
+        assert_eq!(signal["eligibility_net_return"], "cost_model_complete");
+        assert_eq!(
+            signal["observation_window"],
+            serde_json::json!(["t1", "t3", "t5"])
+        );
+        assert!(signal.get("eligibility").is_none());
+    }
+    assert!(registry::Registry::parse(&(input + "\n")).is_ok());
+}
+
+#[test]
+fn cli_rejects_relative_parent_and_symlink_directory_artifact_aliases_before_writing() {
+    // Avoid process-global cwd mutations while testing relative versus absolute.
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    let dir = tempfile::tempdir_in(&cwd).unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source = root.join("TEST_CODE_alias.db");
+    let writer = rusqlite::Connection::open(&source).unwrap();
+    writer.execute_batch(FIXTURE_SCHEMA).unwrap();
+    drop(writer);
+    let original = std::fs::read(&source).unwrap();
+    let output = root.join("review.json");
+    let relative = output.strip_prefix(&cwd).unwrap().to_path_buf();
+    std::fs::create_dir(root.join("child")).unwrap();
+    let mut aliases = vec![relative, root.join("child/../review.json")];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&root, root.join("linked")).unwrap();
+        aliases.push(root.join("linked/review.json"));
+    }
+    for alias in aliases {
+        let error = run(Args {
+            database: source.clone(),
+            registry: None,
+            evidence_manifest: Some(output.clone()),
+            source_label: None,
+            temporary_snapshot: false,
+            from: canonical_date("2026-09-28").unwrap(),
+            to: canonical_date("2026-10-04").unwrap(),
+            observed_at: Some(shanghai_clock("2026-10-08T00:52:00+08:00").unwrap()),
+            format: Format::Json,
+            output: Some(alias.clone()),
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("paths must differ"),
+            "unexpected alias failure for {alias:?}: {error}"
+        );
+        assert!(
+            !alias.exists() && !output.exists(),
+            "alias rejection wrote an artifact"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+}
+
+#[test]
+fn newly_appeared_or_changed_manifest_is_never_silently_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("manifest.json");
+    let expected = b"{\"schema_version\":\"weekly-outcome-evidence-manifest-v1\"}\n";
+    // This represents a path appearing after the initial absent-path preflight.
+    std::fs::write(&path, b"unvalidated appeared file").unwrap();
+    assert!(persist_manifest(&path, expected, false).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"unvalidated appeared file");
+    // Pre-existing byte-identical manifests can be reused, but must still match
+    // at completion. A change after preflight cannot yield successful reuse.
+    std::fs::write(&path, expected).unwrap();
+    persist_manifest(&path, expected, true).unwrap();
+    std::fs::write(&path, b"changed after validation").unwrap();
+    assert!(persist_manifest(&path, expected, true).is_err());
+    assert_eq!(std::fs::read(path).unwrap(), b"changed after validation");
 }

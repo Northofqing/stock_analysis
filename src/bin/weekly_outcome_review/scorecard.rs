@@ -192,10 +192,10 @@ pub fn attach(review: &mut Review, registry: RegistryInput, sha: &str) {
         ));
     }
     pooled.net_return.push(Metric::new("executable_net_return", None, Grade::Unavailable, "no qualified executable fills, observed settlement fees or historical price/PIT evidence supplied", net.clone()));
-    let families = registry.content.signals.iter().map(|signal| {
+    let families = registry.content.signal.iter().map(|signal| {
         let unavailable = |section: &str| Metric::new(section, None, Grade::Unavailable,
             format!("{:?}/{}: missing authoritative original family+signal-version join to {section}; exit/cost-version lineage also required for paper net; free-text reasons/candidate/archive rows are not attribution or physical-delivery evidence", signal.name, signal.signal_version),
-            evidence("scorecard::family_join_unavailable", sha, &format!("registered signal {}; windows {:?}; no attributable qualified sample", signal.id, signal.windows), "all pooled prediction/paper rows excluded from family attribution", "null means attribution unavailable, never zero samples or zero return"));
+            evidence("scorecard::family_join_unavailable", sha, &format!("registered signal {}; windows {:?}; no attributable qualified sample", signal.id, signal.observation_window), "all pooled prediction/paper rows excluded from family attribution", "null means attribution unavailable, never zero samples or zero return"));
         FamilyCard { signal_id: signal.id.clone(), sections: Sections {
             price_observation: vec![unavailable("price_observation")], simulated_fill: vec![unavailable("simulated_fill")], net_return: vec![unavailable("net_return")],
         }}
@@ -280,11 +280,11 @@ impl Scorecard {
             let entry = self
                 .registry
                 .content
-                .signals
+                .signal
                 .iter()
                 .find(|s| s.id == family.signal_id)
                 .unwrap();
-            text.push_str(&format!("\n### {:?} / {}\n\n版本：signal `{}` / exit `{}` / cost `{}`；action {:?} / status {:?}；T+{:?}。\n\nEntry：{}\n\nEligibility：{}\n", entry.name, entry.id, entry.signal_version, entry.exit_version, entry.cost_version, entry.action, entry.status, entry.windows, super::report::escape(&entry.entry_assumptions), super::report::escape(&entry.eligibility)));
+            text.push_str(&format!("\n### {:?} / {}\n\n版本：signal `{}` / exit `{}` / cost `{}`；action {:?} / status {:?}；window {:?}。\n\nEntry：{}\n\nSource module：{}\n\nEligibility price observation：{}\n\nEligibility simulated fill：{}\n\nEligibility net return：{}\n", entry.name, entry.id, entry.signal_version, entry.exit_rule_version, entry.cost_model_version, entry.action, entry.status, entry.observation_window, super::report::escape(&entry.entry_assumption), super::report::escape(&entry.source_module), super::report::escape(&entry.eligibility_price_observation), super::report::escape(&entry.eligibility_simulated_fill), super::report::escape(&entry.eligibility_net_return)));
             text.push_str(&render_sections(&family.sections));
         }
         text.push_str("\n### 汇总描述性证据（无家族归属）\n");

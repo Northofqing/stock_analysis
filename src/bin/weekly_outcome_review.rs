@@ -105,18 +105,27 @@ fn run(args: Args) -> anyhow::Result<()> {
             .as_ref()
             .map(|path| path.with_extension("evidence.json"))
     });
-    if let Some(path) = &manifest_path {
+    if let (Some(output), Some(manifest)) = (&args.output, &manifest_path) {
         anyhow::ensure!(
-            args.output.as_ref() != Some(path),
-            "report and manifest paths must differ"
+            artifact_destination(output)? != artifact_destination(manifest)?,
+            "report and manifest paths must differ after resolving parent directories"
         );
-        if path.exists() {
-            anyhow::ensure!(
-                std::fs::read(path)? == manifest.as_bytes(),
-                "existing evidence manifest differs; refusing overwrite"
-            );
-        }
     }
+    let reuse_manifest = if let Some(path) = &manifest_path {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                anyhow::ensure!(
+                    std::fs::read(path)? == manifest.as_bytes(),
+                    "existing evidence manifest differs; refusing overwrite"
+                );
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        false
+    };
     let mut rendered = match args.format {
         Format::Markdown => review.markdown(),
         Format::Json => serde_json::to_string_pretty(&review)?,
@@ -128,11 +137,34 @@ fn run(args: Args) -> anyhow::Result<()> {
         print!("{rendered}");
     }
     if let Some(path) = manifest_path {
-        if !path.exists() {
-            write_new_private(&path, manifest.as_bytes())?;
-        }
+        persist_manifest(&path, manifest.as_bytes(), reuse_manifest)?;
     }
     Ok(())
+}
+
+/// Output parents must already exist. Resolving them handles relative/absolute,
+/// parent-component and symlinked-directory aliases without creating anything.
+fn artifact_destination(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let filename = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("artifact path must name a file"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    Ok(parent.canonicalize()?.join(filename))
+}
+fn persist_manifest(path: &std::path::Path, bytes: &[u8], reuse: bool) -> anyhow::Result<()> {
+    if reuse {
+        anyhow::ensure!(
+            std::fs::read(path)? == bytes,
+            "reused evidence manifest changed; refusing success"
+        );
+        Ok(())
+    } else {
+        // A path appearing since preflight is never silently considered valid.
+        write_new_private(path, bytes)
+    }
 }
 
 fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
