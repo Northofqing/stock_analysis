@@ -156,3 +156,5 @@ pub use sina_instrument_news::{SinaInstrumentNewsGateway, SinaInstrumentNewsReco
 pub use t0_evidence::{
     T0Batch, T0BookLevel, T0DailyBar, T0Evidence, T0FiveMinuteBar, T0Quote, T0Rejection,
 };
+
+pub use historical_observed_store::read_offline_observed_artifact;

@@ -387,3 +387,36 @@ fn wg06_observed_store_retained_ancestor_replacement_is_rejected_without_writing
         .join(artifact.filename())
         .exists());
 }
+
+#[test]
+fn task4_offline_store_reader_exports_observed_bytes_without_restoring_admission() {
+    let (_directory, root) = isolated();
+    let store = HistoricalObservedStore::open_existing(&root, &[]).unwrap();
+    let (mut parts, _, _) = sample();
+    parts[14]=serde_json::to_vec(&serde_json::json!({"outcome":"EnvelopeObserved","admission":"Admitted","observed_at":"test-time","records":[{"schema":"magic.market.bar","schema_version":1,"content_type":"application/json","data":br#"{"close":10,"qualified":true}"#.to_vec()}]})).unwrap();
+    parts[15] = br#"{"request_binding":"Matched"}"#.to_vec();
+    let capture = hash_capture_parts_v1(&parts);
+    let bytes = encode_parts(&parts, &capture).unwrap();
+    let pin = reference(&capture, &bytes);
+    store.publish_bytes(&bytes, &pin).unwrap();
+    let before = std::fs::read(root.join(pin.filename())).unwrap();
+    let result = crate::data_gateway::read_offline_observed_artifact(
+        &root,
+        pin.capture_sha256(),
+        pin.file_sha256(),
+        pin.byte_length(),
+    )
+    .unwrap();
+    assert_eq!(result["scope"], "ObservedOnly/NotAdmitted/PIT NotCertified");
+    assert_eq!(result["records"][0]["record_json"]["close"], 10);
+    assert!(result.get("admission").is_none());
+    assert_eq!(before, std::fs::read(root.join(pin.filename())).unwrap());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    assert!(crate::data_gateway::read_offline_observed_artifact(
+        &root,
+        pin.capture_sha256(),
+        &"0".repeat(64),
+        pin.byte_length()
+    )
+    .is_err());
+}

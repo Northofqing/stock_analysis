@@ -294,3 +294,5 @@ mod tests {
 }
 
 pub mod p05_auction_unit;
+
+pub mod offline_products;

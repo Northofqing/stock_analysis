@@ -810,3 +810,48 @@ mod anchored {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use anchored::HistoricalObservedStore;
+
+/// Offline integrity-only reader. Declared pins are checked against existing
+/// bytes; they cannot restore a Gateway capture or any admission capability.
+pub fn read_offline_observed_artifact(
+    root: &std::path::Path,
+    capture_sha256: &str,
+    file_sha256: &str,
+    byte_length: u64,
+) -> anyhow::Result<serde_json::Value> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let store = HistoricalObservedStore::open_existing(root, &[])?;
+        let observed = store.read_checked(&ObservedArtifactRef {
+            capture_sha256: capture_sha256.into(),
+            file_sha256: file_sha256.into(),
+            byte_length,
+        })?;
+        let outcome: serde_json::Value = serde_json::from_slice(
+            observed
+                .raw_part("typed_query_outcome")
+                .context("missing typed outcome")?,
+        )?;
+        let binding: serde_json::Value = serde_json::from_slice(
+            observed
+                .raw_part("request_binding_outcome")
+                .context("missing request binding")?,
+        )?;
+        let mut records = Vec::new();
+        if let Some(rows) = outcome["records"].as_array() {
+            for row in rows {
+                let data: Vec<u8> = serde_json::from_value(row["data"].clone())
+                    .context("invalid stored record byte array")?;
+                records.push(serde_json::json!({"schema":row["schema"],"schema_version":row["schema_version"],"content_type":row["content_type"],"raw_sha256":digest(&data),"raw_bytes_hex":hex::encode(&data),"record_json":serde_json::from_slice::<serde_json::Value>(&data).ok()}));
+            }
+        }
+        Ok(
+            serde_json::json!({"scope":"ObservedOnly/NotAdmitted/PIT NotCertified","capture_sha256":observed.artifact().capture_sha256(),"file_sha256":observed.artifact().file_sha256(),"byte_length":observed.artifact().byte_length(),"outcome":outcome["outcome"],"response_observed_at":outcome["observed_at"],"request_binding_observation":binding,"records":records}),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root, capture_sha256, file_sha256, byte_length);
+        anyhow::bail!("anchored observed store reader unavailable on this platform; use an explicit observed pack")
+    }
+}
