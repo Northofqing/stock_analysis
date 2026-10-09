@@ -89,6 +89,7 @@ impl GrpcError {
                 .map(|bytes| Some(bytes.to_vec()))
                 .map_err(|_| ()),
         };
+        log_rpc_failure_observation(status.code(), context, &standard, &trailer);
         let wire = reconcile_raw_error_detail(standard, trailer)
             .and_then(|bytes| decode_error_detail_bytes_at_contract(&bytes, context, decoder));
         grpc_error_from_parts(status.code(), wire, diagnostic)
@@ -241,6 +242,56 @@ pub(crate) fn request_id_correlation(value: &str) -> Option<String> {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value.as_bytes());
     Some(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
+fn failure_carrier_fingerprint(carrier: &Result<Option<Vec<u8>>, ()>) -> String {
+    match carrier {
+        Ok(None) => "absent".to_owned(),
+        Ok(Some(bytes)) => format!(
+            "bytes:{}:sha256:{}",
+            bytes.len(),
+            hex::encode(Sha256::digest(bytes))
+        ),
+        Err(()) => "malformed".to_owned(),
+    }
+}
+
+fn rpc_failure_observation(
+    code: tonic::Code,
+    context: StatusErrorContext<'_>,
+    standard: &Result<Option<Vec<u8>>, ()>,
+    trailer: &Result<Option<Vec<u8>>, ()>,
+) -> Option<String> {
+    let StatusErrorExpectation::Data {
+        method, request_id, ..
+    } = context.expectation
+    else {
+        return None;
+    };
+    let correlation = request_id_correlation(request_id)?;
+    Some(format!(
+        "client_profile={:?} client_method={} client_request_id_correlation={} grpc_code={} status_detail={} error_detail_trailer={}",
+        method.profile(), method.as_str_name(), correlation, code as i32,
+        failure_carrier_fingerprint(standard), failure_carrier_fingerprint(trailer)
+    ))
+}
+
+fn log_rpc_failure_observation(
+    code: tonic::Code,
+    context: StatusErrorContext<'_>,
+    standard: &Result<Option<Vec<u8>>, ()>,
+    trailer: &Result<Option<Vec<u8>>, ()>,
+) {
+    if log::log_enabled!(log::Level::Warn) {
+        if let Some(observation) = rpc_failure_observation(code, context, standard, trailer) {
+            // These are client context and carrier fingerprints, not server
+            // acknowledgment, retained wire bytes or transport-completion time.
+            log::warn!(
+                "[gRPC][FailureCorrelation] status_mapped_at={} {observation}",
+                chrono::Utc::now().to_rfc3339()
+            );
+        }
+    }
 }
 
 fn known_provider(value: &str) -> Option<crate::market_domain::ProviderId> {
@@ -529,6 +580,7 @@ fn decode_status_error_detail(
             .map(|bytes| Some(bytes.to_vec()))
             .map_err(|_| ()),
     };
+    log_rpc_failure_observation(status.code(), context, &standard, &trailer);
     let bytes = reconcile_raw_error_detail(standard, trailer)?;
     decode_error_detail_bytes(&bytes, context)
 }
@@ -778,6 +830,108 @@ impl From<crate::grpc_client::envelope::EnvelopeError> for GrpcError {
 mod tests {
     use super::*;
     use tonic::Code;
+
+    #[test]
+    fn rpc_failure_observation_keeps_local_context_when_remote_identity_is_rejected() {
+        use crate::grpc_client::external_pb::magic::market::v1::{
+            ErrorDetail as ExternalErrorDetail, Operation,
+        };
+        let request_id = "TEST_CODE_LOCAL_FAILURE_REQUEST";
+        let method = MethodIdentity::External(
+            ExternalMethod::try_from_operation(Operation::MoneyFlows).unwrap(),
+        );
+        let wire = ExternalErrorDetail {
+            request_id: "TEST_ONLY_REMOTE_REQUEST_SECRET".into(),
+            operation: Operation::MoneyFlows as i32,
+            provider: "TEST_ONLY_PROVIDER_SECRET".into(),
+            reason_code: "TEST_ONLY_REASON_SECRET".into(),
+            retryable: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let context = StatusErrorContext::data(method, request_id);
+        let mut status = tonic::Status::with_details(
+            Code::Internal,
+            "Bearer TEST_ONLY_STATUS_SECRET",
+            wire.clone().into(),
+        );
+        status.metadata_mut().insert_bin(
+            ERROR_DETAIL_TRAILER,
+            tonic::metadata::MetadataValue::from_bytes(&wire),
+        );
+        let error = GrpcError::from_status_with_decoder(
+            status,
+            context,
+            crate::grpc_client::external_decoder::ExternalDecoder::Current,
+        );
+        assert!(matches!(error, GrpcError::Internal { .. }));
+        assert!(error.details().request_id.is_none());
+        assert!(error.details().provider.is_none());
+        assert_eq!(
+            error.safe_diagnostic(),
+            Some("[redacted-unclassified-status]")
+        );
+        assert!(!format!("{error:?}").contains("TEST_ONLY"));
+
+        let observation = rpc_failure_observation(
+            Code::Internal,
+            context,
+            &Ok(Some(wire.clone())),
+            &Ok(Some(wire.clone())),
+        )
+        .unwrap();
+        assert!(observation.contains("client_profile=ExternalV1"));
+        assert!(observation.contains("client_method=OPERATION_MONEY_FLOWS"));
+        assert!(observation.contains("grpc_code=13"));
+        assert!(observation.contains(&request_id_correlation(request_id).unwrap()));
+        let fingerprint = format!(
+            "bytes:{}:sha256:{}",
+            wire.len(),
+            hex::encode(Sha256::digest(&wire))
+        );
+        assert!(observation.contains(&format!("status_detail={fingerprint}")));
+        assert!(observation.contains(&format!("error_detail_trailer={fingerprint}")));
+        let rendered = observation;
+        assert!(!rendered.contains(request_id));
+        assert!(!rendered.contains("TEST_ONLY"));
+        assert!(!rendered.contains("Bearer"));
+    }
+
+    #[test]
+    fn rpc_failure_observation_distinguishes_missing_malformed_and_empty_carriers() {
+        let method = MethodIdentity::Local(
+            LocalMethod::try_from_raw(
+                crate::grpc_client::pb::magic::market::v1::Operation::MoneyFlows as i32,
+            )
+            .unwrap(),
+        );
+        let context = StatusErrorContext::data(method, "TEST_CODE_LOCAL_REQUEST");
+        let observation =
+            rpc_failure_observation(Code::Unavailable, context, &Ok(None), &Err(())).unwrap();
+        assert!(observation.contains("client_profile=LocalBridgeV1"));
+        assert!(observation.contains("grpc_code=14"));
+        assert!(observation.contains("status_detail=absent"));
+        assert!(observation.contains("error_detail_trailer=malformed"));
+        let empty =
+            rpc_failure_observation(Code::Unavailable, context, &Ok(Some(Vec::new())), &Ok(None))
+                .unwrap();
+        assert!(empty.contains("status_detail=bytes:0:sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+        assert!(rpc_failure_observation(
+            Code::Internal,
+            StatusErrorContext::data(method, ""),
+            &Ok(None),
+            &Ok(None)
+        )
+        .is_none());
+        for context in [
+            StatusErrorContext::unchecked_local(),
+            StatusErrorContext::control(ContractProfile::ExternalV1, "TEST_CODE_CONTROL_REQUEST"),
+        ] {
+            assert!(
+                rpc_failure_observation(Code::Internal, context, &Ok(None), &Ok(None)).is_none()
+            );
+        }
+    }
 
     #[test]
     fn wg06_exact_window_status_keeps_hithink_and_rejects_unknown_provider_or_wrong_request() {

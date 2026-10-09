@@ -1,8 +1,12 @@
 # stock_analysis 开发与上线交接
 
-更新日期：2026-10-08（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
+更新日期：2026-10-09（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
 
 **当前执行范围以 [2026-10-07 用户范围裁定](docs/handoffs/2026-10-07-active-scope.md) 为准：保留 H08、outcome 合并/回填/观测和 monitor 止损/情报推送稳定性；冻结 H01/H02/H03/H09/H10/H14/H17 平台工程；H04–H06 复用现有 paper，H16 改为周报复盘。以下完整平台路线及接续段保留为历史记录，不再自动执行。**
+
+**最新实际发布见 [2026-10-09 业务修复及生产读回](docs/handoffs/2026-10-09-business-closeout-repair.md)**：行为源码 `af66e214` 已安装；10-09 08:27 CST 实际 monitor PID45310、SHA `25e5d4e0…`，bridge PID36126、SHA `a13ed075…`；Windows 841 服务保留。19 条原 Filled 已按精确 guard 恢复，两组价格争议使金额结果继续 unavailable；不重复恢复原行。79 条 Uncertain 中精确4条取消提案已在“调整项目工作优先级”向用户询问且仍待裁定，不重复询问或执行。H08 独立历史资格仍缺；当前健康 Frozen/Unsafe，四路 raw GlobalNews 恢复不能代替内容资格或客户端收件。
+
+后继 [2026-10-09 Status 失败关联开发](docs/handoffs/2026-10-09-rpc-failure-correlation.md) 补有客户端上下文的故障指纹；源码提交、测试与安装分别记录。下文 10-08 早间 f517/4e/旧窄候选状态是历史证据，不是现网接续基线。
 
 当前首轮开发见 [2026-10-08 收敛范围开发](docs/handoffs/2026-10-08-active-scope-development.md)：paper 休市扫描、原候选历史观测日期接线及周报基线。后继验证和提交身份以该交接的实际回执为准，旧全平台下一项不再执行。
 
