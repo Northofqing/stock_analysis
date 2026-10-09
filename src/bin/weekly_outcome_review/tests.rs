@@ -404,6 +404,8 @@ fn weekly_cli_requires_explicit_scope_and_refuses_output_overwrite() {
     let output = dir.path().join("review.json");
     std::fs::write(&output, "existing").unwrap();
     let args = Args {
+        registry: None,
+        evidence_manifest: None,
         database: source,
         source_label: None,
         temporary_snapshot: false,
@@ -448,6 +450,8 @@ fn weekly_cli_creates_machine_report_with_source_identity_and_unavailable_states
     let output = dir.path().join("review.json");
     let before = std::fs::read(&source).unwrap();
     run(Args {
+        registry: None,
+        evidence_manifest: None,
         database: source.clone(),
         source_label: Some("original input label".into()),
         temporary_snapshot: true,
@@ -497,4 +501,224 @@ fn weekly_cli_creates_machine_report_with_source_identity_and_unavailable_states
         serde_json::Value::Null
     );
     assert_eq!(std::fs::read(source).unwrap(), before);
+}
+
+fn scorecard_json(mut review: Review) -> serde_json::Value {
+    scorecard::attach(
+        &mut review,
+        registry::RegistryInput::load(None).unwrap(),
+        &"a".repeat(64),
+    );
+    serde_json::to_value(review).unwrap()
+}
+
+#[test]
+fn registry_rejects_duplicate_missing_unknown_and_invalid_contracts() {
+    let original = registry::DEFAULT_REGISTRY;
+    assert_eq!(
+        registry::Registry::parse(original).unwrap().signals.len(),
+        6
+    );
+    for bad in [
+        original.replace("id = \"main_net_inflow\"", "id = \"news_catalyst\""),
+        original.replace("name = \"MainNetInflow\"", "name = \"NewsCatalyst\""),
+        original.replace("name = \"MainNetInflow\"", "name = \"Unknown\""),
+        original.replace("action = \"observe\"", "action = \"promote_live\""),
+        original.replace("status = \"evidence_pending\"", "status = \"live\""),
+        original.replace("windows = [1, 3, 5]", "windows = [0, 3, 5]"),
+        original.replace("windows = [1, 3, 5]", "windows = [1, 1]"),
+        original.replace("windows = [1, 3, 5]", "windows = []"),
+        original.replace("cost_version = \"lot-rates-v1\"", "cost_version = \"\""),
+        original.replace("exit_version = \"existing-paper-exits-review-v0\"\n", ""),
+        original.replace("signal_version = \"news-catalyst-review-v0\"\n", ""),
+        original.replace("schema_version = 1", "schema_version = 2"),
+    ] {
+        assert!(
+            registry::Registry::parse(&bad).is_err(),
+            "accepted invalid registry: {bad}"
+        );
+    }
+}
+
+#[test]
+fn scorecard_qualification_and_family_join_fail_closed_without_free_text_attribution() {
+    for sql in [
+        QUALIFIED_T1.to_owned() + BUY,
+        QUALIFIED_T1.to_owned() + "INSERT INTO qualified_daily_trading_status SELECT * FROM qualified_daily_trading_status;",
+        QUALIFIED_T1.replace("test-authority-v2", stock_analysis::data_gateway::qualified_trading_facts::QUALIFIED_TRADING_FACTS_CONTRACT_V1),
+    ] {
+        let json = scorecard_json(snapshot(&sql, standard_period()));
+        let pooled = &json["scorecard"]["pooled_descriptive_evidence"]["price_observation"];
+        assert_ne!(pooled[0]["grade"], "reliable");
+        for card in json["scorecard"]["families"].as_array().unwrap() {
+            for section in ["price_observation", "simulated_fill", "net_return"] {
+                assert_eq!(card["sections"][section][0]["grade"], "unavailable");
+                assert!(card["sections"][section][0]["value"].is_null());
+                assert!(card["sections"][section][0]["reason"].as_str().unwrap().contains("missing authoritative"));
+            }
+        }
+        assert!(json["physical_delivery"]["value"].is_null());
+    }
+}
+
+#[test]
+fn scorecard_distinguishes_usable_zero_counts_from_unavailable_and_excludes_future() {
+    let empty = scorecard_json(snapshot("", standard_period()));
+    let pooled = &empty["scorecard"]["pooled_descriptive_evidence"];
+    assert_eq!(pooled["price_observation"][0]["value"], 0);
+    assert_eq!(pooled["price_observation"][0]["grade"], "observational");
+    assert_eq!(pooled["simulated_fill"][0]["value"], 0);
+    assert!(pooled["price_observation"][1]["value"].is_null());
+    assert!(pooled["net_return"][0]["value"].is_null());
+    assert!(pooled["net_return"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no closed cycles"));
+    let future = scorecard_json(snapshot(
+        &(QUALIFIED_T1.to_owned()+"UPDATE qualified_daily_trading_status SET observed_at='2026-10-09T20:00:00+08:00'; INSERT INTO prediction_tracker VALUES(2,'2026-10-09','2026-10-12','TEST_CODE_future','up',100,NULL,NULL,1,NULL,NULL);"), standard_period()));
+    let pred = &future["predictions"]["value"];
+    assert_eq!(pred["windows"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        future["scorecard"]["pooled_descriptive_evidence"]["price_observation"][0]["value"],
+        0
+    );
+    assert!(
+        future["scorecard"]["pooled_descriptive_evidence"]["price_observation"][1]["value"]
+            .is_null()
+    );
+}
+
+#[test]
+fn owner_disputed_summary_blocks_aggregate_amounts_even_with_unrelated_weekly_cycle() {
+    use stock_analysis::performance::economic_position::NetSummary;
+    let mut review = snapshot(&(BUY.to_owned() + SELL), standard_period());
+    let paper = review.verified_paper.value.as_mut().unwrap();
+    // Typed owner guard represents an unresolved open/history dispute: an
+    // unrelated closed cycle can retain its amount, never certify the aggregate.
+    let summary = NetSummary::Unavailable { reason: "original legacy price dispute is unresolved; complete dependent lifecycle net/account amounts are unavailable".into() };
+    let originals = serde_json::to_value(&paper.exits).unwrap();
+    let (cost, net, reason) = report::closed_scenario_amounts(&paper.exits, &summary);
+    assert!(cost.is_none() && net.is_none());
+    assert_eq!(serde_json::to_value(&paper.exits).unwrap(), originals);
+    paper.closed_cycle_scenario_cost_cny = cost;
+    paper.closed_cycle_scenario_net_pnl_cny = net;
+    paper.scenario_amount_unavailable_reason = reason;
+    let json = scorecard_json(review);
+    let metric = &json["scorecard"]["pooled_descriptive_evidence"]["net_return"][1];
+    assert!(metric["value"].is_null());
+    assert_eq!(metric["grade"], "unavailable");
+    assert!(metric["reason"].as_str().unwrap().contains("price dispute"));
+}
+
+#[test]
+fn cli_formats_and_manifest_share_exact_snapshot_clock_registry_and_reader_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("TEST_CODE_identity.db");
+    let writer = rusqlite::Connection::open(&source).unwrap();
+    writer.execute_batch(FIXTURE_SCHEMA).unwrap();
+    writer.execute_batch(QUALIFIED_T1).unwrap();
+    drop(writer);
+    let original = std::fs::read(&source).unwrap();
+    let registry_path = dir.path().join("registry.toml");
+    std::fs::write(
+        &registry_path,
+        registry::DEFAULT_REGISTRY.replace("action = \"observe\"", "action = \"pause\""),
+    )
+    .unwrap();
+    let manifest_path = dir.path().join("evidence-manifest.json");
+    for (format, name) in [
+        (Format::Json, "review.json"),
+        (Format::Markdown, "review.md"),
+    ] {
+        run(Args {
+            database: source.clone(),
+            registry: Some(registry_path.clone()),
+            evidence_manifest: Some(manifest_path.clone()),
+            source_label: None,
+            temporary_snapshot: false,
+            from: canonical_date("2026-09-28").unwrap(),
+            to: canonical_date("2026-10-04").unwrap(),
+            observed_at: Some(shanghai_clock("2026-10-08T00:52:00+08:00").unwrap()),
+            format,
+            output: Some(dir.path().join(name)),
+        })
+        .unwrap();
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("review.json")).unwrap()).unwrap();
+    let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let markdown = std::fs::read_to_string(dir.path().join("review.md")).unwrap();
+    assert_eq!(json["evidence_manifest"], manifest);
+    assert_eq!(json["period"], manifest["period"]);
+    assert_eq!(manifest["input_snapshot_sha256"], bytes_sha256(&original));
+    assert_eq!(
+        manifest["registry"]["sha256"],
+        file_sha256(&registry_path).unwrap()
+    );
+    assert!(markdown.contains(std::str::from_utf8(&manifest_bytes).unwrap().trim_end()));
+    assert_eq!(
+        json["scorecard"]["pooled_descriptive_evidence"]["price_observation"][0]["value"], 1,
+        "manual pause does not change reader observations"
+    );
+    for evidence in manifest["metric_scopes"].as_object().unwrap().values() {
+        assert_eq!(evidence["input_snapshot_sha256"], bytes_sha256(&original));
+        for field in ["reader_id", "sample_scope", "exclusions", "meaning"] {
+            assert!(!evidence[field].as_str().unwrap().is_empty());
+        }
+    }
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    // A changed clock cannot reuse the old sidecar and writes no new report.
+    let output = dir.path().join("mismatched.json");
+    assert!(run(Args {
+        database: dir.path().join("TEST_CODE_identity.db"),
+        registry: Some(registry_path),
+        evidence_manifest: Some(manifest_path),
+        source_label: None,
+        temporary_snapshot: false,
+        from: canonical_date("2026-09-28").unwrap(),
+        to: canonical_date("2026-10-04").unwrap(),
+        observed_at: Some(shanghai_clock("2026-10-08T00:53:00+08:00").unwrap()),
+        format: Format::Json,
+        output: Some(output.clone())
+    })
+    .is_err());
+    assert!(!output.exists());
+}
+
+#[test]
+fn cli_invalid_registry_and_nonempty_wal_fail_without_report_or_source_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("TEST_CODE_reject.db");
+    let writer = rusqlite::Connection::open(&source).unwrap();
+    writer.execute_batch(FIXTURE_SCHEMA).unwrap();
+    drop(writer);
+    let original = std::fs::read(&source).unwrap();
+    let invalid = dir.path().join("invalid.toml");
+    std::fs::write(&invalid, "schema_version = 9").unwrap();
+    let output = dir.path().join("rejected.json");
+    let args = |registry| Args {
+        database: source.clone(),
+        registry,
+        evidence_manifest: None,
+        source_label: None,
+        temporary_snapshot: false,
+        from: canonical_date("2026-09-28").unwrap(),
+        to: canonical_date("2026-10-04").unwrap(),
+        observed_at: Some(shanghai_clock("2026-10-08T00:52:00+08:00").unwrap()),
+        format: Format::Json,
+        output: Some(output.clone()),
+    };
+    assert!(run(args(Some(invalid))).is_err());
+    std::fs::write(
+        format!("{}-wal", source.display()),
+        b"uncheckpointed frames",
+    )
+    .unwrap();
+    assert!(run(args(None))
+        .unwrap_err()
+        .to_string()
+        .contains("nonempty WAL"));
+    assert!(!output.exists());
+    assert_eq!(std::fs::read(source).unwrap(), original);
 }

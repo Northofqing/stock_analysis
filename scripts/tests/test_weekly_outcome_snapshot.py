@@ -16,7 +16,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReadOnlyWeeklySnapshotTests(unittest.TestCase):
-    def fake_cli(self, root, fail_markdown=False):
+    def fake_cli(self, root, fail_markdown=False, mutate_registry=None):
         binary = root / "fake_cli.py"
         binary.write_text("""#!/usr/bin/env python3
 import hashlib, json, os, pathlib, sys
@@ -26,9 +26,22 @@ if value('--format')=='markdown' and FAIL_MARKDOWN: sys.exit(23)
 report={'observed_at':value('--observed-at'),'snapshot':value('--database'),
         'sha256':hashlib.sha256(pathlib.Path(value('--database')).read_bytes()).hexdigest(),
         'source_label':value('--source-label')}
+if '--registry' in args:
+    registry=pathlib.Path(value('--registry'))
+    report['registry_content']=registry.read_text()
+    report['registry_sha256']=hashlib.sha256(registry.read_bytes()).hexdigest()
+    report['registry_snapshot']=str(registry)
+manifest=pathlib.Path(value('--evidence-manifest'))
+if manifest.exists():
+    assert json.loads(manifest.read_text()) == report
+else:
+    fd=os.open(manifest,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(fd,'w') as stream: json.dump(report,stream)
+if MUTATE_REGISTRY and value('--format')=='json':
+    pathlib.Path(MUTATE_REGISTRY).write_text('changed after first child')
 fd=os.open(value('--output'),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 with os.fdopen(fd,'w') as stream: json.dump(report,stream)
-""".replace("FAIL_MARKDOWN", repr(fail_markdown)))
+""".replace("FAIL_MARKDOWN", repr(fail_markdown)).replace("MUTATE_REGISTRY", repr(str(mutate_registry) if mutate_registry else None)))
         binary.chmod(0o700)
         return binary
 
@@ -62,13 +75,14 @@ with os.fdopen(fd,'w') as stream: json.dump(report,stream)
                 json_report = json.loads((version / "review.json").read_text())
                 markdown_report = json.loads((version / "review.md").read_text())
                 self.assertEqual(json_report, markdown_report)
+                self.assertEqual(json_report, json.loads((version / "evidence-manifest.json").read_text()))
                 self.assertFalse(Path(json_report["snapshot"]).exists())
                 self.assertEqual(json_report["observed_at"], clock)
                 self.assertEqual(version.stat().st_mode & 0o777, 0o700)
                 for artifact in version.iterdir():
                     self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
                 status = json.loads((version / "run-status.json").read_text())
-                self.assertEqual(status["completed_artifacts"], ["review.json", "review.md"])
+                self.assertEqual(status["completed_artifacts"], ["review.json", "evidence-manifest.json", "review.md"])
                 self.assertEqual(status["exit_code"], 0)
             self.assertEqual(source.read_bytes(), before)
 
@@ -84,7 +98,7 @@ with os.fdopen(fd,'w') as stream: json.dump(report,stream)
             self.assertTrue((version / "review.json").exists())
             self.assertFalse((version / "review.md").exists())
             status = json.loads((version / "run-status.json").read_text())
-            self.assertEqual(status["completed_artifacts"], ["review.json"])
+            self.assertEqual(status["completed_artifacts"], ["review.json", "evidence-manifest.json"])
             self.assertEqual(status["stage"], "markdown")
             self.assertEqual(status["exit_code"], 23)
 
@@ -122,6 +136,40 @@ with os.fdopen(fd,'w') as stream: json.dump(report,stream)
             self.assertEqual(plist["StartCalendarInterval"], {"Weekday": 5, "Hour": 20, "Minute": 30})
             self.assertFalse(plist["RunAtLoad"])
             self.assertFalse(plist["KeepAlive"])
+
+    def test_registry_is_frozen_for_both_children_despite_original_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "TEST_CODE_registry.db"
+            sqlite3.connect(source).close()
+            registry = root / "signal_registry.toml"
+            original = 'registry_version = "fixture-v0"\n'
+            registry.write_text(original)
+            binary = self.fake_cli(root, mutate_registry=registry)
+            reports = root / "reports"
+            self.assertEqual(MODULE.weekly_run(source, binary, reports,
+                             "2026-10-09T20:30:00+08:00", registry), 0)
+            version = next(reports.iterdir())
+            json_report = json.loads((version / "review.json").read_text())
+            markdown_report = json.loads((version / "review.md").read_text())
+            self.assertEqual(json_report, markdown_report)
+            self.assertEqual(json_report["registry_content"], original)
+            self.assertEqual(registry.read_text(), "changed after first child")
+            self.assertFalse(Path(json_report["registry_snapshot"]).exists())
+            self.assertEqual(json_report, json.loads((version / "evidence-manifest.json").read_text()))
+
+    def test_missing_explicit_registry_preserves_source_and_fails_before_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "TEST_CODE_missing_registry.db"
+            sqlite3.connect(source).close()
+            before = source.read_bytes()
+            reports = root / "reports"
+            self.assertEqual(MODULE.weekly_run(source, root / "absent_cli", reports,
+                             "2026-10-09T20:30:00+08:00", root / "missing.toml"), 2)
+            status = json.loads((next(reports.iterdir()) / "run-status.json").read_text())
+            self.assertEqual(status["completed_artifacts"], [])
+            self.assertEqual(source.read_bytes(), before)
 
     def test_wal_backup_includes_committed_rows_and_preserves_source_inode_catalog_and_data(self):
         with tempfile.TemporaryDirectory() as directory:

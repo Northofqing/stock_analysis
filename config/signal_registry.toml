@@ -1,0 +1,76 @@
+# Manual descriptive review registry. Versions below label review assumptions,
+# not deployed strategy releases, DB schema authority, or activation inputs.
+schema_version = 1
+registry_version = "signal-registry-v0"
+
+[[signals]]
+id = "news_catalyst"
+name = "NewsCatalyst"
+signal_version = "news-catalyst-review-v0"
+exit_version = "existing-paper-exits-review-v0"
+cost_version = "lot-rates-v1"
+action = "observe"
+status = "evidence_pending"
+entry_assumptions = "Original admitted news candidate and entry identity must be independently joined; no entry is inferred from reason text."
+windows = [1, 3, 5]
+eligibility = "Requires original typed family/version identity, qualified session and price evidence, and mature windows; currently no reliable join in weekly readers."
+
+[[signals]]
+id = "main_net_inflow"
+name = "MainNetInflow"
+signal_version = "main-net-inflow-review-v0"
+exit_version = "existing-paper-exits-review-v0"
+cost_version = "lot-rates-v1"
+action = "observe"
+status = "evidence_pending"
+entry_assumptions = "Original admitted ranking candidate and entry identity must be independently joined; ranking membership is not a fill."
+windows = [1, 3, 5]
+eligibility = "Requires original typed family/version identity, qualified session and price evidence, and mature windows; currently no reliable join in weekly readers."
+
+[[signals]]
+id = "volume_surge"
+name = "VolumeSurge"
+signal_version = "volume-surge-review-v0"
+exit_version = "existing-paper-exits-review-v0"
+cost_version = "lot-rates-v1"
+action = "observe"
+status = "evidence_pending"
+entry_assumptions = "Original admitted volume candidate and entry identity must be independently joined; raw volume does not prove eligibility."
+windows = [1, 3, 5]
+eligibility = "Requires original typed family/version identity, qualified session and price evidence, and mature windows; currently no reliable join in weekly readers."
+
+[[signals]]
+id = "post_close_fund_inflow"
+name = "PostCloseFundInflow"
+signal_version = "post-close-fund-inflow-review-v0"
+exit_version = "existing-paper-exits-review-v0"
+cost_version = "lot-rates-v1"
+action = "observe"
+status = "evidence_pending"
+entry_assumptions = "Post-close observation is not an executable entry; original candidate and later entry identity must be independently joined."
+windows = [1, 3, 5]
+eligibility = "Requires original typed family/version identity, qualified session and price evidence, and mature windows; currently no reliable join in weekly readers."
+
+[[signals]]
+id = "streak_leader"
+name = "StreakLeader"
+signal_version = "streak-leader-review-v0"
+exit_version = "existing-paper-exits-review-v0"
+cost_version = "lot-rates-v1"
+action = "observe"
+status = "evidence_pending"
+entry_assumptions = "Original admitted streak candidate and entry identity must be independently joined; a leader label is not a fill."
+windows = [1, 3, 5]
+eligibility = "Requires original typed family/version identity, qualified session and price evidence, and mature windows; currently no reliable join in weekly readers."
+
+[[signals]]
+id = "theme_prediction"
+name = "ThemePrediction"
+signal_version = "theme-prediction-review-v0"
+exit_version = "existing-paper-exits-review-v0"
+cost_version = "lot-rates-v1"
+action = "observe"
+status = "evidence_pending"
+entry_assumptions = "Prediction code/direction alone does not identify a theme family or version; original typed prediction identity must be joined."
+windows = [1, 3, 5]
+eligibility = "Requires original typed family/version identity and historical availability/PIT evidence in addition to revalidated closes; currently no reliable join in weekly readers."

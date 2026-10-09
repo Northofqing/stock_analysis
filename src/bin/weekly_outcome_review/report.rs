@@ -7,6 +7,7 @@ use stock_analysis::calendar::{verified_a_share_trading_day, verified_next_a_sha
 use stock_analysis::database::DatabaseManager;
 use stock_analysis::performance::economic_position::{
     query_effective_fills_through_from_database_typed, report_from_effective, NetMetrics,
+    NetSummary,
 };
 
 const MAX_ROWS: i64 = 100_000;
@@ -729,6 +730,7 @@ pub struct VerifiedPaper {
     pub closed_cycle_scenario_cost_cny: Option<f64>,
     pub closed_cycle_scenario_net_pnl_cny: Option<f64>,
     pub exits: Vec<VerifiedExit>,
+    pub scenario_amount_unavailable_reason: Option<String>,
     pub actual_settlement_costs: ReadState<f64>,
     pub executable_net_return: ReadState<f64>,
 }
@@ -740,8 +742,12 @@ pub struct VerifiedExit {
     pub exit_reasons: Vec<String>,
     pub scenario_cost_cny: Option<f64>,
     pub scenario_net_pnl_cny: Option<f64>,
+    pub scenario_amount_unavailable_reason: Option<String>,
 }
 fn verified_paper(db: &DatabaseManager, period: &Period) -> Result<VerifiedPaper, String> {
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    bounded(&mut conn, "paper_trades", MAX_ROWS)?;
+    drop(conn);
     let effective =
         query_effective_fills_through_from_database_typed(db, period.period_completed_through)
             .map_err(|e| e.to_string())?;
@@ -782,23 +788,48 @@ fn verified_paper(db: &DatabaseManager, period: &Period) -> Result<VerifiedPaper
             exit_reasons: position.exit_reasons.clone(),
             scenario_cost_cny: cost,
             scenario_net_pnl_cny: net,
+            scenario_amount_unavailable_reason: match &position.net {
+                NetMetrics::Unavailable { reason } => Some(reason.clone()),
+                _ => None,
+            },
         });
     }
-    let sum = |field: fn(&VerifiedExit) -> Option<f64>| -> Option<f64> {
-        if exits.is_empty() {
-            None
-        } else {
-            exits.iter().map(field).sum()
-        }
-    };
-    let cycle_cost = sum(|v| v.scenario_cost_cny);
-    let cycle_net = sum(|v| v.scenario_net_pnl_cny);
+    let (cycle_cost, cycle_net, scenario_amount_unavailable_reason) =
+        closed_scenario_amounts(&exits, &economics.net_summary);
+    let aggregate_amounts_available = matches!(economics.net_summary, NetSummary::Available { .. });
     Ok(VerifiedPaper { projection_sha256:effective.receipt().projection_hash.clone(),rule_version:effective.receipt().rule_version.clone(),source_fill_rows:rows.len(),
         legacy_without_terminal_rows:effective.lineage().iter().filter(|v|matches!(v.authority,stock_analysis::trading::paper_ledger::FillAuthority::LegacyNoTerminal)).count(),
-        period_fill_rows:period_ids.len(),period_scenario_fill_cost_cny:(!period_ids.is_empty()).then(||costs.costs.iter().filter(|v|period_ids.contains(&v.fill_id)).map(|v|v.adverse_cost).sum()),
-        closed_cycles_in_week:exits.len(),open_cycles_at_period_end:economics.open_positions.len(),closed_cycle_scenario_cost_cny:cycle_cost,closed_cycle_scenario_net_pnl_cny:cycle_net,exits,
+        period_fill_rows:period_ids.len(),period_scenario_fill_cost_cny:(!period_ids.is_empty() && aggregate_amounts_available).then(||costs.costs.iter().filter(|v|period_ids.contains(&v.fill_id)).map(|v|v.adverse_cost).sum()),
+        closed_cycles_in_week:exits.len(),open_cycles_at_period_end:economics.open_positions.len(),closed_cycle_scenario_cost_cny:cycle_cost,closed_cycle_scenario_net_pnl_cny:cycle_net,exits,scenario_amount_unavailable_reason,
         actual_settlement_costs:ReadState::unavailable("no observed settlement fee evidence is read by this local paper review; lot-rates-v1 costs are scenario estimates"),
         executable_net_return:ReadState::unavailable("verified paper arithmetic and modeled fees do not establish executable fills, brokerage settlement or historical price/PIT qualification") })
+}
+
+/// The owner's typed unavailable summary also guards aggregate amounts when a
+/// disputed lifecycle remains open, or is outside this week's closed subset.
+pub(super) fn closed_scenario_amounts(
+    exits: &[VerifiedExit],
+    summary: &NetSummary,
+) -> (Option<f64>, Option<f64>, Option<String>) {
+    if let NetSummary::Unavailable { reason } = summary {
+        return (None, None, Some(reason.clone()));
+    }
+    if exits.is_empty() {
+        return (
+            None,
+            None,
+            Some(
+                "no closed cycles in completed requested sessions; no zero-return denominator"
+                    .into(),
+            ),
+        );
+    }
+    let cost = exits.iter().map(|v| v.scenario_cost_cny).sum();
+    let net = exits.iter().map(|v| v.scenario_net_pnl_cny).sum();
+    let reason = exits
+        .iter()
+        .find_map(|v| v.scenario_amount_unavailable_reason.clone());
+    (cost, net, reason)
 }
 
 #[derive(Debug, Serialize)]
@@ -813,6 +844,8 @@ pub struct InputSource {
 }
 #[derive(Debug, Serialize)]
 pub struct Review {
+    pub scorecard: Option<super::scorecard::Scorecard>,
+    pub evidence_manifest: Option<super::scorecard::EvidenceManifest>,
     pub report_version: &'static str,
     pub input_source: Option<InputSource>,
     pub period: Period,
@@ -855,13 +888,13 @@ pub fn read(db: &DatabaseManager, period: Period) -> Review {
     }
     actions.push("Monitor：在已完成交易日核对真实接纳/失败/恢复及原未成交/退出原因；休市无新增原行不能证明恢复。".into());
     actions.push("根据描述性原事实复核下周动作；不自动调整策略、预算、实验或投递。".into());
-    Review {report_version:"H16-descriptive-weekly-v1",input_source:None,period,
+    Review {scorecard:None,evidence_manifest:None,report_version:"H16-descriptive-weekly-v1",input_source:None,period,
         source_extent_boundary:"Raw table row counts and readability do not establish independent qualification; kline-inferred status and OHLC cannot certify lifecycle, historical availability or PIT.",
         daily_bars,independent_daily_status,predictions,raw_paper,original_order_attempts,verified_paper,
         physical_delivery:ReadState::unavailable("no independent durable database/card-to-row receipt read supplied; candidate rows, raw outcomes and paper fills are not physical message delivery denominators"),
         next_week_actions:actions,interpretation:"Descriptive snapshot review, not preregistration, causal validation, strategy promotion, historical PIT certification, funding authority or a delivery completion receipt."}
 }
-fn escape(value: &str) -> String {
+pub(super) fn escape(value: &str) -> String {
     value.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 fn amount(value: Option<f64>) -> String {
@@ -1018,6 +1051,14 @@ impl Review {
         ));
         for action in &self.next_week_actions {
             text.push_str(&format!("- {}\n", escape(action)));
+        }
+        if let Some(scorecard) = &self.scorecard {
+            text.push_str(&scorecard.markdown());
+        }
+        if let Some(manifest) = &self.evidence_manifest {
+            text.push_str("\n## 可复现证据 manifest\n\n以下 JSON 与旁存 manifest 相同；最长路径范围覆盖原周报所有下级指标，* 表示数组索引，评分卡指标另含逐项 evidence。\n\n```json\n");
+            text.push_str(&serde_json::to_string_pretty(manifest).expect("serializable manifest"));
+            text.push_str("\n```\n");
         }
         text
     }

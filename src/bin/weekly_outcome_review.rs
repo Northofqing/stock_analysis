@@ -8,8 +8,12 @@ use stock_analysis::database::attribution_reports::{
     AttributionDatabaseAccess, AttributionDatabaseSession,
 };
 
+#[path = "weekly_outcome_review/registry.rs"]
+mod registry;
 #[path = "weekly_outcome_review/report.rs"]
 mod report;
+#[path = "weekly_outcome_review/scorecard.rs"]
+mod scorecard;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
@@ -25,6 +29,13 @@ struct Args {
     /// Existing stable SQLite snapshot. For a live WAL source use the backup wrapper.
     #[arg(long)]
     database: PathBuf,
+    /// Descriptive registry; default is the build's embedded config/signal_registry.toml.
+    #[arg(long)]
+    registry: Option<PathBuf>,
+    /// Sidecar manifest path; defaults to OUTPUT with extension evidence.json.
+    /// An identical existing manifest may be reused for the other report format.
+    #[arg(long)]
+    evidence_manifest: Option<PathBuf>,
     /// Original source label supplied by the backup wrapper/operator, not qualification.
     #[arg(long)]
     source_label: Option<String>,
@@ -62,6 +73,7 @@ fn shanghai_clock(value: &str) -> Result<DateTime<FixedOffset>, String> {
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
+    let registry = registry::RegistryInput::load(args.registry.as_deref())?;
     let observed_at = args
         .observed_at
         .unwrap_or_else(stock_analysis::monitor::prediction::shanghai_now);
@@ -69,43 +81,83 @@ fn run(args: Args) -> anyhow::Result<()> {
         report::Period::new(args.from, args.to, observed_at).map_err(anyhow::Error::msg)?;
     // This API copies existing bytes into an immutable private read-only pool.
     // It does not run DatabaseManager::init or any application DDL.
+    ensure_normalized_snapshot(&args.database)?;
     let before = file_sha256(&args.database)?;
     let session =
         AttributionDatabaseSession::open(&args.database, AttributionDatabaseAccess::ReadOnly)?;
     let mut review = report::read(session.database(), period);
+    ensure_normalized_snapshot(&args.database)?;
     anyhow::ensure!(
         before == file_sha256(&args.database)?,
         "source main changed during report read"
     );
     review.input_source = Some(report::InputSource {
         database_path: args.database.display().to_string(),
-        source_main_sha256: before,
+        source_main_sha256: before.clone(),
         original_source_label: args.source_label,
         temporary_snapshot_deleted_after_run: args.temporary_snapshot,
         boundary: "AttributionDatabaseSession::ReadOnly detached snapshot; no initialization or application writes",
     });
+    scorecard::attach(&mut review, registry, &before);
+    let manifest = serde_json::to_string_pretty(review.evidence_manifest.as_ref().unwrap())? + "\n";
+    let manifest_path = args.evidence_manifest.or_else(|| {
+        args.output
+            .as_ref()
+            .map(|path| path.with_extension("evidence.json"))
+    });
+    if let Some(path) = &manifest_path {
+        anyhow::ensure!(
+            args.output.as_ref() != Some(path),
+            "report and manifest paths must differ"
+        );
+        if path.exists() {
+            anyhow::ensure!(
+                std::fs::read(path)? == manifest.as_bytes(),
+                "existing evidence manifest differs; refusing overwrite"
+            );
+        }
+    }
     let mut rendered = match args.format {
         Format::Markdown => review.markdown(),
         Format::Json => serde_json::to_string_pretty(&review)?,
     };
     rendered.push('\n');
     if let Some(output) = args.output {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(output)?;
-        file.write_all(rendered.as_bytes())?;
+        write_new_private(&output, rendered.as_bytes())?;
     } else {
         print!("{rendered}");
+    }
+    if let Some(path) = manifest_path {
+        if !path.exists() {
+            write_new_private(&path, manifest.as_bytes())?;
+        }
     }
     Ok(())
 }
 
+fn write_new_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)?;
+    Ok(())
+}
+fn ensure_normalized_snapshot(path: &std::path::Path) -> anyhow::Result<()> {
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    anyhow::ensure!(
+        !wal.exists() || std::fs::metadata(wal)?.len() == 0,
+        "input has nonempty WAL; use the read-only backup wrapper for normalized snapshot identity"
+    );
+    Ok(())
+}
+fn bytes_sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
 fn file_sha256(path: &std::path::Path) -> anyhow::Result<String> {
     use std::io::Read;
     let mut source = std::fs::File::open(path)?;

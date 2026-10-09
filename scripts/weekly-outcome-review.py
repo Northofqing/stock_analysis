@@ -35,7 +35,7 @@ def private_json(path: Path, value) -> None:
         stream.write("\n")
 
 
-def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str | None) -> int:
+def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str | None, registry: Path | None = None) -> int:
     start, end, clock = weekly_scope(observed_at)
     output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if output_root.is_symlink() or not output_root.is_dir():
@@ -54,9 +54,11 @@ def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str |
             os.chmod(directory, 0o700)
             backup = Path(directory) / "snapshot.db"
             read_only_backup(source, backup)
+            registry_args = registry_snapshot_args(registry, Path(directory))
             base = [str(binary.resolve(strict=True)), "--database", str(backup),
                     "--from", start, "--to", end, "--observed-at", clock,
-                    "--source-label", str(source.resolve(strict=True)), "--temporary-snapshot"]
+                    "--source-label", str(source.resolve(strict=True)), "--temporary-snapshot",
+                    "--evidence-manifest", str(run / "evidence-manifest.json")] + registry_args
             for format_name, file_name in (("json", "review.json"), ("markdown", "review.md")):
                 status["stage"] = format_name
                 output = run / file_name
@@ -67,6 +69,12 @@ def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str |
                 # Keep even a completed first artifact if the later program fails.
                 os.chmod(output, 0o600)
                 status["completed_artifacts"].append(file_name)
+                manifest = run / "evidence-manifest.json"
+                if not manifest.is_file():
+                    raise RuntimeError("review child succeeded without required evidence manifest")
+                if "evidence-manifest.json" not in status["completed_artifacts"]:
+                    os.chmod(manifest, 0o600)
+                    status["completed_artifacts"].append("evidence-manifest.json")
             if not result:
                 status["stage"] = "complete"
     except (OSError, ValueError, sqlite3.Error, TimeoutError, RuntimeError) as error:
@@ -76,6 +84,19 @@ def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str |
     private_json(run / "run-status.json", status)
     print(str(run))
     return result
+
+
+def registry_snapshot_args(registry: Path | None, directory: Path) -> list[str]:
+    if registry is None:
+        return []  # CLI's embedded registry is independent of launchd cwd.
+    source = registry.resolve(strict=True)
+    if not source.is_file() or source.stat().st_size > 128 * 1024:
+        raise ValueError("registry must be a bounded regular TOML file (<=128 KiB)")
+    frozen = directory / "signal_registry.toml"
+    descriptor = os.open(frozen, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(source.read_bytes())
+    return ["--registry", str(frozen)]
 
 
 def read_only_backup(source: Path, destination: Path) -> None:
@@ -132,6 +153,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--registry", type=Path, help="Explicit descriptive registry; frozen once per run; defaults to CLI embedded config")
+    parser.add_argument("--evidence-manifest", type=Path, help="Explicit sidecar path for single-format mode")
     parser.add_argument("--from", dest="start")
     parser.add_argument("--to")
     parser.add_argument("--observed-at")
@@ -141,9 +164,9 @@ def main() -> int:
                         help="Generate JSON and Markdown for the current Shanghai calendar week in a new private version directory")
     args = parser.parse_args()
     if args.weekly_output_root:
-        if args.start or args.to or args.format or args.output:
+        if args.start or args.to or args.format or args.output or args.evidence_manifest:
             parser.error("weekly-output-root computes its own week and writes both formats; from/to/format/output are not accepted")
-        return weekly_run(args.database, args.binary, args.weekly_output_root, args.observed_at)
+        return weekly_run(args.database, args.binary, args.weekly_output_root, args.observed_at, args.registry)
     if not args.start or not args.to:
         parser.error("explicit from/to are required without weekly-output-root")
     binary = args.binary.resolve(strict=True)
@@ -154,7 +177,9 @@ def main() -> int:
         command = [str(binary), "--database", str(backup), "--from", args.start,
                    "--to", args.to, "--format", args.format or "markdown",
                    "--source-label", str(args.database.resolve(strict=True)),
-                   "--temporary-snapshot"]
+                   "--temporary-snapshot"] + registry_snapshot_args(args.registry, Path(directory))
+        if args.evidence_manifest:
+            command.extend(["--evidence-manifest", str(args.evidence_manifest)])
         if args.observed_at:
             command.extend(["--observed-at", args.observed_at])
         if args.output:
