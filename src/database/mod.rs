@@ -2795,6 +2795,7 @@ pub(crate) mod paper_book_v2_ledger_schema_v1;
 pub(crate) mod paper_book_v2_schema;
 pub(crate) mod paper_inventory_failure_audit;
 pub(crate) mod paper_ledger_schema_v1;
+pub(crate) mod paper_snapshot_activation_schema_v1;
 pub mod position_chain;
 mod positions;
 // BR-215: projection reconciliation is a tool-facing entry point.

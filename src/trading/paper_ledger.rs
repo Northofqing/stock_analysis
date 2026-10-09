@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[path = "paper_ledger_execution.rs"]
 mod execution;
 use execution::apply_fact;
-pub(crate) use execution::OrderFact;
+pub(crate) use execution::{mark_on, OrderFact};
 pub use execution::{ExecuteIntent, ExecutionPriceQualification, PriceIntent, ValuationBatch};
 #[path = "paper_ledger_adjudication.rs"]
 mod adjudication;
@@ -534,6 +534,29 @@ impl<'a> PaperLedger<'a> {
             Ok(view)
         })
     }
+    /// One transaction for account metrics and their economic attribution proof.
+    pub(crate) fn read_account_with_effective(
+        &self,
+        binding: &AccountBinding,
+        as_of: NaiveDate,
+    ) -> Result<(PaperView, VerifiedEffectiveFillSet), LedgerError> {
+        let mut conn = self
+            .db
+            .get_conn()
+            .map_err(|error| LedgerError::Database(error.to_string()))?;
+        conn.transaction(|conn| {
+            let view = read_on(conn, binding)?;
+            let effective = effective::verified_on(
+                conn,
+                &EffectiveFillRequest {
+                    scope: EffectiveFillScope::Epoch(binding.clone()),
+                    history: EffectiveHistory::RestatedLatest,
+                    as_of,
+                },
+            )?;
+            Ok((view, effective))
+        })
+    }
     /// Runtime admission check before fetching quotes or recovering a terminal.
     /// The locked writer checks the same owner again before any mutation.
     pub(crate) fn require_active_v1_owner(
@@ -674,41 +697,50 @@ impl<'a> PaperLedger<'a> {
         conn: &mut SqliteConnection,
         seed: SeedManifest,
     ) -> Result<PaperReceipt, LedgerError> {
-        let binding = seed.binding()?;
-        let existing = account(conn, &seed.account_id)?;
-        if let Some(existing) = existing {
-            if existing.manifest_hash != binding.manifest_hash {
-                return Err(LedgerError::IdentityConflict);
-            }
-            load(conn, &binding)?;
-            let event = events(conn, &binding.account_id)?.remove(0);
-            return Ok(receipt(1, event.event_hash, &decode(&event.payload)?, true));
-        }
-        let projection = seed_projection(&seed)?;
-        if seed.cutover_at > (self.clock)() {
-            return Err(LedgerError::InvalidInput("future cutover".into()));
-        }
-        let legacy = diesel::sql_query("SELECT COALESCE(MAX(id),0) AS value FROM paper_trades")
-            .get_result::<IntegerRow>(conn)?
-            .value;
-        let legacy_audit_high_water =
-            crate::database::order_audit::validate_order_audit_chain(conn)?;
-        let payload = encode(&Fact::Seeded {
-            manifest: seed.clone(),
-            legacy_high_water_id: legacy,
-            legacy_audit_high_water,
-        })?;
-        let hash = event_hash(&binding.account_id, 1, &seed.command_id, GENESIS, &payload)?;
-        diesel::sql_query("INSERT INTO paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes,money_model,fee_model) VALUES (?,?,?,?,?,?)")
-            .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&binding.epoch_id).bind::<Text,_>(&binding.manifest_hash)
-            .bind::<Text,_>(encode(&seed)?).bind::<Text,_>(MONEY_MODEL).bind::<Text,_>(FEE_MODEL).execute(conn)?;
-        diesel::sql_query("INSERT INTO paper_ledger_event(account_id,seq,command_id,previous_hash,event_hash,payload) VALUES (?,1,?,?,?,?)")
-            .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&seed.command_id).bind::<Text,_>(GENESIS).bind::<Text,_>(&hash).bind::<Text,_>(&payload).execute(conn)?;
-        let bytes = encode(&projection)?;
-        diesel::sql_query("INSERT INTO paper_ledger_head(account_id,version,event_hash,projection_bytes,projection_hash) VALUES (?,1,?,?,?)")
-            .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&hash).bind::<Text,_>(&bytes).bind::<Text,_>(digest(&bytes)).execute(conn)?;
-        Ok(receipt(1, hash, &decode(&payload)?, false))
+        seed_on(conn, seed, (self.clock)())
     }
+}
+
+/// Reuse frozen seed semantics in the explicit snapshot installation transaction.
+/// The caller must qualify the namespace and exact account owner first.
+pub(crate) fn seed_on(
+    conn: &mut SqliteConnection,
+    seed: SeedManifest,
+    now: DateTime<Utc>,
+) -> Result<PaperReceipt, LedgerError> {
+    let binding = seed.binding()?;
+    let existing = account(conn, &seed.account_id)?;
+    if let Some(existing) = existing {
+        if existing.manifest_hash != binding.manifest_hash {
+            return Err(LedgerError::IdentityConflict);
+        }
+        load(conn, &binding)?;
+        let event = events(conn, &binding.account_id)?.remove(0);
+        return Ok(receipt(1, event.event_hash, &decode(&event.payload)?, true));
+    }
+    let projection = seed_projection(&seed)?;
+    if seed.cutover_at > now {
+        return Err(LedgerError::InvalidInput("future cutover".into()));
+    }
+    let legacy = diesel::sql_query("SELECT COALESCE(MAX(id),0) AS value FROM paper_trades")
+        .get_result::<IntegerRow>(conn)?
+        .value;
+    let legacy_audit_high_water = crate::database::order_audit::validate_order_audit_chain(conn)?;
+    let payload = encode(&Fact::Seeded {
+        manifest: seed.clone(),
+        legacy_high_water_id: legacy,
+        legacy_audit_high_water,
+    })?;
+    let hash = event_hash(&binding.account_id, 1, &seed.command_id, GENESIS, &payload)?;
+    diesel::sql_query("INSERT INTO paper_ledger_account(account_id,epoch_id,manifest_hash,manifest_bytes,money_model,fee_model) VALUES (?,?,?,?,?,?)")
+        .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&binding.epoch_id).bind::<Text,_>(&binding.manifest_hash)
+        .bind::<Text,_>(encode(&seed)?).bind::<Text,_>(MONEY_MODEL).bind::<Text,_>(FEE_MODEL).execute(conn)?;
+    diesel::sql_query("INSERT INTO paper_ledger_event(account_id,seq,command_id,previous_hash,event_hash,payload) VALUES (?,1,?,?,?,?)")
+        .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&seed.command_id).bind::<Text,_>(GENESIS).bind::<Text,_>(&hash).bind::<Text,_>(&payload).execute(conn)?;
+    let bytes = encode(&projection)?;
+    diesel::sql_query("INSERT INTO paper_ledger_head(account_id,version,event_hash,projection_bytes,projection_hash) VALUES (?,1,?,?,?)")
+        .bind::<Text,_>(&binding.account_id).bind::<Text,_>(&hash).bind::<Text,_>(&bytes).bind::<Text,_>(digest(&bytes)).execute(conn)?;
+    Ok(receipt(1, hash, &decode(&payload)?, false))
 }
 pub(super) fn require_v1_owner_on(
     conn: &mut SqliteConnection,
@@ -727,9 +759,23 @@ pub(super) fn require_v1_owner_on(
         error => LedgerError::IntegrityFailure(error.to_string()),
     })
 }
+pub(crate) fn read_on(
+    conn: &mut SqliteConnection,
+    binding: &AccountBinding,
+) -> Result<PaperView, LedgerError> {
+    verify_v4_read_catalog_on(conn)?;
+    require_v1_owner_on(conn, binding)?;
+    let view = load(conn, binding)?;
+    view.require_available()?;
+    Ok(view)
+}
 /// Historical reads retain V1-V3 behavior; V4/V5 views require the complete
 /// owner/catalog namespace in the same read transaction.
 fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerError> {
+    if crate::database::paper_snapshot_activation_schema_v1::is_present_on(conn)? {
+        crate::database::paper_snapshot_activation_schema_v1::verify_active_on(conn)?;
+        return Ok(());
+    }
     let generation = diesel::sql_query("SELECT user_version AS value FROM pragma_user_version()")
         .get_result::<IntegerRow>(conn)?
         .value;
@@ -754,7 +800,7 @@ fn verify_v4_read_catalog_on(conn: &mut SqliteConnection) -> Result<(), LedgerEr
     }
     Ok(())
 }
-fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
+pub(crate) fn seed_projection(seed: &SeedManifest) -> Result<Projection, LedgerError> {
     fw::historical(seed_projection_with_work(
         seed,
         &mut FinancialWork::Historical,

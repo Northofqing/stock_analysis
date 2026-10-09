@@ -252,6 +252,24 @@ pub(crate) fn require_v1_owner_on(
     manifest_hash: &str,
 ) -> Result<(), PaperBookOwnerError> {
     let found = identity(conn)?;
+    if super::paper_snapshot_activation_schema_v1::is_present_on(conn)
+        .map_err(|_| PaperBookOwnerError::CatalogMismatch)?
+    {
+        return super::paper_snapshot_activation_schema_v1::require_owner_on(
+            conn,
+            &crate::trading::paper_ledger::AccountBinding {
+                account_id: account_id.into(),
+                epoch_id: epoch_id.into(),
+                manifest_hash: manifest_hash.into(),
+            },
+        )
+        .map_err(|error| match error {
+            crate::trading::paper_ledger::LedgerError::InactiveEpoch => {
+                PaperBookOwnerError::InactiveOwner
+            }
+            _ => PaperBookOwnerError::CatalogMismatch,
+        });
+    }
     if found.application_id == APPLICATION_ID
         && found.user_version == super::paper_book_owner_schema_v2::CATALOG_GENERATION
     {

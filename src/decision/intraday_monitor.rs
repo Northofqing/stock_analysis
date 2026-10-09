@@ -147,6 +147,19 @@ fn reconcile_persisted_candidate_buys(
     Ok(recovered)
 }
 
+/// Reconcile a committed terminal with its source row without acquiring new
+/// quotes or authorizing execution. Recovery remains available outside trading
+/// sessions and while live account/data risk facts are incomplete.
+pub fn recover_saved_candidate_buys() -> Result<usize, String> {
+    if std::env::var_os(paper_ledger_runtime::BINDING_ENV).is_none() {
+        return Ok(0);
+    }
+    let binding = paper_ledger_runtime::active_binding()?;
+    let db = DatabaseManager::try_get().ok_or("DB not initialized")?;
+    let mut conn = db.get_conn().map_err(|error| error.to_string())?;
+    reconcile_persisted_candidate_buys(&mut conn, &Local::now(), &binding)
+}
+
 impl IntradayMonitor {
     /// 每 30s 跑一次 (从 main_loop 调, 推送消费核心)
     ///

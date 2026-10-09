@@ -434,6 +434,19 @@ struct Application {
 /// Local exact namespace proof, on the SAME SQLite transaction. This is not a
 /// substitute for whole-application CatalogV2 activation authority.
 pub(super) fn verify_catalog(conn: &mut SqliteConnection) -> Result<(i64, String), LedgerError> {
+    if crate::database::paper_snapshot_activation_schema_v1::is_present_on(conn)? {
+        let binding = crate::database::paper_snapshot_activation_schema_v1::verify_active_on(conn)?;
+        let namespace_hash =
+            crate::database::paper_snapshot_activation_schema_v1::verify_namespace_on(conn)?;
+        return Ok((
+            0,
+            digest(&encode(&(
+                "NativeSnapshotPaperV1",
+                binding,
+                namespace_hash,
+            ))?),
+        ));
+    }
     if diesel::sql_query("SELECT COUNT(*) AS value FROM sqlite_temp_master WHERE lower(name) GLOB 'paper_ledger_*' OR lower(tbl_name) GLOB 'paper_ledger_*'").get_result::<IntegerRow>(conn)?.value!=0 {
         return Err(LedgerError::IntegrityFailure("TEMP paper namespace is not permitted".into()));
     }
@@ -799,7 +812,11 @@ fn legacy_verified_on(
                     "LegacyRaw permits only current raw as-known".into(),
                 ));
             }
-            if matches!(catalog.0, 2 | 4)
+            // Native generation 0 is also used by uninitialized ordinary DBs.
+            // Only the exact activated namespace, already qualified above,
+            // carries a paper account and requires an explicit economic scope.
+            if (matches!(catalog.0, 2 | 4)
+                || crate::database::paper_snapshot_activation_schema_v1::is_present_on(conn)?)
                 && diesel::sql_query("SELECT COUNT(*) AS value FROM paper_ledger_account")
                     .get_result::<IntegerRow>(conn)?
                     .value

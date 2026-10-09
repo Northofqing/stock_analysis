@@ -2182,6 +2182,7 @@ mod tests_account_banner_values {
                 effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
                     .expect("account snapshot time"),
                 source: "TEST_CODE_USER_CONFIRMED".to_string(),
+                paper_account: None,
             }),
         };
         let banner = build_banner(
@@ -3060,6 +3061,32 @@ fn require_account_mode_net_summary(
 }
 
 fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, String> {
+    // A configured independent paper epoch owns its account facts. Invalid
+    // bindings, incomplete quotes or absent paper closes cannot fall back to a
+    // real-account screenshot or an unrelated legacy strategy lifecycle.
+    if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV).is_some() {
+        let paper = stock_analysis::trading::paper_ledger_runtime::account_metrics()?;
+        log::debug!(
+            "[PaperLedger-account] epoch={} head={} cash={} market_value={} equity={} price_at={} pnl_period={:?}",
+            paper.binding.epoch_id, paper.version, paper.cash, paper.market_value,
+            paper.total_assets, paper.effective_at, paper.pnl_period
+        );
+        return Ok(AccountModeMetricsBatch {
+            metrics: paper.metrics,
+            account_fact: Some(push_templates::AccountSnapshotFact {
+                effective_at: paper
+                    .effective_at
+                    .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("China offset")),
+                source: format!(
+                    "独立模拟账本 epoch={}，{}",
+                    paper.binding.epoch_id, paper.valuation_source
+                ),
+                paper_account: Some(push_templates::PaperAccountFact {
+                    pnl_period: paper.pnl_period,
+                }),
+            }),
+        });
+    }
     let observed_at = chrono::Local::now().fixed_offset();
     let summary = stock_analysis::database::user_account_summary::latest()
         .map_err(|error| format!("BR-103 latest user account summary: {error}"))?
@@ -3126,6 +3153,7 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
         account_fact: Some(push_templates::AccountSnapshotFact {
             effective_at,
             source: summary.source,
+            paper_account: None,
         }),
     })
 }
@@ -10184,9 +10212,20 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             if let Err(e) = push_templates::dispatch_auction_candidate_unit_tick(true).await {
                 log::warn!("[P05 Unit] saved/current tick blocked: {e}");
             }
+            // Recover the durable source-consumption seam even when market
+            // data or account metrics cannot authorize another paper attempt.
+            if let Err(error) =
+                stock_analysis::decision::intraday_monitor::recover_saved_candidate_buys()
+            {
+                log::warn!("[intraday_monitor] saved paper candidate recovery blocked: {error}");
+            }
             let risk_context = current_banner_for("v16.3 paper decision").and_then(|banner| {
                 match push_templates::paper_risk_context_from_banner(&banner) {
                     Ok(context) => Some(context),
+                    Err(error) if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV).is_some() => {
+                        log::warn!("[PaperLedger-account] paper risk context unavailable: {error}");
+                        None
+                    }
                     Err(error) => match push_templates::snapshot_paper_risk_context_from_banner(&banner) {
                         Ok(context) => {
                             log::info!("[BR-151] SnapshotPaper 使用用户确认持仓进入虚拟盘引擎");
@@ -10256,6 +10295,45 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             }
             // 任务#3: 每日 15:10 快照过期检查（收盘后用户应上传当日快照）
             let now = chrono::Local::now();
+            // A paper close is independent of the real-account holding
+            // valuation. Retry incomplete coverage; the ledger's date key
+            // and CAS make a completed close stable across process restarts.
+            if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV)
+                .is_some()
+                && calendar::is_trading_day(now.date_naive())
+                && now.time()
+                    >= chrono::NaiveTime::from_hms_opt(15, 35, 0).expect("valid paper close window")
+            {
+                static PAPER_CLOSE_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                    std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let already = *PAPER_CLOSE_LAST
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    == Some(today);
+                if !already {
+                    match tokio::task::spawn_blocking(move || {
+                        stock_analysis::trading::paper_ledger_runtime::settle_closing_valuation(
+                            today,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(receipt)) => {
+                            *PAPER_CLOSE_LAST
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) = Some(today);
+                            log::info!("[PaperLedger-account] paper close confirmed date={today} inserted={}", receipt.is_some());
+                        }
+                        Ok(Err(error)) => log::warn!(
+                            "[PaperLedger-account] paper close unavailable date={today}: {error}"
+                        ),
+                        Err(error) => log::warn!(
+                            "[PaperLedger-account] paper close worker failed date={today}: {error}"
+                        ),
+                    }
+                }
+            }
             match attribution_epoch_runtime::shanghai_attribution_epoch_time(chrono::Utc::now()) {
                 Ok(attribution_epoch_now)
                     if attribution_epoch_runtime::attribution_epoch_window_open(
@@ -12048,7 +12126,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 .as_ref()
                                 .and_then(|rows| rows.iter().position(|(r, _)| r.code == *code))
                                 .map(|position| position + 1);
-                            if !intraday_market::scanner_window_open_at(chrono::Utc::now(), limit_pool_date) {
+                            if !intraday_market::scanner_window_open_at(
+                                chrono::Utc::now(),
+                                limit_pool_date,
+                            ) {
                                 log::warn!("[盘中监控][Scanner] consumer_unavailable=scanner_continuous_session_closed; 本轮持仓价格检测暂停");
                                 break;
                             }

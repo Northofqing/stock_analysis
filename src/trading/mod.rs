@@ -17,6 +17,7 @@ pub mod paper_ledger;
 pub mod paper_ledger_runtime;
 pub(crate) mod paper_lot_ledger;
 pub mod paper_sell; // BR-234: 虚拟仓卖出闭环（paper_trades 聚合持仓 × 四大铁律）
+pub mod paper_snapshot_activation;
 pub mod paper_trade; // v12 PR3-3.5
 pub mod risk_adapter; // v16.3 Commit 1: pre-trade gate (4 项硬检查)
 

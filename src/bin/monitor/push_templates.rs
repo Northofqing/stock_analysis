@@ -1094,15 +1094,22 @@ impl fmt::Debug for CapturedBanner {
     }
 }
 
-/// 与指标同批读取的用户确认账户截图来源。
+/// 与指标同批读取的账户来源；模拟账户与用户截图使用不同盈亏口径。
 #[derive(Clone, Debug)]
 pub struct AccountSnapshotFact {
     pub effective_at: chrono::DateTime<chrono::FixedOffset>,
     pub source: String,
+    pub paper_account: Option<PaperAccountFact>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaperAccountFact {
+    pub pnl_period: Option<stock_analysis::trading::paper_ledger_runtime::PaperPnlPeriod>,
 }
 
 /// v12 §14.0 全局横幅入参。
-/// `today_pnl` 是用户截图所属日期的盈亏百分比，数值完整不代表实时有效。
+/// `today_pnl` 的口径由账户事实绑定：用户截图或独立模拟盘当日/启用日收益。
+/// 数值完整不代表实时有效。
 /// 完整指标只有携带同批 `account_fact` 才能在横幅显示盈亏数值。
 /// `data_missing_note` 仅在 Degraded/Unsafe 出现。
 #[derive(Clone, Debug)]
@@ -1112,7 +1119,7 @@ pub struct BannerCtx {
     pub today_pnl: Option<f64>,
     /// 指标数值完整；不表示账户事实来自当前交易日。
     pub account_metrics_complete: bool,
-    /// 与仓位和盈亏指标同一次读取的用户确认截图事实。
+    /// 与仓位和盈亏指标同一次读取的账户来源及模拟账户盈亏区间。
     pub account_fact: Option<AccountSnapshotFact>,
     pub data_mode: DataMode,
     pub data_missing_note: Option<String>,
@@ -1175,6 +1182,22 @@ impl BannerCtx {
                     }
                 },
                 |value| match self.account_fact.as_ref() {
+                    Some(fact) if fact.paper_account.is_some() => {
+                        use stock_analysis::trading::paper_ledger_runtime::PaperPnlPeriod;
+                        match fact
+                            .paper_account
+                            .as_ref()
+                            .and_then(|paper| paper.pnl_period.as_ref())
+                        {
+                            Some(PaperPnlPeriod::SinceCutover { .. }) => {
+                                format!("模拟盘自启用盈亏{value:+.1}%")
+                            }
+                            Some(PaperPnlPeriod::PreviousClose { .. }) => {
+                                format!("模拟盘日盈亏{value:+.1}%")
+                            }
+                            None => "模拟盘日盈亏未确认".to_string(),
+                        }
+                    }
                     Some(fact) => {
                         format!("{}截图日盈亏{value:+.1}%", fact.effective_at.date_naive())
                     }
@@ -1191,11 +1214,29 @@ impl BannerCtx {
             self.data_mode.label(),
         );
         let account_note = if let Some(fact) = self.account_fact.as_ref() {
-            Some(format!(
-                "用户确认账户快照截至 {}，source={}；非实时账户；收盘估值价格日未绑定",
-                fact.effective_at.to_rfc3339(),
-                fact.source
-            ))
+            if let Some(paper) = &fact.paper_account {
+                use stock_analysis::trading::paper_ledger_runtime::PaperPnlPeriod;
+                let period = match &paper.pnl_period {
+                    Some(PaperPnlPeriod::SinceCutover { cutover_at }) => {
+                        format!("自 {} 启用起算", cutover_at.to_rfc3339())
+                    }
+                    Some(PaperPnlPeriod::PreviousClose { price_date }) => {
+                        format!("基准为模拟盘 {price_date} 收盘权益")
+                    }
+                    None => "当日价格或上一交易日模拟盘收盘基准未齐".to_string(),
+                };
+                Some(format!(
+                    "独立模拟账户估值截至 {}，source={}；{period}；真实账户仅作为初始种子",
+                    fact.effective_at.to_rfc3339(),
+                    fact.source
+                ))
+            } else {
+                Some(format!(
+                    "用户确认账户快照截至 {}，source={}；非实时账户；收盘估值价格日未绑定",
+                    fact.effective_at.to_rfc3339(),
+                    fact.source
+                ))
+            }
         } else if !self.account_metrics_complete {
             Some(account_status_note_from_values(
                 closing_valuation.as_deref(),
@@ -1252,6 +1293,9 @@ pub(crate) fn paper_risk_context_from_banner(
 pub(crate) fn snapshot_paper_risk_context_from_banner(
     banner: &BannerCtx,
 ) -> Result<stock_analysis::trading::paper_trade::PaperRiskContext, String> {
+    if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV).is_some() {
+        return Err("active PaperLedger requires its own evaluated account/data risk facts".into());
+    }
     if banner.data_mode != DataMode::Full {
         let now = chrono::Local::now();
         let latest_valuation =
@@ -20053,6 +20097,7 @@ mod tests {
             effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
                 .expect("snapshot time"),
             source: "TEST_CODE_USER_CONFIRMED".to_string(),
+            paper_account: None,
         });
 
         let rendered = banner.render();
@@ -20066,6 +20111,55 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("收盘估值价格日未绑定"), "{rendered}");
+    }
+
+    #[test]
+    fn paper_account_banner_discloses_seed_period_without_claiming_actual_daily_pnl() {
+        let mut banner = banner_normal();
+        let cutover_at = chrono::DateTime::parse_from_rfc3339("2026-10-09T21:13:00+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        banner.account_fact = Some(AccountSnapshotFact {
+            effective_at: cutover_at
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap()),
+            source: "独立模拟账本 epoch=TEST_CODE_PAPER，初始快照估值".into(),
+            paper_account: Some(PaperAccountFact {
+                pnl_period: Some(
+                    stock_analysis::trading::paper_ledger_runtime::PaperPnlPeriod::SinceCutover {
+                        cutover_at,
+                    },
+                ),
+            }),
+        });
+        banner.today_pnl = Some(0.0);
+        banner.data_mode = DataMode::Unsafe;
+        let rendered = banner.render();
+        assert!(rendered.contains("模拟盘自启用盈亏+0.0%"), "{rendered}");
+        assert!(
+            rendered.contains("独立模拟账户估值截至 2026-10-09T21:13:00+08:00"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("真实账户仅作为初始种子"), "{rendered}");
+        assert!(!rendered.contains("截图日盈亏"), "{rendered}");
+        assert_eq!(
+            paper_risk_context_from_banner(&banner).unwrap().data_mode,
+            stock_analysis::monitor::data_mode::DataMode::Unsafe
+        );
+        banner
+            .account_fact
+            .as_mut()
+            .unwrap()
+            .paper_account
+            .as_mut()
+            .unwrap()
+            .pnl_period = Some(
+            stock_analysis::trading::paper_ledger_runtime::PaperPnlPeriod::PreviousClose {
+                price_date: chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap(),
+            },
+        );
+        let daily = banner.render();
+        assert!(daily.contains("模拟盘日盈亏+0.0%"), "{daily}");
+        assert!(daily.contains("模拟盘 2026-10-09 收盘权益"), "{daily}");
     }
 
     #[test]
@@ -20087,6 +20181,7 @@ mod tests {
             effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-18T15:00:00+08:00")
                 .expect("friday snapshot"),
             source: "TEST_CODE_FRIDAY_SNAPSHOT".to_string(),
+            paper_account: None,
         });
         let rendered = banner.capture_with_external_notes(&ForbiddenExternalNotes);
         assert!(rendered.render().contains("当前日盈亏未确认"));
@@ -20196,6 +20291,7 @@ mod tests {
             effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
                 .expect("bound snapshot time"),
             source: "TEST_CODE_BOUND_ACCOUNT".to_string(),
+            paper_account: None,
         });
         let captured = banner.capture_with_external_notes(&CountingExternalNotes {
             closing_reads: &closing_reads,
@@ -20461,6 +20557,7 @@ mod tests {
                 effective_at: chrono::DateTime::parse_from_rfc3339("2026-09-21T15:00:00+08:00")
                     .expect("bound account time"),
                 source: "TEST_CODE_BOUND_ACCOUNT".to_string(),
+                paper_account: None,
             }),
             ..BannerCtx::test_default()
         };
@@ -26406,6 +26503,7 @@ mod tests {
                 effective_at: chrono::DateTime::parse_from_rfc3339("2026-07-06T15:00:00+08:00")
                     .expect("bound account time"),
                 source: "TEST_CODE_BOUND_ACCOUNT".to_string(),
+                paper_account: None,
             }),
             data_mode: DataMode::Full,
             data_missing_note: None,

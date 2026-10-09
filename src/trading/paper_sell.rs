@@ -110,6 +110,16 @@ fn atr14(data: &[KlineData]) -> Option<f64> {
     Some(sum / 14.0)
 }
 
+/// StopLoss::new consumes ATR percentage relative to the entry price. The
+/// admitted daily-bar range above is CNY/share, so normalize at this boundary.
+fn atr_percent_for_entry(atr_cny: Option<f64>, entry_price: f64) -> Option<f64> {
+    atr_cny
+        .filter(|atr| atr.is_finite() && *atr > 0.0)
+        .filter(|_| entry_price.is_finite() && entry_price > 0.0)
+        .map(|atr| atr / entry_price * 100.0)
+        .filter(|pct| pct.is_finite())
+}
+
 /// 拉取并缓存日K指标（MA5/20/60、ATR14、布林+MACD）。
 /// 失败出声（warn 在调用方），本 tick 跳过该只（fail-closed）。
 fn fetch_indicators(code: &str, io: &impl PaperSellReadIo) -> Result<Indicators, String> {
@@ -632,7 +642,7 @@ fn evaluate_and_sell(
         ma5: indicators.ma5,
         ma20: indicators.ma20,
         ma60: indicators.ma60,
-        atr: indicators.atr,
+        atr: atr_percent_for_entry(indicators.atr, pos.avg_buy_price),
         boll_macd: Some(&indicators.boll_macd),
         today,
     };
@@ -1117,6 +1127,44 @@ mod tests {
         assert_eq!(atr14(&bars), Some(2.0));
         let short: Vec<KlineData> = bars[..5].to_vec();
         assert_eq!(atr14(&short), None);
+    }
+
+    #[test]
+    fn paper_sell_atr_percent_preserves_stop_threshold_across_price_levels() {
+        for entry_price in [10.0, 100.0] {
+            let atr = atr_percent_for_entry(Some(entry_price * 0.01), entry_price);
+            assert_eq!(atr, Some(1.0));
+            for (relative_price, triggers) in [(0.985, false), (0.975, true)] {
+                let evaluation = SellEvaluation {
+                    code: "TEST_CODE_ATR_UNITS",
+                    name: "fixture",
+                    buy_price: entry_price,
+                    buy_date: date(2026, 10, 9),
+                    current_price: entry_price * relative_price,
+                    quantity: 100,
+                    ma5: None,
+                    ma20: None,
+                    ma60: None,
+                    atr,
+                    boll_macd: None,
+                    today: date(2026, 10, 12),
+                };
+                let result = evaluate_sell_rules_with_net_return(
+                    &evaluation,
+                    (relative_price - 1.0) * 100.0,
+                );
+                assert_eq!(
+                    result.is_some(),
+                    triggers,
+                    "entry={entry_price} relative={relative_price}"
+                );
+                if let Some(reason) = result {
+                    assert!(reason.starts_with("ATR动态止损"));
+                }
+            }
+        }
+        assert_eq!(atr_percent_for_entry(Some(1.0), 0.0), None);
+        assert_eq!(atr_percent_for_entry(Some(f64::NAN), 10.0), None);
     }
 
     #[test]

@@ -262,47 +262,57 @@ impl PaperLedger<'_> {
         batch: ValuationBatch,
         now: DateTime<Utc>,
     ) -> Result<PaperReceipt, LedgerError> {
-        let view = load(conn, &batch.binding)?;
-        if let Some(previous) = replay_command(
-            conn,
-            &batch.binding,
-            Some(&batch.command_id),
-            None,
-            Some(&batch),
-        )? {
-            return Ok(previous);
-        }
-        view.require_available()?;
-        check_head(&view, batch.expected_version, &batch.inventory_fingerprint)?;
-        if batch.as_of < view.as_of
-            || batch.as_of > now
-            || batch.marks.iter().any(|m| m.observed_at != batch.as_of)
+        mark_on(conn, batch, now)
+    }
+}
+
+pub(crate) fn mark_on(
+    conn: &mut SqliteConnection,
+    batch: ValuationBatch,
+    now: DateTime<Utc>,
+) -> Result<PaperReceipt, LedgerError> {
+    let view = load(conn, &batch.binding)?;
+    if let Some(previous) = replay_command(
+        conn,
+        &batch.binding,
+        Some(&batch.command_id),
+        None,
+        Some(&batch),
+    )? {
+        return Ok(previous);
+    }
+    view.require_available()?;
+    check_head(&view, batch.expected_version, &batch.inventory_fingerprint)?;
+    if batch.as_of < view.as_of
+        || batch.as_of > now
+        || batch.marks.iter().any(|m| m.observed_at != batch.as_of)
+    {
+        return Err(LedgerError::EvidenceUnavailable(
+            "valuation time mismatch/future/backward".into(),
+        ));
+    }
+    if batch.closing {
+        use chrono::Timelike;
+        if batch
+            .as_of
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .hour()
+            < 15
+            || !crate::calendar::verified_a_share_trading_day(day(batch.as_of))
+                .map_err(LedgerError::EvidenceUnavailable)?
         {
             return Err(LedgerError::EvidenceUnavailable(
-                "valuation time mismatch/future/backward".into(),
+                "closing baseline requires completed verified trading day".into(),
             ));
         }
-        if batch.closing {
-            use chrono::Timelike;
-            if batch
-                .as_of
-                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-                .hour()
-                < 15
-                || !crate::calendar::verified_a_share_trading_day(day(batch.as_of))
-                    .map_err(LedgerError::EvidenceUnavailable)?
-            {
-                return Err(LedgerError::EvidenceUnavailable(
-                    "closing baseline requires completed verified trading day".into(),
-                ));
-            }
-        }
-        admit_marks(&view, &batch.marks, None)?;
-        let binding = batch.binding.clone();
-        let command = batch.command_id.clone();
-        append(conn, &binding, &command, &view, Fact::Marked(batch))
     }
+    admit_marks(&view, &batch.marks, None)?;
+    let binding = batch.binding.clone();
+    let command = batch.command_id.clone();
+    append(conn, &binding, &command, &view, Fact::Marked(batch))
+}
 
+impl PaperLedger<'_> {
     pub(super) fn execute(
         &self,
         conn: &mut SqliteConnection,
