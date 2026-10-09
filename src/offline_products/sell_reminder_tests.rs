@@ -13,7 +13,7 @@ fn source() -> Source {
         invalidated: false,
     }
 }
-fn fixture(price: f64, n: usize) -> EvidencePack {
+pub(super) fn fixture(price: f64, n: usize) -> EvidencePack {
     let now = clock();
     let day = now.date_naive();
     let acquired = NaiveDate::from_ymd_opt(2026, 9, 24).unwrap();

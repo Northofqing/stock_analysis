@@ -14,10 +14,11 @@ import tempfile
 
 RUNTIME = Path('/Users/zhangzhen/.local/share/stock-analysis-runtime')
 AGENTS = Path('/Users/zhangzhen/Library/LaunchAgents')
-BINS = ('weekly_outcome_review', 'assistant_review', 'sell_reminder_preview',
+BINS = ('weekly_outcome_review', 'assistant_review', 'sell_reminder_preview', 'sell_reminder_producer',
         'streak_leader_research', 'day_capture_check')
 SCRIPTS = ('weekly-outcome-review.py', 'monitor_watchdog.py', 'reliability_common.py',
-           'rotate_push_log.py', 'reliability_quality_screen.py', 'performance_sli.py')
+           'rotate_push_log.py', 'reliability_quality_screen.py', 'performance_sli.py',
+           'watchdog_mobile.py', 'run-weekly-assistant-review.py')
 LABELS = ('com.stockanalysis.weekly-outcome-review', 'com.stockanalysis.watchdog')
 RESOURCES = ('signal_registry.toml', 'a_share_market_holidays.csv')
 CONTRACTS = ('contracts/local_bridge_v1/market.proto',
@@ -120,6 +121,8 @@ def layout():
             **{'resources/' + n: 0o400 for n in RESOURCES},
             **{'resources/' + n.replace('/', '__'): 0o400 for n in CONTRACTS},
             **{'launchd/' + label + '.plist': 0o600 for label in LABELS},
+            'resources/watchdog-mobile.example.json': 0o400,
+            'resources/watchdog-mobile.md': 0o400,
             'RUNBOOK.md': 0o600}
 
 
@@ -163,12 +166,12 @@ def validate(bundle):
 
 
 def launcher(destination):
-    return '#!/bin/bash\nset -euo pipefail\numask 077\nexec /usr/bin/python3 -B "' + str(destination / 'scripts/weekly-outcome-review.py') + '" --database "' + str(RUNTIME / 'data/stock_analysis.db') + '" --binary "' + str(destination / 'bin/weekly_outcome_review') + '" --registry "' + str(destination / 'resources/signal_registry.toml') + '" --weekly-output-root "' + str(RUNTIME / 'reports/weekly-outcome-review') + '"\n'
+    return '#!/bin/bash\nset -euo pipefail\numask 077\nexec /usr/bin/python3 -B "' + str(destination / 'scripts/weekly-outcome-review.py') + '" --database "' + str(RUNTIME / 'data/stock_analysis.db') + '" --binary "' + str(destination / 'bin/weekly_outcome_review') + '" --registry "' + str(destination / 'resources/signal_registry.toml') + '" --weekly-output-root "' + str(RUNTIME / 'reports/weekly-outcome-review') + '" --binding-env-file "' + str(RUNTIME / '.env') + '" --assistant-binary "' + str(destination / 'bin/assistant_review') + '" --assistant-script "' + str(destination / 'scripts/run-weekly-assistant-review.py') + '"\n'
 
 
 def job(label, destination):
     weekly = label == LABELS[0]
-    args = ['/bin/bash', str(destination / 'scripts/run-weekly-outcome-review.sh')] if weekly else ['/usr/bin/python3', '-B', str(destination / 'scripts/monitor_watchdog.py'), '--runtime-root', str(RUNTIME), '--calendar', str(destination / 'resources/a_share_market_holidays.csv'), '--output-root', str(RUNTIME / 'data/watchdog'), '--probe-timeout-seconds', '5']
+    args = ['/bin/bash', str(destination / 'scripts/run-weekly-outcome-review.sh')] if weekly else ['/usr/bin/python3', '-B', str(destination / 'scripts/monitor_watchdog.py'), '--runtime-root', str(RUNTIME), '--calendar', str(destination / 'resources/a_share_market_holidays.csv'), '--output-root', str(RUNTIME / 'data/watchdog'), '--probe-timeout-seconds', '5', '--mobile-config', str(RUNTIME / 'data/private_config/watchdog-mobile.json')]
     p = {'Label': label, 'ProgramArguments': args, 'WorkingDirectory': str(RUNTIME),
          'RunAtLoad': False, 'KeepAlive': False, 'Umask': 63,
          'EnvironmentVariables': {'TZ': 'Asia/Shanghai', 'PYTHONDONTWRITEBYTECODE': '1'},
@@ -228,6 +231,12 @@ def binary_sources(repo, source_commit, base_commit, assistant_commit=None, week
     def changed(a, b):
         return set(subprocess.check_output(['git', 'diff', '--name-only', a, b, '--', *compiled], cwd=repo, text=True).splitlines())
     assistant_commit = assistant_commit or source_commit
+    # A fresh selected-bin build records every binary against one exact source;
+    # the historical registry exception applies only to reused old binaries.
+    if base_commit == source_commit and assistant_commit == source_commit:
+        if weekly_commit not in (None, source_commit):
+            raise ValueError('fresh build cannot reuse a different weekly source')
+        return {name: source_commit for name in BINS}
     if changed(base_commit, assistant_commit) - {'src/bin/assistant_review.rs'}:
         raise ValueError('other compiled inputs changed since first release build')
     sources = {name: assistant_commit if name == 'assistant_review' else base_commit for name in BINS}
@@ -277,6 +286,8 @@ def prepare(repo, candidate, version, source_commit, build_log, base_commit=None
         write(bundle / ('scripts/' + name), read(repo / ('scripts/' + name)))
     for name in RESOURCES:
         write(bundle / ('resources/' + name), read(repo / ('config/' + name)), 0o400)
+    for name in ('watchdog-mobile.example.json', 'watchdog-mobile.md'):
+        write(bundle / ('resources/' + name), read(repo / ('scripts/' + name)), 0o400)
     for name in CONTRACTS:
         write(bundle / ('resources/' + name.replace('/', '__')), read(repo / name), 0o400)
     write(bundle / 'scripts/run-weekly-outcome-review.sh', launcher(destination).encode(), 0o500)
@@ -300,7 +311,7 @@ def prepare(repo, candidate, version, source_commit, build_log, base_commit=None
     m = {'schema': 'goal-first-tools-package/v1', 'version': version, 'source_commit': source_commit, 'source_dirty': False,
          'runtime': str(RUNTIME), 'destination': str(destination), 'launchd_labels': list(LABELS),
          'build': {'selected_bins': list(BINS), 'source_commit': base_commit, 'per_bin_source_commit': per_bin_sources, 'assistant_rebuild': {'source_commit': per_bin_sources['assistant_review'], 'selected_bins': ['assistant_review'], 'log': str(assistant_log), 'log_identity': identity(read(assistant_log))}, 'profile': 'release', 'production_root': str(destination), 'rustc': subprocess.check_output(['rustc', '-Vv'], text=True), 'cargo': subprocess.check_output(['cargo', '-V'], text=True), 'log': str(build_log), 'log_identity': identity(read(build_log)), 'features': [], 'python': subprocess.check_output(['/usr/bin/python3', '--version'], text=True).strip(), 'metadata_target_count': len(metadata['packages'][0]['targets'])},
-         'schemas': ['H16-descriptive-weekly-v1', 'weekly-signal-scorecard-v1', 'weekly-outcome-evidence-manifest-v1', 'assistant-phase-a-comparison-v1', 'sell-preview/v1-legacy-rule-units', 'streak-study/v1', 'monitor-health-runtime_snapshot-v2'],
+         'schemas': ['H16-descriptive-weekly-v1', 'weekly-native-paper-account-v1', 'weekly-signal-scorecard-v1', 'weekly-outcome-evidence-manifest-v1', 'assistant-phase-a-comparison-v1', 'sell-preview/v1-legacy-rule-units', 'streak-study/v1', 'monitor-health-runtime_snapshot-v2'],
          'preconditions': preconditions, 'rollback': rollback_files,
          'observed_activation_expected_config_hash': activation.get('expected_config_hash'),
          'attestation': 'disk observations only; no live process, Gateway, PIT or physical delivery authority',

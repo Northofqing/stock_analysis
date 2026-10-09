@@ -226,6 +226,14 @@ pub fn attach(review: &mut Review, registry: RegistryInput, sha: &str) {
         "historical_filled_rows/latest_filled_utc are whole snapshot diagnostics; weekly states/exits restricted to completed_sessions and observed_at; MAX_ROWS=100000", "malformed/future times excluded from weekly metrics and separately diagnosed", "raw persisted state/reasons only; not valid prices, economic qualification, fill-rate or physical delivery"));
     scopes.insert("/original_order_attempts".into(), evidence("report::attempts", sha,
         "original UTC audit timestamps converted to Shanghai; weekly attempts in completed_sessions as of observed_at; MAX_ROWS=100000", "malformed/future times excluded from weekly attempts and separately diagnosed", "raw attempts by typed source/side/outcome and recorded reasons; not verified fill or delivery denominators"));
+    scopes.insert("/paper_account".into(), evidence("paper_account::read",sha,
+        "current explicit native snapshot epoch as of observed_at, separate from completed weekly strategy cycles; immutable detached snapshot/head and original import target physical identity verified",
+        "missing/incorrect binding or original-target provenance, chain failures, future facts or incomplete marks; missing prior paper close/current-day held prices keep daily PnL null; legacy price disputes excluded from this epoch",
+        "persisted paper cash/inventory/equity and modeled fees since cutover; original mark times preserved, reported actual cost reference only; no qualified live price, brokerage settlement or family attribution authority"));
+    scopes.insert("/legacy_verified_paper".into(), evidence("report::legacy_verified_paper",sha,
+        "explicit LegacyBeforeCutover bound scope through completed requested sessions, retained separately from the active epoch",
+        "old original price disputes and incomplete lifecycles keep monetary values null; no legacy fallback for active account",
+        "old descriptive ledger observations only; cannot change active epoch cash, basis, fees or PnL"));
     scopes.insert("/verified_paper".into(), fill);
     // More specific scopes override their parent for monetary fields, including
     // per-exit nullable amounts. These explicit wildcard scopes are documented.
@@ -256,6 +264,9 @@ pub fn attach(review: &mut Review, registry: RegistryInput, sha: &str) {
         include_str!("report.rs"),
         include_str!("registry.rs"),
         include_str!("scorecard.rs"),
+        include_str!("paper_account.rs"),
+        include_str!("../../trading/paper_snapshot_activation.rs"),
+        include_str!("../../database/paper_snapshot_activation_schema_v1.rs"),
         include_str!("../../performance/economic_position.rs"),
         include_str!("../../trading/paper_ledger.rs"),
         include_str!("../../trading/paper_effective_fills.rs"),
@@ -269,7 +280,7 @@ pub fn attach(review: &mut Review, registry: RegistryInput, sha: &str) {
         registry: serde_json::to_value(&review.scorecard.as_ref().unwrap().registry).expect("serializable registry"),
         paper_binding: std::env::var(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV).ok(),
         reader_source_sha256: super::bytes_sha256(fingerprint.as_bytes()),
-        reader_source_inputs: vec!["src/bin/weekly_outcome_review.rs", "src/bin/weekly_outcome_review/report.rs", "src/bin/weekly_outcome_review/registry.rs", "src/bin/weekly_outcome_review/scorecard.rs", "src/performance/economic_position.rs", "src/trading/paper_ledger.rs", "src/trading/paper_effective_fills.rs", "src/trading/paper_legacy_price_disputes.rs", "Cargo.lock"], metric_scopes: scopes,
+        reader_source_inputs: vec!["src/bin/weekly_outcome_review.rs", "src/bin/weekly_outcome_review/report.rs", "src/bin/weekly_outcome_review/registry.rs", "src/bin/weekly_outcome_review/scorecard.rs", "src/bin/weekly_outcome_review/paper_account.rs", "src/trading/paper_snapshot_activation.rs", "src/database/paper_snapshot_activation_schema_v1.rs", "src/performance/economic_position.rs", "src/trading/paper_ledger.rs", "src/trading/paper_effective_fills.rs", "src/trading/paper_legacy_price_disputes.rs", "Cargo.lock"], metric_scopes: scopes,
         boundary: "detached read-only normalized SQLite bytes; SHA is snapshot identity, not qualification. Longest JSON-pointer scope (including * array index) covers descendant legacy metrics; inline metric evidence overrides scopes. Period and original immutable facts are preserved. Registry actions/status are manual only.",
     });
 }

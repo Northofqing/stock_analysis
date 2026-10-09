@@ -18,7 +18,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ReadOnlyWeeklySnapshotTests(unittest.TestCase):
-    def fake_cli(self, root, fail_markdown=False, mutate_registry=None):
+    def fake_cli(self, root, fail_markdown=False, mutate_registry=None, mutate_binding=None):
         binary = root / "fake_cli.py"
         binary.write_text("""#!/usr/bin/env python3
 import hashlib, json, os, pathlib, sys
@@ -27,7 +27,12 @@ def value(flag): return args[args.index(flag)+1]
 if value('--format')=='markdown' and FAIL_MARKDOWN: sys.exit(23)
 report={'observed_at':value('--observed-at'),'snapshot':value('--database'),
         'sha256':hashlib.sha256(pathlib.Path(value('--database')).read_bytes()).hexdigest(),
-        'source_label':value('--source-label')}
+        'source_label':value('--source-label'),
+        'binding':os.environ.get('PAPER_LEDGER_ACCOUNT_BINDING'),
+        'private_env_secret':os.environ.get('TEST_CODE_ENV_SECRET'),
+        'period':{'observed_at':value('--observed-at'),'latest_completed_session':'2026-10-09','period_completed_through':'2026-10-09'}}
+if '--snapshot-source-manifest' in args:
+    report['snapshot_source']=json.loads(pathlib.Path(value('--snapshot-source-manifest')).read_text())
 if '--registry' in args:
     registry=pathlib.Path(value('--registry'))
     report['registry_content']=registry.read_text()
@@ -41,11 +46,121 @@ else:
     with os.fdopen(fd,'w') as stream: json.dump(report,stream)
 if MUTATE_REGISTRY and value('--format')=='json':
     pathlib.Path(MUTATE_REGISTRY).write_text('changed after first child')
+if MUTATE_BINDING and value('--format')=='json':
+    pathlib.Path(MUTATE_BINDING).write_text('PAPER_LEDGER_ACCOUNT_BINDING=changed after first child')
 fd=os.open(value('--output'),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
 with os.fdopen(fd,'w') as stream: json.dump(report,stream)
-""".replace("FAIL_MARKDOWN", repr(fail_markdown)).replace("MUTATE_REGISTRY", repr(str(mutate_registry) if mutate_registry else None)))
+""".replace("FAIL_MARKDOWN", repr(fail_markdown)).replace("MUTATE_REGISTRY", repr(str(mutate_registry) if mutate_registry else None)).replace("MUTATE_BINDING", repr(str(mutate_binding) if mutate_binding else None)))
         binary.chmod(0o700)
         return binary
+
+    def fake_assistant(self, root, exit_code=0, runtime=False):
+        directory = root / "bin" if runtime else root
+        binary = directory / "assistant_review"
+        binary.write_bytes(b"TEST_CODE_binary_marker")
+        script = directory / "run-weekly-assistant-review.py"
+        script.write_text("""import argparse, json, os, pathlib, sys
+p=argparse.ArgumentParser()
+for name in ('report','manifest','as-of','completed-session','output-dir','assistant-binary','registry'):
+    p.add_argument('--'+name)
+a=p.parse_args()
+report=json.loads(pathlib.Path(a.report).read_text())
+assert a.as_of==report['period']['observed_at']
+assert a.completed_session==report['period']['latest_completed_session']
+assert json.loads(pathlib.Path(a.manifest).read_text())==report
+output=pathlib.Path(a.output_dir); output.mkdir(mode=0o700)
+result={'as_of':a.as_of,'completed_session':a.completed_session,'calls':1,'registry':pathlib.Path(a.registry).read_text() if a.registry else None}
+for name in ('comparison.json','status.json'):
+    fd=os.open(output/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(fd,'w') as stream: json.dump(result,stream)
+if EXIT_CODE==0: (output/'comparison.md').write_text('TEST_CODE_comparison')
+sys.exit(EXIT_CODE)
+""".replace("EXIT_CODE",str(exit_code)))
+        return binary, script
+
+    def test_assistant_hook_uses_original_period_once_and_preserves_completed_weekly_on_failure(self):
+        for code in (0,23):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                source=root/'source.db'; sqlite3.connect(source).close()
+                cli=self.fake_cli(root)
+                cli.write_text(cli.read_text().replace("'period_completed_through':'2026-10-09'", "'period_completed_through':'2026-09-30'"))
+                binary,script=self.fake_assistant(root,exit_code=code)
+                registry=root/'registry.toml'; registry.write_text('TEST_CODE_original_registry')
+                output=root/'reports'
+                self.assertEqual(MODULE.weekly_run(source,cli,output,'2026-10-09T22:00:00+08:00',registry=registry,assistant_binary=binary,assistant_script=script),code)
+                version=next(output.iterdir())
+                status=json.loads((version/'run-status.json').read_text())
+                self.assertEqual(status['assistant']['invocations'],1)
+                self.assertEqual(status['assistant']['status'],'complete' if code==0 else 'failed')
+                self.assertEqual(status['stage'],'complete' if code==0 else 'complete_weekly_assistant_failed')
+                for name in ('review.json','review.md','evidence-manifest.json'):
+                    self.assertTrue((version/name).is_file()); self.assertIn(name,status['completed_artifacts'])
+                comparison=json.loads((version/'assistant'/'comparison.json').read_text())
+                self.assertEqual(comparison['calls'],1)
+                self.assertEqual(comparison['as_of'],'2026-10-09T22:00:00+08:00')
+                self.assertEqual(comparison['completed_session'],'2026-10-09')
+                self.assertEqual(comparison['registry'],'TEST_CODE_original_registry')
+
+    def test_weekly_failure_skips_assistant_and_missing_helper_keeps_weekly_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/'source.db'; sqlite3.connect(source).close()
+            binary,script=self.fake_assistant(root)
+            output=root/'reports'
+            self.assertEqual(MODULE.weekly_run(source,self.fake_cli(root,fail_markdown=True),output,'2026-10-09T22:00:00+08:00',assistant_binary=binary,assistant_script=script),23)
+            version=next(output.iterdir()); self.assertFalse((version/'assistant').exists())
+            self.assertEqual(json.loads((version/'run-status.json').read_text())['assistant']['invocations'],0)
+            output=root/'missing_helper'
+            self.assertEqual(MODULE.weekly_run(source,self.fake_cli(root),output,'2026-10-09T22:00:00+08:00',assistant_binary=binary,assistant_script=root/'missing.py'),2)
+            version=next(output.iterdir()); status=json.loads((version/'run-status.json').read_text())
+            self.assertEqual(status['stage'],'complete_weekly_assistant_failed'); self.assertEqual(status['assistant']['invocations'],0)
+            self.assertTrue((version/'review.json').exists()); self.assertTrue((version/'review.md').exists())
+
+    def binding_env(self, root):
+        binding = {"account_id": "TEST_CODE_account", "epoch_id": "TEST_CODE_epoch", "manifest_hash": "a" * 64}
+        path = root / ".env"
+        path.write_text("TEST_CODE_ENV_SECRET=TEST_CODE_do_not_forward\nPAPER_LEDGER_ACCOUNT_BINDING='" + json.dumps(binding, separators=(",", ":")) + "'\n")
+        path.chmod(0o600)
+        return path, json.dumps(binding, separators=(",", ":"))
+
+    def test_binding_is_literal_private_frozen_and_only_binding_reaches_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "TEST_CODE_source.db"
+            sqlite3.connect(source).close()
+            env_file, binding = self.binding_env(root)
+            binary = self.fake_cli(root, mutate_binding=env_file)
+            with patch.dict(os.environ, {MODULE.BINDING_ENV: "TEST_CODE_wrong_inherited"}):
+                self.assertEqual(MODULE.weekly_run(source, binary, root / "reports", "2026-10-09T22:00:00+08:00", binding_env_file=env_file), 0)
+            version = next((root / "reports").iterdir())
+            first = json.loads((version / "review.json").read_text())
+            self.assertEqual(first, json.loads((version / "review.md").read_text()))
+            self.assertEqual(first["binding"], binding)
+            self.assertIsNone(first["private_env_secret"])
+            context = first["snapshot_source"]
+            identity = context["original_database"]
+            self.assertEqual((identity["device"], identity["inode"]), (source.stat().st_dev, source.stat().st_ino))
+            self.assertEqual(context["snapshot_sha256"], first["sha256"])
+            self.assertEqual(context["paper_binding_sha256"], hashlib.sha256(binding.encode()).hexdigest())
+            self.assertNotEqual(identity, context["snapshot_database"])
+
+    def test_binding_rejects_shared_symlink_missing_duplicate_invalid_and_clears_inherited(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env_file, binding = self.binding_env(root)
+            self.assertEqual(MODULE.read_binding_env(env_file), binding)
+            env_file.chmod(0o644)
+            with self.assertRaises(ValueError): MODULE.read_binding_env(env_file)
+            env_file.chmod(0o600)
+            link = root / "link"
+            link.symlink_to(env_file)
+            with self.assertRaises(OSError): MODULE.read_binding_env(link)
+            for value in ("OTHER=unused", "PAPER_LEDGER_ACCOUNT_BINDING={}\nPAPER_LEDGER_ACCOUNT_BINDING={}", "PAPER_LEDGER_ACCOUNT_BINDING='$(touch should-never-exist)'", "PAPER_LEDGER_ACCOUNT_BINDING='{\"account_id\":\"a\",\"epoch_id\":\"b\",\"manifest_hash\":\"invalid\"}'"):
+                env_file.write_text(value)
+                with self.assertRaises(ValueError): MODULE.read_binding_env(env_file)
+            self.assertFalse((root / "should-never-exist").exists())
+            with patch.dict(os.environ, {MODULE.BINDING_ENV: "wrong"}):
+                self.assertNotIn(MODULE.BINDING_ENV, MODULE.child_environment(None))
 
     def test_week_scope_is_shanghai_monday_sunday_including_holidays_and_close_boundary(self):
         for clock, expected in (
@@ -124,6 +239,8 @@ with os.fdopen(fd,'w') as stream: json.dump(report,stream)
             binary = self.fake_cli(root)
             binary.rename(root / "bin" / "weekly_outcome_review")
             sqlite3.connect(root / "data" / "stock_analysis.db").close()
+            self.binding_env(root)
+            self.fake_assistant(root, runtime=True)
             launcher = Path(__file__).resolve().parents[1] / "run-weekly-outcome-review.sh"
             result = subprocess.run(["/bin/bash", str(launcher)],
                                     env={**os.environ, "STOCK_ANALYSIS_RUNTIME_ROOT": str(root)},

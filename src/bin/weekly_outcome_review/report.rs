@@ -20,14 +20,14 @@ pub struct ReadState<T> {
     pub reason: Option<String>,
 }
 impl<T> ReadState<T> {
-    fn available(value: T) -> Self {
+    pub(super) fn available(value: T) -> Self {
         Self {
             status: "available",
             value: Some(value),
             reason: None,
         }
     }
-    fn unavailable(reason: impl Into<String>) -> Self {
+    pub(super) fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             status: "unavailable",
             value: None,
@@ -751,6 +751,27 @@ fn verified_paper(db: &DatabaseManager, period: &Period) -> Result<VerifiedPaper
     let effective =
         query_effective_fills_through_from_database_typed(db, period.period_completed_through)
             .map_err(|e| e.to_string())?;
+    verified_paper_from_effective(&effective, period)
+}
+fn legacy_verified_paper(
+    db: &DatabaseManager,
+    period: &Period,
+    binding: &stock_analysis::trading::paper_ledger::AccountBinding,
+) -> Result<VerifiedPaper, String> {
+    use stock_analysis::trading::paper_ledger::*;
+    let effective = PaperLedger::open(db, &chrono::Utc::now)
+        .verified_effective_fills(&EffectiveFillRequest {
+            scope: EffectiveFillScope::LegacyBeforeCutover(binding.clone()),
+            history: EffectiveHistory::RestatedLatest,
+            as_of: period.period_completed_through,
+        })
+        .map_err(|e| e.to_string())?;
+    verified_paper_from_effective(&effective, period)
+}
+fn verified_paper_from_effective(
+    effective: &stock_analysis::trading::paper_ledger::VerifiedEffectiveFillSet,
+    period: &Period,
+) -> Result<VerifiedPaper, String> {
     let rows = effective.rows().map_err(|e| e.to_string())?;
     let mut period_ids = BTreeSet::new();
     for row in rows {
@@ -766,7 +787,7 @@ fn verified_paper(db: &DatabaseManager, period: &Period) -> Result<VerifiedPaper
         }
     }
     let costs = effective.costs().map_err(|e| e.to_string())?;
-    let economics = report_from_effective(&effective)?;
+    let economics = report_from_effective(effective)?;
     let mut exits = Vec::new();
     for position in economics
         .closed_positions
@@ -855,19 +876,44 @@ pub struct Review {
     pub predictions: ReadState<Predictions>,
     pub raw_paper: ReadState<RawPaper>,
     pub original_order_attempts: ReadState<OrderAttempts>,
+    pub paper_account: ReadState<super::paper_account::PaperAccount>,
     pub verified_paper: ReadState<VerifiedPaper>,
+    pub legacy_verified_paper: ReadState<VerifiedPaper>,
     pub physical_delivery: ReadState<usize>,
     pub next_week_actions: Vec<String>,
     pub interpretation: &'static str,
 }
 pub fn read(db: &DatabaseManager, period: Period) -> Review {
+    read_with_paper_source(db, period, None)
+}
+pub fn read_with_paper_source(
+    db: &DatabaseManager,
+    period: Period,
+    source: Option<&super::paper_account::SnapshotSource>,
+) -> Review {
     let daily_bars = ReadState::from_result(extent(db, "stock_daily", "date"));
     let independent_daily_status =
         ReadState::from_result(extent(db, "qualified_daily_trading_status", "date"));
     let predictions = ReadState::from_result(predictions(db, &period));
     let raw_paper = ReadState::from_result(raw_paper(db, &period));
     let original_order_attempts = ReadState::from_result(attempts(db, &period));
-    let verified_paper = ReadState::from_result(verified_paper(db, &period));
+    let native = super::paper_account::native_present(db);
+    let paper_account = ReadState::from_result(super::paper_account::read(db, &period, source));
+    let verified_paper = match &native {
+        Ok(true) if paper_account.value.is_none() => ReadState::unavailable(
+            paper_account
+                .reason
+                .clone()
+                .unwrap_or("native paper account unavailable".into()),
+        ),
+        Err(reason) => ReadState::unavailable(reason.clone()),
+        _ => ReadState::from_result(verified_paper(db, &period)),
+    };
+    let legacy_verified_paper = if let Some(account) = &paper_account.value {
+        ReadState::from_result(legacy_verified_paper(db, &period, &account.binding))
+    } else {
+        ReadState::unavailable("separate bound legacy-before-cutover observation requires qualified original target and binding")
+    };
     let mut actions = Vec::new();
     if predictions.value.as_ref().is_none_or(|p| {
         p.horizons
@@ -890,7 +936,7 @@ pub fn read(db: &DatabaseManager, period: Period) -> Review {
     actions.push("根据描述性原事实复核下周动作；不自动调整策略、预算、实验或投递。".into());
     Review {scorecard:None,evidence_manifest:None,report_version:"H16-descriptive-weekly-v1",input_source:None,period,
         source_extent_boundary:"Raw table row counts and readability do not establish independent qualification; kline-inferred status and OHLC cannot certify lifecycle, historical availability or PIT.",
-        daily_bars,independent_daily_status,predictions,raw_paper,original_order_attempts,verified_paper,
+        daily_bars,independent_daily_status,predictions,raw_paper,original_order_attempts,paper_account,verified_paper,legacy_verified_paper,
         physical_delivery:ReadState::unavailable("no independent durable database/card-to-row receipt read supplied; candidate rows, raw outcomes and paper fills are not physical message delivery denominators"),
         next_week_actions:actions,interpretation:"Descriptive snapshot review, not preregistration, causal validation, strategy promotion, historical PIT certification, funding authority or a delivery completion receipt."}
 }
@@ -1001,6 +1047,15 @@ impl Review {
                 escape(self.predictions.reason.as_deref().unwrap_or("unknown"))
             ));
         }
+        text.push_str("\n## 独立模拟账户（截至本次观察，独立于本周成交统计）\n");
+        if let Some(account) = &self.paper_account.value {
+            text.push_str(&format!("\n账户 `{}` / epoch `{}`；期初时间 {}；账本版本 {}。现金 {:.2} 元，持仓市值 {:.2} 元，权益 {:.2} 元；期初权益 {:.2} 元，期初以来净盈亏 {:+.2} 元（{:+.4}%）。\n\n模拟费用 {:.2} 元（{}）；已实现净盈亏 {:+.2} 元，未实现净盈亏 {:+.2} 元。估值原观察时间 {}，本次观察日期价格完整性 {}；当日盈亏 {}（{}）。实际成本只作参考，原实盘亏损不进入新 epoch。此处持久价格未因此升级为实时/可成交价格。\n", account.binding.account_id,account.binding.epoch_id,account.cutover_at,account.version,account.cash_cny,account.market_value_cny,account.total_equity_cny,account.seed_equity_cny,account.since_cutover_net_pnl_cny,account.since_cutover_net_pnl_pct,account.modeled_fees_cny,account.fee_model,account.realized_net_pnl_cny,account.unrealized_net_pnl_cny,account.valuation_effective_at,account.valuation_is_current_observation_day,amount(account.daily_pnl_cny.value),escape(account.daily_pnl_cny.reason.as_deref().unwrap_or("exact previous paper close"))));
+        } else {
+            text.push_str(&format!(
+                "\n独立模拟账户不可用：{}；不回退旧账本。\n",
+                escape(self.paper_account.reason.as_deref().unwrap_or("unknown"))
+            ));
+        }
         text.push_str("\n## Paper 原记录、未成交与退出\n");
         if let Some(raw) = &self.raw_paper.value {
             text.push_str(&format!("\n快照全量原 Filled：{}行；全量最后 UTC 时间 {}（含未来原行，非截至观察时刻）。原 Filled 总数不能作可靠胜率或可成交净收益分母。\n\n本期状态原行：{:?}；未成交原因：{:?}；无法归入日期的坏时间原行：{}；快照全量未来时间原行：{}（原 row ID/上海时间见 JSON，不进入本期状态或退出）。无本期记录时执行率/收益不可用，不归因于用户未执行。\n",raw.historical_filled_rows,raw.latest_filled_utc.as_deref().unwrap_or("无合格时间原行"),raw.weekly_states,raw.weekly_not_filled_reasons,raw.malformed_timestamp_rows,raw.future_timestamp_rows));
@@ -1041,6 +1096,20 @@ impl Review {
             }
         } else {
             text.push_str(&format!("\n现有 effective 读端失败/不可用：{}。可靠 paper 样本、费用和净收益保持不可用；原件不改量、不删单、不制造 seed。\n",escape(self.verified_paper.reason.as_deref().unwrap_or("unknown"))));
+        }
+        text.push_str("\n## 期初前旧账本独立观察\n\n旧争议只留在这一范围，不污染新 epoch 的权益、费用或收益。\n");
+        if let Some(legacy) = &self.legacy_verified_paper.value {
+            text.push_str(&format!("\n旧范围有效原行 {}；情景净盈亏 {} 元；金额不可用原因 {}。不授予真实成交或费用资格。\n",legacy.source_fill_rows,amount(legacy.closed_cycle_scenario_net_pnl_cny),escape(legacy.scenario_amount_unavailable_reason.as_deref().unwrap_or("none"))));
+        } else {
+            text.push_str(&format!(
+                "\n旧范围不可用：{}。\n",
+                escape(
+                    self.legacy_verified_paper
+                        .reason
+                        .as_deref()
+                        .unwrap_or("unknown")
+                )
+            ));
         }
         text.push_str(&format!(
             "\n物理消息送达：不可用（{}）。\n\n## 下一周动作\n\n",

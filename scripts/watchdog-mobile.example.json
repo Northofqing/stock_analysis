@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "adapter": "bark",
+  "endpoint": "https://api.day.app/push",
+  "device_key": "",
+  "daily_self_check": true,
+  "severities": ["P0", "P1"]
+}

@@ -53,6 +53,21 @@ class FixedDelivery(unittest.TestCase):
             self.assertFalse(job['KeepAlive'])
             self.assertTrue(any(str(self.destination) in x for x in job['ProgramArguments']))
 
+    def test_scheduled_jobs_use_native_binding_and_optional_mobile_without_secrets(self):
+        launcher = d.launcher(self.destination)
+        self.assertIn('--binding-env-file "' + str(self.runtime / '.env') + '"', launcher)
+        self.assertIn('--assistant-binary "' + str(self.destination / 'bin/assistant_review') + '"', launcher)
+        self.assertIn('--assistant-script "' + str(self.destination / 'scripts/run-weekly-assistant-review.py') + '"', launcher)
+        args = d.job(d.LABELS[1], self.destination)['ProgramArguments']
+        self.assertEqual(args[args.index('--mobile-config') + 1], str(self.runtime / 'data/private_config/watchdog-mobile.json'))
+        self.assertNotIn('device_key', launcher + str(args))
+
+    def test_fresh_build_binds_all_selected_bins_to_one_source(self):
+        with patch.object(d.subprocess, 'check_output', side_effect=AssertionError('no reuse exception needed')):
+            self.assertEqual(d.binary_sources(self.root, 'new', 'new'), {name: 'new' for name in d.BINS})
+            with self.assertRaisesRegex(ValueError, 'different weekly source'):
+                d.binary_sources(self.root, 'new', 'new', weekly_commit='old')
+
     def test_private_resource_symlink_hardlink_and_extra_refused(self):
         resource = self.bundle / 'resources/signal_registry.toml'
         resource.chmod(0o644)

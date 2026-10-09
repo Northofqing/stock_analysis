@@ -8,16 +8,20 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
+import shlex
 import os
 from pathlib import Path
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
 SHANGHAI = timezone(timedelta(hours=8))
+BINDING_ENV = "PAPER_LEDGER_ACCOUNT_BINDING"
 
 
 def weekly_scope(observed_at: str | None):
@@ -35,7 +39,89 @@ def private_json(path: Path, value) -> None:
         stream.write("\n")
 
 
-def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str | None, registry: Path | None = None) -> int:
+def read_binding_env(path: Path | None) -> str | None:
+    """Extract one literal JSON assignment; never source or forward the .env."""
+    if path is None:
+        return None
+    source = path.parent.resolve(strict=True) / path.name
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_mode & 0o077
+                or before.st_uid != os.getuid() or before.st_size > 128 * 1024):
+            raise ValueError("binding env must be an owner-private regular file <=128 KiB")
+        data = bytearray()
+        while len(data) <= 128 * 1024:
+            chunk = os.read(descriptor, 128 * 1024 + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        after = os.fstat(descriptor)
+        named = source.lstat()
+        signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if (len(data) > 128 * 1024 or signature(before) != signature(after)
+                or signature(before) != signature(named) or len(data) != before.st_size):
+            raise ValueError("binding env changed during read")
+    finally:
+        os.close(descriptor)
+    assignments = []
+    for line in data.decode("utf-8").splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == BINDING_ENV:
+            assignments.append(value.strip())
+    if len(assignments) != 1:
+        raise ValueError("binding env must contain exactly one paper account binding")
+    literal = assignments[0]
+    if literal.startswith(("'", '"')):
+        tokens = shlex.split(literal, comments=False, posix=True)
+        if len(tokens) != 1:
+            raise ValueError("paper binding must be one literal JSON assignment")
+        literal = tokens[0]
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate paper binding JSON field")
+            result[key] = value
+        return result
+    binding = json.loads(literal, object_pairs_hook=unique_fields)
+    if (not isinstance(binding, dict) or set(binding) != {"account_id", "epoch_id", "manifest_hash"}
+            or not all(isinstance(binding[key], str) and binding[key].strip() for key in binding)
+            or len(binding["manifest_hash"]) != 64
+            or any(ch not in "0123456789abcdef" for ch in binding["manifest_hash"])):
+        raise ValueError("invalid paper account binding")
+    return json.dumps(binding, ensure_ascii=False, separators=(",", ":"))
+
+
+def child_environment(binding: str | None) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.pop(BINDING_ENV, None)  # No inherited binding or LegacyRaw fallback.
+    if binding is not None:
+        environment[BINDING_ENV] = binding
+    return environment
+
+
+def snapshot_source_args(backup: Path, origin: dict, directory: Path, binding: str | None) -> list[str]:
+    metadata = backup.stat()
+    digest = hashlib.sha256()
+    with backup.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            digest.update(chunk)
+    manifest = directory / "snapshot-source.json"
+    private_json(manifest, {"schema_version": 1, "original_database": origin,
+        "snapshot_database": {"path": str(backup.resolve(strict=True)), "device": metadata.st_dev,
+                              "inode": metadata.st_ino},
+        "snapshot_sha256": digest.hexdigest(),
+        "paper_binding_sha256": hashlib.sha256(binding.encode()).hexdigest() if binding is not None else None})
+    manifest.chmod(0o400)
+    return ["--snapshot-source-manifest", str(manifest)]
+
+
+def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str | None, registry: Path | None = None, binding_env_file: Path | None = None,
+               assistant_binary: Path | None = None, assistant_script: Path | None = None) -> int:
     start, end, clock = weekly_scope(observed_at)
     output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if output_root.is_symlink() or not output_root.is_dir():
@@ -46,24 +132,26 @@ def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str |
     run.mkdir(mode=0o700)
     status = {"requested_from": start, "requested_to": end, "observed_at": clock,
               "original_source_label": str(source.absolute()), "completed_artifacts": [],
-              "stage": "backup", "exit_code": 2}
+              "stage": "backup", "exit_code": 2,
+              "assistant": {"status": "not_configured", "invocations": 0}}
     result = 2
     try:
         # JSON and Markdown use exactly the same logical backup and fixed clock.
         with tempfile.TemporaryDirectory(prefix="stock-analysis-weekly-") as directory:
             os.chmod(directory, 0o700)
+            binding = read_binding_env(binding_env_file)
             backup = Path(directory) / "snapshot.db"
-            read_only_backup(source, backup)
+            origin = read_only_backup(source, backup)
             registry_args = registry_snapshot_args(registry, Path(directory))
             base = [str(binary.resolve(strict=True)), "--database", str(backup),
                     "--from", start, "--to", end, "--observed-at", clock,
                     "--source-label", str(source.resolve(strict=True)), "--temporary-snapshot",
-                    "--evidence-manifest", str(run / "evidence-manifest.json")] + registry_args
+                    "--evidence-manifest", str(run / "evidence-manifest.json")] + registry_args + snapshot_source_args(backup, origin, Path(directory), binding)
             for format_name, file_name in (("json", "review.json"), ("markdown", "review.md")):
                 status["stage"] = format_name
                 output = run / file_name
                 result = subprocess.run(base + ["--format", format_name, "--output", str(output)],
-                                        check=False).returncode
+                                        check=False, env=child_environment(binding), timeout=180).returncode
                 if result:
                     break
                 # Keep even a completed first artifact if the later program fails.
@@ -77,12 +165,59 @@ def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str |
                     status["completed_artifacts"].append("evidence-manifest.json")
             if not result:
                 status["stage"] = "complete"
-    except (OSError, ValueError, sqlite3.Error, TimeoutError, RuntimeError) as error:
+                if assistant_binary is not None:
+                    status["stage"] = "assistant"
+                    status["assistant"] = {"status": "preparing", "invocations": 0}
+                    result = assistant_once(run, registry_args, assistant_binary, assistant_script,
+                                            status["assistant"], child_environment(binding))
+                    status["stage"] = "complete" if not result else "complete_weekly_assistant_failed"
+    except (OSError, ValueError, sqlite3.Error, TimeoutError, RuntimeError, subprocess.TimeoutExpired) as error:
         status["error"] = str(error)
+        if status["stage"] == "assistant":
+            status["assistant"]["status"] = "failed"
+            status["assistant"]["error"] = str(error)
+            status["stage"] = "complete_weekly_assistant_failed"
         result = 2
+    for name in ("comparison.json", "comparison.md", "status.json"):
+        artifact = run / "assistant" / name
+        if artifact.is_file() and not artifact.is_symlink():
+            os.chmod(artifact, 0o600)
+            status["completed_artifacts"].append("assistant/" + name)
     status["exit_code"] = result
     private_json(run / "run-status.json", status)
     print(str(run))
+    return result
+
+
+def assistant_once(run: Path, registry_args: list[str], binary: Path, script: Path | None,
+                   status: dict, environment: dict[str, str]) -> int:
+    """One offline comparison after both weekly artifacts; never restart it."""
+    report = run / "review.json"
+    manifest = run / "evidence-manifest.json"
+    report_value = json.loads(report.read_text())
+    manifest_value = json.loads(manifest.read_text())
+    period = report_value.get("period")
+    if not isinstance(period, dict) or manifest_value.get("period") != period:
+        raise ValueError("assistant needs exact matching weekly report/manifest period")
+    as_of = period.get("observed_at")
+    completed = period.get("latest_completed_session")
+    if not isinstance(as_of, str) or not isinstance(completed, str):
+        raise ValueError("assistant needs original observed_at/latest_completed_session fields")
+    script = script or Path(__file__).with_name("run-weekly-assistant-review.py")
+    for path, name in ((script, "assistant script"), (binary, "assistant binary")):
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError(name + " must be a regular file, not a symlink")
+    command = [sys.executable, str(script.resolve(strict=True)), "--report", str(report),
+               "--manifest", str(manifest), "--as-of", as_of, "--completed-session", completed,
+               "--output-dir", str(run / "assistant"), "--assistant-binary", str(binary.resolve(strict=True))] + registry_args
+    status["invocations"] = 1
+    result = subprocess.run(command, check=False, env=environment, timeout=180).returncode
+    status["exit_code"] = result
+    status["status"] = "complete" if result == 0 else "failed"
+    if result == 0 and any(not (run / "assistant" / name).is_file()
+                           or (run / "assistant" / name).is_symlink()
+                           for name in ("comparison.json", "comparison.md", "status.json")):
+        raise RuntimeError("assistant child succeeded without all required comparison artifacts")
     return result
 
 
@@ -122,7 +257,7 @@ def registry_snapshot_args(registry: Path | None, directory: Path) -> list[str]:
     return ["--registry", str(frozen)]
 
 
-def read_only_backup(source: Path, destination: Path) -> None:
+def read_only_backup(source: Path, destination: Path) -> dict:
     before = source.lstat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("source must be an existing regular file, not a symlink")
@@ -170,12 +305,16 @@ def read_only_backup(source: Path, destination: Path) -> None:
     if shm.exists():
         shm.unlink()
     os.chmod(destination, 0o400)
+    return {"path": str(source), "device": before.st_dev, "inode": before.st_ino}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--binding-env-file", type=Path, help="Owner-private runtime .env; extract only the literal paper binding")
+    parser.add_argument("--assistant-binary", type=Path, help="Run one offline comparison after both weekly formats succeed")
+    parser.add_argument("--assistant-script", type=Path, help="Regular helper script; defaults to sibling run-weekly-assistant-review.py")
     parser.add_argument("--registry", type=Path, help="Explicit descriptive registry; frozen once per run; defaults to CLI embedded config")
     parser.add_argument("--evidence-manifest", type=Path, help="Explicit sidecar path for single-format mode")
     parser.add_argument("--from", dest="start")
@@ -186,29 +325,34 @@ def main() -> int:
     parser.add_argument("--weekly-output-root", type=Path,
                         help="Generate JSON and Markdown for the current Shanghai calendar week in a new private version directory")
     args = parser.parse_args()
+    if args.assistant_script and not args.assistant_binary:
+        parser.error("assistant-script requires assistant-binary")
+    if args.assistant_binary and not args.weekly_output_root:
+        parser.error("assistant hook requires weekly-output-root with both formats")
     if args.weekly_output_root:
         if args.start or args.to or args.format or args.output or args.evidence_manifest:
             parser.error("weekly-output-root computes its own week and writes both formats; from/to/format/output are not accepted")
-        return weekly_run(args.database, args.binary, args.weekly_output_root, args.observed_at, args.registry)
+        return weekly_run(args.database, args.binary, args.weekly_output_root, args.observed_at, args.registry, args.binding_env_file, args.assistant_binary, args.assistant_script)
     if not args.start or not args.to:
         parser.error("explicit from/to are required without weekly-output-root")
     binary = args.binary.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="stock-analysis-weekly-") as directory:
         os.chmod(directory, 0o700)
+        binding = read_binding_env(args.binding_env_file)
         backup = Path(directory) / "snapshot.db"
-        read_only_backup(args.database, backup)
+        origin = read_only_backup(args.database, backup)
         registry_args = registry_snapshot_args(args.registry, Path(directory))
         command = [str(binary), "--database", str(backup), "--from", args.start,
                    "--to", args.to, "--format", args.format or "markdown",
                    "--source-label", str(args.database.resolve(strict=True)),
-                   "--temporary-snapshot"] + registry_args
+                   "--temporary-snapshot"] + registry_args + snapshot_source_args(backup, origin, Path(directory), binding)
         if args.evidence_manifest:
             command.extend(["--evidence-manifest", str(args.evidence_manifest)])
         if args.observed_at:
             command.extend(["--observed-at", args.observed_at])
         if args.output:
             command.extend(["--output", str(args.output)])
-        return subprocess.run(command, check=False).returncode
+        return subprocess.run(command, check=False, env=child_environment(binding), timeout=180).returncode
 
 
 if __name__ == "__main__":

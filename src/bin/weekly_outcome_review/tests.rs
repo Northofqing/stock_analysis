@@ -407,6 +407,7 @@ fn weekly_cli_requires_explicit_scope_and_refuses_output_overwrite() {
         registry: None,
         evidence_manifest: None,
         database: source,
+        snapshot_source_manifest: None,
         source_label: None,
         temporary_snapshot: false,
         from: canonical_date("2026-09-28").unwrap(),
@@ -453,6 +454,7 @@ fn weekly_cli_creates_machine_report_with_source_identity_and_unavailable_states
         registry: None,
         evidence_manifest: None,
         database: source.clone(),
+        snapshot_source_manifest: None,
         source_label: Some("original input label".into()),
         temporary_snapshot: true,
         from: canonical_date("2026-09-28").unwrap(),
@@ -648,6 +650,7 @@ fn cli_formats_and_manifest_share_exact_snapshot_clock_registry_and_reader_ident
             database: source.clone(),
             registry: Some(registry_path.clone()),
             evidence_manifest: Some(manifest_path.clone()),
+            snapshot_source_manifest: None,
             source_label: None,
             temporary_snapshot: false,
             from: canonical_date("2026-09-28").unwrap(),
@@ -688,6 +691,7 @@ fn cli_formats_and_manifest_share_exact_snapshot_clock_registry_and_reader_ident
         database: dir.path().join("TEST_CODE_identity.db"),
         registry: Some(registry_path),
         evidence_manifest: Some(manifest_path),
+        snapshot_source_manifest: None,
         source_label: None,
         temporary_snapshot: false,
         from: canonical_date("2026-09-28").unwrap(),
@@ -715,6 +719,7 @@ fn cli_invalid_registry_and_nonempty_wal_fail_without_report_or_source_writes() 
         database: source.clone(),
         registry,
         evidence_manifest: None,
+        snapshot_source_manifest: None,
         source_label: None,
         temporary_snapshot: false,
         from: canonical_date("2026-09-28").unwrap(),
@@ -821,6 +826,7 @@ fn cli_rejects_relative_parent_and_symlink_directory_artifact_aliases_before_wri
             database: source.clone(),
             registry: None,
             evidence_manifest: Some(output.clone()),
+            snapshot_source_manifest: None,
             source_label: None,
             temporary_snapshot: false,
             from: canonical_date("2026-09-28").unwrap(),
@@ -858,4 +864,328 @@ fn newly_appeared_or_changed_manifest_is_never_silently_reused() {
     std::fs::write(&path, b"changed after validation").unwrap();
     assert!(persist_manifest(&path, expected, true).is_err());
     assert_eq!(std::fs::read(path).unwrap(), b"changed after validation");
+}
+
+/// The actual test subprocess owns its environment, so parallel old-report
+/// tests never inherit an active binding. This runs the real CLI run() boundary.
+#[test]
+fn weekly_native_process_fixture_entry() {
+    let Some(request_path) = std::env::var_os("TEST_CODE_WEEKLY_CHILD_REQUEST") else {
+        return;
+    };
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(request_path).unwrap()).unwrap();
+    run(Args {
+        database: PathBuf::from(request["database"].as_str().unwrap()),
+        registry: None,
+        snapshot_source_manifest: request["manifest"].as_str().map(PathBuf::from),
+        evidence_manifest: None,
+        source_label: Some("TEST_CODE_original_target_provenance".into()),
+        temporary_snapshot: true,
+        from: canonical_date("2026-10-05").unwrap(),
+        to: canonical_date("2026-10-11").unwrap(),
+        observed_at: Some(shanghai_clock(request["observed_at"].as_str().unwrap()).unwrap()),
+        format: Format::Json,
+        output: Some(PathBuf::from(request["output"].as_str().unwrap())),
+    })
+    .unwrap();
+}
+
+struct NativeWeeklyFixture {
+    _dir: tempfile::TempDir,
+    original: PathBuf,
+    snapshot: PathBuf,
+    binding: stock_analysis::trading::paper_ledger::AccountBinding,
+}
+fn native_weekly_fixture() -> NativeWeeklyFixture {
+    use serde_json::json;
+    use std::os::unix::fs::MetadataExt;
+    use stock_analysis::trading::paper_ledger::{Mark, Money, RiskPolicyV1, SeedLot, SeedManifest};
+    use stock_analysis::trading::paper_snapshot_activation::*;
+    let dir = tempfile::tempdir().unwrap();
+    let directory = dir.path().canonicalize().unwrap();
+    let original = directory.join("TEST_CODE_native_weekly_original.db");
+    let writer = rusqlite::Connection::open(&original).unwrap();
+    // Frozen native DDL, without running DatabaseManager init/catalog migration.
+    for line in include_str!("../../database/fixtures/global_schema_legacy_ddl_v1.tsv")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+    {
+        let (_, hex) = line.split_once('|').unwrap();
+        writer
+            .execute_batch(&String::from_utf8(hex::decode(hex).unwrap()).unwrap())
+            .unwrap();
+    }
+    writer.execute_batch("INSERT INTO paper_trades(plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts) VALUES('TEST_CODE_old_trade','TEST_CODE_000001','TEST_CODE_fixture','buy',9,100,'Filled',9,'TEST_CODE_legacy','Normal','Full','2026-10-08 02:00:00');
+      INSERT INTO user_account_summary(effective_at,total_assets,securities_market_value,available_cash,position_ratio_pct,daily_pnl,source) VALUES('2026-10-09T21:13:00+08:00',11000,1000,10000,9.090909,-100,'TEST_CODE_user_confirmed_account');").unwrap();
+    let input=stock_analysis::portfolio::user_position_snapshot::user_position_snapshot_input_from_json(
+        r#"{"schema_version":1,"effective_at":"2026-10-09T21:13:00+08:00","confirm_empty":false,"items":[{"code":"TEST_CODE_000001","name":"TEST_CODE_fixture","quantity":100,"cost_price":12.0}]}"#,
+        DateTime::parse_from_rfc3339("2026-10-09T21:20:00+08:00").unwrap()).unwrap();
+    writer.execute("INSERT INTO user_position_snapshot(snapshot_id,effective_at,confirmed_at,source,confirm_empty,evidence_sha256,item_count) VALUES(?1,'2026-10-09T21:13:00+08:00','2026-10-09T21:20:00+08:00','user_confirmed_full_snapshot',0,?2,1)",rusqlite::params![input.snapshot_id,input.evidence_sha256]).unwrap();
+    writer.execute("INSERT INTO user_position_snapshot_item VALUES(?1,'TEST_CODE_000001','TEST_CODE_fixture',100,12)",[&input.snapshot_id]).unwrap();
+    let summary=writer.query_row("SELECT id,effective_at,total_assets,securities_market_value,available_cash,position_ratio_pct,daily_pnl,source,recorded_at FROM user_account_summary WHERE id=1",[],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"effective_at":r.get::<_,String>(1)?,"total_assets":r.get::<_,f64>(2)?,"securities_market_value":r.get::<_,f64>(3)?,"available_cash":r.get::<_,f64>(4)?,"position_ratio_pct":r.get::<_,f64>(5)?,"daily_pnl":r.get::<_,f64>(6)?,"source":r.get::<_,String>(7)?,"recorded_at":r.get::<_,String>(8)?}))).unwrap();
+    let snapshot_row=writer.query_row("SELECT id,snapshot_id,effective_at,confirmed_at,source,confirm_empty,evidence_sha256,item_count,recorded_at FROM user_position_snapshot WHERE id=1",[],|r|Ok(json!({"id":r.get::<_,i64>(0)?,"snapshot_id":r.get::<_,String>(1)?,"effective_at":r.get::<_,String>(2)?,"confirmed_at":r.get::<_,String>(3)?,"source":r.get::<_,String>(4)?,"confirm_empty":r.get::<_,i64>(5)?,"evidence_sha256":r.get::<_,String>(6)?,"item_count":r.get::<_,i64>(7)?,"recorded_at":r.get::<_,String>(8)?}))).unwrap();
+    let image = directory.join("TEST_CODE_original.jpg");
+    std::fs::write(&image, b"TEST_CODE_same_batch_image_bytes").unwrap();
+    let image_sha = bytes_sha256(b"TEST_CODE_same_batch_image_bytes");
+    let evidence=json!({"original_image_sha256":image_sha,"effective_at":snapshot_row["effective_at"],"confirmed_at":snapshot_row["confirmed_at"],"snapshot_id":input.snapshot_id,"position_evidence_sha256":input.evidence_sha256,"market_prices_role":SNAPSHOT_MARK_SOURCE,"positions":[{"code":"TEST_CODE_000001","name":"TEST_CODE_fixture","quantity":100,"cost_price":"12.000","current_price":"10.000","market_value":"1000.00"}]}).to_string();
+    let metadata = std::fs::metadata(&original).unwrap();
+    let receipt=json!({"status":"committed_and_verified","database":original,"database_identity":{"device":metadata.dev(),"inode":metadata.ino()},"effective_at":snapshot_row["effective_at"],"confirmed_at":snapshot_row["confirmed_at"],"position_row_id":1,"account_summary_row_id":1,"snapshot_id":input.snapshot_id,"image_sha256":image_sha,"readback":{"summary":summary,"positions":snapshot_row,"items":[{"code":"TEST_CODE_000001","name":"TEST_CODE_fixture","quantity":100,"cost_price":12.0}]}}).to_string();
+    let evidence_path = directory.join("TEST_CODE_evidence.json");
+    let receipt_path = directory.join("TEST_CODE_import_receipt.json");
+    std::fs::write(&evidence_path, &evidence).unwrap();
+    std::fs::write(&receipt_path, &receipt).unwrap();
+    let cutover = DateTime::parse_from_rfc3339("2026-10-09T21:13:00+08:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let request = SnapshotPaperActivationRequest {
+        schema_version: 1,
+        summary_row_id: 1,
+        snapshot_id: input.snapshot_id,
+        source_batch_reference: "TEST_CODE_user_snapshot_image_batch".into(),
+        source_evidence: SnapshotSourceEvidence {
+            image_path: image,
+            image_sha256: image_sha,
+            snapshot_evidence_path: evidence_path,
+            snapshot_evidence_sha256: bytes_sha256(evidence.as_bytes()),
+            import_receipt_path: receipt_path,
+            import_receipt_sha256: bytes_sha256(receipt.as_bytes()),
+        },
+        establish_after_hours_close: true,
+        seed: SeedManifest {
+            account_id: "TEST_CODE_paper_account".into(),
+            epoch_id: "TEST_CODE_paper_epoch".into(),
+            command_id: "TEST_CODE_activate".into(),
+            cutover_at: cutover,
+            account_effective_at: cutover,
+            positions_effective_at: cutover,
+            source_reference: "TEST_CODE_user_snapshot_image_batch".into(),
+            source_hash: String::new(),
+            approved_by: "TEST_CODE_explicit_user".into(),
+            cash: Money::from_cny(10000.0).unwrap(),
+            original_total: Money::from_cny(11000.0).unwrap(),
+            excluded_residual: None,
+            lots: vec![SeedLot {
+                code: "TEST_CODE_000001".into(),
+                name: "TEST_CODE_fixture".into(),
+                quantity: 100,
+                reported_cost: Some(Money::from_cny(12.0).unwrap()),
+                sellable_from: None,
+                sellability_evidence: None,
+            }],
+            marks: vec![Mark {
+                code: "TEST_CODE_000001".into(),
+                price: Money::from_cny(10.0).unwrap(),
+                observed_at: cutover,
+                source: SNAPSHOT_MARK_SOURCE.into(),
+            }],
+            policy: RiskPolicyV1::default(),
+        },
+    };
+    drop(writer);
+    let now = DateTime::parse_from_rfc3339("2026-10-09T21:30:00+08:00")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut conn = open_snapshot_activation_database(&original, true).unwrap();
+    let prepared = preview_snapshot_paper_activation(&mut conn, &request, now)
+        .unwrap()
+        .prepared_request;
+    let outcome = apply_snapshot_paper_activation(&mut conn, &prepared, now).unwrap();
+    drop(conn);
+    let snapshot = directory.join("TEST_CODE_detached_snapshot.db");
+    std::fs::copy(&original, &snapshot).unwrap();
+    NativeWeeklyFixture {
+        _dir: dir,
+        original,
+        snapshot,
+        binding: outcome.binding,
+    }
+}
+fn native_weekly_child(
+    fixture: &NativeWeeklyFixture,
+    case: &str,
+    observed_at: &str,
+    binding: Option<&str>,
+    origin: Option<&PathBuf>,
+    include_manifest: bool,
+) -> serde_json::Value {
+    use serde_json::json;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let directory = fixture.original.parent().unwrap();
+    let output = directory.join(format!("{case}.json"));
+    let manifest = directory.join(format!("{case}.source.json"));
+    let original = origin.unwrap_or(&fixture.original);
+    let origin_meta = std::fs::metadata(original).unwrap();
+    let snapshot_meta = std::fs::metadata(&fixture.snapshot).unwrap();
+    let source = paper_account::SnapshotSource {
+        schema_version: 1,
+        original_database: paper_account::DatabaseIdentity {
+            path: original.clone(),
+            device: origin_meta.dev(),
+            inode: origin_meta.ino(),
+        },
+        snapshot_database: paper_account::DatabaseIdentity {
+            path: fixture.snapshot.clone(),
+            device: snapshot_meta.dev(),
+            inode: snapshot_meta.ino(),
+        },
+        snapshot_sha256: file_sha256(&fixture.snapshot).unwrap(),
+        paper_binding_sha256: binding.map(|b| bytes_sha256(b.as_bytes())),
+    };
+    std::fs::write(&manifest, serde_json::to_vec(&source).unwrap()).unwrap();
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let request = directory.join(format!("{case}.request.json"));
+    std::fs::write(&request,json!({"database":fixture.snapshot,"manifest":include_manifest.then_some(manifest),"output":output,"observed_at":observed_at}).to_string()).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "tests::weekly_native_process_fixture_entry",
+            "--nocapture",
+        ])
+        .env("TEST_CODE_WEEKLY_CHILD_REQUEST", request)
+        .env_remove(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV);
+    if let Some(binding) = binding {
+        child.env(
+            stock_analysis::trading::paper_ledger_runtime::BINDING_ENV,
+            binding,
+        );
+    }
+    let result = child.output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap()
+}
+
+#[test]
+fn weekly_native_snapshot_epoch_reports_accurate_independent_account_and_legacy_separately() {
+    let fixture = native_weekly_fixture();
+    let original_before = std::fs::read(&fixture.original).unwrap();
+    let snapshot_before = std::fs::read(&fixture.snapshot).unwrap();
+    let binding = serde_json::to_string(&fixture.binding).unwrap();
+    let review = native_weekly_child(
+        &fixture,
+        "valid",
+        "2026-10-09T22:00:00+08:00",
+        Some(&binding),
+        None,
+        true,
+    );
+    let account = &review["paper_account"]["value"];
+    assert_eq!(review["paper_account"]["status"], "available");
+    assert_eq!(account["ledger_kind"], "NativeSnapshotPaperV1");
+    assert_eq!(account["cash_cny"], 10000.0);
+    assert_eq!(account["market_value_cny"], 1000.0);
+    assert_eq!(account["total_equity_cny"], 11000.0);
+    assert_eq!(account["seed_equity_cny"], 11000.0);
+    assert_eq!(account["since_cutover_net_pnl_cny"], 0.0);
+    assert_eq!(account["modeled_fees_cny"], 0.0);
+    assert_eq!(account["holdings"][0]["reported_actual_cost_cny"], 12.0);
+    assert_eq!(account["holdings"][0]["basis_price_cny"], 10.0);
+    assert_eq!(account["valuation_effective_at"], "2026-10-09T13:13:00Z");
+    assert_eq!(account["daily_pnl_cny"]["status"], "unavailable");
+    assert_eq!(review["verified_paper"]["value"]["source_fill_rows"], 0);
+    assert_eq!(
+        review["legacy_verified_paper"]["value"]["source_fill_rows"],
+        1
+    );
+    assert_eq!(review["raw_paper"]["value"]["historical_filled_rows"], 1);
+    let stale = native_weekly_child(
+        &fixture,
+        "stale_marks",
+        "2026-10-12T22:00:00+08:00",
+        Some(&binding),
+        None,
+        true,
+    );
+    assert_eq!(stale["paper_account"]["status"], "available");
+    assert_eq!(
+        stale["paper_account"]["value"]["valuation_is_current_observation_day"],
+        false
+    );
+    assert_eq!(
+        stale["paper_account"]["value"]["daily_pnl_cny"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        stale["paper_account"]["value"]["valuation_effective_at"],
+        "2026-10-09T13:13:00Z"
+    );
+    assert_eq!(std::fs::read(&fixture.original).unwrap(), original_before);
+    assert_eq!(std::fs::read(&fixture.snapshot).unwrap(), snapshot_before);
+}
+
+#[test]
+fn weekly_native_snapshot_missing_wrong_binding_fixture_source_and_historical_head_never_fallback()
+{
+    let fixture = native_weekly_fixture();
+    let binding = serde_json::to_string(&fixture.binding).unwrap();
+    let mut wrong = fixture.binding.clone();
+    wrong.epoch_id = "TEST_CODE_wrong_epoch".into();
+    let wrong = serde_json::to_string(&wrong).unwrap();
+    let copied = fixture
+        .original
+        .parent()
+        .unwrap()
+        .join("TEST_CODE_fixture_copy.db");
+    std::fs::copy(&fixture.original, &copied).unwrap();
+    for (case, clock, binding, origin, manifest) in [
+        (
+            "missing_binding",
+            "2026-10-09T22:00:00+08:00",
+            None,
+            None,
+            true,
+        ),
+        (
+            "wrong_binding",
+            "2026-10-09T22:00:00+08:00",
+            Some(wrong.as_str()),
+            None,
+            true,
+        ),
+        (
+            "copied_original",
+            "2026-10-09T22:00:00+08:00",
+            Some(binding.as_str()),
+            Some(&copied),
+            true,
+        ),
+        (
+            "missing_manifest",
+            "2026-10-09T22:00:00+08:00",
+            Some(binding.as_str()),
+            None,
+            false,
+        ),
+        (
+            "before_activation_commit",
+            "2026-10-09T21:25:00+08:00",
+            Some(binding.as_str()),
+            None,
+            true,
+        ),
+        (
+            "historical_future_head",
+            "2026-10-08T22:00:00+08:00",
+            Some(binding.as_str()),
+            None,
+            true,
+        ),
+    ] {
+        let review = native_weekly_child(&fixture, case, clock, binding, origin, manifest);
+        assert_eq!(
+            review["paper_account"]["status"], "unavailable",
+            "{case}: {review}"
+        );
+        assert_eq!(review["verified_paper"]["status"], "unavailable", "{case}");
+        assert!(
+            review["raw_paper"]["value"].is_object(),
+            "raw facts retained: {case}"
+        );
+    }
 }

@@ -4,6 +4,9 @@ use super::*;
 #[path = "bin/weekly_outcome_review/registry.rs"]
 mod registry;
 #[allow(dead_code)]
+#[path = "bin/weekly_outcome_review/paper_account.rs"]
+mod paper_account;
+#[allow(dead_code)]
 #[path = "bin/weekly_outcome_review/report.rs"]
 mod report;
 #[allow(dead_code)]

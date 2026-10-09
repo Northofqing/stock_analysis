@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent read-only health probe and durable local alerts; no delivery adapter."""
+"""Independent health probe, durable local alerts, and opt-in mobile operations alerts."""
 import argparse
 import copy
 import fcntl
@@ -13,6 +13,7 @@ import time
 
 from reliability_common import (Calendar, absolute, clock, digest, json_bytes,
                                 open_dir, read_at, regular, write_at)
+from watchdog_mobile import dispatch_mobile
 
 PROBE_LIMIT = 64 * 1024
 RUNTIME = '/Users/zhangzhen/.local/share/stock-analysis-runtime'
@@ -208,6 +209,13 @@ def persist_incidents(fd, incidents, observation, poll, prior, now):
     old = state.get('active', {})
     current = {}
     events = []
+    # Only events referenced by a successfully committed local state are eligible
+    # for mobile delivery. A crash after event write but before state publication
+    # leaves an unsent audit artifact, rather than a second sendable first event.
+    outbox = [entry for entry in state.get('mobile_outbox', [])
+              if 0 <= age(entry['observed_at'], now) <= 86400]
+    resolved_generations = {key: entry for key, entry in state.get('mobile_resolved_generations', {}).items()
+                            if 0 <= age(entry['observed_at'], now) <= 86400}
     for incident in incidents:
         previous = old.get(incident['key'])
         same_rule = [v for v in old.values() if v['rule'] == incident['rule'] and incident['rule'] != 'capability']
@@ -215,16 +223,22 @@ def persist_incidents(fd, incidents, observation, poll, prior, now):
         if action is None and incident['severity'] == 'P0' and age(previous['last_event_at'], now) >= 3600:
             action = 'reminder'
         entry = dict(incident)
+        entry['generation_sha256'] = (previous.get('generation_sha256') if previous else None) or digest(
+            json_bytes([incident['key'], previous['last_event_at'] if previous else now.isoformat()]))
         entry['last_event_at'] = now.isoformat() if action else previous['last_event_at']
         current[incident['key']] = entry
         if action:
-            events.append(dict(incident, action=action))
+            events.append(dict(incident, action=action, generation_sha256=entry['generation_sha256']))
     for key, previous in old.items():
         if key not in current:
             if any(i['rule'] == previous['rule'] for i in incidents) and previous['rule'] != 'capability':
                 continue  # Changed reason/severity is represented by the new event.
             if previous['rule'] in observation['resolved_rules']:
-                events.append(dict(previous, action='recovery', recovery_basis='verified_scope_or_session_resolution'))
+                generation = previous.get('generation_sha256') or digest(
+                    json_bytes([key, previous['last_event_at']]))
+                events.append(dict(previous, action='recovery', generation_sha256=generation,
+                                   recovery_basis='verified_scope_or_session_resolution'))
+                resolved_generations[key] = {'generation_sha256': generation, 'observed_at': now.isoformat()}
             else:
                 current[key] = previous  # Unknown probe/data does not establish recovery.
     eventfd = open_dir(Path(observation['output_root']) / 'events', create=True, private=True)
@@ -232,11 +246,19 @@ def persist_incidents(fd, incidents, observation, poll, prior, now):
         for event in events:
             binding()
             event.update(schema_version=1, observed_at=now.isoformat(), delivery_scope='local_persistence_only')
-            write_at(eventfd, digest(json_bytes(event)) + '.json', json_bytes(event))
+            event_hash = digest(json_bytes(event))
+            raw = json_bytes(event)
+            try:
+                write_at(eventfd, event_hash + '.json', raw)
+            except FileExistsError:
+                if read_at(eventfd, event_hash + '.json', private=True)[0] != raw:
+                    raise ValueError('event retry content mismatch')
+            outbox.append({'event_sha256': event_hash, 'observed_at': event['observed_at']})
     finally:
         os.close(eventfd)
     binding()
-    state.update(schema_version=1, active=current, **poll)
+    state.update(schema_version=1, active=current, mobile_outbox=outbox,
+                 mobile_resolved_generations=resolved_generations, **poll)
     # Event failures above never advance this durable dedup state.
     write_at(fd, 'state.json', json_bytes(state), replace=True)
     write_at(fd, 'latest.json', json_bytes(dict(schema_version=1, observed_at=now.isoformat(),
@@ -246,7 +268,7 @@ def persist_incidents(fd, incidents, observation, poll, prior, now):
         read_at(fd, day, private=True)
     except FileNotFoundError:
         raw = json_bytes({'schema_version': 1, 'observed_at': now.isoformat(),
-                          'scope': 'local_write_read_only', 'mobile_delivery': 'unconfigured'})
+                          'scope': 'local_write_read_only', 'mobile_delivery': 'not_attempted'})
         write_at(fd, day, raw)
         if read_at(fd, day, private=True)[0] != raw:
             raise ValueError('self-check reread failed')
@@ -261,6 +283,8 @@ def main():
     parser.add_argument('--output-root', required=True, type=absolute)
     parser.add_argument('--observed-at')
     parser.add_argument('--probe-timeout-seconds', type=float, default=5)
+    parser.add_argument('--mobile-config', type=absolute,
+                        help='explicit opt-in private JSON; absent means no mobile network calls')
     args = parser.parse_args()
     if not 0 < args.probe_timeout_seconds <= 30:
         parser.error('probe timeout must be >0 and <=30 seconds')
@@ -289,8 +313,16 @@ def main():
         report, error = probe(args.runtime_root, args.probe_timeout_seconds)
         incidents, observation, poll = classify(report, now, calendar, prior, error)
         observation['output_root'] = str(args.output_root)
-        persist_incidents(fd, incidents, observation, poll, prior, now)
+        state = persist_incidents(fd, incidents, observation, poll, prior, now)
         print('local_observation_persisted')
+        # This independent operations alert owner never enters business delivery
+        # or modifies its database. Local persistence always precedes networking.
+        try:
+            mobile = dispatch_mobile(fd, args.output_root, state, now, args.mobile_config)
+            print('mobile_configuration=' + mobile['configuration_status'])
+        except (OSError, ValueError, KeyError, TypeError):
+            print('watchdog_mobile_receipt_unavailable_local_observation_retained')
+            return 2
         return 1 if any(i['severity'] == 'P0' for i in incidents) else 0
     except (OSError, ValueError, KeyError, TypeError):
         print('watchdog_local_persistence_or_input_unavailable')

@@ -9,6 +9,9 @@ use chrono::{NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+#[path = "sell_reminder_producer.rs"]
+pub mod producer;
+
 pub const VERSION: &str = "sell-preview/v1-legacy-rule-units";
 const SEMANTICS: &str = "逐批独立申报；不跨批合并；买入费用按建议股数比例截断分摊，余数留在剩余批次；卖出费用按该批本次独立申报。净收益分母为不含费买入金额，单位百分点。ATR14=最近14根high-low的元/股均值，但StopLoss按百分比使用；保留遗留单位差异，生产推广待明确解决。MA60不足时沿用MA20；少于35根不能确认Hold。";
 const MANUAL: &str = "仅供人工在券商核对后申报，未连接券商、未下单或发送提醒。上交所盘后固定价格接受/撮合15:05–15:30（15:00–15:05尚未开始）；当日15:00停牌排除；限价不得高于确认收盘价；当日有效、时间优先且不保证成交。撤单以券商/交易所确认及受理时段为准。深交所须遵循其来源确认的时段与数量合同。";

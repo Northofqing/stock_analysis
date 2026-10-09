@@ -92,6 +92,91 @@ fn evidence_check(v: &Value, snapshot: &Value) -> anyhow::Result<()> {
     }
     Ok(())
 }
+fn paper_observation(
+    report: &Value,
+    manifest: &Value,
+    as_of: DateTime<FixedOffset>,
+    facts: &mut BTreeMap<String, Value>,
+) -> anyhow::Result<Value> {
+    let state = &report["paper_account"];
+    if state.is_null() || state["status"] == "unavailable" {
+        return Ok(
+            json!({"status":"unavailable","reason":"native paper account observation unavailable in this artifact"}),
+        );
+    }
+    let account = &state["value"];
+    anyhow::ensure!(
+        state["status"] == "available"
+            && account["schema_version"] == "weekly-native-paper-account-v1"
+            && account["ledger_kind"] == "NativeSnapshotPaperV1"
+            && account["account_scope"]
+                == "current_account_as_of_observed_at_not_historical_week_close"
+            && account["snapshot_sha256"] == manifest["input_snapshot_sha256"]
+            && manifest["metric_scopes"]["/paper_account"]["input_snapshot_sha256"]
+                == manifest["input_snapshot_sha256"],
+        "paper_observation_identity"
+    );
+    let mut context = json!({"status":"available","grade":"observational",
+        "scope":"same current paper observation for all arms; not weekly strategy outcome or executable quote",
+        "valuation_is_current_observation_day":account["valuation_is_current_observation_day"]});
+    for key in [
+        "cutover_at",
+        "ledger_as_of",
+        "valuation_effective_at",
+        "original_actual_account_as_of",
+    ] {
+        let timestamp = DateTime::parse_from_rfc3339(
+            account[key]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("paper_observation_time"))?,
+        )?;
+        anyhow::ensure!(timestamp <= as_of, "paper_observation_future");
+        context[key] = account[key].clone();
+    }
+    for key in [
+        "seed_equity_cny",
+        "cash_cny",
+        "market_value_cny",
+        "total_equity_cny",
+        "since_cutover_net_pnl_cny",
+        "realized_net_pnl_cny",
+        "unrealized_net_pnl_cny",
+        "modeled_fees_cny",
+    ] {
+        let value = account[key]
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| anyhow::anyhow!("paper_observation_amount"))?;
+        if [
+            "seed_equity_cny",
+            "cash_cny",
+            "market_value_cny",
+            "total_equity_cny",
+            "modeled_fees_cny",
+        ]
+        .contains(&key)
+        {
+            anyhow::ensure!(value >= 0.0, "paper_observation_amount");
+        }
+        context[key] = account[key].clone();
+        facts.insert(format!("paper_account/{key}"), account[key].clone());
+    }
+    anyhow::ensure!(
+        (account["cash_cny"].as_f64().unwrap() + account["market_value_cny"].as_f64().unwrap()
+            - account["total_equity_cny"].as_f64().unwrap())
+        .abs()
+            < 0.011
+            && (account["seed_equity_cny"].as_f64().unwrap()
+                + account["since_cutover_net_pnl_cny"].as_f64().unwrap()
+                - account["total_equity_cny"].as_f64().unwrap())
+            .abs()
+                < 0.011,
+        "paper_observation_arithmetic"
+    );
+    context["daily_pnl"] = json!({"status":"unavailable","reason":"daily paper baseline and price qualification are outside this common context"});
+    context["authority"] = json!("artifact identity and arithmetic only; no new source qualification, broker balance, model advice or historical PIT authority");
+    Ok(context)
+}
 impl FrozenPack {
     pub fn load(
         report: &Path,
@@ -306,7 +391,9 @@ impl FrozenPack {
                 }
             }
         }
+        let paper = paper_observation(&report, &manifest, as_of, &mut facts)?;
         let base = json!({"schema":"assistant-base-v1","period":period,"registry":content,
+            "paper_account_observation":paper,
             "current_evidence":[],"current_evidence_reason":"weekly artifact has no current market evidence projection",
             "gaps":gaps,"pit":"unavailable: v1 lacks exact historical availability/revision and family/instrument joins",
             "authority":"descriptive manual review; no promotion or trading intent"});
@@ -394,7 +481,7 @@ impl FrozenPack {
     fn allowed_facts(&self, outcomes: bool) -> BTreeMap<String, Value> {
         self.facts
             .iter()
-            .filter(|(_, v)| outcomes || v.is_null())
+            .filter(|(k, v)| outcomes || k.starts_with("paper_account/") || v.is_null())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
@@ -753,6 +840,11 @@ pub fn markdown(comparison: &Value) -> anyhow::Result<String> {
             .replace('\r', " ")
     }
     let mut text=format!("# 每周证据复盘（只读）\n\n观察时刻：{}。离线模板可用；汇总结果仅作描述性观察。历史 PIT 与精确家族/证券结果记忆不可用，不能据此晋级策略。\n\n",cell(&comparison["as_of"]));
+    let paper = &comparison["base"]["paper_account_observation"];
+    if paper["status"] == "available" {
+        text.push_str(&format!("三组复核共用同一模拟账户观察：现金 {} 元，市值 {} 元，权益 {} 元，期初以来净盈亏 {} 元，模拟费用 {} 元。估值原时间 {}；当前账户观察与本周策略结果分开，持久价格不因此成为可成交报价。\n\n",
+            cell(&paper["cash_cny"]),cell(&paper["market_value_cny"]),cell(&paper["total_equity_cny"]),cell(&paper["since_cutover_net_pnl_cny"]),cell(&paper["modeled_fees_cny"]),cell(&paper["valuation_effective_at"])));
+    }
     text.push_str("| 对照臂 | 状态 | 降级原因 |\n| --- | --- | --- |\n");
     for arm in comparison["arms"]
         .as_array()
@@ -878,6 +970,58 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 10, 8).unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn native_paper_context_is_common_and_preserves_observation_boundary() {
+        let (r, m) = fixture();
+        let mut report: Value = serde_json::from_slice(&r).unwrap();
+        let mut manifest: Value = serde_json::from_slice(&m).unwrap();
+        manifest["metric_scopes"]["/paper_account"] =
+            json!({"input_snapshot_sha256":"a".repeat(64)});
+        report["evidence_manifest"] = manifest.clone();
+        report["paper_account"] = json!({"status":"available","value":{
+            "schema_version":"weekly-native-paper-account-v1","ledger_kind":"NativeSnapshotPaperV1",
+            "account_scope":"current_account_as_of_observed_at_not_historical_week_close",
+            "snapshot_sha256":"a".repeat(64),"cutover_at":"2026-10-08T15:00:00+08:00",
+            "ledger_as_of":"2026-10-08T15:01:00+08:00","valuation_effective_at":"2026-10-08T14:59:00+08:00",
+            "original_actual_account_as_of":"2026-10-08T14:59:00+08:00","valuation_is_current_observation_day":true,
+            "seed_equity_cny":100.0,"cash_cny":20.0,"market_value_cny":81.0,"total_equity_cny":101.0,
+            "since_cutover_net_pnl_cny":1.0,"realized_net_pnl_cny":0.0,"unrealized_net_pnl_cny":1.0,"modeled_fees_cny":0.0}});
+        let parse = |report: &Value, manifest: &Value| {
+            FrozenPack::parse(
+                &serde_json::to_vec(report).unwrap(),
+                &serde_json::to_vec(manifest).unwrap(),
+                None,
+                "2026-10-08T16:00:00+08:00",
+                NaiveDate::from_ymd_opt(2026, 10, 8).unwrap(),
+            )
+        };
+        let pack = parse(&report, &manifest).unwrap();
+        assert_eq!(
+            pack.allowed_facts(false)["paper_account/cash_cny"],
+            json!(20.0)
+        );
+        assert_eq!(
+            pack.allowed_facts(true)["paper_account/cash_cny"],
+            json!(20.0)
+        );
+        assert_eq!(
+            pack.base["paper_account_observation"]["grade"],
+            "observational"
+        );
+        assert_eq!(
+            pack.base["paper_account_observation"]["daily_pnl"]["status"],
+            "unavailable"
+        );
+        let original = report.clone();
+        report["paper_account"]["value"]["ledger_as_of"] = json!("2026-10-08T16:01:00+08:00");
+        assert!(parse(&report, &manifest).is_err());
+        report = original.clone();
+        report["paper_account"]["value"]["total_equity_cny"] = json!(102.0);
+        assert!(parse(&report, &manifest).is_err());
+        report = original;
+        report["paper_account"]["value"]["snapshot_sha256"] = json!("c".repeat(64));
+        assert!(parse(&report, &manifest).is_err());
     }
     fn pricing() -> ReviewedPricing {
         serde_json::from_value(json!({"schema_version":"assistant-reviewed-pricing-v1","reviewed_by":"test-only","contract_version":"fake-v1",

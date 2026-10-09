@@ -8,6 +8,8 @@ use stock_analysis::database::attribution_reports::{
     AttributionDatabaseAccess, AttributionDatabaseSession,
 };
 
+#[path = "weekly_outcome_review/paper_account.rs"]
+mod paper_account;
 #[path = "weekly_outcome_review/registry.rs"]
 mod registry;
 #[path = "weekly_outcome_review/report.rs"]
@@ -39,6 +41,9 @@ struct Args {
     /// Original source label supplied by the backup wrapper/operator, not qualification.
     #[arg(long)]
     source_label: Option<String>,
+    /// Private wrapper provenance binding this detached snapshot to its original physical target.
+    #[arg(long)]
+    snapshot_source_manifest: Option<PathBuf>,
     /// Mark a private input that will be deleted after this process exits.
     #[arg(long)]
     temporary_snapshot: bool,
@@ -83,14 +88,22 @@ fn run(args: Args) -> anyhow::Result<()> {
     // It does not run DatabaseManager::init or any application DDL.
     ensure_normalized_snapshot(&args.database)?;
     let before = file_sha256(&args.database)?;
+    let source = args
+        .snapshot_source_manifest
+        .as_ref()
+        .map(|path| paper_account::SnapshotSource::load(path, &args.database, &before))
+        .transpose()?;
     let session =
         AttributionDatabaseSession::open(&args.database, AttributionDatabaseAccess::ReadOnly)?;
-    let mut review = report::read(session.database(), period);
+    let mut review = report::read_with_paper_source(session.database(), period, source.as_ref());
     ensure_normalized_snapshot(&args.database)?;
     anyhow::ensure!(
         before == file_sha256(&args.database)?,
         "source main changed during report read"
     );
+    if let Some(source) = &source {
+        source.verify_original()?;
+    }
     review.input_source = Some(report::InputSource {
         database_path: args.database.display().to_string(),
         source_main_sha256: before.clone(),
