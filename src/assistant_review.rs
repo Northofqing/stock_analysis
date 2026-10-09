@@ -479,6 +479,28 @@ fn template(pack: &FrozenPack, outcomes: bool) -> Value {
             "保留逐臂评分空字段，按完成会话记录省时与遗漏，暂不宣称有效性。"]})
 }
 /// Fixed weekly task; exactly one reserved attempt per agent arm, no critic/retry/fallback calls.
+fn receipt_metadata_matches(
+    receipt: &crate::llm::ModelCallReceipt,
+    provider: &dyn LlmProvider,
+    pricing: &ReviewedPricing,
+    prompt: &str,
+    started: chrono::DateTime<chrono::Utc>,
+    completed: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    receipt.provider() == provider.name()
+        && receipt.requested_model() == Some(provider.model())
+        && pricing.upstream_models.iter().any(|m| m == receipt.model())
+        && receipt
+            .upstream_response_id()
+            .is_some_and(|s| !s.trim().is_empty())
+        && receipt.system_sha256() == bytes_sha256(SYSTEM.as_bytes())
+        && receipt.user_sha256() == bytes_sha256(prompt.as_bytes())
+        && sha_valid(&json!(receipt.response_sha256()))
+        && receipt.started_at() >= &started
+        && receipt.completed_at() >= receipt.started_at()
+        && receipt.completed_at() <= &completed
+}
+
 pub async fn compare(
     pack: &FrozenPack,
     provider: Option<&dyn LlmProvider>,
@@ -502,7 +524,7 @@ pub async fn compare(
     ] {
         let prompt = pack.prompt(outcomes);
         let mut arm = json!({"arm":name,"mode":"degraded_template","status":"degraded","output":template(pack,outcomes),
-            "raw_model_output":null,"model_receipt":null,"actual_usage":null,"reservation":null,
+            "raw_model_output":null,"raw_model_output_state":"unavailable","model_receipt":null,"receipt_validation":"unavailable","actual_usage":null,"reservation":null,
             "prompt_sha256":bytes_sha256(prompt.as_bytes()),"treatment_sha256":bytes_sha256(&serde_json::to_vec(&json!({"base_sha256":base_sha,"supplement_sha256":outcomes.then_some(&supplement_sha)}))?),
             "fallback_reason":"provider_unavailable"});
         if halted {
@@ -514,6 +536,7 @@ pub async fn compare(
                         Err(code) => arm["fallback_reason"] = json!(code),
                         Ok(permit) => {
                             arm["reservation"] = serde_json::to_value(permit.reservation())?;
+                            let call_started_at = chrono::Utc::now();
                             let call = p.chat_json_bounded_with_receipt(
                                 BoundedJsonRequest {
                                     system: SYSTEM,
@@ -535,26 +558,93 @@ pub async fn compare(
                                 Ok(Err(e)) => {
                                     halted = e.started;
                                     arm["fallback_reason"] = json!(e.code);
-                                    arm["model_receipt"] = serde_json::to_value(e.receipt)?;
+                                    let raw = e
+                                        .raw_content
+                                        .as_deref()
+                                        .filter(|s| s.len() <= limits.max_content_bytes);
+                                    arm["raw_model_output"] = json!(raw);
+                                    arm["raw_model_output_state"] = json!(if raw.is_some() {
+                                        "retained_exact_untrusted"
+                                    } else if e.raw_content_state
+                                        == "omitted_content_limit_full_hash_only"
+                                        || e.raw_content.is_some()
+                                    {
+                                        "omitted_content_limit_full_hash_only"
+                                    } else {
+                                        "unavailable"
+                                    });
+                                    if let Some(usage) = &e.usage {
+                                        if usage.prompt_tokens <= limits.max_input_tokens
+                                            && usage.completion_tokens
+                                                <= limits.max_output_tokens as u32
+                                            && usage
+                                                .prompt_tokens
+                                                .checked_add(usage.completion_tokens)
+                                                == Some(usage.total_tokens)
+                                        {
+                                            arm["actual_usage"] = serde_json::to_value(usage)?;
+                                        }
+                                    }
+                                    if let Some(receipt) = &e.receipt {
+                                        let valid = e.started
+                                            && receipt_metadata_matches(
+                                                receipt,
+                                                p,
+                                                pricing,
+                                                &prompt,
+                                                call_started_at,
+                                                chrono::Utc::now(),
+                                            )
+                                            && raw.is_none_or(|s| {
+                                                receipt.response_sha256()
+                                                    == bytes_sha256(s.as_bytes())
+                                            });
+                                        arm["model_receipt"] = serde_json::to_value(receipt)?;
+                                        if !valid {
+                                            halted = true;
+                                        }
+                                        arm["receipt_validation"] = json!(if !valid {
+                                            "invalid_provenance"
+                                        } else if raw.is_some() {
+                                            "verified_metadata_and_exact_raw_hash"
+                                        } else {
+                                            "verified_metadata_raw_hash_unavailable"
+                                        });
+                                    }
                                 }
                                 Ok(Ok(result)) => {
                                     let receipt = result.response.receipt();
                                     let raw = result.response.raw_content();
-                                    arm["raw_model_output"] = json!(raw);
+                                    arm["raw_model_output"] =
+                                        if raw.len() <= limits.max_content_bytes {
+                                            json!(raw)
+                                        } else {
+                                            Value::Null
+                                        };
                                     arm["model_receipt"] = serde_json::to_value(receipt)?;
                                     arm["actual_usage"] = serde_json::to_value(&result.usage)?;
-                                    let valid_receipt = receipt.provider() == p.name()
-                                        && receipt.requested_model() == Some(p.model())
-                                        && !receipt.model().trim().is_empty()
-                                        && receipt
-                                            .upstream_response_id()
-                                            .is_some_and(|s| !s.trim().is_empty())
-                                        && receipt.system_sha256()
-                                            == bytes_sha256(SYSTEM.as_bytes())
-                                        && receipt.user_sha256() == bytes_sha256(prompt.as_bytes())
-                                        && receipt.response_sha256()
-                                            == bytes_sha256(raw.as_bytes())
-                                        && receipt.completed_at() >= receipt.started_at();
+                                    arm["raw_model_output_state"] =
+                                        json!(if raw.len() <= limits.max_content_bytes {
+                                            "retained_exact_untrusted"
+                                        } else {
+                                            "omitted_content_limit_full_hash_only"
+                                        });
+                                    let valid_receipt = receipt_metadata_matches(
+                                        receipt,
+                                        p,
+                                        pricing,
+                                        &prompt,
+                                        call_started_at,
+                                        chrono::Utc::now(),
+                                    ) && receipt.response_sha256()
+                                        == bytes_sha256(raw.as_bytes());
+                                    arm["receipt_validation"] = json!(if !valid_receipt {
+                                        "invalid_provenance"
+                                    } else if raw.len() <= limits.max_content_bytes {
+                                        "verified_metadata_and_exact_raw_hash"
+                                    } else {
+                                        "verified_metadata_raw_hash_unavailable"
+                                    });
                                     let valid = if result.usage.prompt_tokens
                                         > limits.max_input_tokens
                                         || result.usage.completion_tokens
@@ -818,26 +908,63 @@ mod tests {
                     content["claims"] = json!([{"fact_id":"pooled/price_observation/t1_revalidated_samples","value":99}])
                 }
                 "malformed" => content = json!({"price":123,"tools":["send"]}),
-                "empty" => content = json!(""),
+                "empty" | "error_empty" => content = json!(""),
+                "error_over_cap" => content = json!("x".repeat(r.limits.max_content_bytes + 1)),
                 _ => (),
             }
-            let raw = serde_json::to_string(&content).unwrap();
+            let raw = if self.kind == "error_empty" {
+                String::new()
+            } else if self.kind == "error_json" {
+                "invalid".into()
+            } else {
+                serde_json::to_string(&content).unwrap()
+            };
             let response = ReceiptBearingJson::test_fixture_requested_model(
-                "fake",
+                if self.kind == "error_wrong_provider" {
+                    "other"
+                } else {
+                    "fake"
+                },
                 "fake-model",
                 "fake-model",
                 None,
                 "real-test-response",
                 r.system,
-                if self.kind == "wrong_hash" {
+                if self.kind == "wrong_hash" || self.kind == "error_wrong_prompt" {
                     "wrong prompt"
                 } else {
                     r.user
                 },
                 &raw,
-                chrono::Utc::now(),
+                chrono::Utc::now()
+                    - chrono::Duration::seconds(if self.kind == "error_old_time" { 1 } else { 0 }),
                 chrono::Utc::now(),
             );
+            if self.kind.starts_with("error_") {
+                let mut error = BoundedFailure::new("json_schema", true);
+                error.receipt = Some(response.receipt().clone());
+                error.usage = Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 10,
+                    total_tokens: 20,
+                    cache: None,
+                });
+                error.raw_content = if self.kind == "error_over_cap" {
+                    None
+                } else if self.kind == "error_empty" {
+                    Some(String::new())
+                } else if self.kind == "error_wrong_raw" {
+                    Some("different".into())
+                } else {
+                    Some(raw)
+                };
+                error.raw_content_state = if self.kind == "error_over_cap" {
+                    "omitted_content_limit_full_hash_only"
+                } else {
+                    "retained_exact_untrusted"
+                };
+                return Err(error);
+            }
             Ok(BoundedResponse {
                 response,
                 usage: Usage {
@@ -996,6 +1123,75 @@ mod tests {
                 result["arms"][2]["fallback_reason"], "prior_attempt_uncertain_or_invalid",
                 "{kind}"
             );
+        }
+    }
+    #[tokio::test]
+    async fn rejected_diagnostics_and_failure_receipt_provenance_preserve_halt_and_reservation() {
+        for kind in [
+            "error_json",
+            "error_empty",
+            "error_over_cap",
+            "error_wrong_prompt",
+            "error_wrong_provider",
+            "error_old_time",
+            "error_wrong_raw",
+        ] {
+            let fake = Fake {
+                calls: AtomicUsize::new(0),
+                kind,
+            };
+            let result = compare(
+                &pack(),
+                Some(&fake),
+                Some(&pricing()),
+                Limits {
+                    ceiling_micro_cny: 100,
+                    ..Limits::default()
+                },
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let arm = &result["arms"][1];
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(arm["status"], "degraded");
+            assert_eq!(arm["actual_usage"]["total_tokens"], 20);
+            assert!(
+                result["run_reservations"]["retained_maximum_micro_cny"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                result["arms"][2]["fallback_reason"],
+                "prior_attempt_uncertain_or_invalid"
+            );
+            match kind {
+                "error_over_cap" => {
+                    assert!(arm["raw_model_output"].is_null());
+                    assert_eq!(
+                        arm["raw_model_output_state"],
+                        "omitted_content_limit_full_hash_only"
+                    );
+                    assert_eq!(
+                        arm["receipt_validation"],
+                        "verified_metadata_raw_hash_unavailable"
+                    );
+                }
+                "error_json" | "error_empty" => {
+                    assert!(arm["raw_model_output"].is_string());
+                    if kind == "error_empty" {
+                        assert_eq!(arm["raw_model_output"], "");
+                    } else {
+                        assert_eq!(arm["raw_model_output"], "invalid");
+                    }
+                    assert_eq!(
+                        arm["receipt_validation"],
+                        "verified_metadata_and_exact_raw_hash"
+                    );
+                }
+                _ => assert_eq!(arm["receipt_validation"], "invalid_provenance"),
+            }
         }
     }
     #[tokio::test]

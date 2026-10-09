@@ -123,6 +123,11 @@ pub struct BoundedFailure {
     pub code: &'static str,
     pub started: bool,
     pub receipt: Option<ModelCallReceipt>,
+    /// Exact received content is diagnostic only; never retains content above the cap.
+    pub raw_content: Option<String>,
+    pub raw_content_state: &'static str,
+    /// Available only after all supported usage/billing/bound checks pass.
+    pub usage: Option<Usage>,
 }
 impl BoundedFailure {
     pub fn new(code: &'static str, started: bool) -> Self {
@@ -130,6 +135,9 @@ impl BoundedFailure {
             code,
             started,
             receipt: None,
+            raw_content: None,
+            raw_content_state: "unavailable",
+            usage: None,
         }
     }
 }
@@ -345,41 +353,157 @@ pub(super) async fn call(
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_owned)
         };
-        let actual = nonempty(&raw["model"]).ok_or_else(|| fail("receipt_missing", true))?;
-        let id = nonempty(&raw["id"]).ok_or_else(|| fail("receipt_missing", true))?;
-        let choices = raw["choices"]
-            .as_array()
-            .filter(|v| v.len() == 1)
-            .ok_or_else(|| fail("choices", true))?;
-        let choice = &choices[0];
-        let content = choice["message"]["content"]
-            .as_str()
-            .ok_or_else(|| fail("empty_response", true))?
-            .to_owned();
-        let receipt = ModelCallReceipt {
-            provider: provider.into(),
-            model: actual.clone(),
-            requested_model: Some(model.into()),
-            upstream_request_id: None,
-            upstream_response_id: Some(id),
-            system_sha256: hash(request.system.as_bytes()),
-            user_sha256: hash(request.user.as_bytes()),
-            response_sha256: hash(content.as_bytes()),
-            started_at,
-            completed_at: Utc::now(),
-        };
+        let actual = nonempty(&raw["model"]);
+        let id = nonempty(&raw["id"]);
+        let choices = raw["choices"].as_array().filter(|v| v.len() == 1);
+        let absent = Value::Null;
+        let choice = choices.and_then(|c| c.first()).unwrap_or(&absent);
+        let received_content = choice["message"]["content"].as_str();
+        let content = received_content.unwrap_or_default().to_owned();
+        let receipt = received_content
+            .and_then(|_| actual.as_ref().zip(id))
+            .map(|(actual, id)| ModelCallReceipt {
+                provider: provider.into(),
+                model: actual.clone(),
+                requested_model: Some(model.into()),
+                upstream_request_id: None,
+                upstream_response_id: Some(id),
+                system_sha256: hash(request.system.as_bytes()),
+                user_sha256: hash(request.user.as_bytes()),
+                response_sha256: hash(content.as_bytes()),
+                started_at,
+                completed_at: Utc::now(),
+            });
         let with_receipt = |code| BoundedFailure {
             code,
             started: true,
-            receipt: Some(receipt.clone()),
+            receipt: receipt.clone(),
+            raw_content: (received_content.is_some()
+                && content.len() <= request.limits.max_content_bytes)
+                .then(|| content.clone()),
+            raw_content_state: if received_content.is_none() {
+                "unavailable"
+            } else if content.len() <= request.limits.max_content_bytes {
+                "retained_exact_untrusted"
+            } else {
+                "omitted_content_limit_full_hash_only"
+            },
+            usage: None,
         };
+        // Known cache partitions are non-additional prompt tokens; no discount is assumed.
+
+        let validated_usage = (|| -> Result<Usage, BoundedFailure> {
+            let usage = raw["usage"]
+                .as_object()
+                .ok_or_else(|| with_receipt("usage_missing"))?;
+            let allowed: &[&str] = if provider == "deepseek" {
+                &[
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "prompt_tokens_details",
+                    "prompt_cache_hit_tokens",
+                    "prompt_cache_miss_tokens",
+                    "completion_tokens_details",
+                ]
+            } else {
+                &["prompt_tokens", "completion_tokens", "total_tokens"]
+            };
+            if usage.keys().any(|k| !allowed.contains(&k.as_str())) {
+                return Err(with_receipt("usage_scope"));
+            }
+            let token = |key: &str| {
+                usage
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| with_receipt("usage_invalid"))
+            };
+            let cache = if provider == "deepseek" {
+                let hit = token("prompt_cache_hit_tokens")?;
+                let miss = token("prompt_cache_miss_tokens")?;
+                let details = usage
+                    .get("prompt_tokens_details")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| with_receipt("cache_usage_missing"))?;
+                if details.keys().any(|k| k != "cached_tokens") {
+                    return Err(with_receipt("usage_scope"));
+                }
+                let cached = details
+                    .get("cached_tokens")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| with_receipt("cache_usage_missing"))?;
+                if hit.checked_add(miss) != Some(token("prompt_tokens")?) || cached != hit {
+                    return Err(with_receipt("cache_usage_invalid"));
+                }
+                let reasoning = if let Some(v) = usage.get("completion_tokens_details") {
+                    let obj = v.as_object().ok_or_else(|| with_receipt("usage_scope"))?;
+                    if obj.keys().any(|k| k != "reasoning_tokens") {
+                        return Err(with_receipt("usage_scope"));
+                    }
+                    let n = obj
+                        .get("reasoning_tokens")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .ok_or_else(|| with_receipt("usage_invalid"))?;
+                    if n != 0 {
+                        return Err(with_receipt("unexpected_thinking"));
+                    }
+                    Some(n)
+                } else {
+                    None
+                };
+                Some(CacheUsage {
+                    prompt_cache_hit_tokens: hit,
+                    prompt_cache_miss_tokens: miss,
+                    cached_tokens: cached,
+                    reasoning_tokens: reasoning,
+                })
+            } else {
+                None
+            };
+            let usage = Usage {
+                prompt_tokens: token("prompt_tokens")?,
+                completion_tokens: token("completion_tokens")?,
+                total_tokens: token("total_tokens")?,
+                cache,
+            };
+            if usage.prompt_tokens.checked_add(usage.completion_tokens) != Some(usage.total_tokens)
+                || usage.prompt_tokens > permit.reservation.input_tokens
+                || usage.completion_tokens > permit.reservation.output_tokens as u32
+            {
+                return Err(with_receipt("usage_limit"));
+            }
+            Ok(usage)
+        })();
+        let completed_failure = |code| {
+            let mut error = with_receipt(code);
+            error.usage = if code == "unexpected_thinking" {
+                None
+            } else {
+                validated_usage.as_ref().ok().cloned()
+            };
+            error
+        };
+        if choices.is_none() {
+            return Err(completed_failure("choices"));
+        }
+        if received_content.is_none() {
+            return Err(completed_failure("empty_response"));
+        }
         if content.trim().is_empty() {
-            return Err(with_receipt("empty_response"));
+            return Err(completed_failure("empty_response"));
         }
         if content.len() > request.limits.max_content_bytes {
-            return Err(with_receipt("content_limit"));
+            return Err(completed_failure("content_limit"));
         }
-        if !permit.pricing.upstream_models.contains(&actual)
+        if receipt.is_none() {
+            return Err(completed_failure("receipt_missing"));
+        }
+        if !actual
+            .as_ref()
+            .is_some_and(|m| permit.pricing.upstream_models.contains(m))
             || choice["index"] != 0
             || choice["finish_reason"] != "stop"
             || choice["message"]
@@ -389,104 +513,26 @@ pub(super) async fn call(
                 .get("function_call")
                 .is_some_and(|v| !v.is_null())
         {
-            return Err(with_receipt("protocol"));
+            return Err(completed_failure("protocol"));
         }
         if choice["message"]
             .get("reasoning_content")
             .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
         {
-            return Err(with_receipt("unexpected_thinking"));
+            return Err(completed_failure("unexpected_thinking"));
         }
-        // Known cache partitions are non-additional prompt tokens; no discount is assumed.
-
-        let usage = raw["usage"]
-            .as_object()
-            .ok_or_else(|| with_receipt("usage_missing"))?;
-        let allowed: &[&str] = if provider == "deepseek" {
-            &[
-                "prompt_tokens",
-                "completion_tokens",
-                "total_tokens",
-                "prompt_tokens_details",
-                "prompt_cache_hit_tokens",
-                "prompt_cache_miss_tokens",
-                "completion_tokens_details",
-            ]
-        } else {
-            &["prompt_tokens", "completion_tokens", "total_tokens"]
-        };
-        if usage.keys().any(|k| !allowed.contains(&k.as_str())) {
-            return Err(with_receipt("usage_scope"));
-        }
-        let token = |key: &str| {
-            usage
-                .get(key)
-                .and_then(Value::as_u64)
-                .and_then(|v| u32::try_from(v).ok())
-                .ok_or_else(|| with_receipt("usage_invalid"))
-        };
-        let cache = if provider == "deepseek" {
-            let hit = token("prompt_cache_hit_tokens")?;
-            let miss = token("prompt_cache_miss_tokens")?;
-            let details = usage
-                .get("prompt_tokens_details")
-                .and_then(Value::as_object)
-                .ok_or_else(|| with_receipt("cache_usage_missing"))?;
-            if details.keys().any(|k| k != "cached_tokens") {
-                return Err(with_receipt("usage_scope"));
-            }
-            let cached = details
-                .get("cached_tokens")
-                .and_then(Value::as_u64)
-                .and_then(|v| u32::try_from(v).ok())
-                .ok_or_else(|| with_receipt("cache_usage_missing"))?;
-            if hit.checked_add(miss) != Some(token("prompt_tokens")?) || cached != hit {
-                return Err(with_receipt("cache_usage_invalid"));
-            }
-            let reasoning = if let Some(v) = usage.get("completion_tokens_details") {
-                let obj = v.as_object().ok_or_else(|| with_receipt("usage_scope"))?;
-                if obj.keys().any(|k| k != "reasoning_tokens") {
-                    return Err(with_receipt("usage_scope"));
-                }
-                let n = obj
-                    .get("reasoning_tokens")
-                    .and_then(Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .ok_or_else(|| with_receipt("usage_invalid"))?;
-                if n != 0 {
-                    return Err(with_receipt("unexpected_thinking"));
-                }
-                Some(n)
-            } else {
-                None
-            };
-            Some(CacheUsage {
-                prompt_cache_hit_tokens: hit,
-                prompt_cache_miss_tokens: miss,
-                cached_tokens: cached,
-                reasoning_tokens: reasoning,
-            })
-        } else {
-            None
-        };
-        let usage = Usage {
-            prompt_tokens: token("prompt_tokens")?,
-            completion_tokens: token("completion_tokens")?,
-            total_tokens: token("total_tokens")?,
-            cache,
-        };
-        if usage.prompt_tokens.checked_add(usage.completion_tokens) != Some(usage.total_tokens)
-            || usage.prompt_tokens > permit.reservation.input_tokens
-            || usage.completion_tokens > permit.reservation.output_tokens as u32
-        {
-            return Err(with_receipt("usage_limit"));
-        }
-        let value = serde_json::from_str(&content).map_err(|_| with_receipt("json_schema"))?;
+        let parsed = serde_json::from_str(&content);
+        let usage = validated_usage?;
+        let value = parsed.map_err(|_| {
+            let mut error = with_receipt("json_schema");
+            error.usage = Some(usage.clone());
+            error
+        })?;
         Ok(BoundedResponse {
             response: ReceiptBearingJson {
                 value,
                 raw_content: content,
-                receipt,
+                receipt: receipt.expect("identity checked"),
             },
             usage,
             reservation: permit.reservation,
@@ -712,6 +758,18 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(e.code, "content_limit");
+        assert!(e.raw_content.is_none());
+        assert_eq!(e.raw_content_state, "omitted_content_limit_full_hash_only");
+        assert_eq!(
+            e.receipt.unwrap().response_sha256(),
+            hash(
+                body()["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+            )
+        );
+        assert!(e.usage.is_some());
     }
     #[tokio::test]
     async fn request_byte_limit_is_enforced_before_send() {
@@ -783,6 +841,19 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(e.started, "{kind}");
+            if kind == "json" {
+                assert_eq!(e.raw_content.as_deref(), Some("invalid"));
+                assert_eq!(e.raw_content_state, "retained_exact_untrusted");
+                assert_eq!(e.usage.as_ref().unwrap().total_tokens, 15);
+            }
+            if kind == "detail" {
+                assert!(e.usage.is_none());
+            }
+            if kind == "empty" || kind == "multiple" {
+                assert_eq!(e.raw_content_state, "unavailable");
+                assert!(e.raw_content.is_none());
+                assert_eq!(e.usage.as_ref().unwrap().total_tokens, 15);
+            }
         }
     }
     #[tokio::test]
@@ -867,9 +938,14 @@ mod tests {
                 );
             } else {
                 let error = result.unwrap_err();
+                if kind == "content_thinking" {
+                    assert!(error.usage.is_none());
+                }
                 if kind == "empty_content" {
                     assert_eq!(error.code, "empty_response");
                     assert_eq!(error.receipt.unwrap().response_sha256(), hash(b""));
+                    assert_eq!(error.raw_content.as_deref(), Some(""));
+                    assert!(error.usage.is_some());
                 }
             }
         }

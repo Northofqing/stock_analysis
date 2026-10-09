@@ -8,7 +8,7 @@ use stock_analysis::{
     assistant_review::{self, FrozenPack},
     llm::{
         bounded::{Limits, ReviewedPricing},
-        LlmRegistry,
+        LlmProvider, LlmRegistry,
     },
 };
 #[derive(Clone, Copy, ValueEnum)]
@@ -36,7 +36,7 @@ struct Args {
     ceiling_micro_cny: u64,
     #[arg(long)]
     output: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t=Format::Json)]
+    #[arg(long, value_enum, default_value_t=Format::Markdown)]
     format: Format,
 }
 async fn run(args: Args) -> anyhow::Result<()> {
@@ -44,8 +44,19 @@ async fn run(args: Args) -> anyhow::Result<()> {
         ceiling_micro_cny: args.ceiling_micro_cny,
         ..Limits::default()
     };
+    run_with(args, limits, None).await
+}
+// Injection keeps local fake tests on the exact load/compare/serialize/emission path.
+async fn run_with(
+    args: Args,
+    limits: Limits,
+    provider_override: Option<&dyn LlmProvider>,
+) -> anyhow::Result<()> {
     let started = Instant::now();
     let deadline = started + Duration::from_millis(limits.wall_ms);
+    // Publication is inside the declared whole budget; timeout drops the model future.
+    let publication_ms = 2_000.min(limits.wall_ms / 2);
+    let model_deadline = deadline - Duration::from_millis(publication_ms);
     let pack = FrozenPack::load(
         &args.report,
         &args.manifest,
@@ -66,16 +77,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Err(_) => (None, Some("reviewed_pricing_invalid_or_unavailable")),
     };
     // No dotenv/logger/DB initialization. Default path never initializes registry or providers.
-    let registry = args.model.then(LlmRegistry::from_env);
+    let registry = (args.model && provider_override.is_none()).then(LlmRegistry::from_env);
     let provider = registry.as_ref().and_then(|r| r.select("assistant_review"));
+    let limits_wall_ms = limits.wall_ms;
     let mut result = assistant_review::compare(
         &pack,
-        provider.as_deref(),
+        provider_override.or(provider.as_deref()),
         pricing.as_ref(),
         limits,
-        deadline,
+        model_deadline,
     )
     .await?;
+    result["deadline_budgets"] = serde_json::json!({"whole_run_ms":limits_wall_ms, "publication_reserved_ms":publication_ms,"model_work_ms":limits_wall_ms-publication_ms});
     result["pricing_diagnostic"] = serde_json::json!(pricing_diagnostic);
     result["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
     let bytes = match args.format {
@@ -109,6 +122,45 @@ async fn main() -> std::process::ExitCode {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use stock_analysis::llm::{
+        bounded::{BoundedFailure, BoundedJsonRequest, BoundedResponse, SingleAttemptPermit},
+        LlmError,
+    };
+    struct PendingFake {
+        calls: AtomicUsize,
+        dropped: AtomicBool,
+    }
+    struct CancelGuard<'a>(&'a AtomicBool);
+    impl Drop for CancelGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for PendingFake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+        fn bounded_endpoint(&self) -> Option<String> {
+            Some("https://fake.invalid/chat/completions".into())
+        }
+        async fn chat_json(&self, _: &str, _: &str) -> Result<Value, LlmError> {
+            panic!("legacy path")
+        }
+        async fn chat_json_bounded_with_receipt(
+            &self,
+            _: BoundedJsonRequest<'_>,
+            _: SingleAttemptPermit,
+        ) -> Result<BoundedResponse, BoundedFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _guard = CancelGuard(&self.dropped);
+            std::future::pending().await
+        }
+    }
     #[test]
     fn explicit_inputs_and_default_offline_mode() {
         let a = Args::try_parse_from([
@@ -123,10 +175,26 @@ mod tests {
             "2026-10-08",
         ])
         .unwrap();
+        assert!(matches!(a.format, Format::Markdown));
         assert!(!a.model);
         assert_eq!(a.ceiling_micro_cny, 0);
         assert!(a.reviewed_pricing.is_none());
         assert!(Args::try_parse_from(["assistant_review", "--report", "r"]).is_err());
+        let explicit_json = Args::try_parse_from([
+            "assistant_review",
+            "--report",
+            "r",
+            "--manifest",
+            "m",
+            "--as-of",
+            "2026-10-08T16:00:00+08:00",
+            "--completed-session",
+            "2026-10-08",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(explicit_json.format, Format::Json));
     }
     #[tokio::test]
     async fn offline_cli_new_output_same_loaded_bytes_and_no_overwrite() {
@@ -200,6 +268,69 @@ mod tests {
             "reviewed_pricing_invalid_or_unavailable"
         );
         assert_eq!(degraded["run_reservations"]["attempt_slots_issued"], 0);
+        // Same CLI emission path with a local pending future; no environment or endpoints.
+        let price = json!({"schema_version":"assistant-reviewed-pricing-v1","reviewed_by":"localfake-test","contract_version":"fixture", "valid_until":"2099-01-01T00:00:00Z", "provider":"fake","requested_model":"fake-model","endpoint":"https://fake.invalid/chat/completions","upstream_models":["fake-model"],"currency":"CNY","billing_scope":"prompt_completion_only_no_hidden_tokens","input_bound_method":"utf8_bytes_plus_reviewed_framing","framing_tokens":20,"max_output_tokens":8192,"input_micro_cny_per_million":1,"output_micro_cny_per_million":1,"fixed_max_micro_cny":1});
+        let price_path = dir.path().join("fake-pricing.json");
+        assistant_review::write_new_private(&price_path, &serde_json::to_vec(&price).unwrap())
+            .unwrap();
+        let fake = PendingFake {
+            calls: AtomicUsize::new(0),
+            dropped: AtomicBool::new(false),
+        };
+        for format in [Format::Json, Format::Markdown] {
+            let mut timed = args();
+            timed.reviewed_pricing = Some(price_path.clone());
+            let timed_path = dir.path().join(if matches!(format, Format::Json) {
+                "timeout.json"
+            } else {
+                "timeout.md"
+            });
+            timed.output = Some(timed_path.clone());
+            timed.format = format;
+            let before = Instant::now();
+            tokio::time::timeout(
+                Duration::from_millis(1000),
+                run_with(
+                    timed,
+                    Limits {
+                        wall_ms: 1000,
+                        ceiling_micro_cny: 100,
+                        ..Limits::default()
+                    },
+                    Some(&fake),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(before.elapsed() < Duration::from_millis(1000));
+            assert!(fake.dropped.load(Ordering::SeqCst));
+            let text = std::fs::read_to_string(timed_path).unwrap();
+            if matches!(format, Format::Json) {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["arms"][1]["fallback_reason"], "deadline");
+                assert_eq!(value["arms"][1]["model_receipt"], Value::Null);
+                assert_eq!(value["arms"][1]["raw_model_output_state"], "unavailable");
+                assert_eq!(
+                    value["arms"][2]["fallback_reason"],
+                    "prior_attempt_uncertain_or_invalid"
+                );
+                assert_eq!(value["run_reservations"]["attempt_slots_issued"], 1);
+                assert!(
+                    value["run_reservations"]["retained_maximum_micro_cny"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+                assert_eq!(value["run_reservations"]["refunds_micro_cny"], 0);
+                assert_eq!(value["deadline_budgets"]["publication_reserved_ms"], 500);
+            } else {
+                assert!(text.contains("本周"));
+                assert!(text.contains("deadline"));
+                assert!(text.contains("retained_maximum_micro_cny"));
+            }
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2); // one per separate run
         let md = assistant_review::markdown(&comparison).unwrap();
         assert!(md.contains("degraded_template"));
         assert!(md.contains(comparison["report_sha256"].as_str().unwrap()));

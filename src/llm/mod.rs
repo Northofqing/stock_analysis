@@ -137,7 +137,7 @@ impl ReceiptBearingJson {
         completed_at: DateTime<Utc>,
     ) -> Self {
         Self {
-            value: serde_json::from_str(raw_content).expect("test response JSON"),
+            value: serde_json::from_str(raw_content).unwrap_or(Value::Null),
             raw_content: raw_content.to_owned(),
             receipt: ModelCallReceipt {
                 provider: provider.to_owned(),
