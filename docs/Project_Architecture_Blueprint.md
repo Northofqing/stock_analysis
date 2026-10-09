@@ -2,14 +2,24 @@
 
 > 生成日期：2026-09-03  
 > 专项修订：2026-09-02（推送系统审计与演进路线；v18/v19 设计覆盖、冲突裁决与周期）  
-> 当前架构同步：2026-09-03（外置 provider-host、gRPC-only 数据平面、BR-249/250/255、inventory 与网页再生成）  
+> 当前增量同步：2026-10-09（goal-first E1–E4源码工具、待安装版本包、真实运行根；旧九月表格按历史保留）
 > 事实基线：当前工作树中的 Rust 源码、Cargo metadata、配置、测试、CI 与 README  
 > 生成配置：Rust / Auto-detect / C4-oriented Mermaid / Implementation-Ready  
 > 规模快照：514 个 Rust 文件，379,107 行；1 个 library、28 个 binary、41 个 integration-test、1 个 benchmark、1 个 build-script target
 
 ## 1. 阅读约定与证据规则
 
-本文是当前实现蓝图，不是愿景图。图中节点与文字采用以下状态标签：
+2026-10-09 范围面板优先于旧图中的 `CURRENT`：源码实现、候选包、安装观察、用户价值是四个独立验收。旧定量表/完整catalog/§24–25路线图是2026-09基线，不能用其数量或 proposed 接线描述今天生产。E5 facade/workspace/通用平台工程冻结，未来仍按 seam-first 从测得收益的单模块接口着手。
+
+| 范围 | 当前证据与状态 |
+| --- | --- |
+| CURRENT_SOURCE | E1描述性registry/三档scorecard，E2独立watchdog/安全archive与候选screen，E4 artifact-only Phase A、SELL preview/Streak observed研究，E3全前缀分页与软SLI。详见[本次交接](handoffs/2026-10-09-goal-first-delivery.md) |
+| STAGED | 五个selected release bins与Python3.9.6依赖闭包；版本root在Desktop外候选目录；新weekly/watchdog plist未安装/加载 |
+| INSTALLED_OBSERVED | 九月迁移记录及10-09 discovery只读磁盘观察：runtime `/Users/zhangzhen/.local/share/stock-analysis-runtime`、launchd monitor/本地gRPC bridge、daily21:17/weeklyFriday20:30。磁盘binary/activation哈希不同于live进程证明，未在本次重新探测 |
+| EXTERNAL_PENDING | family/version/PIT、独立close/真实lots/fees、可执行history、手机channel、历史monetary/Unknown人工处置、安装与≥20completed-session用户价值 |
+| FROZEN_PROPOSAL | §24统一facade/PhaseScheduler/新catalog迁移及§25全平台路线不在本交付推进 |
+
+图中旧标签保留其历史阅读意义：
 
 | 标签 | 含义 |
 | --- | --- |
@@ -25,7 +35,7 @@
 证据写作规则：
 
 - `path:line` 指向当前源文件中的起始位置；行号会随代码编辑漂移，路径和符号名是长期锚点。
-- 数量来自当前 `cargo metadata --no-deps`、`src/lib.rs`、`tests/` 与冻结 schema catalog 的实测。
+- 最终2026-10-09 `cargo metadata --no-deps --offline`：41 bins、43 integration-test targets、1 lib、1 bench、1 build-script；附录旧28/41及模块/行数只作2026-09历史inventory，未移除任何target。
 - “完整”指架构面完整：运行单元、模块、数据流、状态机、存储、协议、横切约束、测试、部署和扩展点均列出；不逐行复述 379,107 行实现。
 - 53-table catalog 是 legacy generation-1 冻结集合，不等于业务数据库所有增量 DDL 的总表数。
 
@@ -42,8 +52,8 @@
 | package | `stock_analysis 0.1.2`，单 Cargo package | `Cargo.toml`、Cargo metadata |
 | library | 61 个公开顶层模块 | `src/lib.rs`；附录 A |
 | production entrypoints | `monitor` 常驻控制面；`stock_analysis` 默认 CLI；provider-host 不属于本 package | `src/bin/monitor/main.rs`、`src/main.rs`、`README.md:28-44` |
-| binary targets | 28，含 CLI、monitor、导入、回填、探针、研究与回测工具 | Cargo metadata；附录 A |
-| integration tests | 41 | Cargo metadata；附录 B |
+| binary targets | 41（2026-10-09），新增goal-first工具为独立离线入口，不是resident owner | Cargo metadata；本次handoff；附录 A旧表历史 |
+| integration tests | 43（2026-10-09） | Cargo metadata；附录 B旧表历史 |
 | project features | 无 `[features]`；所有生产市场数据路径均为远程 gRPC，不能切换本地 provider | `Cargo.toml`、`README.md:28-29` |
 | async runtime | Tokio；CLI/monitor 使用 multi-thread runtime | `src/main.rs`、`src/bin/monitor/main.rs` |
 | primary DB | SQLite + Diesel + r2d2 + descriptor attestation | `src/database/mod.rs:419`、`:1893`、`:2442` |
@@ -54,6 +64,8 @@
 | delivery | 同步权威投递/审计 + observation-only bus/JSONL | `src/bin/monitor/main.rs:4744-4748`、`src/event/jsonl_writer.rs:1-12` |
 
 ### 2.3 代码热点
+
+下表行数与模块描述是2026-09-03历史快照，未作为当前热点重新统计。
 
 | 代码域 | Rust 行数 | 架构含义 |
 | --- | ---: | --- |
@@ -148,7 +160,7 @@ flowchart TB
 
 关键边界：
 
-- provider-host 是 `EXTERNAL`：不在 Cargo targets、不链接本仓业务 DB，也不由本仓启动。证据：Cargo metadata、`README.md:28-44,94-95`。
+- 外部provider-host/VM与本机bridge是不同部署单元：ExternalV1上游 `10.211.55.3:50051`，独立构建的本机 LocalBridgeV1 `127.0.0.1:18082` 由 `com.northofqing.grpc-market-server` 管理；bridge不在本Cargo targets，运行根与主库共用。不从“仓外provider”推断没有本机bridge。
 - `tests/support/grpc_fixture` 只在 integration-test crate 中编译，不是 production container。证据：`README.md:85-90`、`tests/support/mod.rs`。
 - default CLI 不是 monitor 控制客户端；它直接复用 library pipeline。证据：`src/main.rs` 的 mode dispatch 与 `src/app/bootstrap.rs`。
 - `data_provider` 是委托统一 Gateway 的进程级 facade/cache，不是 provider implementation。证据：`README.md:44`、`src/data_provider/service.rs`。
@@ -185,7 +197,21 @@ flowchart LR
     monitor --> sinks["EXTERNAL Feishu / WeChat / HTTP"]
 ```
 
-部署事实：本仓库没有 provider-host 部署单元，也没有根级 Dockerfile、docker-compose、systemd unit、Kubernetes 资源或 service discovery。运维顺序是先确保外部 host 和凭据可用，再运行 client-side opening probe，最后启动唯一 monitor lease owner。证据：`README.md:92-116`。
+2026-10-09 增量部署事实（旧图的external端点由下图展开）：
+
+```mermaid
+flowchart LR
+    vm["EXTERNAL VM ExternalV1 10.211.55.3:50051"] --> bridge["launchd local bridge 127.0.0.1:18082"]
+    bridge --> monitor["launchd唯一monitor counted owner"]
+    daily["已安装daily21:17 backfills"] --> db[("runtime主库")]
+    monitor --> db
+    weekly["已安装weekly Friday20:30；新版本plist STAGED"] --> artifacts["private周报artifact"]
+    artifacts --> assistant["STAGED bounded artifact-only Phase A"]
+    watchdog["STAGED独立60s watchdog"] -->|只读health| monitor
+    watchdog --> events["local events/self-check；无手机receipt"]
+```
+
+Monitor/bridge由Desktop外runtime的正式launchd job管理。daily写回填仍属既有独立任务，不能删掉其bin aliases；新版本weekly复用唯一label、RunAtLoad=false，不增加重复日程。watchdog只调用已安装monitor早期只读 `--health --json`，不重启/启动monitor。安装源码工具不等于已加载新job。
 
 ## 6. C4 Level 3：统一数据平面
 
@@ -367,6 +393,8 @@ CLI 与 monitor 的故障策略不同：CLI 的 business DB 初始化失败会�
 
 ## 10. 业务能力地图
 
+E1–E4新增入口只有离线/描述性权限：`weekly_outcome_review` detached SQLite/query-only→完整JSON/manifest；`assistant_review::FrozenPack`只消费同一period/schema/原registry bytes→三臂comparison。registry action/status是人工描述字段，无自动strategy promotion；family/version join缺失保持null/unavailable，open cycles右删失与monetary dispute不被LLM覆盖。`sell_reminder_preview`公开observed/imported输入无admission，真实lot/fee/close缺失，15:30 expiry；ATR CNY与既有percent规则歧义仍待独立修复。`streak_leader_research`严格区分observed gross价格与private synthetic qualified engine，public可执行样本0，不承诺收益。
+
 ```mermaid
 flowchart LR
     data["Data & evidence"] --> analysis["Analysis"]
@@ -471,6 +499,8 @@ BR-178 又增加一层运行保护：当 production `DatabaseManager` 没有 ame
 证据：`src/database/global_schema_catalog_v1.rs:27-146`。
 
 ## 12. 持久化投递与权威审计
+
+本次不新增durable owner/schema；CLI不直接取得生产durable SQLite写权限。现有counted `push_counted_with_binding` 保持唯一owner。Unknown/Uncertain只对账/人工处置，不被重发或restore DB“回退”；event bus/JSONL为观测，不是durable queue或receipt。§24统一facade仍冻结。
 
 ### 12.1 投递序列
 
@@ -577,6 +607,8 @@ monitor bus lag 会记录丢失条数并继续；它不是 durable queue。通�
 
 ## 14. 数据架构
 
+Goal-first数据流使用detached逻辑backup/query-only与私有exclusive新产物；不运行DatabaseManager::init。manifest/SHA定位loaded bytes和claimed provenance，不能认证历史PIT或重建source authority；quality screen只出候选，R1/R5独立资格缺失保持unavailable。archive与prune是不同显式操作，install/rollback不清理原件。
+
 ### 14.1 物理存储拓扑
 
 ```mermaid
@@ -651,6 +683,8 @@ flowchart TB
 | 篡改证据 | chain tables、no-update/no-delete triggers、SHA-256 canonical bytes |
 
 ## 15. AI、LLM 与 Agent 子系统
+
+当前Phase A通过 `assistant_review::compare` 的FrozenPack调用bounded provider seam；不使用历史AgentRunner写日志/工具循环路径。默认offline0calls，无credentials要求；只有显式model/pricing/cash ceiling可走两次最多one-POST尝试。report64MiB/manifest2MiB/output8MiB独立有限；CLI input65536/request131072，18+2s、response32000/content16000、output1500与rounded reservation/no-refund保留。缺sources/真实billing与人类效益仍是不同验收。
 
 ```mermaid
 flowchart LR
@@ -740,6 +774,8 @@ flowchart TB
 - singleton lease、fence token、reservation、cross-process lock 防止双 owner；测试 namespace 与 production namespace 强隔离。
 
 ### 17.4 日志、指标与可观察性
+
+`monitor --health --json` 已有 `runtime_snapshot.version=2`，读取banner-v2/heartbeat与既有production lease；valid unhealthy exit1不是调用失败。独立STAGED watchdog检测process/account/data、600s heartbeat+60s poll、会话calendar和local dedup/recovery；events/self-check不证明手机送达/用户阅读。未安装运行的证据不得从fixtures外推。
 
 - `env_logger` 使用本地毫秒时间、level、target。证据：`src/main.rs:37-51`。
 - event bus 暴露 published/no-subscriber/rejected metrics。证据：`src/event/bus.rs:43-58`、`:156-166`。
@@ -845,6 +881,8 @@ fn legal_transition(from: DecisionState, to: DecisionState) -> bool {
 
 ## 19. 测试架构与质量门禁
 
+2026-10-09局部交付复用各任务已审范围检查，新增actual Rust producer0/76/4096→FrozenPack/fake三臂容量、零调用默认/低ceiling拒绝、resource0400/singlelink、fixed installer/hash/drift/nooverwrite/relocation覆盖。完整commands/失败历史见永久证据；没有全suite/production probe。E3大fixtureRSS下降79.639%，小fixturelatency上涨31.8705%约2.855ms；debug warm-cache观察不是生产speedup，optimized Criterion/three-way builds/真实capture-counting仍未测。
+
 ```mermaid
 flowchart LR
     unit["Inline unit tests\nmodule invariants"]
@@ -891,6 +929,8 @@ flowchart LR
 注意：`scripts/check-no-magic-dependencies.sh all` 当前是仓库内可运行的静态门禁，但未接入上述 workflows；不得写成 CI 已执行。`compliance.yml` 仍引用 Cargo metadata 中不存在的 `--test e2e`，属于待修 CI 配置漂移。架构维护时应验证 workflow 命令真实可解析，而不是只读注释。
 
 ## 20. 构建、部署与运行手册
+
+Isolated工具包布局与具体plan-default installer见[交付runbook](ops/goal-first-delivery-runbook.md)。版本发布至runtime/tools/goal-first/<version>，不sync checkout/src/config、不覆盖monitor/bridge/DB/locks。只有manifest中全部monitor-bound输入与binary/prior launcher哈希不变，才无需activation/restart；若改动则拒绝此范围。Activation v2实际绑定所有src/config（除activation文件）、Cargo*.toml/Cargo.lock/build.rs与COMPILED_PUBLIC_CONTRACT_INPUTS，不限于旧src/config概括。记录activation declared expected hash、diskbinary hash与live attestation三者不同。Rollback恢复确切旧launcher/plist bytes，保留local events/reports/archive，禁止恢复DB/重发Unknown/旧Desktopplist。
 
 ### 20.1 构建矩阵
 
@@ -1089,6 +1129,8 @@ sequenceDiagram
 - 宣称“热重载”却只重载 `.env` 或只更新一份 config projection。
 
 ## 24. 推送系统专项架构与演进路线
+
+**HISTORICAL / FROZEN_PROPOSAL（2026-10-09）**：本节旧catalog数字/全量对账是2026-09基线；统一facade、PhaseScheduler、new intent/catalog和平台迁移路线冻结，不作为今天穷举清单或已交付实现。现行counted owner/状态语义按CLAUDE与source；本次仅E1–E4artifact工具，不提前实施E5。
 
 > 状态：`PROPOSED`  
 > 审计日期：2026-09-01 至 2026-09-02  
@@ -1753,7 +1795,7 @@ Data Contract Gate / DataHealthSnapshot
 | PR-2 BannerSnapshot | 单一结构化 health truth | 当前仍是 `Mutex<Option<BannerCtx>>`，缺失时 caller 记录字符串并跳过（`src/bin/monitor/main.rs:1666-1695`） | `PROPOSED`；不能把现有 BannerCtx 重命名后算完成 |
 | PR-3 ErrorCode | typed code/retryable/severity/retry_after | exact type 0 命中；当前大量 reason_code 仍分散 | `PROPOSED`；应与 §24 `ReasonCode`、readiness reason schema 合并设计，避免第二套错误 taxonomy |
 | PR-4 Log rotation | 日切、50MB、30 日、warn 分流 | 无 `src/log/rotate.rs`/tracing rotation 实现 | `PROPOSED`；保留期与 secrets/redaction policy 要先定 |
-| PR-5 `--health` | 1 秒内人读/JSON health | 无 health command/module；现有 opening readiness 通过日志暴露 | `PROPOSED`；应读取同一 snapshot，不触发 provider 或业务 sink |
+| PR-5 `--health` | 人读/JSON health | 已实现早期只读health runtime_snapshot v2；本任务未实测1s/live acceptance | `CURRENT_SOURCE`；STAGED watchdog消费同一schema，无provider/sink |
 | PR-6 25+ metrics | operational metrics catalog | 当前 `MonitorMetrics` 明确只有 6 项（`src/bin/monitor/metrics.rs:1-67`） | `PARTIAL`；标签基数、单位和 authoritative/BestEffort 结果须与 §24 对齐 |
 | PR-7 per-source breaker | Closed/Open/HalfOpen + recovery | `BackoffState` 已有失败升级、CircuitBreak 和 half-open 检查（`src/monitor/rate_budget.rs:94-230`） | `PARTIAL`；尚未证明每个真实 source 都统一接线或进入 banner；原设计 threshold=5/10 自相矛盾，须先冻结 |
 | PR-8 recovery fields | 每源 last successful pull/失败时长 | 当前 BannerCtx 没有统一 per-source map | `PROPOSED`；source identity 应复用 Gateway evidence catalog |
@@ -1824,7 +1866,7 @@ production presentation tuples          == 58 / 54 unique kinds
 durable counted PushKind catalog         == 23
 ```
 
-网页同步流程：正文事实只在本 Markdown 维护；运行 `ruby scripts/render-architecture-blueprint-html.rb` 刷新预渲染正文、目录、指标、Mermaid 图源、内嵌 Markdown 与 SHA-256，再用同一命令的 `--check` 模式验证 HTML 幂等且未过期。HTML 的 CSS/交互外壳可以独立演进，但不得手改生成区来绕过源文档。
+网页同步边界（2026-10-09）：此旧main蓝图Markdown为本次窄事实维护面；当前wrapper实际针对 `docs/architecture/current/Project_Architecture_Blueprint.md` 的审计pair，冻结catalog/file-set尚不包含新源码。本次实际 `--draft` 与 `--draft --check` 均exit1 `file_set_mismatch pair=current`，没有生成新HTML；旧HTML不代表本次更新。保持guard与冻结工具范围，另次明确审计同步后才能发布其HTML。历史流程说明：正文事实只在相应Markdown维护；运行 `ruby scripts/render-architecture-blueprint-html.rb --draft` 刷新预渲染正文、目录、指标、Mermaid 图源、内嵌 Markdown 与 SHA-256，再用同一命令的 `--draft --check` 模式验证 HTML 幂等且未过期。HTML仍为provisional draft，不代表冻结平台路线完成。HTML 的 CSS/交互外壳可以独立演进，但不得手改生成区来绕过源文档。
 
 ---
 
@@ -1892,7 +1934,7 @@ durable counted PushKind catalog         == 23
 | `breakout` | `engine`、`position`、`signal` |
 | `llm` | `providers`、`registry`、`ticker_extractor` |
 
-### A.3 28 个 binary targets
+### A.3 历史：2026-09的28个binary targets
 
 | 类别 | targets |
 | --- | --- |
@@ -1903,7 +1945,7 @@ durable counted PushKind catalog         == 23
 
 依据：Cargo metadata 的 `kind=["bin"]` targets；不能仅统计 `src/bin/*.rs`，因为 `monitor` 是目录式 target，`stock_analysis` 在 `src/main.rs`。
 
-## 附录 B：41 个 integration-test targets
+## 附录 B：历史2026-09的41个integration-test targets
 
 | # | target | # | target |
 | ---: | --- | ---: | --- |
@@ -2048,6 +2090,8 @@ durable counted PushKind catalog         == 23
 | coverage/compliance | `.github/workflows/*`、`config/design_contracts.toml` | `test_coverage_thresholds`、compliance scripts |
 
 ## 附录 I：架构非目标与已知债务
+
+2026-10-09新增边界：E1–E4已实现本地工具、release候选包STAGED；installation/source-qualified SELL/可执行Streak/真实provider与human-value pending。E5结构改造继续conditional，未来先从单模块seam、可测收益与public surface收窄开始。见[本次交接](handoffs/2026-10-09-goal-first-delivery.md)与已保存的原v2方案。
 
 - 非目标：微服务拆分、Kubernetes、真实 broker 下单、Exactly-once broadcast、bus 作为 durable queue、全系统 TOML 热重载。
 - 已知债务：`bin`/database/data_gateway 超大；单 crate 依赖环；legacy/v2 selection 并存；NotificationService、push L1-L7、production durable route 多套抽象并存；L3 renderer 缺位；22 个 gRPC operations 只冻结合同、未进入 consumer-used 集；`build.rs`/`Cargo.toml` 的少量注释仍把测试 fixture/server trait 描述成历史本地 server；Prometheus metrics 模块尚未接入 monitor composition root 或 HTTP exporter；no-Magic guard 尚未接入 CI；compliance workflow 仍引用已不存在的 `--test e2e` target。

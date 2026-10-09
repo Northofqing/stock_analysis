@@ -22,6 +22,8 @@ R3 reports original IDs, creation/target dates, calendar hash and optional freez
 
 ## Later installation and cutover
 
+2026-10-09交付以[版本工具包runbook](goal-first-delivery-runbook.md)为当前方案；以下runtime/bin直接复制命令保留作Task2历史stage，勿与版本root方案混用。新的weekly/watchdog绝对路径、资源0400、prior rollback及precondition统一由版本manifest绑定。
+
 Installation is a separate runtime action. Inspect existing files/job first; stop if an existing watchdog belongs to a different release. Keep any old watchdog scripts/plist in a separate private rollback directory before replacement. Do not overwrite the installed monitor or bridge plist, their environment, config, activation or binary. This watchdog-only copy uses `runtime/bin/watchdog-a-share-holidays.csv`; it does not change monitor's source/config and does not require a monitor restart or activation resend.
 
 After authorizing installation, run from the reviewed checkout with the actual absolute `reliability_source` path:

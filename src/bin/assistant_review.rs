@@ -40,10 +40,7 @@ struct Args {
     format: Format,
 }
 async fn run(args: Args) -> anyhow::Result<()> {
-    let limits = Limits {
-        ceiling_micro_cny: args.ceiling_micro_cny,
-        ..Limits::default()
-    };
+    let limits = assistant_review::cli_limits(args.ceiling_micro_cny);
     run_with(args, limits, None).await
 }
 // Injection keeps local fake tests on the exact load/compare/serialize/emission path.
