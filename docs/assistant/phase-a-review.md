@@ -1,0 +1,47 @@
+# Bounded offline Phase A weekly review
+
+`assistant_review` consumes one frozen Task1 JSON report and its exact evidence manifest. It never opens a database or starts the monitor. Its default deterministic template lists all cited values, unavailable family results, unresolved monetary reasons, historical availability gaps, and concrete human checks. No credentials are needed.
+
+Use artifacts generated from the same detached Task1 snapshot and clock. Inputs must be regular, owner-private files (0400 or 0600); symlinks, hardlinks, non-regular files and inputs above 2 MiB are refused. Supply the explicit Shanghai clock and latest completed session recorded in the report:
+
+```sh
+cargo run --bin assistant_review -- \
+  --report /absolute/private/review.json \
+  --manifest /absolute/private/evidence-manifest.json \
+  --as-of 2026-10-08T16:00:00+08:00 \
+  --completed-session 2026-10-08 \
+  --format markdown \
+  --output /absolute/private/phase-a-comparison.md
+```
+
+The example clock must match your artifacts; it does not create a snapshot. `--output` exclusively creates a new 0600 file in an existing directory; existing files are refused. Without it, output is written to stdout. `--format markdown` renders a short Chinese review with exact pooled metrics, three arm statuses and three human checks, followed by the same canonical evidence block. JSON is the default and remains available for comparison tooling. `--registry /absolute/private/signal_registry.toml` optionally verifies original registry bytes and parsed content. Without those original TOML bytes, byte-source verification stays unavailable: the embedded and sidecar registry objects must still match exactly. Hashes identify loaded artifact bytes, not source qualification, historical availability, executable performance or snapshot recovery.
+
+The output schema is `assistant-phase-a-comparison-v1`. It preserves the common base, explicit outcome supplement, original report/manifest/snapshot hashes, exact as-of/completed period, three arm outputs, degradation reasons, citations, inferences, gaps, genuine model receipts when available, limits, conservative reservations and actual upstream usage when available. The base contains registry metadata and unavailable gaps; it carries no numeric score or return history. Only the outcome supplement adds the descriptive scorecard. The v1 source has no exact qualified family/instrument/availability observation rows: outcome memory stays unavailable, and pooled prices are never turned into symbol memory.
+
+The three arms are the offline template, selected model without outcomes, and the same model with the frozen supplement. Default agent arms explicitly degrade to templates. Human evaluation fields are initially null. Preserve each raw arm output and score time saved and omissions found on at least 20 completed sessions before discussing efficacy. This release grants no strategy promotion or Phase B/C action capability.
+
+## Optional bounded model mode
+
+`--model` selects the existing `LlmRegistry` role `assistant_review`. Configuration names are `LLM_ROLE_ASSISTANT_REVIEW`, `LLM_DEFAULT_FALLBACK`, `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`, `MiniMax_API_KEY`, `MiniMax_BASE_URL`, and `MiniMax_MODEL`. Supply credentials through your existing environment. This CLI does not load `.env`, initialize logging, or display credentials. Registry fallback only selects one configured provider; there is no fallback provider call.
+
+A key alone cannot enable a call. Both `--reviewed-pricing /absolute/private/pricing.json` and `--ceiling-micro-cny INTEGER` are required. There is no default pricing or spending allowance. The owner-reviewed JSON descriptor must use the exact fields of `llm::bounded::ReviewedPricing`:
+
+- `schema_version`: `assistant-reviewed-pricing-v1`; nonempty `reviewed_by` and `contract_version`; future RFC3339 `valid_until`.
+- Exact `provider`, `requested_model`, HTTPS `endpoint` (complete `/chat/completions` URL), and nonempty allowed `upstream_models`.
+- `currency`: `CNY`; `billing_scope`: `prompt_completion_only_no_hidden_tokens`.
+- `input_bound_method`: `utf8_bytes_plus_reviewed_framing`; reviewed nonnegative integer `framing_tokens` covering all billed framing/overhead. The owner must establish this conservative byte bound for this provider/model tokenizer. It is not universal certification.
+- Reviewed `max_output_tokens`; integer worst-case `input_micro_cny_per_million`, `output_micro_cny_per_million`, and `fixed_max_micro_cny`. Cached discounts are not assumed.
+
+No sample prices are supplied: prices, framing and billing completeness require a real review. Models with unbounded hidden reasoning/other billing classes cannot use this narrow contract. DeepSeek cache hit/miss partitions and cached-token details are validated against total prompt tokens, with no price discount. Optional reasoning-token details must be zero, and reasoning content must be absent/empty in this non-thinking scope. Unknown billing/detail classes are refused. MiniMax remains unsupported until a separate bounded thinking/billing contract is reviewed.
+
+The CLI has fixed limits and no size-limit override flags. Larger reviewed requests are library-only: call `assistant_review::compare` with an explicitly constructed `llm::bounded::Limits` within its validated maxima, the same owner-reviewed descriptor and explicit monetary ceiling. A normal pack exceeding the CLI byte/token bound honestly degrades before networking; no automatic limit increase occurs.
+
+Default limits: 20 seconds shared run deadline, at most two calls total and one per model arm, 32,000 input tokens per attempt, 1,500 output tokens per attempt, 64,000 request bytes, 32,000 retained response bytes, and 16,000 decoded content bytes. Library limits are validated with hard maxima. Reserve each worst-case attempt before networking with checked integer arithmetic and rounded-up costs. Both arms share one in-memory allowance; reservations are never refunded, including on timeout, rejection or invalid content. They are modeled maxima, not settled bills or protection against upstream overbilling.
+
+The bounded DeepSeek path supports only the documented requested names `deepseek-flash` and `deepseek-v4-pro`, explicitly setting `thinking.type=disabled`. Retired aliases/custom names and all MiniMax bounded calls are unavailable before networking; legacy methods/defaults are unchanged. Set the existing process-local configuration names `DEEPSEEK_MODEL` and `LLM_ROLE_ASSISTANT_REVIEW` explicitly if you opt in. This scope follows the [official Chat Completions schema](https://api-docs.deepseek.com/api/create-chat-completion/).
+
+Bounded calls build one fresh HTTP/1-only client with proxies and redirects disabled, no pooling, one POST, finite connect/request timeout and one shared deadline for send plus body collection. SDK calls, HTTP/2 retries, critics and automatic repairs are absent. Bodies are capped while collecting chunks; an incoming transport chunk can exist before the cap check, so this is a retained-body bound rather than a process-memory guarantee. A started uncertain/invalid attempt halts subsequent arms. Legacy provider adapters remain unchanged.
+
+Completed agent responses require exactly one `stop` choice, real upstream model/response IDs, consistent nonnegative bounded basic usage, genuine prompt/content receipt hashes and constrained JSON. Models may assert only supplied fact IDs and exactly matching values. Narrative is rendered from allowlisted inference/check codes; arbitrary prose or unsupported numbers/codes cannot become accepted facts. Rejected bounded raw model output is retained as untrusted diagnostic content, never promoted to evidence. No model has database, file, market, network, write, order, config or send tools.
+
+Library projections `FrozenPack::get_signal_scorecard` and `get_outcome_memory` accept explicit family/time/field allowlists. Unknown families/fields, instrument requests without an authoritative join, future intervals, and aggregate scorecard time slicing are refused. The loaded pack is immutable throughout the comparison.

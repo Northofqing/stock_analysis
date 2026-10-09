@@ -7,7 +7,7 @@ use super::{
     openai_compatible_chat_json, openai_compatible_chat_json_with_receipt, LlmError, LlmProvider,
     ReceiptBearingJson,
 };
-use async_openai::{config::OpenAIConfig, Client};
+use async_openai::{config::{Config, OpenAIConfig}, Client};
 
 // ============================================================================
 // DeepSeek
@@ -70,6 +70,18 @@ impl LlmProvider for DeepSeekProvider {
         openai_compatible_chat_json(&self.client, &self.model, system, user).await
     }
 
+    fn bounded_endpoint(&self) -> Option<String> {
+        matches!(self.model.as_str(), "deepseek-flash" | "deepseek-v4-pro")
+            .then(|| self.client.config().url("/chat/completions"))
+    }
+    async fn chat_json_bounded_with_receipt(
+        &self,
+        request: super::bounded::BoundedJsonRequest<'_>,
+        permit: super::bounded::SingleAttemptPermit,
+    ) -> Result<super::bounded::BoundedResponse, super::bounded::BoundedFailure> {
+        super::bounded::call(self.client.config(), self.name(), &self.model, request, permit).await
+    }
+
     async fn chat_json_with_receipt(
         &self,
         system: &str,
@@ -126,6 +138,9 @@ impl LlmProvider for MiniMaxProvider {
     async fn chat_json(&self, system: &str, user: &str) -> Result<serde_json::Value, LlmError> {
         openai_compatible_chat_json(&self.client, &self.model, system, user).await
     }
+
+    // Thinking/billing completeness is not yet reviewed for this bounded scope.
+    // Default bounded capability fails before networking; legacy methods stay available.
 
     async fn chat_json_with_receipt(
         &self,
@@ -232,6 +247,15 @@ mod tests {
         )
     }
 
+    #[test]
+    fn bounded_capability_only_advertises_documented_non_thinking_models() {
+        for model in ["deepseek-flash","deepseek-v4-pro","deepseek-chat","deepseek-reasoner","custom"] {
+            let p=DeepSeekProvider{client:Client::with_config(OpenAIConfig::new().with_api_key("local-only")),model:model.into()};
+            assert_eq!(p.bounded_endpoint().is_some(),matches!(model,"deepseek-flash"|"deepseek-v4-pro"));
+        }
+        let minimax=MiniMaxProvider{client:Client::with_config(OpenAIConfig::new().with_api_key("local-only")),model:"MiniMax-M2.7".into()};
+        assert!(minimax.bounded_endpoint().is_none());
+    }
     #[test]
     fn deepseek_provider_reads_canonical_names_only() {
         let settings = DeepSeekProvider::settings_from_lookup(|name| match name {
