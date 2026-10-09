@@ -673,6 +673,7 @@ mod tests {
         use crate::performance::attribution_epoch::EpochActivationSource;
         use crate::performance::attribution_replay::commit_effective_window;
         use crate::trading::paper_ledger::PaperCommand;
+        use diesel::connection::SimpleConnection;
         let directory = tempfile::tempdir().unwrap();
         let db = DatabaseManager::open_isolated_for_test(
             directory.path().join("TEST_CODE_daily_observation.db"),
@@ -685,15 +686,29 @@ mod tests {
                 invoked_at: offset.with_ymd_and_hms(2026, 9, 1, 15, 40, 0).unwrap(),
             })
             .unwrap();
+        // This ordinary seeded fixture has no NativeSnapshotPaperV1 sealed
+        // activation proof. Declare the existing CatalogV2 test contract;
+        // 0/0 with a nonempty unsealed paper namespace must remain rejected.
+        db.get_conn()
+            .unwrap()
+            .batch_execute("PRAGMA application_id=1398035265; PRAGMA user_version=2")
+            .unwrap();
         let seed = manifest();
         let binding = seed.binding().unwrap();
         let ledger = PaperLedger::open(&db, &clock);
         ledger.apply(PaperCommand::Seed(seed)).unwrap();
         let before = ledger.read(&binding).unwrap();
+        ledger
+            .read_account_with_effective(&binding, day(clock()))
+            .unwrap_or_else(|error| panic!("TEST_CODE invalid effective fixture: {error}"));
         let at = clock().with_timezone(&offset);
         let error =
             commit_effective_window(&db, binding.clone(), day(clock()), 30, at).unwrap_err();
-        assert_eq!(error.class(), ReplayErrorClass::Unavailable);
+        assert_eq!(
+            error.class(),
+            ReplayErrorClass::Unavailable,
+            "actual error: {error:?}"
+        );
         assert_eq!(error.code(), "paper_attribution_cutover_not_aligned");
         assert!(native_daily_observation_is_permitted(&error));
         let (summary, md) =
