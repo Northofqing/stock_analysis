@@ -1,0 +1,2 @@
+# Preserve captured compiler output byte-for-byte, including its final blank line.
+*.log -whitespace
