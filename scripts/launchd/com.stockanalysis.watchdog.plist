@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.stockanalysis.watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/zhangzhen/.local/share/stock-analysis-runtime/bin/monitor_watchdog.py</string>
+    <string>--runtime-root</string><string>/Users/zhangzhen/.local/share/stock-analysis-runtime</string>
+    <string>--calendar</string><string>/Users/zhangzhen/.local/share/stock-analysis-runtime/bin/watchdog-a-share-holidays.csv</string>
+    <string>--output-root</string><string>/Users/zhangzhen/.local/share/stock-analysis-runtime/data/watchdog</string>
+    <string>--probe-timeout-seconds</string><string>5</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/zhangzhen/.local/share/stock-analysis-runtime</string>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/watchdog.stdout.log</string>
+  <key>StandardErrorPath</key><string>/Users/zhangzhen/.local/share/stock-analysis-runtime/logs/watchdog.stderr.log</string>
+</dict>
+</plist>
