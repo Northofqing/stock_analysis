@@ -1,6 +1,8 @@
-# Goal-first 工具包交付（待安装）
+# Goal-first 工具包交付与安装操作
 
-本包只包含五个离线工具与 Python 辅助脚本。`manifest.json` 固定 source commit、release/toolchain/编译 root、每文件字节数/SHA、原 registry/calendar/contracts、CLI/schema、安装前 monitor 输入树/二进制/任务文件哈希。初始五target、assistant-only输出上限修复、weekly-only registry descriptor修复三次构建分别记录source commit/日志/每bin身份。第三次修复会改变被library借用的loader源码，library编译以日志为准；schema/parser/default bytes未改，复用其余四bin并保留其实际旧身份。旧候选包仅保留作历史证据，最终待安装包为 `/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c`。哈希识别内容；不证明 Gateway、历史 PIT、交易资格、送达或当前进程身份。Python 为本机 `/usr/bin/python3` 3.9.6。
+2026-10-09本包及weekly/watchdog已正式安装，monitor和日度工具另按完整发布契约切换，实测结果见[发布记录](../handoffs/2026-10-09-goal-first-release.md)。下方保留独立工具包的安装步骤；其旧monitor基线只适用于本次安装前，后续正式monitor变更造成已知漂移。
+
+本包只包含五个离线工具与 Python 辅助脚本。`manifest.json` 固定 source commit、release/toolchain/编译 root、每文件字节数/SHA、原 registry/calendar/contracts、CLI/schema、安装前 monitor 输入树/二进制/任务文件哈希。初始五target、assistant-only输出上限修复、weekly-only registry descriptor修复三次构建分别记录source commit/日志/每bin身份。第三次修复会改变被library借用的loader源码，library编译以日志为准；schema/parser/default bytes未改，复用其余四bin并保留其实际旧身份。旧候选包仅保留作历史证据，本次已安装的最终候选源为 `/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c`。哈希识别内容；不证明 Gateway、历史 PIT、交易资格、送达或当前进程身份。Python 为本机 `/usr/bin/python3` 3.9.6。
 
 目录：`<candidate>/goal-first/<version>/{bin,scripts,resources,launchd,manifest.json,RUNBOOK.md}`；唯一发布位置为 `/Users/zhangzhen/.local/share/stock-analysis-runtime/tools/goal-first/<version>`。目录0700，release binary/launcher0500，普通脚本/文档/plist0600，原始资源0400。原 TOML/CSV bytes 与编译资源绑定；Rust calendar 是编译输入，修改复制 CSV 不会更新 binary。
 
@@ -12,7 +14,7 @@
 
 授权安装后，显式追加 `--install` 仅原子发布新版本目录；已有相同 manifest 返回 already_published，不同版本内容拒绝。发布前两次核对完整 monitor `src/config`、Cargo/build/contracts、monitor/bridge binary 与旧 launcher/plist 字节哈希；缺失、symlink、非单链接、不匹配、额外包文件或 drift 都拒绝。无 activation_prepare、无 DB 初始化、无 launchctl、无 pruning、无 .env 加载。发布发生在同一 filesystem，macOS renamex_np(RENAME_EXCL) 原子且禁止覆盖。若 source/config/binary/bound contract 需要改变，拒绝 isolated-tool 范围，另按正式 monitor release 契约做未来 activation、单 owner 切换、DB/lock 保留与一致 rollback。
 
-任务加载是另一步明确运行操作，**本交付没有执行**。先核对 host timezone 为 Asia/Shanghai、既有 runtime/logs 为真实目录，确认没有另一个同类 label/周报日程；weekly 只保留 `com.stockanalysis.weekly-outcome-review` Friday20:30，RunAtLoad=false/KeepAlive=false；watchdog `com.stockanalysis.watchdog` StartInterval60、RunAtLoad=false。二者 plist 已绑定安装版本绝对路径，watchdog 仅调用已有 runtime/target/release/monitor 的 `--health --json` 早期只读路径；不启动第二个 monitor。无初始 catch-up/manual 周报调用。
+任务加载是另一步明确运行操作，**2026-10-09已按以下步骤完成并核对自然watchdog间隔**。先核对 host timezone 为 Asia/Shanghai、既有 runtime/logs 为真实目录，确认没有另一个同类 label/周报日程；weekly 只保留 `com.stockanalysis.weekly-outcome-review` Friday20:30，RunAtLoad=false/KeepAlive=false；watchdog `com.stockanalysis.watchdog` StartInterval60、RunAtLoad=false。二者 plist 已绑定安装版本绝对路径，watchdog 仅调用已有 runtime/target/release/monitor 的 `--health --json` 早期只读路径；不启动第二个 monitor。无初始 catch-up/manual 周报调用。
 
 1. 重跑默认 check，记录结果。卸载仅将要替换的 weekly/watchdog label（不存在则不卸载），不触碰 monitor、bridge、daily21:17任务。
 2. 检查 manifest.rollback 对应的私有旧 plist/launcher bytes/hash。用 `install -m 600` 将**本版本已校验**的 `launchd/<label>.plist` 替换各自 `~/Library/LaunchAgents/<label>.plist`，逐文件原子临时文件+rename；若检查后又漂移，停止。旧 runtime/bin launcher 不必替换：新 weekly plist 直接指向版本内 launcher。

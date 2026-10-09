@@ -63,3 +63,9 @@ F-Q01两处registry入口已使用单descriptor的regular/no-follow/nonblocking/
 [最终修复证据](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/final-fix/pinned-package-check-results.json)包含最终各文件/来源核验和default/relocated plan各EXIT0；此前13项实际新weekly/wrapper/76预测双格式→离线assistant/FIFO等有限3秒检查复用，weekly与wrapper和所有其他包文件（除packager/manifest）SHA与执行版本一致。修复后weekly6847612bytes/SHA `5e64691601c84907486d9a88d23462788ab849669d96a22ef202aa21b6dc3168`；wrapper10519bytes/SHA `fc8c1dfa59fed61d0c36836e59e78d74556a7e3fa63e35561af119180e0498cb`。原四bin/resources/plists/launcher身份不变，来源fixture未改，默认0模型calls；旧41项其他包检查按未改字节复用。原全部证据/117memberarchive没有改写。
 
 修复中间包（13probe实际执行时仍在final-fix路径）仅在执行结束后整树迁至 `/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix-pre-pin`；保留manifest375024bytes/SHA `664a47e45809a07c4e6088348b6fadc53f42d7bfc1f11b6084b087beca9f8a59`。精确旧→新映射与probe日志/结果身份见[迁移记录](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/final-fix/interim-relocation.json)，历史命令中的原执行路径未改写，不宣称曾在迁移后路径执行。最终rollback副本在 `/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/rollback-v20261009-f3761320c`；字节与原保存一致。所有包均未安装/加载；最终scoped rereview、本地集成与late supplement待root收尾。
+
+## 开发收尾与正式发布补充
+
+上文的未安装、待收尾表述保留原开发阶段时间边界。最终修复复审、本地集成及late supplement现已完成；补充归档266members/59,773,451 raw bytes，20,807,515bytes/SHA-256 `19c4beb8875e4e9698762472178648ef652d095fbf4b1ad4eb19d4c2f650443d`，逐member长度/哈希复核通过。旧archive和候选原字节未改。
+
+用户随后授权“直接 发布 用最新的”。最终工具包已发布到原计划runtime版本路径，weekly/watchdog已加载；消费者source a9b3aa7正式构建发布，新monitor PID97621、保留现行bridge PID96490，未来activation Enabled、same-store身份、startup固定点及自然watchdog恢复/去重均已实测。安装/live process/activation观察不再pending；实际交易/来源、人类裁定/用户价值及首次20:30周报仍独立待验收。见[正式发布记录](../2026-10-09-goal-first-release.md)与[私有发布收据](/Users/zhangzhen/.local/share/stock-analysis-deployments/20261009-goal-first/deployment-receipt.json)。

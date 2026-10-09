@@ -2,7 +2,7 @@
 
 > 生成日期：2026-09-03  
 > 专项修订：2026-09-02（推送系统审计与演进路线；v18/v19 设计覆盖、冲突裁决与周期）  
-> 当前增量同步：2026-10-09（goal-first E1–E4源码工具、待安装版本包、真实运行根；旧九月表格按历史保留）
+> 当前增量同步：2026-10-09（goal-first E1–E4源码工具、已安装版本包与最新monitor、真实运行根；旧九月表格按历史保留）
 > 事实基线：当前工作树中的 Rust 源码、Cargo metadata、配置、测试、CI 与 README  
 > 生成配置：Rust / Auto-detect / C4-oriented Mermaid / Implementation-Ready  
 > 规模快照：514 个 Rust 文件，379,107 行；1 个 library、28 个 binary、41 个 integration-test、1 个 benchmark、1 个 build-script target
@@ -14,9 +14,9 @@
 | 范围 | 当前证据与状态 |
 | --- | --- |
 | CURRENT_SOURCE | E1描述性registry/三档scorecard，E2独立watchdog/安全archive与候选screen，E4 artifact-only Phase A、SELL preview/Streak observed研究，E3全前缀分页与软SLI。详见[本次交接](handoffs/2026-10-09-goal-first-delivery.md) |
-| STAGED | 五个selected release bins与Python3.9.6依赖闭包；版本root在Desktop外候选目录；新weekly/watchdog plist未安装/加载 |
-| INSTALLED_OBSERVED | 九月迁移记录及10-09 discovery只读磁盘观察：runtime `/Users/zhangzhen/.local/share/stock-analysis-runtime`、launchd monitor/本地gRPC bridge、daily21:17/weeklyFriday20:30。磁盘binary/activation哈希不同于live进程证明，未在本次重新探测 |
-| EXTERNAL_PENDING | family/version/PIT、独立close/真实lots/fees、可执行history、手机channel、历史monetary/Unknown人工处置、安装与≥20completed-session用户价值 |
+| STAGED | 五个selected release bins与Python3.9.6依赖闭包的候选副本继续保留；正式版本已发布到runtime/tools/goal-first/v20261009-f3761320c |
+| INSTALLED_OBSERVED | 10-09正式发布实测：runtime `/Users/zhangzhen/.local/share/stock-analysis-runtime`，monitor PID97621/bridge PID96490、binary inode/SHA、未来activation Enabled、core DB及startup固定点通过；daily21:17/weeklyFriday20:30、新watchdog60s已加载。健康仍Frozen/Unsafe，见[发布记录](handoffs/2026-10-09-goal-first-release.md) |
+| EXTERNAL_PENDING | family/version/PIT、独立close/真实lots/fees、可执行history、手机channel、历史monetary/Unknown人工处置、首次真实周报与≥20completed-session用户价值 |
 | FROZEN_PROPOSAL | §24统一facade/PhaseScheduler/新catalog迁移及§25全平台路线不在本交付推进 |
 
 图中旧标签保留其历史阅读意义：
@@ -205,13 +205,13 @@ flowchart LR
     bridge --> monitor["launchd唯一monitor counted owner"]
     daily["已安装daily21:17 backfills"] --> db[("runtime主库")]
     monitor --> db
-    weekly["已安装weekly Friday20:30；新版本plist STAGED"] --> artifacts["private周报artifact"]
-    artifacts --> assistant["STAGED bounded artifact-only Phase A"]
-    watchdog["STAGED独立60s watchdog"] -->|只读health| monitor
+    weekly["已安装新版weekly Friday20:30"] --> artifacts["private周报artifact"]
+    artifacts --> assistant["已安装 bounded artifact-only Phase A"]
+    watchdog["已安装独立60s watchdog"] -->|只读health| monitor
     watchdog --> events["local events/self-check；无手机receipt"]
 ```
 
-Monitor/bridge由Desktop外runtime的正式launchd job管理。daily写回填仍属既有独立任务，不能删掉其bin aliases；新版本weekly复用唯一label、RunAtLoad=false，不增加重复日程。watchdog只调用已安装monitor早期只读 `--health --json`，不重启/启动monitor。安装源码工具不等于已加载新job。
+Monitor/bridge由Desktop外runtime的正式launchd job管理。daily写回填仍属既有独立任务，不能删掉其bin aliases；新版本weekly复用唯一label、RunAtLoad=false，不增加重复日程。watchdog只调用已安装monitor早期只读 `--health --json`，不重启/启动monitor。本次已核对新job实际加载及自然watchdog运行；首次真实周报仍等20:30日程。
 
 ## 6. C4 Level 3：统一数据平面
 
