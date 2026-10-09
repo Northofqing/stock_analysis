@@ -1,13 +1,13 @@
 # Goal-first 工具包交付（待安装）
 
-本包只包含五个离线工具与 Python 辅助脚本。`manifest.json` 固定 source commit、release/toolchain/编译 root、每文件字节数/SHA、原 registry/calendar/contracts、CLI/schema、安装前 monitor 输入树/二进制/任务文件哈希。哈希识别内容；不证明 Gateway、历史 PIT、交易资格、送达或当前进程身份。Python 为本机 `/usr/bin/python3` 3.9.6。
+本包只包含五个离线工具与 Python 辅助脚本。`manifest.json` 固定 source commit、release/toolchain/编译 root、每文件字节数/SHA、原 registry/calendar/contracts、CLI/schema、安装前 monitor 输入树/二进制/任务文件哈希。初始五target构建与随后assistant-only输出上限修复重建分别记录source commit/日志/每bin身份；其他compiled inputs未改，不重建其余bin。哈希识别内容；不证明 Gateway、历史 PIT、交易资格、送达或当前进程身份。Python 为本机 `/usr/bin/python3` 3.9.6。
 
 目录：`<candidate>/goal-first/<version>/{bin,scripts,resources,launchd,manifest.json,RUNBOOK.md}`；唯一发布位置为 `/Users/zhangzhen/.local/share/stock-analysis-runtime/tools/goal-first/<version>`。目录0700，release binary/launcher0500，普通脚本/文档/plist0600，原始资源0400。原 TOML/CSV bytes 与编译资源绑定；Rust calendar 是编译输入，修改复制 CSV 不会更新 binary。
 
 先检查（默认 plan，不复制、不启动）：
 
 ```sh
-/usr/bin/python3 /absolute/candidate/goal-first/VERSION/scripts/prepare_goal_first_delivery.py --bundle /absolute/candidate/goal-first/VERSION
+/usr/bin/python3 -B /absolute/candidate/goal-first/VERSION/scripts/prepare_goal_first_delivery.py --bundle /absolute/candidate/goal-first/VERSION
 ```
 
 授权安装后，显式追加 `--install` 仅原子发布新版本目录；已有相同 manifest 返回 already_published，不同版本内容拒绝。发布前两次核对完整 monitor `src/config`、Cargo/build/contracts、monitor/bridge binary 与旧 launcher/plist 字节哈希；缺失、symlink、非单链接、不匹配、额外包文件或 drift 都拒绝。无 activation_prepare、无 DB 初始化、无 launchctl、无 pruning、无 .env 加载。发布发生在同一 filesystem，macOS renamex_np(RENAME_EXCL) 原子且禁止覆盖。若 source/config/binary/bound contract 需要改变，拒绝 isolated-tool 范围，另按正式 monitor release 契约做未来 activation、单 owner 切换、DB/lock 保留与一致 rollback。
@@ -25,10 +25,11 @@
 
 ```sh
 PACKAGE=/absolute/candidate/goal-first/VERSION
+export PYTHONDONTWRITEBYTECODE=1
 "$PACKAGE/bin/assistant_review" --report /absolute/private/review.json --manifest /absolute/private/evidence-manifest.json --registry "$PACKAGE/resources/signal_registry.toml" --as-of 2026-10-08T16:00:00+08:00 --completed-session 2026-10-08 --output /absolute/private/new-comparison.md
 "$PACKAGE/bin/sell_reminder_preview" --evidence /absolute/private/sell-observed.json --as-of 2026-10-09T15:05:00+08:00
 "$PACKAGE/bin/streak_leader_research" --evidence /absolute/private/streak-observed.json --as-of 2026-10-09T15:05:00+08:00
-/usr/bin/python3 "$PACKAGE/scripts/rotate_push_log.py" --help
+/usr/bin/python3 -B "$PACKAGE/scripts/rotate_push_log.py" --help
 ```
 
 需要真实来源才能晋级：SELL lots/fee/expiry与独立close，Streak PIT/可执行历史，scorecard family/version，model端点/价格/tokenizer/账单，人类≥20completed-session价值比较。当前预览不可发送/下单，模型默认0calls。report64MiB/manifest2MiB/output8MiB有限，CLI输入65536/request131072，保持2attempts、18+2s、1500 output tokens、response32000/content16000、cash ceiling/rounded reservation/no refund；较大文件JSON树有额外内存开销，较大输入可能因原cash ceiling拒绝。

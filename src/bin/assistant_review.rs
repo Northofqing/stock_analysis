@@ -93,11 +93,23 @@ async fn run_with(
         Format::Markdown => assistant_review::markdown(&result)?.into_bytes(),
     };
     anyhow::ensure!(Instant::now() < deadline, "whole_run_deadline");
-    if let Some(path) = args.output {
-        assistant_review::write_new_private(&path, &bytes)?;
+    emit(
+        &bytes,
+        args.output.as_deref(),
+        &mut std::io::stdout().lock(),
+    )
+}
+fn emit(
+    bytes: &[u8],
+    output: Option<&std::path::Path>,
+    stdout: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    // Both destinations retain the same finite output cap after the larger report loader.
+    anyhow::ensure!(bytes.len() <= 8 * 1024 * 1024, "output_limit");
+    if let Some(path) = output {
+        assistant_review::write_new_private(path, bytes)?;
     } else {
-        use std::io::Write;
-        std::io::stdout().lock().write_all(&bytes)?;
+        stdout.write_all(bytes)?;
     }
     Ok(())
 }
@@ -157,6 +169,22 @@ mod tests {
             let _guard = CancelGuard(&self.dropped);
             std::future::pending().await
         }
+    }
+    #[test]
+    fn emission_cap_covers_stdout_and_file_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("oversized.json");
+        let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+        for destination in [None, Some(output.as_path())] {
+            let mut stdout = Vec::new();
+            assert!(emit(&oversized, destination, &mut stdout).is_err());
+            assert!(stdout.is_empty());
+            assert!(!output.exists());
+        }
+        let exact = vec![b'x'; 8 * 1024 * 1024];
+        let mut stdout = Vec::new();
+        emit(&exact, None, &mut stdout).unwrap();
+        assert_eq!(stdout, exact);
     }
     #[test]
     fn explicit_inputs_and_default_offline_mode() {

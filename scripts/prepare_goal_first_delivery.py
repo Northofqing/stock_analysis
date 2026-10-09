@@ -158,12 +158,12 @@ def validate(bundle):
 
 
 def launcher(destination):
-    return '#!/bin/bash\nset -euo pipefail\numask 077\nexec /usr/bin/python3 "' + str(destination / 'scripts/weekly-outcome-review.py') + '" --database "' + str(RUNTIME / 'data/stock_analysis.db') + '" --binary "' + str(destination / 'bin/weekly_outcome_review') + '" --registry "' + str(destination / 'resources/signal_registry.toml') + '" --weekly-output-root "' + str(RUNTIME / 'reports/weekly-outcome-review') + '"\n'
+    return '#!/bin/bash\nset -euo pipefail\numask 077\nexec /usr/bin/python3 -B "' + str(destination / 'scripts/weekly-outcome-review.py') + '" --database "' + str(RUNTIME / 'data/stock_analysis.db') + '" --binary "' + str(destination / 'bin/weekly_outcome_review') + '" --registry "' + str(destination / 'resources/signal_registry.toml') + '" --weekly-output-root "' + str(RUNTIME / 'reports/weekly-outcome-review') + '"\n'
 
 
 def job(label, destination):
     weekly = label == LABELS[0]
-    args = ['/bin/bash', str(destination / 'scripts/run-weekly-outcome-review.sh')] if weekly else ['/usr/bin/python3', str(destination / 'scripts/monitor_watchdog.py'), '--runtime-root', str(RUNTIME), '--calendar', str(destination / 'resources/a_share_market_holidays.csv'), '--output-root', str(RUNTIME / 'data/watchdog'), '--probe-timeout-seconds', '5']
+    args = ['/bin/bash', str(destination / 'scripts/run-weekly-outcome-review.sh')] if weekly else ['/usr/bin/python3', '-B', str(destination / 'scripts/monitor_watchdog.py'), '--runtime-root', str(RUNTIME), '--calendar', str(destination / 'resources/a_share_market_holidays.csv'), '--output-root', str(RUNTIME / 'data/watchdog'), '--probe-timeout-seconds', '5']
     p = {'Label': label, 'ProgramArguments': args, 'WorkingDirectory': str(RUNTIME),
          'RunAtLoad': False, 'KeepAlive': False, 'Umask': 63,
          'EnvironmentVariables': {'TZ': 'Asia/Shanghai', 'PYTHONDONTWRITEBYTECODE': '1'},
@@ -216,12 +216,17 @@ def install(bundle):
     return {'status': 'published', 'destination': str(destination), 'jobs': 'not_loaded'}
 
 
-def prepare(repo, candidate, version, source_commit, build_log):
+def prepare(repo, candidate, version, source_commit, build_log, base_commit=None, assistant_log=None):
     if not version or len(version) > 64 or version in ('.', '..') or any(c not in 'abcdefghijklmnopqrstuvwxyz0123456789-.' for c in version):
         raise ValueError('version')
     repo = clean_path(repo)
     if subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip() != source_commit or subprocess.check_output(['git', 'diff', 'HEAD', '--name-only'], cwd=repo):
         raise ValueError('clean committed source required')
+    if not base_commit or len(base_commit) != 40 or any(c not in '0123456789abcdef' for c in base_commit) or assistant_log is None:
+        raise ValueError('explicit two-build provenance required')
+    changed_binary_inputs = subprocess.check_output(['git', 'diff', '--name-only', base_commit, source_commit, '--', 'src', 'config', 'contracts', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'build_support'], cwd=repo, text=True).splitlines()
+    if set(changed_binary_inputs) - {'src/bin/assistant_review.rs'}:
+        raise ValueError('other compiled inputs changed since first release build')
     bundle = clean_path(candidate) / 'goal-first' / version
     if 'Desktop' in bundle.parts or bundle.exists():
         raise ValueError('fresh Desktop-external candidate required')
@@ -258,7 +263,7 @@ def prepare(repo, candidate, version, source_commit, build_log):
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--offline', '--format-version', '1'], cwd=repo))
     m = {'schema': 'goal-first-tools-package/v1', 'version': version, 'source_commit': source_commit, 'source_dirty': False,
          'runtime': str(RUNTIME), 'destination': str(destination), 'launchd_labels': list(LABELS),
-         'build': {'selected_bins': list(BINS), 'profile': 'release', 'production_root': str(destination), 'rustc': subprocess.check_output(['rustc', '-Vv'], text=True), 'cargo': subprocess.check_output(['cargo', '-V'], text=True), 'log': str(build_log), 'log_identity': identity(read(build_log)), 'features': [], 'python': subprocess.check_output(['/usr/bin/python3', '--version'], text=True).strip(), 'metadata_target_count': len(metadata['packages'][0]['targets'])},
+         'build': {'selected_bins': list(BINS), 'source_commit': base_commit, 'per_bin_source_commit': {name: source_commit if name == 'assistant_review' else base_commit for name in BINS}, 'assistant_rebuild': {'source_commit': source_commit, 'selected_bins': ['assistant_review'], 'log': str(assistant_log), 'log_identity': identity(read(assistant_log))}, 'profile': 'release', 'production_root': str(destination), 'rustc': subprocess.check_output(['rustc', '-Vv'], text=True), 'cargo': subprocess.check_output(['cargo', '-V'], text=True), 'log': str(build_log), 'log_identity': identity(read(build_log)), 'features': [], 'python': subprocess.check_output(['/usr/bin/python3', '--version'], text=True).strip(), 'metadata_target_count': len(metadata['packages'][0]['targets'])},
          'schemas': ['H16-descriptive-weekly-v1', 'weekly-signal-scorecard-v1', 'weekly-outcome-evidence-manifest-v1', 'assistant-phase-a-comparison-v1', 'sell-preview/v1-legacy-rule-units', 'streak-study/v1', 'monitor-health-runtime_snapshot-v2'],
          'preconditions': preconditions, 'rollback': rollback_files,
          'observed_activation_expected_config_hash': activation.get('expected_config_hash'),
@@ -280,12 +285,14 @@ def main():
     p.add_argument('--version')
     p.add_argument('--source-commit')
     p.add_argument('--build-log', type=Path)
+    p.add_argument('--base-binary-source-commit')
+    p.add_argument('--assistant-build-log', type=Path)
     a = p.parse_args()
     try:
         if a.prepare:
-            if a.install or a.bundle or not all((a.repo, a.candidate_root, a.version, a.source_commit, a.build_log)):
+            if a.install or a.bundle or not all((a.repo, a.candidate_root, a.version, a.source_commit, a.build_log, a.base_binary_source_commit, a.assistant_build_log)):
                 raise ValueError('explicit preparation arguments required')
-            result = prepare(a.repo, a.candidate_root, a.version, a.source_commit, a.build_log)
+            result = prepare(a.repo, a.candidate_root, a.version, a.source_commit, a.build_log, a.base_binary_source_commit, a.assistant_build_log)
         elif a.bundle:
             result = install(a.bundle) if a.install else {'status': 'checked_plan_only', 'destination': check(a.bundle)['destination'], 'jobs': 'not_loaded', 'changes': 'none'}
         else:
