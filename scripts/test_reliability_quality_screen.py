@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import reliability_quality_screen as q
 import rotate_push_log as r
@@ -104,6 +105,68 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(len(rotated['candidates'][0]['occurrences']), 2)
         self.assertEqual(rotated['physical_delivery_inference'], 'unavailable_from_markdown')
         self.assertEqual(q.screen_physical(self.reader(self.delivery), 100)['candidates'], [])
+
+    def test_rotated_archive_budget_rejects_whole_date_before_tar_read_and_counts_io(self):
+        for name in ('a.md', 'b.md'):
+            (self.day / name).write_bytes(b'body')
+        archive = self.root / 'archive'
+        r.rotate(self.root, archive, archive=True, prune=True, observed_at='2026-10-09T10:00:00+08:00')
+        read_names = []
+        original = r.read_at
+        def measured(fd, name, *args, **kwargs):
+            read_names.append(name)
+            return original(fd, name, *args, **kwargs)
+        with patch.object(r, 'read_at', side_effect=measured):
+            limited = q.screen_archives(self.push, archive, 1)
+        self.assertEqual(read_names, ['2026-07-01.manifest.json'])
+        self.assertTrue(limited['truncated'])
+        self.assertEqual(limited['candidates'], [])
+        self.assertEqual(limited['files_read'], 1)  # Actual manifest filesystem read, not a processed body.
+        self.assertEqual(limited['processed_occurrences'], 0)
+        accounting = limited['read_accounting']['archive_verification']
+        self.assertEqual(accounting['declared_members'], 2)
+        self.assertEqual(accounting['member_read_attempts'], 0)
+        self.assertEqual(accounting['file_read_successes'], 1)
+        self.assertEqual(accounting['file_bytes_returned'], (archive / '2026-07-01.manifest.json').stat().st_size)
+        full = q.screen_archives(self.push, archive, 2)
+        self.assertEqual(full['processed_occurrences'], 2)
+        self.assertEqual(full['files_read'], 2)  # Manifest and tar physical reads.
+        accounting = full['read_accounting']['archive_verification']
+        self.assertEqual(accounting['member_read_attempts'], 2)
+        self.assertEqual(accounting['member_read_successes'], 2)
+        self.assertEqual(accounting['member_bytes_returned'], 8)
+        self.assertEqual(accounting['file_bytes_returned'], sum(p.stat().st_size for p in archive.iterdir()))
+        self.assertEqual(len(full['candidates']), 1)
+        (archive / '2026-07-01.tar').write_bytes(b'corrupt')
+        rejected = q.screen_archives(self.push, archive, 2)
+        self.assertEqual(rejected['processed_occurrences'], 0)
+        self.assertEqual(rejected['files_read'], 2)
+        self.assertEqual(rejected['candidates'], [])
+        self.assertEqual(rejected['read_accounting']['archive_verification']['member_read_attempts'], 0)
+        self.assertEqual(rejected['status'], 'partial_unavailable')
+
+    def test_hash_conflicted_original_excluded_from_all_body_candidates(self):
+        (self.day / 'a.md').write_bytes(b'old')
+        (self.day / 'b.md').write_bytes(b'old')
+        archive = self.root / 'archive'
+        r.rotate(self.root, archive, archive=True, prune=True, observed_at='2026-10-09T10:00:00+08:00')
+        (self.day / 'a.md').write_bytes(b'new')
+        (self.day / 'c.md').write_bytes(b'new')
+        report = q.screen_archives(self.push, archive, 100)
+        self.assertEqual(report['status'], 'partial_unavailable')
+        self.assertEqual(report['candidates'], [])
+        self.assertEqual(len(report['content_conflicts']), 1)
+        conflict = report['content_conflicts'][0]
+        self.assertEqual(conflict['path'], '2026-07-01/a.md')
+        self.assertEqual({v['sha256'] for v in conflict['revisions']}, {digest(b'old'), digest(b'new')})
+        self.assertEqual({v['source'] for v in conflict['revisions']}, {'live_markdown', 'verified_rotated_markdown'})
+        self.assertTrue(all(v['location'].startswith(str(self.root)) for v in conflict['revisions']))
+        # Independent agreeing paths can still support a candidate, but the conflict never does.
+        (self.day / 'd.md').write_bytes(b'new')
+        report = q.screen_archives(self.push, archive, 100)
+        self.assertEqual(len(report['candidates']), 1)
+        self.assertEqual([v['path'] for v in report['candidates'][0]['occurrences']],
+                         ['2026-07-01/c.md', '2026-07-01/d.md'])
 
     def test_pending_committed_pair_one_attempt_and_missing_join(self):
         pending = {'schema': 'stock_analysis.counted_push_log.v1', 'state': 'AuditPending',

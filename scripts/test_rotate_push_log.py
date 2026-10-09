@@ -56,13 +56,51 @@ class RotationTests(unittest.TestCase):
         self.assertEqual(archive_before, {p.name: p.read_bytes() for p in self.archive.iterdir()})
         report = self.rotate(archive=True, prune=True)
         self.assertEqual(len(report['results'][0]['removed']), 2)
-        self.assertEqual(len(self.rotate(archive=True, prune=True)['results'][0]['already_absent']), 2)
+        rerun = self.rotate(archive=True, prune=True)
+        self.assertEqual(rerun['results'], [])
+        self.assertEqual(rerun['skipped_dates'][0]['date'], '2026-07-01')
+        self.assertEqual(rerun['skipped_dates'][0]['listed_sources_remaining'], 0)
         for path, inode in self.inodes.items():
             self.assertEqual(path.stat().st_ino, inode)
         self.assertEqual((self.root / '2026-10-09/today.md').read_bytes(), b'keep')
         self.assertEqual((self.root / '2026-10-10/today.md').read_bytes(), b'keep')
         self.assertEqual(manifest['schema_version'], 1)
         self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in self.archive.iterdir()))
+
+    def test_default_batches_progress_two_dates_for_archive_and_prune_modes(self):
+        for prune in (False, True):
+            with self.subTest(prune=prune):
+                runtime = self.runtime / ('prune-mode' if prune else 'archive-mode')
+                root = runtime / 'data/push_log'
+                dates = [root / '2026-07-01', root / '2026-07-02']
+                for directory in dates:
+                    directory.mkdir(parents=True)
+                    (directory / 'a.md').write_bytes(b'old')
+                    (directory / 'keep.json').write_bytes(b'{}')
+                lock = root / '.push_log.lock'
+                lock.touch(mode=0o600)
+                preserved = {p: p.stat().st_ino for p in [root, lock] + dates + [d / 'keep.json' for d in dates]}
+                archive = runtime / 'archive'
+                options = dict(archive=True, prune=prune, observed_at='2026-10-09T10:00:00+08:00')
+                first = r.rotate(runtime, archive, **options)
+                first_tar = (archive / '2026-07-01.tar').read_bytes()
+                self.assertEqual(first['results'][0]['date'], '2026-07-01')
+                self.assertTrue(first['truncated'])
+                second = r.rotate(runtime, archive, **options)
+                self.assertEqual(second['results'][0]['date'], '2026-07-02')
+                self.assertEqual(second['skipped_dates'][0]['date'], '2026-07-01')
+                self.assertFalse(second['truncated'])
+                self.assertEqual(first_tar, (archive / '2026-07-01.tar').read_bytes())
+                third = r.rotate(runtime, archive, **options)
+                self.assertEqual(third['results'], [])
+                self.assertEqual(len(third['skipped_dates']), 2)
+                for directory in dates:
+                    self.assertEqual((directory / 'a.md').exists(), not prune)
+                self.assertEqual(preserved, {p: p.stat().st_ino for p in preserved})
+                # Skipping a completed date still revalidates its immutable archive.
+                (archive / '2026-07-01.tar').write_bytes(b'corrupt')
+                with self.assertRaises(ValueError):
+                    r.rotate(runtime, archive, **options)
 
     def test_corrupt_archive_never_prunes(self):
         self.rotate(archive=True)

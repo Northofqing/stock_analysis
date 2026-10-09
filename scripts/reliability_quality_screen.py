@@ -9,9 +9,9 @@ import sqlite3
 import tempfile
 import tarfile
 
-from reliability_common import (Calendar, absolute, clock, date, digest, exclusive_json,
+from reliability_common import (MAX_FILE, Calendar, absolute, clock, date, digest, exclusive_json,
                                 json_bytes, open_dir, read_at, read_path)
-from rotate_push_log import validate_archive
+from rotate_push_log import ARCHIVE_LIMIT, ArchiveMemberBudgetExceeded, validate_archive
 
 
 def canonical(raw, sha, sorted_keys=False):
@@ -253,7 +253,17 @@ def screen_physical(connection, limit):
 
 def screen_archives(push_log, archive_root, limit):
     hashes, attempts, commits, unavailable_files = {}, {}, [], []
-    read_count, truncated = 0, False
+    read_count, source_successes, source_bytes, processed, truncated = 0, 0, 0, 0, False
+    archive_dates_attempted = 0
+    archive_io = {'file_read_attempts': 0, 'file_read_successes': 0, 'file_bytes_returned': 0,
+                  'member_read_attempts': 0, 'member_read_successes': 0, 'member_bytes_returned': 0,
+                  'declared_members': 0}
+    revisions = {}
+    def record_body(path, body, source, location):
+        sha = digest(body)
+        revisions.setdefault(path, []).append({'sha256': sha, 'bytes': len(body), 'source': source, 'location': location})
+        group = hashes.setdefault(sha, {})
+        group[path] = 'live_and_verified_rotated_markdown' if path in group else source
     rootfd = open_dir(push_log)
     try:
         for day in sorted(os.listdir(rootfd)):
@@ -273,8 +283,11 @@ def screen_archives(push_log, archive_root, limit):
                     label = day + '/' + name
                     try:
                         raw, _ = read_at(dayfd, name)
+                        source_successes += 1
+                        source_bytes += len(raw)
+                        processed += 1
                         if name.endswith('.md'):
-                            hashes.setdefault(digest(raw), {})[label] = 'live_markdown'
+                            record_body(label, raw, 'live_markdown', str(push_log / label))
                         else:
                             value = json.loads(raw)
                             if value.get('schema') != 'stock_analysis.counted_push_log.v1':
@@ -309,33 +322,38 @@ def screen_archives(push_log, archive_root, limit):
             for name in sorted(os.listdir(archivefd)):
                 if not name.endswith('.manifest.json'):
                     continue
-                if read_count >= limit:
+                remaining = limit - read_count - archive_io['member_read_attempts']
+                if remaining <= 0 or archive_dates_attempted >= limit:
                     truncated = True
                     break
+                archive_dates_attempted += 1
                 day = name[:-len('.manifest.json')]
                 try:
                     date(day)
-                    manifest, bodies = validate_archive(archivefd, day)
+                    manifest, bodies = validate_archive(archivefd, day, max_members=remaining, accounting=archive_io)
                     if manifest['source_root'] != str(push_log):
                         raise ValueError('archive source mismatch')
                     manifests.append({'path': str(archive_root / name), 'sha256': digest(json_bytes(manifest))})
+                    # Entire date fits the remaining budget and was fully verified before any grouping.
                     for path, body in sorted(bodies.items()):
-                        if read_count >= limit:
-                            truncated = True
-                            break
-                        read_count += 1
-                        # Copy of the same relative original is one content occurrence.
-                        if any(path in paths for sha, paths in hashes.items() if sha != digest(body)):
-                            unavailable_files.append({'path': path, 'reason': 'live_archive_path_hash_mismatch'})
-                        existing = hashes.setdefault(digest(body), {})
-                        if path in existing:
-                            existing[path] = 'live_and_verified_rotated_markdown'
-                        else:
-                            existing[path] = 'verified_rotated_markdown'
+                        processed += 1
+                        record_body(path, body, 'verified_rotated_markdown',
+                                    str(archive_root / manifest['archive']) + '#' + path)
+                except ArchiveMemberBudgetExceeded as error:
+                    truncated = True
+                    unavailable_files.append({'path': name, 'reason': 'archive_member_budget_exceeded_before_tar_read',
+                                              'declared_members': error.declared, 'available_member_budget': error.available})
                 except (OSError, ValueError, KeyError, TypeError, tarfile.TarError):
                     unavailable_files.append({'path': name, 'reason': 'archive_verification_unavailable'})
         finally:
             os.close(archivefd)
+    conflicts = []
+    for path, loaded in sorted(revisions.items()):
+        if len({revision['sha256'] for revision in loaded}) > 1:
+            conflicts.append({'path': path, 'revisions': loaded})
+            unavailable_files.append({'path': path, 'reason': 'live_archive_path_hash_mismatch'})
+            for paths in hashes.values():
+                paths.pop(path, None)  # Unavailable original identity cannot support any candidate group.
     for key, path, pending_hash in commits:
         attempt = attempts.get(key)
         if not attempt or pending_hash not in attempt['pending_hashes']:
@@ -344,7 +362,15 @@ def screen_archives(push_log, archive_root, limit):
             attempt['committed_paths'].append(path)
     return {'status': 'partial_unavailable' if unavailable_files or truncated else 'candidates_only',
             'source_root': str(push_log), 'archive_root': str(archive_root) if archive_root else None,
-            'files_read': read_count, 'truncated': truncated, 'max_files': limit,
+            'files_read': source_successes + archive_io['file_read_successes'],
+            'processed_occurrences': processed, 'truncated': truncated, 'max_files': limit,
+            'read_limit_semantics': 'source_leaf_attempts_plus_archive_member_attempts; separate_archive_date_attempt_budget',
+            'read_budgets': {'source_leaf_plus_archive_members': limit, 'archive_date_attempts': limit,
+                             'manifest_max_bytes': MAX_FILE, 'tar_max_bytes': ARCHIVE_LIMIT},
+            'read_accounting': {'source_leaf_read_attempts': read_count, 'source_leaf_read_successes': source_successes,
+                                'source_leaf_bytes_returned': source_bytes, 'archive_dates_attempted': archive_dates_attempted,
+                                'archive_verification': archive_io},
+            'content_conflicts': conflicts,
             'candidates': [{'kind': 'archive_body_duplicate', 'sha256': sha,
                             'occurrences': [{'path': p, 'source': source} for p, source in sorted(paths.items())]}
                            for sha, paths in sorted(hashes.items()) if len(paths) > 1],

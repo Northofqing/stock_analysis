@@ -26,12 +26,31 @@ def same_directory(path, fd):
         os.close(probe)
 
 
-def validate_archive(archivefd, day):
-    manifest_raw, _ = read_at(archivefd, day + '.manifest.json', private=True)
+class ArchiveMemberBudgetExceeded(ValueError):
+    def __init__(self, declared, available):
+        super().__init__('archive member budget exceeded before tar read')
+        self.declared, self.available = declared, available
+
+
+def validate_archive(archivefd, day, max_members=None, accounting=None):
+    accounting = accounting if accounting is not None else {}
+    def count(key, amount=1):
+        accounting[key] = accounting.get(key, 0) + amount
+    def counted_read(name, limit):
+        count('file_read_attempts')
+        raw, witness = read_at(archivefd, name, limit, private=True)
+        count('file_read_successes')
+        count('file_bytes_returned', len(raw))
+        return raw, witness
+    manifest_raw, _ = counted_read(day + '.manifest.json', MAX_FILE)
     manifest = json.loads(manifest_raw)
     if manifest['schema_version'] != 1 or manifest['date'] != day or manifest['archive'] != day + '.tar':
         raise ValueError('archive manifest schema invalid')
-    raw, _ = read_at(archivefd, manifest['archive'], ARCHIVE_LIMIT, private=True)
+    declared = len(manifest['entries'])
+    count('declared_members', declared)
+    if max_members is not None and declared > max_members:
+        raise ArchiveMemberBudgetExceeded(declared, max_members)
+    raw, _ = counted_read(manifest['archive'], ARCHIVE_LIMIT)
     if len(raw) != manifest['archive_bytes'] or digest(raw) != manifest['archive_sha256']:
         raise ValueError('archive checksum mismatch')
     expected = {e['path']: e for e in manifest['entries']}
@@ -46,7 +65,10 @@ def validate_archive(archivefd, day):
         for member in archive:
             if not member.isfile() or member.name not in expected or member.name in bodies or member.size > MAX_FILE:
                 raise ValueError('unexpected archive member')
+            count('member_read_attempts')
             body = archive.extractfile(member).read(MAX_FILE + 1)
+            count('member_read_successes')
+            count('member_bytes_returned', len(body))
             entry = expected[member.name]
             if len(body) != entry['bytes'] or digest(body) != entry['sha256']:
                 raise ValueError('archive member checksum mismatch')
@@ -71,7 +93,7 @@ def rotate(runtime, archive_root, before=None, archive=False, prune=False,
     deadline = time.monotonic() + time_limit
     rootfd = open_dir(root)
     lockfd = archivefd = None
-    results = []
+    results, selected, skipped, unexamined = [], [], [], []
     try:
         lockfd = os.open('.push_log.lock', os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=rootfd)
         lock_info = os.fstat(lockfd)
@@ -103,10 +125,12 @@ def rotate(runtime, archive_root, before=None, archive=False, prune=False,
                 continue
             if day < cutoff:
                 days.append(name)
-        selected = days[:max_dates]
         if archive:
             archivefd = open_dir(archive_root, create=True, private=True)
-        for day in selected:
+        for index, day in enumerate(days):
+            if len(selected) >= max_dates:
+                unexamined = days[index:]
+                break
             binding()
             daypath = root / day
             dayfd = os.open(day, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=rootfd)
@@ -114,16 +138,32 @@ def rotate(runtime, archive_root, before=None, archive=False, prune=False,
                 if os.fstat(dayfd).st_mode & 0o022:
                     raise ValueError('writable source date directory')
                 names = sorted(n for n in os.listdir(dayfd) if n.endswith('.md'))
-                if len(names) > max_files:
-                    raise ValueError('date exceeds max-files; no partial date archive')
                 manifest = bodies = None
                 if archive:
                     try:
-                        manifest, bodies = validate_archive(archivefd, day)
+                        manifest, bodies = validate_archive(archivefd, day, max_members=max_files)
                     except FileNotFoundError:
                         # A published orphan tar from an interrupted publication is never overwritten.
                         if day + '.tar' in os.listdir(archivefd):
                             raise ValueError('orphan archive requires human review')
+                if manifest is not None:
+                    if manifest['source_root'] != str(root):
+                        raise ValueError('archive belongs to another source root')
+                    listed = {Path(entry['path']).name for entry in manifest['entries']}
+                    present_listed = listed.intersection(names)
+                    if not prune or not present_listed:
+                        same_directory(daypath, dayfd)
+                        skipped.append({'date': day, 'reason': 'verified_archive_complete_for_mode',
+                                        'manifest_sha256': digest(json_bytes(manifest)),
+                                        'unlisted_md': sorted(set(names) - listed),
+                                        'listed_sources_remaining': len(present_listed)})
+                        continue
+                elif not names:
+                    skipped.append({'date': day, 'reason': 'no_markdown_work', 'unlisted_md': []})
+                    continue
+                if len(names) > max_files:
+                    raise ValueError('date exceeds max-files; no partial date archive')
+                selected.append(day)
                 if manifest is None:
                     entries, bodies, total = [], {}, 0
                     for name in names:
@@ -158,7 +198,7 @@ def rotate(runtime, archive_root, before=None, archive=False, prune=False,
                                 raise ValueError('source changed before publication')
                         write_at(archivefd, day + '.tar', raw)
                         write_at(archivefd, day + '.manifest.json', json_bytes(manifest))
-                        manifest, bodies = validate_archive(archivefd, day)
+                        manifest, bodies = validate_archive(archivefd, day, max_members=max_files)
                 if manifest['source_root'] != str(root):
                     raise ValueError('archive belongs to another source root')
                 removed, already_absent = [], []
@@ -195,7 +235,8 @@ def rotate(runtime, archive_root, before=None, archive=False, prune=False,
                 os.close(dayfd)
         binding()
         return {'schema_version': 1, 'observed_at': now.isoformat(), 'before_exclusive': cutoff.isoformat(),
-                'eligible_dates': len(days), 'selected_dates': len(selected), 'truncated': len(days) > len(selected),
+                'eligible_dates': len(days), 'selected_dates': len(selected), 'truncated': bool(unexamined),
+                'skipped_dates': skipped, 'unexamined_dates': unexamined,
                 'max_dates': max_dates, 'max_files_per_date': max_files, 'time_limit_seconds': time_limit,
                 'results': results, 'json_and_directories_preserved': True}
     finally:
