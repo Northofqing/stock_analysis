@@ -3329,6 +3329,38 @@ pub(super) async fn push_retained_market_observation(
     crate::durable_delivery_runtime::deliver_counted_binding(binding, kind, text, None).await
 }
 
+/// Sealed operational T-02 route for auction input facts. Neither raw text nor
+/// an arbitrary counted binding can select this source-only context.
+pub(super) async fn push_auction_input_alert(
+    report: crate::auction_input_alerts::PreparedAuctionInputAlert,
+) -> PushOutcome {
+    let kind = PushKind::DataMode;
+    let token = match crate::presentation_registry::acquire_token(
+        "T-02-data-mode",
+        kind,
+        "data_mode_hook",
+        "render_data_mode",
+    ) {
+        Ok(token) => token,
+        Err(reason) => return PushOutcome::Denied(reason),
+    };
+    if token.descriptor().push_kind != kind || !launch_gate_check(kind) {
+        return PushOutcome::Denied("launch_gate_stage".into());
+    }
+    match crate::v14_adapter::v14_gate_auction_input_alert(&report) {
+        crate::v14_adapter::V14Gate::Approved(_) => {}
+        crate::v14_adapter::V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
+        crate::v14_adapter::V14Gate::Deduped => {
+            return PushOutcome::Denied("counted_gate_returned_legacy_dedup".into())
+        }
+    }
+    if let Err(reason) = report.validate_for_use() {
+        return PushOutcome::Denied(reason);
+    }
+    let (text, binding) = report.into_parts();
+    crate::durable_delivery_runtime::deliver_counted_binding(binding, kind, text, None).await
+}
+
 /// BR-194 sole counted SourceOnly entry. The profile is derived from the
 /// canonical R-04 binding and cannot be selected by a caller.
 pub async fn push_counted_source_only_with_binding(

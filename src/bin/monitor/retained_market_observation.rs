@@ -344,6 +344,12 @@ fn parse_stored_time(value: &serde_json::Value) -> Result<DateTime<Utc>, String>
 /// Exact occurrence ownership is read from the original durable store before
 /// fetching, including Delivered/Uncertain. A changed quote after restart does
 /// not create another card for the same slot.
+fn should_acquire_input(slot: &ObservationSlot, observation_owned: bool) -> bool {
+    // The auction input monitor remains live after its ordinary quote card
+    // closes. Intraday observation retains the original one-acquisition slot.
+    slot.slot == "auction" || !observation_owned
+}
+
 pub(super) async fn run() {
     let mut completed = None::<String>;
     loop {
@@ -352,46 +358,66 @@ pub(super) async fn run() {
             continue;
         };
         let occurrence = slot.occurrence();
-        if completed.as_ref() != Some(&occurrence) {
+        let observation_owned = if completed.as_ref() == Some(&occurrence) {
+            true
+        } else {
             match crate::durable_delivery_runtime::retained_observation_occurrence_owned(
                 slot.business_date,
                 &occurrence,
             ) {
                 Ok(true) => {
-                    completed = Some(occurrence);
+                    completed = Some(occurrence.clone());
+                    true
                 }
                 Err(error) => {
-                    log::error!("[retained-observation] owner inspection failed: {error}")
+                    log::error!("[retained-observation] owner inspection failed: {error}");
+                    // No new ordinary card without a verified occurrence
+                    // read. Independent auction input admission still checks
+                    // its own original durable owners before any notice.
+                    true
                 }
-                Ok(false) => {
-                    let banner = crate::current_banner_for("retained quote observation")
-                        .map(|banner| banner.render())
-                        .unwrap_or_else(|| "[账户状态不可用 | 不提供交易指令]".to_owned());
-                    match tokio::task::spawn_blocking(move || {
-                        fetch_scanner_position_quotes()
-                            .and_then(|quotes| PreparedObservation::prepare(slot, quotes, &banner))
-                    })
-                    .await
-                    {
-                        Ok(Ok(prepared)) => {
-                            let outcome =
-                                crate::notify::push_retained_market_observation(prepared).await;
-                            log::info!("[retained-observation] occurrence={occurrence} outcome={outcome:?}");
-                            if matches!(
-                                outcome,
-                                crate::notify::PushOutcome::Pushed
-                                    | crate::notify::PushOutcome::Deduped
-                            ) {
-                                completed = Some(occurrence);
-                            }
-                        }
-                        Ok(Err(error)) => log::warn!(
-                            "[retained-observation] unavailable={error} occurrence={occurrence}"
-                        ),
-                        Err(error) => {
-                            log::error!("[retained-observation] acquisition task failed: {error}")
-                        }
+                Ok(false) => false,
+            }
+        };
+        if should_acquire_input(&slot, observation_owned) {
+            let banner = crate::current_banner_for("retained quote observation")
+                .map(|banner| banner.render())
+                .unwrap_or_else(|| "[账户状态不可用 | 不提供交易指令]".to_owned());
+            match tokio::task::spawn_blocking(fetch_scanner_position_quotes).await {
+                Ok(Ok(quotes)) => {
+                    crate::auction_input_alerts::position_batch(&quotes, Utc::now()).await;
+                    if observation_owned {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        continue;
                     }
+                    let prepared = match PreparedObservation::prepare(slot, quotes, &banner) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            log::warn!("[retained-observation] unavailable={error} occurrence={occurrence}");
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            continue;
+                        }
+                    };
+                    let outcome = crate::notify::push_retained_market_observation(prepared).await;
+                    log::info!(
+                        "[retained-observation] occurrence={occurrence} outcome={outcome:?}"
+                    );
+                    if matches!(
+                        outcome,
+                        crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
+                    ) {
+                        completed = Some(occurrence);
+                    }
+                }
+                Ok(Err(error)) => {
+                    log::warn!(
+                        "[retained-observation] unavailable={error} occurrence={occurrence}"
+                    );
+                    crate::auction_input_alerts::position_failure(Utc::now()).await;
+                }
+                Err(error) => {
+                    log::error!("[retained-observation] acquisition task failed: {error}");
+                    crate::auction_input_alerts::position_failure(Utc::now()).await;
                 }
             }
         }
@@ -406,6 +432,15 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&Utc)
+    }
+    #[test]
+    fn auction_input_quote_acquisition_continues_after_ordinary_owner_but_intraday_is_unchanged() {
+        let auction = ObservationSlot::at(at("2026-10-09T01:20:00Z")).unwrap();
+        let intraday = ObservationSlot::at(at("2026-10-09T02:00:00Z")).unwrap();
+        assert!(should_acquire_input(&auction, false));
+        assert!(should_acquire_input(&auction, true));
+        assert!(should_acquire_input(&intraday, false));
+        assert!(!should_acquire_input(&intraday, true));
     }
     #[test]
     fn retained_observation_auction_only_current_live_window_no_catch_up() {

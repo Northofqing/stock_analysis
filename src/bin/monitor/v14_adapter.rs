@@ -551,6 +551,35 @@ fn retained_observation_profile() -> TemplateMetadata {
     profile
 }
 
+/// Only the opaque auction input report can request this source-only T-02
+/// route. DataMode's existing operational policy is unchanged; no account
+/// financial snapshot or trading authority is consumed by an input notice.
+pub(super) fn v14_gate_auction_input_alert(
+    report: &crate::auction_input_alerts::PreparedAuctionInputAlert,
+) -> V14Gate {
+    if let Err(reason) = report.validate_for_use() {
+        return V14Gate::Denied(reason);
+    }
+    let kind = PushKind::DataMode;
+    let (source, kind_str, severity) = map_push_kind(kind);
+    let mut event = SignalEvent::new(
+        source, kind_str, None, Local::now(), signal_payload_for_kind(kind), severity,
+    );
+    event.event_id = stock_analysis::push_l1::make_source_fact_event_id(
+        kind_str, report.binding().schedule_occurrence_identity(),
+    );
+    v14_gate_prepared(V14PreparedGate {
+        kind,
+        has_governance_identity: false,
+        sub_kind: None,
+        cooldown_override_secs: None,
+        event,
+        profile: default_profile_for_kind(kind),
+        context_source: GovernanceContextSource::CountedSourceOnly,
+        context_override: None,
+    })
+}
+
 /// BR-194 narrow L5 gate for the canonical R-04 provider binding.
 pub fn v14_gate_counted_source_only_binding(
     kind: PushKind,
@@ -2114,6 +2143,18 @@ mod tests {
         assert!(default_profile_for_kind(PushKind::T0Advice).frozen_mode_respect);
         assert!(default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
         assert_eq!(default_profile_for_kind(PushKind::IntradayMarket).data_mode_min, DataMode::Degraded);
+    }
+
+    #[test]
+    fn auction_input_operational_profile_keeps_data_down_and_frozen_policy_without_advice_exemption() {
+        let operational = default_profile_for_kind(PushKind::DataMode);
+        assert_eq!(operational.category, stock_analysis::push_l2::TemplateCategory::DataSource);
+        assert_eq!(operational.data_mode_min, DataMode::Down);
+        assert!(operational.always_send_on_data_source_down);
+        assert!(!operational.frozen_mode_respect);
+        assert_eq!(operational.cooldown_secs, 0);
+        assert!(default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
+        assert_eq!(default_profile_for_kind(PushKind::AuctionVolume).data_mode_min, DataMode::Degraded);
     }
 
     #[test]

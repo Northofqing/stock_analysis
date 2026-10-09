@@ -1140,6 +1140,16 @@ impl AuthoritativeSinkPort for MagiclawAuthoritativeSink {
                 observed_at: Utc::now(),
             });
         }
+        if let Err(reason) = crate::auction_input_alerts::validate_authoritative_request(
+            &self.namespace, request, Utc::now(),
+        ) {
+            return AuthoritativeSinkResult::Rejected(stock_analysis::durable_delivery::TypedRejection {
+                reason_code: "auction_input_physical_guard_rejected".to_owned(),
+                evidence: reason.into_bytes(),
+                retry_authorized: false,
+                observed_at: Utc::now(),
+            });
+        }
         crate::notify::deliver_authoritative_blocking(
             &self.namespace,
             &self.push_log_writer,
@@ -1357,6 +1367,37 @@ pub(super) fn retained_observation_occurrence_owned(
             owner.is_some()
         })
         .map_err(|error| error.to_string())
+}
+
+/// Source-only auction notices keep the real mode in the ordinary T-02
+/// binding. Inspect all mode variants so a global mode change cannot duplicate
+/// the same input episode. No mutation, resume, or retry is authorized here.
+pub(super) fn auction_input_occurrence_source(
+    date: NaiveDate, fingerprint: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if !is_sha256_hex(fingerprint) { return Err("auction_input_fingerprint_invalid".into()); }
+    let state = runtime_state()?;
+    auction_input_occurrence_source_from(&state.coordinator, date, fingerprint)
+}
+
+pub(super) fn auction_input_occurrence_source_from(
+    coordinator: &DurableDeliveryCoordinator, date: NaiveDate, fingerprint: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut source = None;
+    for mode in ["Full", "Degraded", "Unsafe"] {
+        let occurrence = format!("data-mode-v2:{date}:{mode}:{fingerprint}");
+        let owner = coordinator.inspect_exact_occurrence_owner(
+            &date.to_string(), DurablePushKind::DataMode, DeliverySubKind::None, "GLOBAL", &occurrence,
+        ).map_err(|error| error.to_string())?;
+        if let Some(owner) = owner {
+            if source.is_some() { return Err("auction_input_multiple_mode_owners".into()); }
+            if owner.envelope.retry_authorized || owner.envelope.task_binding.is_some() {
+                return Err("auction_input_original_authority_invalid".into());
+            }
+            source = Some(owner.envelope.source_binding_canonical);
+        }
+    }
+    Ok(source)
 }
 
 pub fn pending_schedule_hydrations() -> Result<Vec<ScheduleHydration>, String> {

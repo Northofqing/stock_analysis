@@ -555,6 +555,7 @@ fn audit_full_market_rankings_unavailable(owner: &str) {
 
 mod intraday_market;
 mod retained_market_observation;
+mod auction_input_alerts;
 
 mod durable_delivery_runtime;
 mod g5b_v2;
@@ -11557,13 +11558,19 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 Ok(Ok(tick_data)) => Some(tick_data),
                                 Ok(Err(error)) => {
                                     log::error!("[竞价] 涨停池批次拒绝: {}", error);
+                                    auction_input_alerts::volume_failure(chrono::Utc::now()).await;
                                     None
                                 }
                                 Err(error) => {
                                     log::error!("[竞价] 涨停池后台任务失败: {}", error);
+                                    auction_input_alerts::volume_failure(chrono::Utc::now()).await;
                                     None
                                 }
                             };
+
+                        if let Some(tick) = auction_tick_data.as_ref() {
+                            auction_input_alerts::volume_batch(tick, chrono::Utc::now()).await;
+                        }
 
                         let limit_stocks = auction_tick_data
                             .as_ref()
