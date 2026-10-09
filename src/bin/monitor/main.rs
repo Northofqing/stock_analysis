@@ -553,9 +553,9 @@ fn audit_full_market_rankings_unavailable(owner: &str) {
     );
 }
 
+mod auction_input_alerts;
 mod intraday_market;
 mod retained_market_observation;
-mod auction_input_alerts;
 
 mod durable_delivery_runtime;
 mod g5b_v2;
@@ -4513,7 +4513,9 @@ fn install_mode_owned_core_database(test_mode: bool) -> Result<std::path::PathBu
     let initialized = if test_mode {
         stock_analysis::database::DatabaseManager::init(Some(database_path.clone()))
     } else {
-        stock_analysis::database::DatabaseManager::init_retained_monitor(Some(database_path.clone()))
+        stock_analysis::database::DatabaseManager::init_retained_monitor(Some(
+            database_path.clone(),
+        ))
     };
     initialized.map_err(|error| format!("initialize mode-owned core database: {error}"))?;
     Ok(database_path)
@@ -8596,6 +8598,7 @@ async fn push_e2e_14x_templates(
         theme: "PCB",
 
         score: Some(8.5),
+        score_basis: None,
         persistent: pt::PersistentLevel::High,
 
         member_count: 3,
@@ -10592,7 +10595,11 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     compute_epoch_daily, compute_epoch_window, persist_epoch_daily,
                     AttributionEpochRuntimeError,
                 };
-                use stock_analysis::performance::report::{render_full_markdown, render_summary};
+                use stock_analysis::performance::report::{
+                    native_daily_observation_is_permitted, render_effective_daily_details,
+                    render_full_markdown_with_details, render_native_daily_account_observation,
+                    render_summary_with_details,
+                };
                 static ATTRIBUTION_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
                 let today = now.date_naive();
@@ -10667,37 +10674,35 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             let invoked_at = chrono::Utc::now().with_timezone(
                                 &chrono::FixedOffset::east_opt(8 * 3600).unwrap(),
                             );
-                            let (prepared, _receipt) = stock_analysis::performance::attribution_replay::commit_effective_window(
-                                database,
-                                binding,
-                                today,
-                                30,
-                                invoked_at,
-                            )
-                            .map_err(|error| {
-                                use stock_analysis::performance::attribution_replay::ReplayErrorClass;
-                                match error.class() {
-                                    ReplayErrorClass::FailedIntegrity => {
-                                        AttributionEpochRuntimeError::FailedIntegrity {
-                                            reason_code: error.code(),
-                                            detail: error.to_string(),
-                                        }
-                                    }
-                                    ReplayErrorClass::Unavailable | ReplayErrorClass::Storage => {
-                                        AttributionEpochRuntimeError::Unavailable {
-                                            reason_code: error.code(),
-                                            retryable: error.retryable(),
-                                            detail: error.to_string(),
-                                        }
-                                    }
+                            let effective = stock_analysis::performance::attribution_replay::commit_effective_window(
+                                database, binding.clone(), today, 30, invoked_at,
+                            );
+                            let (summary, md) = match effective {
+                                Ok((prepared, _receipt)) => render_effective_daily_details(
+                                    database, prepared.report(), invoked_at,
+                                ).map_err(map_effective).map_err(FreezeError::Prepare)?,
+                                Err(error) if native_daily_observation_is_permitted(&error) => {
+                                    // A known missing strategy-sample join does not invalidate
+                                    // the separately verified native account. Freeze only an
+                                    // explicit account observation; never claim strategy success,
+                                    // mutate the old epoch or substitute old-account losses.
+                                    render_native_daily_account_observation(
+                                        database, &binding, today, invoked_at,
+                                    ).map_err(map_effective).map_err(FreezeError::Prepare)?
                                 }
-                            })
-                            .map_err(FreezeError::Prepare)?;
-                            let md = prepared
-                                .report()
-                                .render_markdown()
-                                .map_err(map_effective)
-                                .map_err(FreezeError::Prepare)?;
+                                Err(error) => {
+                                    use stock_analysis::performance::attribution_replay::ReplayErrorClass;
+                                    let error = match error.class() {
+                                        ReplayErrorClass::FailedIntegrity => AttributionEpochRuntimeError::FailedIntegrity {
+                                            reason_code: error.code(), detail: error.to_string(),
+                                        },
+                                        ReplayErrorClass::Unavailable | ReplayErrorClass::Storage => AttributionEpochRuntimeError::Unavailable {
+                                            reason_code: error.code(), retryable: error.retryable(), detail: error.to_string(),
+                                        },
+                                    };
+                                    return Err(FreezeError::Prepare(error));
+                                }
+                            };
                             let report_revision_path =
                                 stock_analysis::performance::report::persist_report_revision(
                                     std::path::Path::new("data/attribution"),
@@ -10707,7 +10712,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             .map_err(map_effective)
                             .map_err(FreezeError::Prepare)?;
                             return Ok(PreparedAttributionDaily {
-                                summary: prepared.report().render_summary(),
+                                summary,
                                 report_revision_path,
                             });
                         }
@@ -10730,7 +10735,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             .reserve_before_commit(today)
                             .map_err(FreezeError::Storage)?;
                         persist_epoch_daily(database, &daily).map_err(FreezeError::Prepare)?;
-                        let md = render_full_markdown(daily.daily(), window.window());
+                        let md = render_full_markdown_with_details(
+                            daily.daily(), window.window(), daily.details(),
+                        );
                         let report_revision_path =
                             stock_analysis::performance::report::persist_report_revision(
                                 std::path::Path::new("data/attribution"),
@@ -10746,7 +10753,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         })
                         .map_err(FreezeError::Prepare)?;
                         Ok(PreparedAttributionDaily {
-                            summary: render_summary(daily.daily(), window.window()),
+                            summary: render_summary_with_details(
+                                daily.daily(), window.window(), daily.details(),
+                            ),
                             report_revision_path,
                         })
                     }) {
@@ -12064,9 +12073,15 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let (flow_overlay, fresh_scanner_quotes) =
                             intraday_market::acquire_scanner_quotes_after_overlay(
                                 fetch_flow_overlay(flow_codes),
-                                move || intraday_market::scanner_window_open_at(chrono::Utc::now(), limit_pool_date),
+                                move || {
+                                    intraday_market::scanner_window_open_at(
+                                        chrono::Utc::now(),
+                                        limit_pool_date,
+                                    )
+                                },
                                 market_data::fetch_scanner_position_quotes,
-                            ).await;
+                            )
+                            .await;
                         let scanner_position_quotes = match fresh_scanner_quotes {
                             Ok(quotes) => Some(quotes),
                             Err(error) => {
@@ -12997,10 +13012,18 @@ fn render_board_flow_market_view(
 
     let avg_return = normalized.iter().map(|entry| entry.1).sum::<f64>() / normalized.len() as f64;
     let strong = normalized.iter().filter(|entry| entry.1 > 3.0).count();
+    let (first, first_return, first_net) = normalized[0];
     let mut text = format!(
-        "📊 概念板块主力净流入样本 ({hhmm} 盘中)\n样本涨幅均值 {avg_return:+.2}% | 样本涨幅>3% {strong} 个\n"
+        "📊 资金样本榜首: {} 主力{:+.2}亿、涨跌{:+.2}%（{hhmm}）\n概念板块主力净流入样本 {} 个 | 涨幅算术均值 {avg_return:+.2}% | 涨幅>3% {strong} 个\n",
+        first.name,
+        first_net / 1e8,
+        first_return,
+        normalized.len(),
     );
-    text.push_str("Provider 主力净流入排名 Top5:\n");
+    text.push_str(&format!(
+        "Provider 主力净流入排名 Top{}:\n",
+        normalized.len().min(5)
+    ));
     for (board, return_pct, main_net_yuan) in normalized.iter().take(5) {
         text.push_str(&format!(
             "  {} {:+.2}% 主力{:.2}亿\n",
@@ -13009,6 +13032,32 @@ fn render_board_flow_market_view(
             main_net_yuan / 1e8
         ));
     }
+    let display_time = |field, raw: Option<&str>| {
+        raw.and_then(|value| {
+            stock_analysis::data_gateway::parse_evidence_instant(
+                "BoardFlows",
+                evidence.provider,
+                field,
+                value,
+            )
+            .ok()
+        })
+        .map(|time| {
+            time.with_timezone(
+                &chrono::FixedOffset::east_opt(8 * 3600).expect("Shanghai offset is valid"),
+            )
+            .format("%m-%d %H:%M:%S +08:00")
+            .to_string()
+        })
+        .unwrap_or_else(|| "未取得可展示时点".to_string())
+    };
+    text.push_str(&format!(
+        "来源: {:?} / {}\n源时点: {} | 系统观察: {}\n口径: Provider 返回的资金排名样本，非全市场，也未核验持仓关联。",
+        evidence.provider,
+        evidence.source,
+        display_time("source_at", evidence.source_at.as_deref()),
+        display_time("observed_at", Some(&evidence.observed_at)),
+    ));
     log::info!(
         "[盘中盘面][BR-188] status=available provider={:?} observed_at={} batch_id={} records={}",
         evidence.provider,
@@ -13558,7 +13607,12 @@ mod tests_v17_4_d {
         ]);
         let rendered = render_board_flow_market_view(&batch, "TEST_CODE_10:00").unwrap();
         assert!(rendered.contains("概念板块主力净流入样本"));
-        assert!(rendered.contains("Provider 主力净流入排名 Top5"));
+        assert!(rendered.contains("Provider 主力净流入排名 Top2"));
+        assert!(rendered.starts_with("📊 资金样本榜首: 测试概念甲 主力+3.00亿、涨跌-1.00%"));
+        assert!(rendered.contains("样本 2 个 | 涨幅算术均值 +2.00% | 涨幅>3% 1 个"));
+        assert!(rendered.contains("TEST_CODE_eastmoney-board-flow"));
+        assert!(rendered.contains("+08:00"));
+        assert!(rendered.contains("非全市场，也未核验持仓关联"));
         assert!(rendered.find("测试概念甲").unwrap() < rendered.find("测试概念乙").unwrap());
         assert!(!rendered.contains("领涨板块"));
     }
@@ -13588,6 +13642,24 @@ mod tests_v17_4_d {
                 .unwrap_err()
                 .contains("顺序非法")
         );
+    }
+
+    #[test]
+    fn br188_market_view_missing_clock_is_explicit_without_current_time_fallback() {
+        let mut batch = board_flow_batch(vec![board_flow(
+            "TEST_CODE_BK0001",
+            "测试概念",
+            1,
+            Some(1.0),
+            Some(300_000_000.0),
+        )]);
+        if let stock_analysis::data_gateway::GatewayBatch::Available { evidence, .. } = &mut batch {
+            evidence.source_at = None;
+            evidence.observed_at = "TEST_CODE_INVALID_TIMESTAMP".to_owned();
+        }
+        let text = render_board_flow_market_view(&batch, "TEST_CODE_10:00").unwrap();
+        assert!(text.contains("源时点: 未取得可展示时点 | 系统观察: 未取得可展示时点"));
+        assert!(!text.contains("源时点: TEST_CODE_10:00"));
     }
 
     /// AC46: config 默认值 screener_min_score = 75

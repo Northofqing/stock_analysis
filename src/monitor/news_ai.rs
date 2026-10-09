@@ -1723,31 +1723,40 @@ impl GovernedNewsAiDelivery {
             None => self.fact.target_code().to_owned(),
         };
         format!(
-            "🧠 AI 新闻证据分析\n\
-             标的：{}\n\
-             产业链：{}\n\
+            "🧠 AI 新闻证据分析｜{}（置信度 {}%）\n\
              标题：{}\n\
-             来源：{} / {:?}\n\
-             发布时间：{}\n\
-             影响：{}（置信度 {}%）\n\
+             标的：{}\n\
+             处理：影响参考｜持仓关系未核验\n\
+             ━━━━━━━━━━━━━━━━━━━━\n\
+             【判断与缺口】\n\
              核心逻辑：{}\n\
              不确定性：{}\n\
+             产业链：{}\n\
+             【来源与核验】\n\
+             来源：{} / {:?}\n\
+             发布时间：{}\n\
              模型：{} / {}\n\
              模型响应：{}\n\
              证据哈希：{}\n\
              评估审计：{}\n\
              投递身份：{}\n\
              ⚠️ 仅为来源绑定的模型分析，不构成交易建议。",
-            target_line,
-            chain_line,
-            self.fact.title(),
-            self.fact.source(),
-            self.fact.provider(),
-            self.fact.published_at().to_rfc3339(),
             impact,
             self.assessment.confidence(),
+            self.fact.title(),
+            target_line,
             self.assessment.core_logic(),
             self.assessment.uncertainty(),
+            chain_line,
+            self.fact.source(),
+            self.fact.provider(),
+            self.fact
+                .published_at()
+                .with_timezone(
+                    &chrono::FixedOffset::east_opt(8 * 3600)
+                        .expect("Shanghai fixed offset is valid"),
+                )
+                .format("%Y-%m-%d %H:%M:%S +08:00"),
             self.assessment.receipt().provider(),
             self.assessment.receipt().model(),
             self.assessment.receipt().upstream_response_id(),
@@ -4361,6 +4370,26 @@ mod tests {
         assert!(card.contains(audited.delivery().identity().sha256()));
         assert!(card.contains("不构成交易建议"));
         assert!(!card.contains("建议买入"));
+        assert!(card.starts_with("🧠 AI 新闻证据分析｜正面（置信度 70%）"));
+        assert!(card.lines().take(4).any(|line| line.starts_with("标题：")));
+        assert!(card.lines().take(4).any(|line| line.starts_with("标的：")));
+        assert!(card
+            .lines()
+            .take(4)
+            .any(|line| line.contains("持仓关系未核验")));
+        assert!(card.find("不确定性：").unwrap() < card.find("模型响应：").unwrap());
+        assert!(card.contains("2026-07-27 09:00:"));
+
+        // A recovery must use the originally frozen bytes even when today's
+        // renderer has changed its information order.
+        let mut frozen_delivery = audited.delivery().clone();
+        let legacy_card = "🧠 AI 新闻证据分析\nTEST_CODE 原先冻结的正文";
+        frozen_delivery.rendered_card = Some(legacy_card.to_owned());
+        assert_eq!(frozen_delivery.render_card(), legacy_card);
+        assert_eq!(
+            frozen_delivery.identity().sha256(),
+            audited.delivery().identity().sha256()
+        );
     }
 
     #[test]

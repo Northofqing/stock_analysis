@@ -1,6 +1,14 @@
 //! 归因报告渲染 — 全文 markdown + 推送摘要 (spec §4.4).
 
-use super::attribution::{DailyAttribution, FamilyAggregate, SignalFamily, WindowAttribution};
+use super::attribution::{
+    DailyAttribution, DailyAttributionDetails, FamilyAggregate, SignalFamily, WindowAttribution,
+};
+
+mod paper_account;
+pub use paper_account::{
+    native_daily_observation_is_permitted, render_effective_daily_details,
+    render_native_daily_account_observation,
+};
 
 /// Append-only file presentation; the immutable database report is authoritative.
 pub fn persist_report_revision(
@@ -76,24 +84,113 @@ fn fmt_signed_money(v: f64) -> String {
     }
 }
 
-/// 推送摘要 (~20 行, spec §4.4; 族按 |合计PnL| 降序, 序号由 ranks 数组索引 — 无硬编码)
+/// Separate realized activity from the end-of-day inventory valuation. A carried
+/// position loss is cumulative, not today's mark-to-market change.
 pub fn render_summary(daily: &DailyAttribution, window: &WindowAttribution) -> String {
+    render_summary_with_optional_details(daily, window, None)
+}
+
+pub fn render_summary_with_details(
+    daily: &DailyAttribution,
+    window: &WindowAttribution,
+    details: &DailyAttributionDetails,
+) -> String {
+    render_summary_with_optional_details(daily, window, Some(details))
+}
+
+fn render_summary_with_optional_details(
+    daily: &DailyAttribution,
+    window: &WindowAttribution,
+    details: Option<&DailyAttributionDetails>,
+) -> String {
     let date = daily.date.format("%Y-%m-%d");
-    let today_total: f64 = daily.families.iter().map(|f| f.total_pnl).sum();
+    let daily_realized: f64 = daily.families.iter().map(|f| f.realized_pnl).sum();
+    let end_unrealized: f64 = daily.families.iter().map(|f| f.unrealized_pnl).sum();
     let win_realized: f64 = window.families.iter().map(|f| f.realized_pnl).sum();
-    let win_unreal: f64 = window.families.iter().map(|f| f.unrealized_pnl).sum();
+    let open_lots: i64 = daily.families.iter().map(|f| f.open_lots).sum();
+    let sold_segments: i64 = daily.families.iter().map(|f| f.realized_trades).sum();
+    let valuation_incomplete = daily
+        .families
+        .iter()
+        .any(|f| f.suspicious_lots > 0 || f.unvalued_lots > 0);
     let mut lines = vec![
         format!("📊 虚拟盘归因 {date}"),
-        "━━━━━━━━━━━━━━━━━━━━".to_string(),
-        format!("【今日】合计 {:<12}", fmt_money(today_total)),
+        "━━━━━━━━━━━━━━━━━━━━".into(),
+        if valuation_incomplete {
+            "重点：数据存疑或缺估值，可信持仓合计不可用；以下价差仅作参考。".into()
+        } else if sold_segments == 0 {
+            format!("重点：今日无已平仓交易；期末仍持有 {open_lots} 个批次。")
+        } else {
+            format!(
+                "重点：今日已实现 {} 元；期末持仓浮盈 {} 元。",
+                fmt_signed_money(daily_realized),
+                fmt_signed_money(end_unrealized)
+            )
+        },
+        format!("【今日已实现】{} 元", fmt_signed_money(daily_realized)),
         format!(
-            "【{}天】已实现 {:<8} 期末浮盈 {}",
-            window.days,
-            fmt_money(win_realized),
-            fmt_money(win_unreal)
+            "【期末累计浮盈】{} 元（不是今日涨跌）",
+            fmt_signed_money(end_unrealized)
         ),
-        "━━━━━━━━━━━━━━━━━━━━".to_string(),
+        format!(
+            "【{}天】已实现 {} 元",
+            window.days,
+            fmt_signed_money(win_realized)
+        ),
+        "口径：旧策略账本价差；实扣费用未核验，与新持仓起点账户分开。".into(),
+        "━━━━━━━━━━━━━━━━━━━━".into(),
     ];
+    if let Some(details) = details {
+        lines.push(format!(
+            "今日成交：买入 {} 笔/{} 股；卖出 {} 笔/{} 股",
+            details.buy_fills, details.buy_quantity, details.sell_fills, details.sell_quantity
+        ));
+        lines.push(format!(
+            "持仓明细（{} 个股票/策略组合）：",
+            details.holdings.len()
+        ));
+        for holding in details.holdings.iter().take(6) {
+            let value = holding
+                .market_value
+                .map(fmt_money)
+                .unwrap_or_else(|| "不可用".into());
+            let pnl = holding
+                .unrealized_pnl
+                .map(fmt_signed_money)
+                .unwrap_or_else(|| "不可用".into());
+            let price = holding
+                .close_price
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "缺收盘价".into());
+            lines.push(format!(
+                "• {} {} 股｜成本 {:.3}/收盘 {}",
+                holding.code,
+                holding.quantity,
+                holding.cost_notional / holding.quantity as f64,
+                price
+            ));
+            lines.push(format!(
+                "  市值 {value} 元｜期末浮盈 {pnl} 元｜{}{}",
+                holding.family.as_str(),
+                if holding.suspicious {
+                    "｜数据存疑"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if details.holdings.len() > 6 {
+            lines.push(format!(
+                "其余 {} 项见完整日报。",
+                details.holdings.len() - 6
+            ));
+        }
+        if details.holdings.is_empty() {
+            lines.push("当前无未平仓持仓。".into());
+        }
+    } else if open_lots > 0 {
+        lines.push("持仓逐股明细不可用；不能用空交易行代替持仓。".into());
+    }
     let mut families: Vec<&FamilyAggregate> = daily.families.iter().collect();
     families.sort_by(|a, b| {
         b.total_pnl
@@ -101,28 +198,35 @@ pub fn render_summary(daily: &DailyAttribution, window: &WindowAttribution) -> S
             .partial_cmp(&a.total_pnl.abs())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let ranks = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
-    for (i, f) in families.iter().enumerate() {
-        let rank = ranks.get(i).copied().unwrap_or("•");
-        let label = match f.family {
-            SignalFamily::PostCloseFundInflow => "盘后资金流入",
-            SignalFamily::ExitByRule => "ExitByRule(卖)",
-            other => other.as_str(),
-        };
+    for f in families {
+        if f.open_lots == 0 && f.realized_trades == 0 {
+            continue;
+        }
         let win = f
             .win_rate
-            .map(|w| format!("胜率{:.0}%", w * 100.0))
-            .unwrap_or_else(|| "胜率-".to_string());
+            .map(|w| format!("｜卖出匹配段胜率 {:.0}%", w * 100.0))
+            .unwrap_or_default();
         lines.push(format!(
-            "{} {:<8} {:>6}笔 {:<10} {}",
-            rank,
-            label,
-            f.realized_trades,
-            fmt_money(f.realized_pnl),
+            "{}：持仓 {} 批｜卖出匹配 {} 段",
+            family_label(f.family),
+            f.open_lots,
+            f.realized_trades
+        ));
+        lines.push(format!(
+            "  已实现 {}｜期末浮盈 {}{}",
+            fmt_signed_money(f.realized_pnl),
+            fmt_signed_money(f.unrealized_pnl),
             win
         ));
     }
-    lines.push("━━━━━━━━━━━━━━━━━━━━".to_string());
+    for trade in daily.top_trades.iter().take(3) {
+        lines.push(format!(
+            "平仓重点：{} {} 元｜{}",
+            trade.code,
+            fmt_signed_money(trade.pnl),
+            family_label(trade.entry_family)
+        ));
+    }
     let suspicious: i64 = daily.families.iter().map(|f| f.suspicious_lots).sum();
     let suspicious_pnl: f64 = daily.families.iter().map(|f| f.suspicious_pnl).sum();
     let unvalued: i64 = daily.families.iter().map(|f| f.unvalued_lots).sum();
@@ -132,30 +236,36 @@ pub fn render_summary(daily: &DailyAttribution, window: &WindowAttribution) -> S
         .filter(|f| f.family == SignalFamily::Unknown)
         .map(|f| f.open_lots + f.realized_trades)
         .sum();
-    let mut quality = Vec::new();
     if suspicious > 0 {
-        // spec §4.4.2 影响金额: 已实现口径 (suspicious_pnl), 正数带 "+"
-        quality.push(format!(
-            "⚠ 数据存疑 {suspicious}笔 ({})",
+        lines.push(format!(
+            "⚠ 数据存疑 {suspicious}笔 ({})；可信合计不可用，以上为未核验参考。",
             fmt_signed_money(suspicious_pnl)
         ));
     }
     if unvalued > 0 {
-        quality.push(format!("⚠ 未估值 {unvalued} lot"));
+        lines.push(format!("⚠ 未估值 {unvalued} lot；完整持仓合计不可用。"));
     }
     if unknown > 0 {
-        quality.push(format!("⚠ Unknown {unknown}"));
+        lines.push(format!("⚠ Unknown {unknown}；不能据此判断策略胜负。"));
     }
-    if !quality.is_empty() {
-        lines.push(quality.join("  |  "));
-    }
+    lines.push("下一步：核对持仓估值与成交依据；本报告不签发买卖指令。".into());
     lines.join("\n")
+}
+
+fn family_label(family: SignalFamily) -> &'static str {
+    match family {
+        SignalFamily::PostCloseFundInflow => "盘后资金流入",
+        SignalFamily::ExitByRule => "ExitByRule(卖)",
+        other => other.as_str(),
+    }
 }
 
 /// 全文 markdown (spec §4.4 五节)
 pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution) -> String {
     let date = daily.date.format("%Y-%m-%d");
     let mut out = vec![format!("# 虚拟盘归因 {date}"), String::new()];
+    out.push("口径：当日卖出价差与期末累计浮盈分列。期末浮盈不是今日损益；实扣手续费未核验。旧策略账本与以实际持仓为起点的新账户分开。".into());
+    out.push(String::new());
     out.push("## 数据质量审计".to_string());
     let mut suspicious_count: i64 = 0;
     let mut suspicious_total: f64 = 0.0;
@@ -184,11 +294,14 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
         .iter()
         .any(|f| f.suspicious_lots > 0 || f.unvalued_lots > 0)
     {
-        out.push("- 无数据质量问题".to_string());
+        out.push(
+            "- 当前审计未发现已标记的可疑 lot 或缺价；不代表成交价格、实扣费用与收益已全面核验。"
+                .into(),
+        );
     }
     out.push(String::new());
     out.push("## 今日归因".to_string());
-    out.push("| 信号族 | 已实现 | 浮盈 | 合计 | 笔数 | 胜率 |".to_string());
+    out.push("| 信号族 | 今日已实现 | 期末累计浮盈 | 已实现加期末浮盈（非今日损益） | 卖出匹配段 | 匹配段胜率 |".to_string());
     out.push("|---|---|---|---|---|---|".to_string());
     for f in &daily.families {
         out.push(format!(
@@ -241,6 +354,48 @@ pub fn render_full_markdown(daily: &DailyAttribution, window: &WindowAttribution
     }
     out.push(String::new());
     out.join("\n")
+}
+
+/// Same frozen daily inputs; no database read or accounting recalculation occurs
+/// while producing the detailed artifact.
+pub fn render_full_markdown_with_details(
+    daily: &DailyAttribution,
+    window: &WindowAttribution,
+    details: &DailyAttributionDetails,
+) -> String {
+    let mut markdown = render_full_markdown(daily, window);
+    markdown.push_str("\n## 今日成交与当前持仓明细\n");
+    markdown.push_str(&format!("买入 {} 笔/{} 股；卖出 {} 笔/{} 股。匹配段胜率按卖出消耗的入场 lot 统计，不等于完整策略周期胜率。\n\n", details.buy_fills, details.buy_quantity, details.sell_fills, details.sell_quantity));
+    markdown.push_str("| 代码 | 入场族 | 数量 | 剩余成本均价 | 收盘价 | 期末市值 | 期末累计浮盈 | 质量 |\n|---|---|---:|---:|---:|---:|---:|---|\n");
+    for h in &details.holdings {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {:.3} | {} | {} | {} | {} |\n",
+            h.code,
+            h.family.as_str(),
+            h.quantity,
+            h.cost_notional / h.quantity as f64,
+            h.close_price
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "不可用".into()),
+            h.market_value
+                .map(fmt_money)
+                .unwrap_or_else(|| "不可用".into()),
+            h.unrealized_pnl
+                .map(fmt_signed_money)
+                .unwrap_or_else(|| "不可用".into()),
+            if h.suspicious {
+                "存疑，仅作参考"
+            } else if h.close_price.is_none() {
+                "缺收盘价"
+            } else {
+                "沿用本次归因估值输入"
+            }
+        ));
+    }
+    if details.holdings.is_empty() {
+        markdown.push_str("当前无未平仓持仓。\n");
+    }
+    markdown
 }
 
 #[cfg(test)]
@@ -426,5 +581,68 @@ mod tests {
                 "forbidden test string leaked: {forbidden}"
             );
         }
+    }
+    fn carried_position_report() -> (DailyAttribution, WindowAttribution, DailyAttributionDetails) {
+        use crate::performance::attribution::{
+            aggregate_families, daily_attribution_details, fifo_match, AttributionFillRow,
+        };
+        let date = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let rows = vec![AttributionFillRow {
+            id: 1,
+            code: "TEST_CODE_600000".into(),
+            direction: "buy".into(),
+            fill_price: Some(10.0),
+            quantity: 1000,
+            local_ts: "2026-10-08 10:00:00".into(),
+            plan_id: "TEST_CODE_news_entry".into(),
+            virtual_reason: "NewsCatalyst".into(),
+        }];
+        let prices = std::collections::HashMap::from([("TEST_CODE_600000".into(), 4.3)]);
+        let (trades, open) = fifo_match(&rows, date).unwrap();
+        let families = aggregate_families(&trades, &open, &prices);
+        (
+            DailyAttribution {
+                date,
+                families: families.clone(),
+                top_trades: vec![],
+            },
+            WindowAttribution {
+                days: 30,
+                end: date,
+                families,
+            },
+            daily_attribution_details(date, &rows, &open, &prices).unwrap(),
+        )
+    }
+    #[test]
+    fn carried_loss_is_presented_as_end_valuation_not_todays_loss_or_empty_strategy() {
+        let (daily, window, details) = carried_position_report();
+        let text = render_summary_with_details(&daily, &window, &details);
+        assert!(text.contains("今日无已平仓交易"));
+        assert!(text.contains("【今日已实现】+0"));
+        assert!(text.contains("【期末累计浮盈】-5,700"));
+        assert!(text.contains("TEST_CODE_600000 1000 股｜成本 10.000/收盘 4.300"));
+        assert!(text.contains("市值 4,300 元｜期末浮盈 -5,700"));
+        assert!(!text.contains("【今日】合计 -5,700"));
+        assert!(!text.contains("0笔 0"));
+        let markdown = render_full_markdown_with_details(&daily, &window, &details);
+        assert!(markdown.contains(
+            "| TEST_CODE_600000 | NewsCatalyst | 1000 | 10.000 | 4.300 | 4,300 | -5,700 |"
+        ));
+        assert!(text.contains("实扣费用未核验"));
+    }
+    #[test]
+    fn missing_or_disputed_valuation_is_unavailable_not_a_trusted_zero() {
+        let (mut daily, window, mut details) = carried_position_report();
+        details.holdings[0].market_value = None;
+        details.holdings[0].close_price = None;
+        details.holdings[0].unrealized_pnl = None;
+        daily.families[0].unvalued_lots = 1;
+        daily.families[0].suspicious_lots = 1;
+        let text = render_summary_with_details(&daily, &window, &details);
+        assert!(text.contains("市值 不可用 元｜期末浮盈 不可用 元"));
+        assert!(text.contains("可信合计不可用"));
+        assert!(text.contains("完整持仓合计不可用"));
+        assert!(text.contains("以上为未核验参考"));
     }
 }

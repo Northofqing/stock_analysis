@@ -171,7 +171,12 @@ fn render(
     scope_note: &str,
     rows: &[&AdmittedRealtimeQuote],
 ) -> String {
-    let mut text = report_header(slot, banner, scope_note);
+    let changes = rows
+        .iter()
+        .map(|quote| (quote.name(), quote.code(), quote.change_percent()))
+        .collect::<Vec<_>>();
+    let focus = quote_focus(&changes);
+    let mut text = report_header(slot, banner, scope_note, &focus);
     for quote in rows {
         text.push_str(&format!(
             "{}({}) {:.2} {:+.2}% | 源 {}\n",
@@ -190,10 +195,57 @@ fn render(
     );
     text
 }
-fn report_header(slot: &ObservationSlot, banner: &str, scope_note: &str) -> String {
+// Display-only statistics over the sealed quotes above. This private string
+// formatter cannot create a PreparedObservation, evidence or delivery binding.
+fn quote_focus(changes: &[(&str, &str, f64)]) -> String {
+    if changes.is_empty() {
+        return "本轮: 无可展示报价\n".to_owned();
+    }
+    let rising = changes.iter().filter(|row| row.2 > 0.0).count();
+    let falling = changes.iter().filter(|row| row.2 < 0.0).count();
+    let unchanged = changes.len() - rising - falling;
+    let mut ranked = changes.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .2
+            .abs()
+            .total_cmp(&left.2.abs())
+            .then_with(|| left.1.cmp(right.1))
+    });
+    let mut focus = format!(
+        "本轮: {} 只报价 | 涨 {} / 跌 {} / 平 {} | 最大绝对涨跌幅 {:.2}%\n",
+        changes.len(),
+        rising,
+        falling,
+        unchanged,
+        ranked[0].2.abs()
+    );
+    focus.push_str(&format!(
+        "变动较大 Top{}（较昨收，按绝对涨跌幅）:\n",
+        ranked.len().min(3)
+    ));
+    for (name, code, change) in ranked.iter().take(3) {
+        focus.push_str(&format!("· {name}({code}) {change:+.2}%\n"));
+    }
+    focus
+}
+
+fn report_header(slot: &ObservationSlot, banner: &str, scope_note: &str, focus: &str) -> String {
+    let window = if slot.slot == "auction" {
+        "09:20–09:25".to_owned()
+    } else {
+        slot.slot
+            .strip_prefix("intraday:")
+            .and_then(|start| chrono::NaiveTime::parse_from_str(start, "%H:%M").ok())
+            .map(|start| {
+                let (end, _) = start.overflowing_add_signed(chrono::Duration::minutes(15));
+                format!("{}–{}", start.format("%H:%M"), end.format("%H:%M"))
+            })
+            .unwrap_or_else(|| "时段未确认".to_owned())
+    };
     format!(
-        "{}\n📊 {}（{}，北京时间）\n{}\n",
-        banner, slot.label, slot.business_date, scope_note
+        "📊 {}（{} {}，北京时间）\n边界: 名单报价观察，不代表当前持仓或账户收益\n{}{}\n{}\n【完整报价明细】\n",
+        slot.label, slot.business_date, window, focus, banner, scope_note
     )
 }
 
@@ -489,10 +541,55 @@ mod tests {
             &slot,
             "[🔴 Frozen | 仓位缺失 | 日盈亏缺失 | 数据Degraded]",
             "观察名单来源: 本地记录 2026-09-28；不代表今日持仓",
+            "",
         );
         assert!(text.contains("Frozen | 仓位缺失 | 日盈亏缺失 | 数据Degraded"));
         assert!(text.contains("2026-09-28；不代表今日持仓"));
         assert!(!text.contains("买入") && !text.contains("涨停"));
+        assert!(text.starts_with("📊 盘内报价观察（2026-10-08 13:30–13:45，北京时间）"));
+        assert!(text
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("不代表当前持仓或账户收益"));
+    }
+    #[test]
+    fn retained_observation_focus_counts_and_ranks_changes_without_portfolio_pnl() {
+        let original = [
+            ("TEST_CODE 甲", "TEST_CODE_000001", 1.5),
+            ("TEST_CODE 乙", "TEST_CODE_000002", -4.0),
+            ("TEST_CODE 丙", "TEST_CODE_000003", 4.0),
+            ("TEST_CODE 丁", "TEST_CODE_000004", 0.0),
+            ("TEST_CODE 戊", "TEST_CODE_000005", -0.5),
+        ];
+        let focus = quote_focus(&original);
+        assert!(focus.contains("5 只报价 | 涨 2 / 跌 2 / 平 1 | 最大绝对涨跌幅 4.00%"));
+        assert!(focus.contains("TEST_CODE 乙(TEST_CODE_000002) -4.00%"));
+        assert!(focus.contains("TEST_CODE 丙(TEST_CODE_000003) +4.00%"));
+        assert!(focus.find("TEST_CODE 乙").unwrap() < focus.find("TEST_CODE 丙").unwrap());
+        assert!(focus.find("TEST_CODE 丙").unwrap() < focus.find("TEST_CODE 甲").unwrap());
+        assert!(!focus.contains("TEST_CODE 丁") && !focus.contains("TEST_CODE 戊"));
+        assert!(!focus.contains("组合") && !focus.contains("盈亏") && !focus.contains("买入"));
+    }
+    #[test]
+    fn retained_observation_empty_focus_is_unavailable_not_zero_pnl() {
+        let focus = quote_focus(&[]);
+        assert_eq!(focus, "本轮: 无可展示报价\n");
+        assert!(!focus.contains("0.00%"));
+    }
+    #[test]
+    fn retained_observation_auction_focus_precedes_full_scope_and_account_banner() {
+        let slot = ObservationSlot::at(at("2026-10-08T01:20:00Z")).unwrap();
+        let focus = quote_focus(&[("TEST_CODE 标的", "TEST_CODE_000001", -2.0)]);
+        let text = report_header(&slot, "TEST_CODE Frozen", "TEST_CODE 原名单来源", &focus);
+        assert!(text.starts_with("📊 集合竞价报价观察（2026-10-08 09:20–09:25，北京时间）"));
+        assert!(text
+            .lines()
+            .nth(2)
+            .unwrap()
+            .contains("1 只报价 | 涨 0 / 跌 1 / 平 0"));
+        assert!(text.find("最大绝对涨跌幅").unwrap() < text.find("TEST_CODE Frozen").unwrap());
+        assert!(text.contains("TEST_CODE 原名单来源"));
     }
     #[test]
     fn retained_observation_missing_quote_is_unavailable_before_any_binding() {

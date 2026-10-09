@@ -1396,6 +1396,68 @@ struct DataModeTextParams<'a> {
     eta: Option<&'a str>,
 }
 
+/// New-message focus uses only this notification's actual restrictions and
+/// missing list. The caller did not supply the previous missing list, so a
+/// same-mode update cannot claim which individual capability recovered.
+fn render_data_mode_focus(params: &DataModeTextParams<'_>) -> String {
+    let state = if params.old == Some(params.new) {
+        match params.new {
+            DataMode::Full => "当前行情状态维持",
+            DataMode::Degraded | DataMode::Unsafe => "行情限制仍在",
+        }
+    } else {
+        "行情状态更新"
+    };
+    let restriction = if params.restrictions.is_empty() {
+        if params.new == DataMode::Full {
+            "本轮未设置行情输出限制；账户与交易资格仍需单独核验".to_owned()
+        } else {
+            "本轮输出限制未披露，不能据此判断恢复".to_owned()
+        }
+    } else {
+        params.restrictions.join("；")
+    };
+    let missing = params.missing_items.trim();
+    let missing = if missing == "(无)" || missing == "无" {
+        "无".to_owned()
+    } else if missing.is_empty() {
+        "未披露".to_owned()
+    } else {
+        let items = missing
+            .split('/')
+            .filter(|item| !item.trim().is_empty())
+            .collect::<Vec<_>>();
+        let mut labels = items
+            .iter()
+            .take(3)
+            .map(|item| match item.trim() {
+                "Quote" => "实时价格",
+                "Kline" => "K 线",
+                "MoneyFlow" => "资金流",
+                "News" => "新闻",
+                "OrderBook" => "盘口深度",
+                other => other,
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        if items.len() > 3 {
+            labels.push_str(&format!(
+                "（另有 {} 项，见下方受影响列表）",
+                items.len() - 3
+            ));
+        }
+        if labels.is_empty() {
+            "未披露".to_owned()
+        } else {
+            labels
+        }
+    };
+    format!(
+        "📡 {state}（{}）\n重点：{restriction}\n主要缺项：{missing}\n\n【状态与账户依据】\n",
+        params.hhmm
+    )
+}
+
 fn render_data_mode_body(params: &DataModeTextParams<'_>, account_status: Option<&str>) -> String {
     let mut out = format!(
         "📡 数据状态变更（{}）\n{} → {}\n受影响: {}\n输出限制:",
@@ -1417,13 +1479,18 @@ fn render_data_mode_message(
     params: &DataModeTextParams<'_>,
     source: &impl BannerExternalNoteSource,
 ) -> String {
+    let mut text = render_data_mode_focus(params);
     if let Some(banner) = banner {
-        let mut text = format!("{}\n", banner.capture_with_external_notes(source).render());
+        text.push_str(&format!(
+            "{}\n",
+            banner.capture_with_external_notes(source).render()
+        ));
         text.push_str(&render_data_mode_body(params, None));
         return text;
     }
     let account_status = account_status_note_with_source(source);
-    render_data_mode_body(params, Some(&account_status))
+    text.push_str(&render_data_mode_body(params, Some(&account_status)));
+    text
 }
 
 pub fn render_data_mode(
@@ -2036,7 +2103,7 @@ pub struct PaperTradeParams<'a> {
 }
 
 /// T-11 竞价异动 (复用 AuctionVolume, 加横幅)
-/// v12 §14.1 T-11 AuctionVolume 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
+/// T-11 将输入首位竞价观察前置；其余条目保留原顺序与完整治理横幅。
 pub fn render_auction_volume(
     banner: &BannerCtx,
     hhmm: &str,
@@ -2055,13 +2122,23 @@ fn render_auction_volume_from_captured(
     sentiment: &str,
     watch_status: &str,
 ) -> String {
-    let mut out = format!(
-        "{}\n🌅 竞价热点量能 Top{}（{}）",
-        banner.render(),
-        items.len(),
-        hhmm
-    );
-    for it in items {
+    let mut out = format!("🌅 竞价热点量能 Top{}（{}）", items.len(), hhmm);
+    if let Some(first) = items.first() {
+        out.push_str(&format!(
+            "\n首位观察: {}({}) 高开{:+.1}% 量比{:.1} [{}]",
+            first.name, first.code, first.gap_pct, first.vol_ratio, first.tag
+        ));
+    } else {
+        out.push_str("\n重点: 无有效竞价条目");
+    }
+    out.push_str(&format!(
+        "\n处理: 等待开盘成交核验｜持仓关系未核验\n{}",
+        banner.render()
+    ));
+    if items.len() > 1 {
+        out.push_str("\n【其他竞价条目】");
+    }
+    for it in items.iter().skip(1) {
         out.push_str(&format!(
             "\n  {}({}) 高开{:+.1}% 量比{:.1} [{}]",
             it.name, it.code, it.gap_pct, it.vol_ratio, it.tag,
@@ -9745,6 +9822,7 @@ pub fn render_auction_repush(
     top5: &[stock_analysis::opportunity::candidate_panel::CandidateEntry],
 ) -> String {
     let mut text = format!("🔔 竞价优选 Top{}（{}）\n", top5.len(), hhmm);
+    let mut remaining_rows = String::new();
     for (index, entry) in top5.iter().enumerate() {
         let price = entry
             .current_price
@@ -9756,7 +9834,7 @@ pub fn render_auction_repush(
             .filter(|value| value.is_finite())
             .map(|value| format!("{value:+.0}"))
             .unwrap_or_else(|| "-".to_string());
-        text.push_str(&format!(
+        let row = format!(
             "{}. {}({}) {} | 现价 {} | 热度 {}\n",
             index + 1,
             entry.name,
@@ -9768,7 +9846,21 @@ pub fn render_auction_repush(
                 .unwrap_or("候选"),
             price,
             heat,
-        ));
+        );
+        if index == 0 {
+            text.push_str("首位观察: ");
+            text.push_str(&row);
+        } else {
+            remaining_rows.push_str(&row);
+        }
+    }
+    if top5.is_empty() {
+        text.push_str("重点: 无有效候选\n");
+    }
+    text.push_str("处理: 等待开盘成交核验｜持仓关系未核验\n");
+    if !remaining_rows.is_empty() {
+        text.push_str("【其他候选明细】\n");
+        text.push_str(&remaining_rows);
     }
     text.push_str("竞价阶段, 以开盘实际成交为准 | 辅助建议, 非下单指令");
     text
@@ -11028,15 +11120,16 @@ where
 #[derive(Debug)]
 pub struct PositionReviewParams<'a> {
     pub date: &'a str,
+    pub account_snapshot_at: &'a str,
     pub total_assets: f64,
+    pub account_market_value: f64,
     pub position_ratio_pct: f64,
     pub available_cash: f64,
     pub daily_pnl: f64,
     pub unrealized_pnl: f64,
-    pub unrealized_return_pct: f64,
-    pub position_count: usize,
+    pub unrealized_return_pct: Option<f64>,
     pub market_value: f64,
-    /// (行业, 市值占比 %) — 按市值加权, top5 + 其他 (BR-222 排序规则)
+    /// 用户持仓标签，按本批收盘市值加权；标签不等同于行业。
     pub sectors: &'a [(String, f64)],
     /// 个股明细 (BR-233: 逐个复盘)
     pub items: &'a [PositionReviewItem],
@@ -11061,7 +11154,7 @@ pub struct PositionReviewItem {
 fn validated_position_review_items(
     valuation: &stock_analysis::portfolio::closing_valuation::ClosingValuationView,
 ) -> Result<(Vec<PositionReviewItem>, f64, f64), String> {
-    if valuation.covered != valuation.total {
+    if valuation.covered != valuation.total || valuation.items.len() != valuation.total {
         return Err(format!(
             "closing valuation coverage incomplete: covered={} total={}",
             valuation.covered, valuation.total
@@ -11078,6 +11171,12 @@ fn validated_position_review_items(
 
     let mut items = Vec::with_capacity(valuation.items.len());
     for item in &valuation.items {
+        if item.quantity == 0 || !item.cost_price.is_finite() || item.cost_price <= 0.0 {
+            return Err(format!(
+                "closing valuation {} quantity or cost invalid",
+                item.code
+            ));
+        }
         let close = item
             .close
             .filter(|value| value.is_finite() && *value > 0.0)
@@ -11131,18 +11230,59 @@ fn validated_position_review_items(
 /// BR-222: R-11 持仓复盘模板渲染 (用户确认持仓摘要, 盘后 1次/日)。
 pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
     let mut out = format!("🏦 持仓复盘（{}）\n", p.date);
+    let ret = p
+        .unrealized_return_pct
+        .map(|v| format!("{v:+.2}%"))
+        .unwrap_or_else(|| "未取得".to_string());
     out.push_str(&format!(
-        "总资产 {:.0} | 仓位 {:.1}% | 可用现金 {:.0}\n",
-        p.total_assets, p.position_ratio_pct, p.available_cash
+        "收盘市值 {:.2} | 累计浮盈 {:+.2}（成本收益率 {}）\n",
+        p.market_value, p.unrealized_pnl, ret
+    ));
+    if let Some(item) = p
+        .items
+        .iter()
+        .max_by(|a, b| a.market_value.total_cmp(&b.market_value))
+    {
+        let weight = if p.market_value > 0.0 {
+            item.market_value / p.market_value * 100.0
+        } else {
+            0.0
+        };
+        out.push_str(&format!(
+            "重点：最大持仓 {}({})，市值占比 {:.1}%\n",
+            item.name, item.code, weight
+        ));
+    }
+    if let Some(item) = p
+        .items
+        .iter()
+        .filter(|i| i.unrealized_pnl < 0.0)
+        .min_by(|a, b| a.unrealized_pnl.total_cmp(&b.unrealized_pnl))
+    {
+        out.push_str(&format!(
+            "最大累计浮亏 {}({}) {:+.2}\n",
+            item.name, item.code, item.unrealized_pnl
+        ));
+    }
+    let daily = p
+        .items
+        .iter()
+        .try_fold(0.0, |sum, item| {
+            item.daily_price_pnl.map(|value| sum + value)
+        })
+        .filter(|value| value.is_finite());
+    out.push_str(&format!(
+        "按本批数量计算的参考收盘价格损益：{}\n",
+        daily
+            .map(|v| format!("{v:+.2}"))
+            .unwrap_or_else(|| "未取得（参考收盘价覆盖不足）".to_string())
     ));
     out.push_str(&format!(
-        "日盈亏 {:+.2} | 未实现盈亏 {:+.2}（{:.2}%）\n",
-        p.daily_pnl, p.unrealized_pnl, p.unrealized_return_pct
+        "{} 只 | {} 已验证收盘估值\n",
+        p.items.len(),
+        p.date
     ));
-    out.push_str(&format!(
-        "持仓 {} 只 | 持仓市值 {:.0}\n",
-        p.position_count, p.market_value
-    ));
+    out.push_str("浮盈按已记录成本计算，可能与券商精确成本有尾差；价格损益比较日期未记录，不包含现金与成交变化。\n");
     if !p.items.is_empty() {
         out.push_str("\n逐个复盘:\n");
         for (index, item) in p.items.iter().enumerate() {
@@ -11159,7 +11299,7 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
                 .map(|v| format!("{v:+.2}"))
                 .unwrap_or_else(|| "-".to_string());
             out.push_str(&format!(
-                "{}. {}({}) {}股 | 成本{:.2} 现价{} | 市值{:.0}\n   未实现{:+.0}({}) | 当日{}\n",
+                "{}. {}({}) {}股 | 成本{:.3} 收盘价{} | 市值{:.2}\n   累计浮盈{:+.2}({}) | 参考收盘价格损益{}\n",
                 index + 1,
                 item.name,
                 item.code,
@@ -11173,9 +11313,13 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
             ));
         }
     }
-    out.push_str("行业分布（按市值）: ");
+    out.push_str("最新持仓标签（按本批收盘市值；非行业分类）: ");
     if p.sectors.is_empty() {
-        out.push_str("(无持仓)\n");
+        out.push_str(if p.items.is_empty() {
+            "(无持仓)\n"
+        } else {
+            "(标签未取得)\n"
+        });
     } else {
         for (index, (sector, pct)) in p.sectors.iter().enumerate() {
             out.push_str(&format!(
@@ -11187,8 +11331,22 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
         }
         out.push('\n');
     }
-    out.push_str("仅结构化事实, 非下单指令");
+    out.push_str(&format!(
+        "\n用户确认账户快照（{}）\n资产 {:.2} | 证券市值 {:.2} | 现金 {:.2} | 仓位 {:.1}%\n快照记录的当日盈亏 {:+.2}；仅代表该快照时点，未用来补算本批估值。\n仅结构化事实, 非下单指令",
+        p.account_snapshot_at, p.total_assets, p.account_market_value, p.available_cash,
+        p.position_ratio_pct, p.daily_pnl
+    ));
     out
+}
+
+fn position_review_cost_return(items: &[PositionReviewItem], unrealized_pnl: f64) -> Option<f64> {
+    let cost: f64 = items
+        .iter()
+        .map(|item| item.quantity as f64 * item.cost_price)
+        .sum();
+    (cost.is_finite() && cost > 0.0 && unrealized_pnl.is_finite())
+        .then(|| unrealized_pnl / cost * 100.0)
+        .filter(|value| value.is_finite())
 }
 
 /// BR-xxx: R-11 复盘 AI 研判段 — 持仓市值 Top-N 调 deep_analyzer 多角色研判。
@@ -11197,7 +11355,7 @@ pub fn render_position_review(p: PositionReviewParams<'_>) -> String {
 /// - `--test` 进程不真跑 LLM（隔离）。
 /// - 未配置 DOUBAO/DEEPSEEK/GEMINI 任一 key → warn 出声跳过（fail-open，不阻塞复盘）。
 /// - 单只失败/超时（90s）→ warn 出声跳过该只。
-/// - 报告写 `reports/details/{date}_{code}.md`，推送文本只带摘要路径（全文过长）。
+/// - 报告写 `reports/details/{date}_{code}.md`，路径只记录日志，推送说明归档状态。
 #[derive(Debug, PartialEq, Eq)]
 enum ReviewAiWorkerOutcome<T> {
     Completed(T),
@@ -11299,12 +11457,7 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
                     secs,
                     path.display()
                 );
-                lines.push(format!(
-                    "AI研判 {}({}) 报告: {}",
-                    item.name,
-                    code,
-                    path.display()
-                ));
+                lines.push(format!("AI研判 {}({}) 详细报告已归档", item.name, code));
             }
             Ok(ReviewAiWorkerOutcome::Completed(Err(error))) => {
                 log::warn!(
@@ -11337,7 +11490,7 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
 ///
 /// 数据门: `user_account_summary` 无用户确认行 → no_data (不虚构账户状态);
 /// 收盘估值未持久化 → no_data。空持仓仍投递 (显示 "无持仓"), 用户确认摘要本身
-/// 是权威信息。行业分布按市值加权聚合, top5 + 其余归入 "其他"。
+/// 是权威信息。用户账户快照与本批收盘估值分别标注时点；标签分布只用本批市值。
 async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
     use stock_analysis::database::closing_valuation::{
         persisted_valuation_view_for_date, ClosingValuationView,
@@ -11443,29 +11596,23 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
             }
         };
 
-    // 行业分布: 持仓市值 = 收盘估值 market_value (优先) 或 shares * cost_price; 按 Position.sector 聚合
+    // 标签只是辅助元数据；数量与权重只来自同一已持久化估值，不能用新持仓补旧估值。
     let mut sector_value: std::collections::BTreeMap<String, f64> =
         std::collections::BTreeMap::new();
-    let mut total_position_value = 0.0_f64;
-    for position in &positions {
-        if position.status != stock_analysis::portfolio::PositionStatus::Holding {
-            continue;
-        }
-        let market_value = valuation
-            .valuation
-            .items
+    for item in &items {
+        let label = positions
             .iter()
-            .find(|item| item.code == position.code)
-            .and_then(|item| item.market_value)
-            .unwrap_or(position.shares as f64 * position.cost_price);
-        total_position_value += market_value;
-        *sector_value.entry(position.sector.clone()).or_insert(0.0) += market_value;
+            .find(|position| position.code == item.code)
+            .map(|position| position.sector.trim())
+            .filter(|label| !label.is_empty())
+            .unwrap_or("未分类");
+        *sector_value.entry(label.to_string()).or_insert(0.0) += item.market_value;
     }
     let mut sector_rows: Vec<(String, f64)> = sector_value
         .into_iter()
         .map(|(sector, value)| {
-            let pct = if total_position_value > 0.0 {
-                value / total_position_value * 100.0
+            let pct = if total_market_value > 0.0 {
+                value / total_market_value * 100.0
             } else {
                 0.0
             };
@@ -11486,23 +11633,17 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
         top_sectors.push(("其他".to_string(), remainder));
     }
 
-    let unrealized_return_pct = if summary.securities_market_value > 0.0 {
-        total_unrealized_pnl / summary.securities_market_value * 100.0
-    } else {
-        0.0
-    };
+    let unrealized_return_pct = position_review_cost_return(&items, total_unrealized_pnl);
     let params = PositionReviewParams {
         date,
+        account_snapshot_at: &summary.effective_at,
         total_assets: summary.total_assets,
+        account_market_value: summary.securities_market_value,
         position_ratio_pct: summary.position_ratio_pct,
         available_cash: summary.available_cash,
         daily_pnl: summary.daily_pnl,
         unrealized_pnl: total_unrealized_pnl,
         unrealized_return_pct,
-        position_count: positions
-            .iter()
-            .filter(|p| p.status == stock_analysis::portfolio::PositionStatus::Holding)
-            .count(),
         market_value: total_market_value,
         sectors: &top_sectors,
         items: &items,
@@ -11518,15 +11659,31 @@ async fn dispatch_position_review_outcome(date: &str) -> crate::review_batch::Re
     // 决策身份稳定 → 重启错过补偿批重跑时 preflight 复用, 不再重复推送。
     let source_binding_canonical = match serde_json::to_vec(&(
         date,
+        &valuation.run_id,
+        &valuation.valuation.provider,
+        (
+            &summary.effective_at,
+            summary.total_assets,
+            summary.securities_market_value,
+            summary.available_cash,
+            summary.position_ratio_pct,
+            summary.daily_pnl,
+            &summary.source,
+        ),
+        &top_sectors,
         items
             .iter()
             .map(|item| {
                 (
                     item.code.clone(),
+                    item.name.clone(),
                     item.quantity,
                     item.cost_price,
                     item.close,
                     item.unrealized_pnl,
+                    item.market_value,
+                    item.unrealized_return_pct,
+                    item.daily_price_pnl,
                 )
             })
             .collect::<Vec<_>>(),
@@ -11628,6 +11785,30 @@ fn r12_source_binding_canonical(
         .map_err(|error| format!("R-12 source binding serialization failed: {error}"))
 }
 
+/// New occurrences archive the original complete presentation before freezing
+/// a short card. Existing decisions are returned by the dispatcher preflight
+/// and continue to recover their original immutable envelope bytes.
+fn prepare_r12_review_presentation(
+    date: chrono::NaiveDate,
+    result: &stock_analysis::review::backtest::R12BacktestResult,
+    report_directory: &std::path::Path,
+) -> Result<(Vec<u8>, String), String> {
+    let source_binding = r12_source_binding_canonical(date, result)?;
+    let full = stock_analysis::review::backtest::render_r12(result);
+    let report = stock_analysis::performance::report::persist_report_revision(
+        report_directory,
+        date,
+        full.as_bytes(),
+    )?;
+    log::info!(
+        "[R-12] complete research report archived path={}",
+        report.display()
+    );
+    let mut text = stock_analysis::review::backtest::render_r12_summary(result);
+    text.push_str("\n完整样本与计算明细已归档。");
+    Ok((source_binding, text))
+}
+
 #[cfg(test)]
 mod tests_r12_review_audit {
     use super::{r12_has_auditable_result, r12_source_binding_canonical};
@@ -11724,6 +11905,63 @@ mod tests_r12_review_audit {
         assert_eq!(value["unaligned_signals"], 0);
         assert_eq!(value["censored_windows"], 0);
     }
+
+    #[test]
+    fn r12_short_card_archives_original_complete_bytes_without_changing_source_binding() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let result = stock_analysis::review::backtest::R12BacktestResult {
+            exit_rows_excluded: 347,
+            ..Default::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory.path().join("2026-10-08.md");
+        std::fs::write(&legacy, b"TEST_CODE_frozen_old_full_report").unwrap();
+        let full = stock_analysis::review::backtest::render_r12(&result);
+        let expected_source = r12_source_binding_canonical(date, &result).unwrap();
+        let (source, text) =
+            super::prepare_r12_review_presentation(date, &result, directory.path())
+                .expect("complete report must precede a short presentation");
+        assert_eq!(source, expected_source);
+        assert!(text.starts_with("📈 买入事件研究\n重点：暂无可对齐"));
+        assert!(text.contains("347 笔卖出事实"));
+        assert!(text.ends_with("完整样本与计算明细已归档。"));
+        assert!(!text.contains("reports/"));
+        let files = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &legacy)
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), full.as_bytes());
+        assert_eq!(
+            std::fs::read(&legacy).unwrap(),
+            b"TEST_CODE_frozen_old_full_report"
+        );
+        assert_eq!(
+            super::prepare_r12_review_presentation(date, &result, directory.path()).unwrap(),
+            (source, text),
+            "same report reuses its immutable revision"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn r12_archive_failure_produces_no_short_card() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let result = stock_analysis::review::backtest::R12BacktestResult {
+            exit_rows_excluded: 1,
+            ..Default::default()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let occupied = directory.path().join("TEST_CODE_not_a_report_directory");
+        std::fs::write(&occupied, b"TEST_CODE_existing_bytes").unwrap();
+        assert!(super::prepare_r12_review_presentation(date, &result, &occupied).is_err());
+        assert_eq!(
+            std::fs::read(&occupied).unwrap(),
+            b"TEST_CODE_existing_bytes"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 }
 
 async fn dispatch_r12_backtest_outcome_with_runner<Runner, RunnerFuture>(
@@ -11809,16 +12047,20 @@ async fn dispatch_r12_backtest_after_capability(
         log_dispatcher_attempt("R-12", false, 0, "no backtest signals in window");
         return crate::review_batch::ReviewTaskOutcome::no_data("no backtest signals in window");
     }
-    let text = stock_analysis::review::backtest::render_r12(&result);
     // BR-192 counted delivery: 信号计数来自同一回测窗口 (确定性), 决策身份稳定 →
     // 重启错过补偿批重跑时 preflight 复用, 不再重复推送。
-    let source_binding_canonical = match r12_source_binding_canonical(today, &result) {
-        Ok(canonical) => canonical,
-        Err(reason) => {
-            log_dispatcher_attempt("R-12", false, 1, &reason);
-            return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
-        }
-    };
+    let report_directory = stock_analysis::production_root::root_for_mode(
+        stock_analysis::risk::env_guard::runtime_is_test_process(),
+    )
+    .join("reports/review-backtest");
+    let (source_binding_canonical, text) =
+        match prepare_r12_review_presentation(today, &result, &report_directory) {
+            Ok(presentation) => presentation,
+            Err(reason) => {
+                log_dispatcher_attempt("R-12", false, 1, &reason);
+                return crate::review_batch::ReviewTaskOutcome::failed(true, reason);
+            }
+        };
     let outcome = dispatch_review_task_counted(
         "R-12-backtest-review",
         crate::notify::PushKind::ReviewBacktest,
@@ -16536,6 +16778,9 @@ async fn dispatch_catalyst_review_daily_outcome(
         date: &snapshot.date,
         theme: &snapshot.theme,
         score: derived_score,
+        score_basis: snapshot.score.is_none().then_some(
+            "当日涨停结构；min(涨停成员,100)×0.30 + min(连板成员,60)×0.50 + 结构档位常数(高20/中10/低0)，上限100；非收益预测",
+        ),
         persistent: snapshot.persistent,
         member_count: snapshot.member_count,
         continuous_count: snapshot.continuous_count,
@@ -17786,9 +18031,11 @@ pub fn render_bound_preopen_news_hot(
     let hhmm = input.captured_observed_at.format("%H:%M");
     let mut text = match mode {
         crate::p01::P01RenderMode::Scheduled => {
-            format!("📰 盘前热点（{hhmm}）\n")
+            format!("📰 盘前热点（{hhmm}）｜{}只样本观察\n", input.heads.len())
         }
-        crate::p01::P01RenderMode::Compensation => "📰 盘前热点补发\n".to_string(),
+        crate::p01::P01RenderMode::Compensation => {
+            format!("📰 盘前热点补发｜{}只样本观察\n", input.heads.len())
+        }
     };
     text.push_str(&format!("业务日 {}\n", input.context.business_date));
     text.push_str(&format!("依据前一交易日 {}\n", input.context.evidence_date));
@@ -17796,18 +18043,14 @@ pub fn render_bound_preopen_news_hot(
         text.push_str(&format!("补发时间 {hhmm}\n"));
     }
 
-    text.push_str("主线: ");
-    text.push_str(
-        &input
-            .heads
-            .iter()
-            .map(|head| head.concept.as_str())
-            .collect::<Vec<_>>()
-            .join(" / "),
-    );
-    text.push('\n');
-    text.push_str("催化:\n");
-    for head in &input.heads {
+    for (index, head) in input.heads.iter().enumerate() {
+        text.push_str(&format!(
+            "{}. {}({})｜样本分类: {}\n",
+            index + 1,
+            head.name,
+            head.code,
+            head.concept
+        ));
         // BR-241: each head contributes its newest admitted row. All remaining
         // rows and hashes stay in the canonical source binding for audit.
         if let Some(news) = head.news.first() {
@@ -17819,17 +18062,12 @@ pub fn render_bound_preopen_news_hot(
                 )
                 .format("%m-%d %H:%M");
             text.push_str(&format!(
-                "· {} → {}（{} {}）\n",
-                news.title, head.concept, news.source_name, published
+                "  来源新闻: {}（{} {}）\n",
+                news.title, news.source_name, published
             ));
+        } else {
+            text.push_str("  来源新闻: 未取得该标的有效新闻\n");
         }
-    }
-    text.push_str("关注票:\n");
-    for head in &input.heads {
-        text.push_str(&format!(
-            "· {}({}) 逻辑: {}\n",
-            head.name, head.code, head.concept
-        ));
     }
     text.push_str("辅助建议, 非下单指令");
     Ok(text)
@@ -17847,6 +18085,7 @@ pub fn render_intraday_market(banner: &BannerCtx, p: IntradayMarketParams<'_>) -
             }
         };
         let sc = score
+            .filter(|value| value.is_finite())
             .map(|v| format!("{:.1}", v))
             .unwrap_or_else(|| "N/A".to_string());
         let s_display = if s.is_empty() { "无" } else { s };
@@ -17857,36 +18096,53 @@ pub fn render_intraday_market(banner: &BannerCtx, p: IntradayMarketParams<'_>) -
         RotationState::Diverging => "分化",
         RotationState::Fading => "退潮",
     };
-    let main = p.main_attack.unwrap_or("暂无主攻");
+    let main = p
+        .main_attack
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("暂无主攻");
     format!(
-        "{}\n📊 盘中轮动（{}）\n科技: {}\n电力: {}\n机器人: {}\n当前主攻: {} | 轮动状态: {}\n辅助建议, 非下单指令",
-        banner.render(),
+        "📊 盘中轮动（{}）\n当前主攻: {} | 轮动状态: {}\n处理: 观察板块轮动｜持仓关系未核验\n{}\n【板块明细】\n科技: {}\n电力: {}\n机器人: {}\n辅助建议, 非下单指令",
         p.hhmm,
+        main,
+        state,
+        banner.render(),
         render_sub(p.tech_sub, p.tech_score),
         render_sub(p.power_sub, p.power_score),
         render_sub(p.robot_sub, p.robot_score),
-        main,
-        state,
     )
 }
 
 /// v13 §14.2 I-02 新闻催化映射（盘中交易建议类带 banner）
 pub fn render_news_catalyst(banner: &BannerCtx, p: NewsCatalystParams<'_>) -> String {
     let theme = p.theme.unwrap_or("未分类");
+    let missing_quotes = p
+        .stocks
+        .iter()
+        .filter(|(_, _, change, _)| change.is_none_or(|value| !value.is_finite()))
+        .count();
+    let quote_note = if missing_quotes > 0 {
+        format!("；{missing_quotes} 只缺涨跌幅，不判断其行情表现")
+    } else {
+        String::new()
+    };
     let mut s = format!(
-        "{}\n📰⚡ 新闻催化跟踪（{}）\n新闻: {}\n受益板块: {}\n",
-        banner.render(),
+        "📰⚡ 新闻催化跟踪（{}）\n新闻: {}\n受益板块: {} | 关联标的 {} 只\n处理: 催化参考｜持仓关系未核验{}\n{}\n【关联标的明细】\n",
         p.hhmm,
         p.headline,
-        theme
+        theme,
+        p.stocks.len(),
+        quote_note,
+        banner.render(),
     );
     for (name, code, chg, reason) in &p.stocks {
-        if let Some(c) = chg {
-            s.push_str(&format!(
-                "· {}({}) {:+.1}% | 原因:{}\n",
-                name, code, c, reason
-            ));
-        }
+        let change = chg
+            .filter(|value| value.is_finite())
+            .map(|value| format!("{value:+.1}%"))
+            .unwrap_or_else(|| "涨跌幅缺失".to_string());
+        s.push_str(&format!(
+            "· {}({}) {} | 原因:{}\n",
+            name, code, change, reason
+        ));
     }
     s.push_str("辅助建议, 非下单指令");
     s
@@ -17958,21 +18214,9 @@ pub fn render_news_to_idea(banner: &BannerCtx, p: NewsToIdeaParams<'_>) -> Strin
     };
     let theme = p.theme.unwrap_or("未分类");
     let mut s = format!(
-        "{}\n🧭 新闻驱动个股（{}）\n新闻: {}\n板块: {} | 阶段: {}\n个股: {}({})\n",
-        banner.render(),
-        p.hhmm,
-        p.headline,
-        theme,
-        stage,
-        p.name,
-        p.code
+        "🧭 新闻驱动个股（{}）\n个股: {}({}) | 板块: {} | 阶段: {}\n新闻: {}\n",
+        p.hhmm, p.name, p.code, theme, stage, p.headline,
     );
-    if !p.reasons.is_empty() {
-        s.push_str("推送原因:\n");
-        for r in &p.reasons {
-            s.push_str(&format!("· {}\n", r));
-        }
-    }
     if let Some(act) = p.action {
         let a = match act {
             NewsAction::Observe => "观察",
@@ -17980,6 +18224,15 @@ pub fn render_news_to_idea(banner: &BannerCtx, p: NewsToIdeaParams<'_>) -> Strin
             NewsAction::DoNotChase => "不追",
         };
         s.push_str(&format!("[建议动作: {}]\n", a));
+    } else {
+        s.push_str("处理: 观察；当前无动作标签\n");
+    }
+    s.push_str(&format!("{}\n", banner.render()));
+    if !p.reasons.is_empty() {
+        s.push_str("推送原因:\n");
+        for r in &p.reasons {
+            s.push_str(&format!("· {}\n", r));
+        }
     }
     s.push_str("辅助建议, 非下单指令");
     s
@@ -17990,6 +18243,9 @@ pub struct CatalystReviewParams<'a> {
     pub date: &'a str,
     pub theme: &'a str,
     pub score: Option<f32>,
+    /// Presentation provenance; an unlabeled number must not appear to be an
+    /// independently admitted score or an expected investment return.
+    pub score_basis: Option<&'a str>,
     pub persistent: PersistentLevel,
     pub member_count: usize,
     pub continuous_count: usize,
@@ -18015,6 +18271,7 @@ fn name_code_pairs(names: &[&str], codes: &[&str]) -> String {
 pub fn render_catalyst_review(p: CatalystReviewParams<'_>) -> String {
     let score = p
         .score
+        .filter(|value| value.is_finite())
         .map(|value| format!("{value:.1}"))
         .unwrap_or_else(|| "数据缺失（无独立评分批次）".to_string());
     let persistent = match p.persistent {
@@ -18023,9 +18280,16 @@ pub fn render_catalyst_review(p: CatalystReviewParams<'_>) -> String {
         PersistentLevel::Low => "低",
     };
     let mut s = format!(
-        "📰 题材催化复盘（{}）\n主线: {}\n涨停成员: {}家 | 连板成员: {}家 | 持续性结构: {}\n题材评分: {}\n",
-        p.date, p.theme, p.member_count, p.continuous_count, persistent, score
+        "📰 题材催化复盘（{}）｜{}家涨停 / {}家连板\n样本标签: {} | 结构档位: {}\n题材评分: {}\n",
+        p.date, p.member_count, p.continuous_count, p.theme, persistent, score
     );
+    if p.score.is_some_and(|value| value.is_finite()) {
+        let score_basis = p
+            .score_basis
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("未注明，不能解读为收益或胜率");
+        s.push_str(&format!("评分口径: {score_basis}\n"));
+    }
     if !p.leading_names.is_empty() {
         s.push_str(&format!(
             "前排成员（按连板数）: {}\n",
@@ -18903,13 +19167,14 @@ pub fn build_test_template_catalog(
         "R-11-position-review",
         render_position_review(PositionReviewParams {
             date,
+            account_snapshot_at: "2026-10-08T19:12:00+08:00",
             total_assets: 100_000.0,
+            account_market_value: 61_300.0,
             position_ratio_pct: 61.3,
             available_cash: 38_700.0,
             daily_pnl: 1_864.60,
             unrealized_pnl: -21_729.90,
-            unrealized_return_pct: -3.51,
-            position_count: 7,
+            unrealized_return_pct: Some(-3.51),
             market_value: 61_300.0,
             sectors: &[
                 ("TEST_CODE 算力".to_string(), 45.0),
@@ -19158,6 +19423,7 @@ pub fn build_test_template_catalog(
             date,
             theme: "TEST_CODE 算力",
             score: Some(8.5),
+            score_basis: None,
             persistent: PersistentLevel::High,
             member_count: 3,
             continuous_count: 2,
@@ -19652,6 +19918,80 @@ mod tests {
         let error = validated_position_review_items(&valuation)
             .expect_err("partial valuation must remain unavailable");
         assert!(error.contains("coverage incomplete"), "error={error}");
+    }
+
+    #[test]
+    fn position_review_separates_old_account_snapshot_from_closing_cost_return() {
+        let items = vec![PositionReviewItem {
+            code: "TEST_CODE_000001".into(),
+            name: "测试持仓".into(),
+            quantity: 100,
+            cost_price: 20.0,
+            close: Some(10.0),
+            market_value: 1_000.0,
+            unrealized_pnl: -1_000.0,
+            unrealized_return_pct: Some(-50.0),
+            daily_price_pnl: Some(-10.0),
+        }];
+        let ret = position_review_cost_return(&items, -1_000.0);
+        assert_eq!(ret, Some(-50.0));
+        let text = render_position_review(PositionReviewParams {
+            date: "2026-10-09",
+            account_snapshot_at: "2026-10-08T19:12:00+08:00",
+            total_assets: 5_000.0,
+            account_market_value: 3_000.0,
+            available_cash: 2_000.0,
+            position_ratio_pct: 60.0,
+            daily_pnl: 257.75,
+            unrealized_pnl: -1_000.0,
+            unrealized_return_pct: ret,
+            market_value: 1_000.0,
+            sectors: &[("高市盈率".into(), 100.0)],
+            items: &items,
+        });
+        let (current, old_snapshot) = text
+            .split_once("用户确认账户快照")
+            .expect("separate snapshot");
+        assert!(current.contains("成本收益率 -50.00%"));
+        assert!(current.contains("参考收盘价格损益：-10.00"));
+        assert!(current.contains("最大累计浮亏 测试持仓"));
+        assert!(!current.contains("257.75"));
+        assert!(!current.contains("资产 5000"));
+        assert!(!current.contains("行业分布"));
+        assert!(old_snapshot.contains("2026-10-08T19:12:00+08:00"));
+        assert!(old_snapshot.contains("仅代表该快照时点"));
+    }
+
+    #[test]
+    fn position_review_missing_previous_close_and_empty_cost_remain_unavailable() {
+        let items = vec![PositionReviewItem {
+            code: "TEST_CODE_000001".into(),
+            name: "测试持仓".into(),
+            quantity: 100,
+            cost_price: 20.0,
+            close: Some(10.0),
+            market_value: 1_000.0,
+            unrealized_pnl: -1_000.0,
+            unrealized_return_pct: Some(-50.0),
+            daily_price_pnl: None,
+        }];
+        assert_eq!(position_review_cost_return(&[], 0.0), None);
+        let text = render_position_review(PositionReviewParams {
+            date: "2026-10-09",
+            account_snapshot_at: "2026-10-08T19:12:00+08:00",
+            total_assets: 5_000.0,
+            account_market_value: 3_000.0,
+            available_cash: 2_000.0,
+            position_ratio_pct: 60.0,
+            daily_pnl: 257.75,
+            unrealized_pnl: -1_000.0,
+            unrealized_return_pct: position_review_cost_return(&items, -1_000.0),
+            market_value: 1_000.0,
+            sectors: &[],
+            items: &items,
+        });
+        assert!(text.contains("未取得（参考收盘价覆盖不足）"));
+        assert!(!text.contains("价格损益：+0.00"));
     }
 
     #[test]
@@ -20642,6 +20982,58 @@ mod tests {
     // ---- T-02 数据模式 ----
 
     #[test]
+    fn t02_focus_same_unsafe_keeps_actual_restrictions_and_missing_list_up_front() {
+        let banner = BannerCtx {
+            data_mode: DataMode::Unsafe,
+            ..BannerCtx::test_default()
+        };
+        let text = render_data_mode_message(
+            Some(&banner),
+            &DataModeTextParams {
+                hhmm: "00:03",
+                old: Some(DataMode::Unsafe),
+                new: DataMode::Unsafe,
+                missing_items: "Quote/MoneyFlow/News/OrderBook",
+                restrictions: &["禁出价格型建议".to_owned(), "仅保留风险类推送".to_owned()],
+                eta: None,
+            },
+            &NoBannerExternalNotes,
+        );
+        assert!(text.starts_with(
+            "📡 行情限制仍在（00:03）\n重点：禁出价格型建议；仅保留风险类推送\n主要缺项：实时价格、资金流、新闻（另有 1 项"
+        ));
+        assert!(text.contains("受影响: Quote/MoneyFlow/News/OrderBook"));
+        assert!(!text.contains("盘口已恢复"));
+        assert!(!text.contains("可以交易"));
+    }
+
+    #[test]
+    fn t02_focus_full_keeps_account_and_trade_qualification_separate() {
+        let text = render_data_mode_focus(&DataModeTextParams {
+            hhmm: "09:45",
+            old: Some(DataMode::Unsafe),
+            new: DataMode::Full,
+            missing_items: "(无)",
+            restrictions: &[],
+            eta: None,
+        });
+        assert!(text.starts_with("📡 行情状态更新（09:45）"));
+        assert!(text.contains("账户与交易资格仍需单独核验"));
+        assert!(text.contains("主要缺项：无"));
+        assert!(!text.contains("可以买入"));
+        let unknown = render_data_mode_focus(&DataModeTextParams {
+            hhmm: "09:45",
+            old: None,
+            new: DataMode::Unsafe,
+            missing_items: "",
+            restrictions: &[],
+            eta: None,
+        });
+        assert!(unknown.contains("本轮输出限制未披露"));
+        assert!(unknown.contains("主要缺项：未披露"));
+    }
+
+    #[test]
     fn t02_message_keeps_one_dated_account_snapshot() {
         use std::cell::Cell;
 
@@ -20704,7 +21096,13 @@ mod tests {
                         辅助建议, 非下单指令";
 
         assert_eq!(text.matches("用户确认账户快照").count(), 1, "{text}");
-        assert_eq!(text, expected);
+        assert!(
+            text.ends_with(expected),
+            "the original dated details remain intact: {text}"
+        );
+        assert!(
+            text.starts_with("📡 行情状态更新（10:59）\n重点：禁出价格型建议；仅保留风险类推送")
+        );
         assert!(!text.contains("账户状态:"), "{text}");
         assert_eq!(source.closing_reads.get(), 1);
         assert_eq!(source.user_summary_reads.get(), 1);
@@ -20761,15 +21159,14 @@ mod tests {
             &source,
         );
 
-        assert_eq!(
-            text,
+        assert!(text.ends_with(
             "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n\
              📡 数据状态变更（11:00）\n\
              Unsafe → Full\n\
              受影响: (无)\n\
              输出限制:\n\
              辅助建议, 非下单指令"
-        );
+        ));
         assert!(!text.contains("TEST_CODE_OLD_CLOSING"), "{text}");
         assert!(!text.contains("TEST_CODE_OLD_ACCOUNT"), "{text}");
         assert!(!text.contains("账户状态:"), "{text}");
@@ -20816,8 +21213,7 @@ mod tests {
             &source,
         );
 
-        assert_eq!(
-            text,
+        assert!(text.ends_with(
             "📡 数据状态变更（11:01）\n\
              未建立 → Unsafe\n\
              受影响: TEST_CODE_QUOTE_MISSING\n\
@@ -20826,7 +21222,7 @@ mod tests {
              · 仅保留风险类推送\n\
              账户状态: 实时账户未接入；用户确认账户摘要不可用\n\
              辅助建议, 非下单指令"
-        );
+        ));
         assert_eq!(text.matches("账户状态:").count(), 1);
         assert_eq!(source.closing_reads.get(), 1);
         assert_eq!(source.user_summary_reads.get(), 1);
@@ -20897,7 +21293,11 @@ mod tests {
                         恢复预计: TEST_CODE_FRESHNESS_RECOVERY\n\
                         辅助建议, 非下单指令";
 
-        assert_eq!(text, expected);
+        assert!(
+            text.ends_with(expected),
+            "original captured detail changed: {text}"
+        );
+        let frozen = text.clone();
         assert_eq!(text.matches("TEST_CODE_FIRST_CLOSING").count(), 1);
         assert!(!text.contains("TEST_CODE_FIRST_ACCOUNT"), "{text}");
         assert_eq!(source.closing_reads.get(), 1);
@@ -20910,7 +21310,7 @@ mod tests {
             .user_summary
             .replace(Some("TEST_CODE_SECOND_ACCOUNT".to_string()));
 
-        assert_eq!(text, expected);
+        assert_eq!(text, frozen);
         assert!(!text.contains("TEST_CODE_SECOND_CLOSING"), "{text}");
         assert!(!text.contains("TEST_CODE_SECOND_ACCOUNT"), "{text}");
         assert_eq!(source.closing_reads.get(), 1);
@@ -22071,6 +22471,9 @@ mod tests {
         assert!(s.contains("B(TEST_CODE_600000) 高开+2.1% 量比3.2 [观察池]"));
         assert!(s.contains("情绪判读: 强承接, 观察池今日可操作"));
         assert!(s.contains("辅助建议, 非下单指令"));
+        assert!(s.lines().nth(1).unwrap().starts_with("首位观察: A("));
+        assert_eq!(s.matches("A(TEST_CODE_000001)").count(), 1);
+        assert!(s.find("A(TEST_CODE_000001)").unwrap() < s.find("B(TEST_CODE_600000)").unwrap());
     }
 
     #[test]
@@ -22093,9 +22496,10 @@ mod tests {
         assert_eq!(
             frozen,
             concat!(
-                "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n",
                 "🌅 竞价热点量能 Top1（09:25）\n",
-                "  共享渲染(TEST_CODE_000001) 高开+3.4% 量比5.6 [TEST_TAG]\n",
+                "首位观察: 共享渲染(TEST_CODE_000001) 高开+3.4% 量比5.6 [TEST_TAG]\n",
+                "处理: 等待开盘成交核验｜持仓关系未核验\n",
+                "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n",
                 "情绪判读: 强承接, 观察池今日可操作\n",
                 "辅助建议, 非下单指令",
             )
@@ -22652,10 +23056,24 @@ mod tests {
 
         assert!(text.starts_with("📰 盘前热点（15:30）"));
         assert!(!text.contains("补发"));
-        assert!(text.contains("主线: TEST_CODE_AI_CHAIN"));
+        assert!(text.contains("样本分类: TEST_CODE_AI_CHAIN"));
         assert!(text.contains("TEST_CODE_PROVIDER_HEADLINE"));
         assert!(text.contains("TEST_CODE_IDENTITY_NAME(TEST_CODE_000001)"));
         assert!(text.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn p01_bound_risk_news_is_not_promoted_to_benefit_or_industry_mainline() {
+        let mut input = crate::p01::P01InputBinding::complete_test_input();
+        input.heads[0].concept = "TEST_CODE 最近情绪".to_owned();
+        input.heads[0].news[0].title = "TEST_CODE 公司提示交易风险，业绩下滑".to_owned();
+        let text =
+            render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
+        assert!(text.lines().next().unwrap().contains("1只样本观察"));
+        assert!(text.contains("样本分类: TEST_CODE 最近情绪"));
+        assert!(text.contains("来源新闻: TEST_CODE 公司提示交易风险，业绩下滑"));
+        assert_eq!(text.matches("TEST_CODE 最近情绪").count(), 1);
+        assert!(!text.contains("利好") && !text.contains("主线:") && !text.contains("关注票:"));
     }
 
     // ====== v13 I-01 盘中轮动总览 (3 用例) ======
@@ -22681,6 +23099,8 @@ mod tests {
         assert!(out.contains("轮动状态: 扩散"));
         assert!(out.contains("当前主攻: AI算力"));
         assert!(out.ends_with("辅助建议, 非下单指令"));
+        assert!(out.starts_with("📊 盘中轮动（10:30）\n当前主攻: AI算力"));
+        assert!(out.find("轮动状态: 扩散").unwrap() < out.find("科技:").unwrap());
     }
 
     #[test]
@@ -22753,7 +23173,7 @@ mod tests {
     }
 
     #[test]
-    fn news_catalyst_missing_chg_omits_row() {
+    fn news_catalyst_missing_chg_preserves_related_stock_and_reason() {
         let p = NewsCatalystParams {
             hhmm: "10:30",
             headline: "X",
@@ -22765,9 +23185,32 @@ mod tests {
         };
         let banner = BannerCtx::test_default();
         let out = render_news_catalyst(&banner, p);
-        assert!(!out.contains("· A(TEST_CODE_000001)"));
+        assert!(out.contains("· A(TEST_CODE_000001) 涨跌幅缺失 | 原因:r"));
         assert!(out.contains("· B(TEST_CODE_000002) +3.0% | 原因:r2"));
         assert!(out.contains("受益板块: 未分类"));
+        assert!(out.contains("1 只缺涨跌幅，不判断其行情表现"));
+        assert!(!out.contains("建议买入"));
+    }
+
+    #[test]
+    fn news_catalyst_nonfinite_quote_is_an_explicit_gap() {
+        let out = render_news_catalyst(
+            &BannerCtx::test_default(),
+            NewsCatalystParams {
+                hhmm: "10:30",
+                headline: "TEST_CODE 来源事件",
+                theme: None,
+                stocks: vec![(
+                    "TEST_CODE 关联股",
+                    "TEST_CODE_000001",
+                    Some(f32::NAN),
+                    "来源映射",
+                )],
+            },
+        );
+        assert!(out.contains("TEST_CODE 关联股(TEST_CODE_000001) 涨跌幅缺失 | 原因:来源映射"));
+        assert!(out.contains("1 只缺涨跌幅，不判断其行情表现"));
+        assert!(!out.contains("NaN%"));
     }
 
     #[test]
@@ -22946,6 +23389,7 @@ mod tests {
             date: "2026-07-06",
             theme: "AI算力",
             score: Some(85.0),
+            score_basis: None,
             persistent: PersistentLevel::High,
             member_count: 3,
             continuous_count: 3,
@@ -22957,9 +23401,10 @@ mod tests {
         };
         let out = render_catalyst_review(p);
         assert!(out.contains("📰 题材催化复盘（2026-07-06）"));
-        assert!(out.contains("主线: AI算力"));
-        assert!(out.contains("涨停成员: 3家 | 连板成员: 3家 | 持续性结构: 高"));
+        assert!(out.starts_with("📰 题材催化复盘（2026-07-06）｜3家涨停 / 3家连板"));
+        assert!(out.contains("样本标签: AI算力 | 结构档位: 高"));
         assert!(out.contains("题材评分: 85.0"));
+        assert!(out.contains("评分口径: 未注明，不能解读为收益或胜率"));
         assert!(out.contains("前排成员（按连板数）: A(600001)、B(600002)"));
         assert!(out.contains("其余同题材成员: C(600003)"));
         assert!(out.contains("明日观察点: 明日是否扩散"));
@@ -22974,6 +23419,7 @@ mod tests {
             date: "2026-07-06",
             theme: "X",
             score: None,
+            score_basis: None,
             persistent: PersistentLevel::Low,
             member_count: 0,
             continuous_count: 0,
@@ -22985,10 +23431,32 @@ mod tests {
         };
         let out = render_catalyst_review(p);
         assert!(out.contains("题材评分: 数据缺失（无独立评分批次）"));
-        assert!(out.contains("持续性结构: 低"));
+        assert!(out.contains("结构档位: 低"));
         assert!(!out.contains("前排成员"));
         assert!(!out.contains("其余同题材成员"));
         assert!(out.contains("明日观察点: 数据缺失（未接入独立量能/走势批次）"));
+    }
+
+    #[test]
+    fn catalyst_review_structure_score_keeps_its_calculation_basis_visible() {
+        let out = render_catalyst_review(CatalystReviewParams {
+            date: "2026-10-09",
+            theme: "TEST_CODE 最近情绪",
+            score: Some(22.4),
+            score_basis: Some("当日涨停结构；成员×0.30 + 连板成员×0.50 + 高档20"),
+            persistent: PersistentLevel::High,
+            member_count: 3,
+            continuous_count: 3,
+            leading_names: vec![],
+            leading_codes: vec![],
+            other_names: vec![],
+            other_codes: vec![],
+            watch_point: None,
+        });
+        assert!(out.starts_with("📰 题材催化复盘（2026-10-09）｜3家涨停 / 3家连板"));
+        assert!(out.contains("样本标签: TEST_CODE 最近情绪"));
+        assert!(out.contains("评分口径: 当日涨停结构；成员×0.30 + 连板成员×0.50 + 高档20"));
+        assert!(!out.contains("主线:") && !out.contains("胜率 22.4"));
     }
 
     // A-10 br160 映射/拒绝/loader-guard 测试已随装载函数迁至
@@ -25617,6 +26085,7 @@ mod tests {
             date: "2026-07-06",
             theme: "AI算力",
             score: Some(85.0),
+            score_basis: None,
             persistent: PersistentLevel::High,
             member_count: 3,
             continuous_count: 3,

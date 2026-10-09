@@ -941,6 +941,131 @@ pub fn render_r12(result: &R12BacktestResult) -> String {
     lines.join("\n")
 }
 
+/// Short presentation for a new delivery. The original full renderer remains
+/// unchanged for the append-only report and any previously frozen message.
+/// Counts from different forward windows are never added together as trades.
+pub fn render_r12_summary(result: &R12BacktestResult) -> String {
+    let date = result
+        .research_window
+        .as_ref()
+        .map(|window| format!("（{}）", window.end))
+        .unwrap_or_default();
+    let conclusion = if result.virtual_buy.is_empty() {
+        "暂无可对齐的虚拟买入样本，不能形成策略结论。"
+    } else if result.virtual_buy.iter().all(SignalGroup::is_under_sampled) {
+        "虚拟买入各窗口样本不足 200，不能形成策略结论。"
+    } else {
+        "部分买入窗口样本达 200；结果仅描述短期价格路径。"
+    };
+    let mut lines = vec![
+        format!("📈 买入事件研究{date}"),
+        format!("重点：{conclusion}"),
+    ];
+    if let Some(window) = &result.research_window {
+        lines.push(format!("信号日期：{}～{}", window.start, window.end));
+    }
+    let scope = match result
+        .effective_projection
+        .as_ref()
+        .map(|proof| &proof.request.scope)
+    {
+        Some(crate::trading::paper_ledger::EffectiveFillScope::Epoch(_)) => {
+            "模拟范围：当前独立账户的策略成交；期初持仓不算策略买入样本。"
+        }
+        Some(crate::trading::paper_ledger::EffectiveFillScope::LegacyBeforeCutover(_)) => {
+            "模拟范围：接线前历史成交，不能作为当前账户收益。"
+        }
+        Some(crate::trading::paper_ledger::EffectiveFillScope::LegacyRaw) => {
+            "模拟范围：历史原始成交，不能作为当前账户收益。"
+        }
+        None => "模拟范围未取得，不能认定当前账户结果。",
+    };
+    lines.push(scope.to_owned());
+    lines.push(format!(
+        "15 分钟 K 线来源：{} 只证券（实际尾部，非完整窗口或全市场覆盖）",
+        result.minute15_sources.len()
+    ));
+    if result.unaligned_signals > 0 || result.censored_windows > 0 {
+        lines.push(format!(
+            "覆盖局限：{} 个买入事件未对齐；{} 个未来窗口未完成，均未进入相应统计分母。",
+            result.unaligned_signals, result.censored_windows
+        ));
+    }
+    lines.push("【虚拟买入路径】".to_owned());
+    append_r12_summary_groups(&mut lines, &result.virtual_buy, "无可对齐样本");
+    lines.push("【技术信号路径】".to_owned());
+    append_r12_summary_groups(&mut lines, &result.boll_macd, "无可对齐买入信号");
+    if result.exit_rows_excluded > 0 {
+        lines.push(format!(
+            "另有 {} 笔卖出事实，未计入买入上涨比例。",
+            result.exit_rows_excluded
+        ));
+    }
+    lines.push("上涨比例不是扣成本策略胜率；不同窗口分别统计，样本数不可相加。".to_owned());
+    lines.push("做 T 缺历史五档盘口和分时均价，暂无回测结果。".to_owned());
+    lines.join("\n")
+}
+
+fn append_r12_summary_groups(lines: &mut Vec<String>, groups: &[SignalGroup], empty: &str) {
+    const MAX_GROUPS: usize = 4;
+    if groups.is_empty() {
+        lines.push(empty.to_owned());
+        return;
+    }
+    let mut ordered = groups.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.reason.cmp(&b.reason))
+            .then_with(|| a.window_bars.cmp(&b.window_bars))
+    });
+    for group in ordered.into_iter().take(MAX_GROUPS) {
+        let label = match group.reason.as_str() {
+            "NewsCatalyst" => "新闻催化",
+            "VolumeSurge" => "成交量放大",
+            "MainNetInflow" => "主力净流入",
+            "Breakout" => "突破",
+            "SectorLeader" => "板块龙头",
+            "AuctionAnomaly" => "竞价异动",
+            "LLMSelect" => "模型选股",
+            "Momentum" => "动量",
+            "PostCloseFundInflow" => "盘后资金流入",
+            "BottomBuy" => "底部买入信号",
+            "UptrendStart" => "上行启动信号",
+            other => other,
+        };
+        let label = label
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .take(32)
+            .collect::<String>();
+        lines.push(format!(
+            "· {label}／{}根：样本 {}，上涨比例 {}，平均终点 {}{}\n  区间平均最大上涨 {}／最大下跌 {}",
+            group.window_bars,
+            group.count,
+            summary_rate(group.up_rate, false),
+            summary_rate(group.avg_terminal_ret, true),
+            if group.is_under_sampled() { "（样本不足）" } else { "" },
+            summary_rate(group.avg_mfe, true),
+            summary_rate(group.avg_mae, true),
+        ));
+    }
+    if groups.len() > MAX_GROUPS {
+        lines.push(format!(
+            "另有 {} 个来源／窗口分组，见完整报告。",
+            groups.len() - MAX_GROUPS
+        ));
+    }
+}
+
+fn summary_rate(rate: Option<f64>, signed: bool) -> String {
+    match rate.filter(|rate| rate.is_finite()) {
+        Some(rate) if signed => format!("{:+.2}%", rate * 100.0),
+        Some(rate) => format!("{:.0}%", rate * 100.0),
+        None => "未取得".to_owned(),
+    }
+}
+
 fn pct(rate: Option<f64>) -> String {
     match rate {
         Some(r) => format!("{:.0}%", r * 100.0),
@@ -952,6 +1077,138 @@ fn signed_pct(rate: Option<f64>) -> String {
     match rate {
         Some(value) => format!("{:+.2}%", value * 100.0),
         None => "-".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    fn group(reason: &str, window: usize, count: usize, endpoint: Option<f64>) -> SignalGroup {
+        SignalGroup {
+            reason: reason.to_owned(),
+            window_bars: window,
+            count,
+            up_rate: Some(0.5),
+            avg_terminal_ret: endpoint,
+            avg_mfe: Some(0.02),
+            avg_mae: Some(-0.01),
+        }
+    }
+
+    #[test]
+    fn r12_summary_puts_sample_and_coverage_limits_before_results_without_double_counting() {
+        let result = R12BacktestResult {
+            research_window: Some(R12ResearchWindow {
+                start: NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(),
+                end: NaiveDate::from_ymd_opt(2026, 10, 8).unwrap(),
+            }),
+            virtual_buy: vec![
+                group("NewsCatalyst", 4, 1, Some(0.0017)),
+                group("NewsCatalyst", 16, 1, Some(-0.0069)),
+            ],
+            unaligned_signals: 313,
+            censored_windows: 973,
+            ..Default::default()
+        };
+        let short = render_r12_summary(&result);
+        assert!(short.lines().nth(1).unwrap().contains("不足 200"));
+        assert!(
+            short.find("313 个买入事件未对齐").unwrap() < short.find("【虚拟买入路径】").unwrap()
+        );
+        assert!(short.contains("973 个未来窗口未完成"));
+        assert!(short.contains("新闻催化／4根：样本 1"));
+        assert!(short.contains("新闻催化／16根：样本 1"));
+        assert!(!short.contains("样本 2"));
+        assert!(short.contains("平均终点 +0.17%"));
+        assert!(short.contains("平均终点 -0.69%"));
+        assert!(short.contains("不是扣成本策略胜率"));
+    }
+
+    #[test]
+    fn r12_summary_cannot_turn_technical_samples_into_virtual_strategy_results() {
+        let result = R12BacktestResult {
+            boll_macd: vec![group("BottomBuy", 4, 13_102, Some(-0.0009))],
+            ..Default::default()
+        };
+        let short = render_r12_summary(&result);
+        assert!(short
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("暂无可对齐的虚拟买入样本"));
+        assert!(short.contains("底部买入信号／4根：样本 13102"));
+        assert!(!short.contains("部分买入窗口样本达 200"));
+        assert!(!short.contains("建议买入"));
+    }
+
+    #[test]
+    fn r12_summary_keeps_missing_metrics_explicit_and_bounds_group_names() {
+        let mut missing = group(&format!("TEST_CODE\n{}", "来源".repeat(1000)), 4, 1, None);
+        missing.up_rate = None;
+        missing.avg_mfe = Some(f64::NAN);
+        missing.avg_mae = None;
+        let result = R12BacktestResult {
+            virtual_buy: vec![missing; 40],
+            ..Default::default()
+        };
+        let short = render_r12_summary(&result);
+        assert!(short.contains("上涨比例 未取得，平均终点 未取得"));
+        assert!(short.contains("模拟范围未取得，不能认定当前账户结果"));
+        assert!(short.contains("最大上涨 未取得／最大下跌 未取得"));
+        assert!(short.contains("另有 36 个来源／窗口分组"));
+        assert!(!short.contains("NaN"));
+        assert!(!short.contains("0.00%"));
+        assert!(short.chars().count() < 1200);
+    }
+
+    #[test]
+    fn r12_summary_size_does_not_grow_with_full_source_date_evidence() {
+        let source = Minute15Receipt {
+            code: "600000".to_owned(),
+            provider: "Tdx".to_owned(),
+            batch_id: "TEST_CODE_source_batch".to_owned(),
+            source_at: "2026-10-09T11:15:00+08:00".to_owned(),
+            observed_at: "2026-10-09T11:16:00+08:00".to_owned(),
+            request_sha256: "a".repeat(64),
+            response_sha256: "a".repeat(64),
+            capture_sha256: "a".repeat(64),
+            artifact_sha256: "a".repeat(64),
+            descriptor_sha256: "a".repeat(64),
+            server_source_revision: "b".repeat(40),
+            first_boundary: "2026-07-23 11:30:00".to_owned(),
+            last_boundary: "2026-10-09 11:15:00".to_owned(),
+            date_counts: (0..50)
+                .map(|n| (format!("TEST_CODE_date_{n:02}"), 16))
+                .collect(),
+            requested_limit: 800,
+            bars_sha256: "a".repeat(64),
+        };
+        let sources = (0..260)
+            .map(|n| {
+                let mut source = source.clone();
+                source.code = format!("{:06}", 600000 + n);
+                source
+            })
+            .collect();
+        let result = R12BacktestResult {
+            minute15_sources: sources,
+            research_window: Some(R12ResearchWindow {
+                start: NaiveDate::from_ymd_opt(2026, 9, 9).unwrap(),
+                end: NaiveDate::from_ymd_opt(2026, 10, 8).unwrap(),
+            }),
+            virtual_buy: vec![group("NewsCatalyst", 4, 1, Some(0.0017))],
+            ..Default::default()
+        };
+        let complete = render_r12(&result);
+        let short = render_r12_summary(&result);
+        assert!(complete.chars().count() > 100_000);
+        assert!(complete.contains("TEST_CODE_date_49:16根"));
+        assert!(short.contains("260 只证券"));
+        assert!(short.chars().count() < 1000);
+        assert!(!short.contains("TEST_CODE_source_batch"));
+        assert!(!short.contains("TEST_CODE_date_49"));
+        assert!(!short.contains(&"a".repeat(64)));
     }
 }
 

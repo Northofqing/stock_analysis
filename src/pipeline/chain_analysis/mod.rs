@@ -1168,6 +1168,259 @@ fn parse_conclusion(analysis: &str) -> Option<(String, String, String)> {
     ))
 }
 
+/// A bounded reading guide from already collected facts and model text. It
+/// changes neither the complete report nor any analysis/selection authority.
+fn render_report_focus(
+    clusters: &[ChainCluster],
+    sections: &[(String, Option<String>)],
+    scores: &[Option<ChainScore>],
+    candidate_statuses: &CandidateSupplementStatuses,
+) -> String {
+    let mut ranked = sections
+        .iter()
+        .zip(clusters)
+        .enumerate()
+        .filter_map(|(index, ((concept, analysis), cluster))| {
+            if concept != &cluster.concept {
+                return None;
+            }
+            let score = scores.get(index)?.as_ref()?;
+            if ![
+                score.logic_hardness,
+                score.sentiment_position,
+                score.fund_consensus,
+                score.chip_health,
+                score.falsify_prob,
+            ]
+            .into_iter()
+            .all(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+            {
+                return None;
+            }
+            let conclusion = parse_conclusion(analysis.as_deref()?)?;
+            if conclusion.0 == "-"
+                || conclusion.1 == "-"
+                || conclusion.0.trim().is_empty()
+                || conclusion.1.trim().is_empty()
+            {
+                return None;
+            }
+            Some((cluster, score, conclusion))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(a_cluster, a_score, _), (b_cluster, b_score, _)| {
+        b_score
+            .total()
+            .total_cmp(&a_score.total())
+            .then_with(|| a_cluster.concept.cmp(&b_cluster.concept))
+    });
+    let mut out = String::from("## 先看三项重点\n\n");
+    out.push_str(&format!(
+        "完整评分与结论：{} / {} 个概念分组。",
+        ranked.len(),
+        clusters.len()
+    ));
+    if ranked.is_empty() {
+        out.push_str(" 当前缺完整排序依据，不能形成参与结论。\n\n");
+        return out;
+    }
+    let above_threshold = ranked
+        .iter()
+        .filter(|(_, score, _)| score.total() >= 60.0)
+        .count();
+    if above_threshold == 0 {
+        out.push_str(" 已有完整分析均未达到报告 60 分门槛，不能据此形成参与结论。\n\n");
+    } else {
+        out.push_str(&format!(
+            " 其中 {} 个模型评分达到 60 分；不表示行情或交易条件已满足。\n\n",
+            above_threshold
+        ));
+    }
+    let bounded = |text: &str, limit| {
+        text.chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .take(limit)
+            .collect::<String>()
+    };
+    for (index, (cluster, score, (stage, rating, candidates))) in ranked.iter().take(3).enumerate()
+    {
+        let status = candidate_statuses.get(&cluster.concept);
+        let supplement = candidate_supplement_summary(status, candidates.clone());
+        let supplement = if matches!(status, Some(CandidateSupplementStatus::Available { .. })) {
+            format!(
+                "补涨批次：已取得；模型候选（未逐项核验）：{}",
+                bounded(&supplement, 72)
+            )
+        } else {
+            format!("补涨数据：{}", bounded(&supplement, 72))
+        };
+        out.push_str(&format!(
+            "{}. **{}**：模型评分 {:.0}/100，涨停 {} 只，近 10 自然日出现 {} 天。\n   原分析：阶段={}；参与={}。{}。\n",
+            index + 1,
+            bounded(&cluster.concept, 36),
+            score.total(),
+            cluster.stocks.len(),
+            cluster.streak_days,
+            bounded(stage, 80),
+            bounded(rating, 40),
+            supplement,
+        ));
+    }
+    out.push_str("\n以上按已有模型评分排序，不按涨停家数认定产业主线；完整成员、分析与缺失数据说明保留如下。\n\n");
+    out
+}
+
+#[cfg(test)]
+mod report_focus_tests {
+    use super::*;
+
+    fn fixture(
+        concept: &str,
+        score: f64,
+        members: usize,
+    ) -> (ChainCluster, (String, Option<String>), Option<ChainScore>) {
+        let analysis = format!("【结论】阶段=TEST_CODE原阶段｜参与=回避｜候选=TEST_CODE模型候选\n【评分】产业逻辑={score}/100｜情绪位置={score}/100｜资金共识={score}/100｜筹码健康={score}/100｜证伪概率={}/100\nTEST_CODE完整明细-{concept}", 100.0 - score);
+        let parsed = parse_chain_score(&analysis);
+        let cluster = ChainCluster {
+            concept: concept.to_owned(),
+            aliases: vec![],
+            stocks: vec![TopStock::default(); members],
+            continuation_count: 0,
+            streak_days: 3,
+            candidates: vec![],
+            score: None,
+            scenario: None,
+        };
+        (cluster, (concept.to_owned(), Some(analysis)), parsed)
+    }
+
+    #[test]
+    fn focus_ranks_existing_scores_limits_three_and_keeps_model_and_candidate_risks() {
+        let fixtures = vec![
+            fixture("TEST_CODE情绪大簇", 21.0, 20),
+            fixture("TEST_CODE储能", 58.0, 6),
+            fixture("TEST_CODE创投", 47.0, 8),
+            fixture("TEST_CODE电池", 51.0, 8),
+        ];
+        let mut clusters = fixtures.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+        let sections = fixtures.iter().map(|r| r.1.clone()).collect::<Vec<_>>();
+        let scores = fixtures.iter().map(|r| r.2.clone()).collect::<Vec<_>>();
+        let statuses = clusters
+            .iter()
+            .map(|c| {
+                (
+                    c.concept.clone(),
+                    CandidateSupplementStatus::Unavailable {
+                        reason: "TEST_CODE_source_missing".to_owned(),
+                        board_evidence: vec![],
+                    },
+                )
+            })
+            .collect();
+        let focus = render_report_focus(&clusters, &sections, &scores, &statuses);
+        assert!(focus.contains("4 / 4 个概念分组"));
+        assert!(focus.contains("均未达到报告 60 分门槛"));
+        assert!(
+            focus.find("1. **TEST_CODE储能**").unwrap()
+                < focus.find("2. **TEST_CODE电池**").unwrap()
+        );
+        assert!(focus.contains("3. **TEST_CODE创投**"));
+        assert!(!focus.contains("TEST_CODE情绪大簇"));
+        assert!(!focus.contains("4. **"));
+        assert!(focus.contains("参与=回避"));
+        assert!(focus.contains("数据不可用"));
+        assert!(!focus.contains("TEST_CODE模型候选"));
+        assert!(!focus.contains("建议买入"));
+
+        clusters[1].candidates.push(TopStock {
+            code: "TEST_CODE_BATCH_MEMBER".to_owned(),
+            ..TopStock::default()
+        });
+        let mut available_statuses = statuses;
+        available_statuses.insert(
+            "TEST_CODE储能".to_owned(),
+            CandidateSupplementStatus::Available {
+                board_evidence: vec![],
+                candidate_evidence: BatchEvidence {
+                    provider: crate::market_domain::ProviderId::Tdx,
+                    source: "TEST_CODE_available_candidate_batch".to_owned(),
+                    source_at: Some("2026-10-09T15:00:00+08:00".to_owned()),
+                    observed_at: "2026-10-09T15:00:01+08:00".to_owned(),
+                    batch_id: "TEST_CODE_candidate_batch".to_owned(),
+                },
+            },
+        );
+        let focus = render_report_focus(&clusters, &sections, &scores, &available_statuses);
+        assert!(focus.contains("补涨批次：已取得；模型候选（未逐项核验）：TEST_CODE模型候选"));
+        assert!(focus.contains("补涨数据：数据不可用"));
+        assert!(!focus.contains("补涨数据：TEST_CODE模型候选"));
+        assert!(clusters[1]
+            .candidates
+            .iter()
+            .all(|candidate| candidate.code != "TEST_CODE模型候选"));
+    }
+
+    #[test]
+    fn focus_absent_or_invalid_analysis_never_becomes_a_ranked_zero_score() {
+        let fixtures = vec![
+            fixture("TEST_CODE_no_analysis", 50.0, 3),
+            fixture("TEST_CODE_nan", f64::NAN, 3),
+            fixture("TEST_CODE_mismatch", 50.0, 3),
+            fixture("TEST_CODE_no_conclusion", 50.0, 3),
+            fixture("TEST_CODE_empty_conclusion", 50.0, 3),
+        ];
+        let clusters = fixtures.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+        let mut sections = fixtures.iter().map(|r| r.1.clone()).collect::<Vec<_>>();
+        let scores = fixtures.iter().map(|r| r.2.clone()).collect::<Vec<_>>();
+        sections[0].1 = None;
+        sections[2].0 = "TEST_CODE_other_concept".to_owned();
+        sections[3].1 = Some("TEST_CODE只有模型段落，没有完整结论".to_owned());
+        sections[4].1 = sections[4]
+            .1
+            .as_ref()
+            .map(|analysis| analysis.replace("阶段=TEST_CODE原阶段｜参与=回避", "阶段=  ｜参与= "));
+        let focus = render_report_focus(&clusters, &sections, &scores, &HashMap::new());
+        assert!(focus.contains("0 / 5 个概念分组"));
+        assert!(focus.contains("当前缺完整排序依据"));
+        assert!(!focus.contains("模型评分 0"));
+        assert!(!focus.contains("1. **"));
+        assert!(!focus.contains("NaN"));
+    }
+
+    #[test]
+    fn focus_precedes_mail_details_and_full_members_and_analysis_remain_available() {
+        let (cluster, section, _) = fixture("TEST_CODE完整分组", 70.0, 3);
+        let sections = vec![section];
+        let clusters = vec![cluster];
+        let report = build_report(
+            "2026-10-09",
+            &clusters[0].stocks,
+            &clusters,
+            &sections,
+            &HashMap::new(),
+            &[],
+            None,
+            "TEST_CODE盘后催化原文",
+            &HashMap::new(),
+            &[],
+        );
+        assert!(
+            report.find("## 先看三项重点").unwrap() < report.find("TEST_CODE盘后催化原文").unwrap()
+        );
+        assert!(
+            report.find("## 先看三项重点").unwrap() < report.find("## 一页纸决策摘要").unwrap()
+        );
+        assert!(report.contains("TEST_CODE完整明细-TEST_CODE完整分组"));
+        assert!(report.contains("## 主线成员一览"));
+        assert!(report.contains("补涨候选数据状态"));
+        assert!(
+            report.contains("参与=回避"),
+            "preserve the model conclusion, not score-derived participation"
+        );
+        assert!(report.contains("不表示行情或交易条件已满足"));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     date: &str,
@@ -1189,6 +1442,12 @@ fn build_report(
 
     let mut md = String::new();
     md.push_str(&format!("# 产业链主线决策参考 {}\n\n", date));
+    md.push_str(&render_report_focus(
+        clusters,
+        sections,
+        &scores,
+        candidate_statuses,
+    ));
     md.push_str(&format!(
         "> 涨停 **{}** 只｜主线 **{}** 条（深度分析 {} 条 + 简化分析 {} 条）｜孤立 **{}** 只。概念标签来自东财 F10 存在蹭概念污染，结论为倾向性参考而非交易指令。\n\n",
         limit_ups.len(),

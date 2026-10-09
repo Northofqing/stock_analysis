@@ -355,6 +355,111 @@ pub struct DailyAttribution {
     pub top_trades: Vec<TradeAttribution>,
 }
 
+/// Presentation from the same scoped FIFO rows and marks as the daily aggregate.
+/// This does not alter the immutable family payload or grant execution authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyAttributionDetails {
+    pub buy_fills: usize,
+    pub sell_fills: usize,
+    pub buy_quantity: i64,
+    pub sell_quantity: i64,
+    pub holdings: Vec<AttributionHolding>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributionHolding {
+    pub code: String,
+    pub family: SignalFamily,
+    pub quantity: i64,
+    pub cost_notional: f64,
+    pub close_price: Option<f64>,
+    pub market_value: Option<f64>,
+    pub unrealized_pnl: Option<f64>,
+    pub suspicious: bool,
+}
+
+pub fn daily_attribution_details(
+    date: NaiveDate,
+    rows: &[AttributionFillRow],
+    open: &[OpenLot],
+    prices: &HashMap<String, f64>,
+) -> Result<DailyAttributionDetails, String> {
+    let mut details = DailyAttributionDetails {
+        buy_fills: 0,
+        sell_fills: 0,
+        buy_quantity: 0,
+        sell_quantity: 0,
+        holdings: Vec::new(),
+    };
+    for row in rows {
+        let at = chrono::NaiveDateTime::parse_from_str(&row.local_ts, "%Y-%m-%d %H:%M:%S")
+            .map_err(|error| error.to_string())?;
+        if at.date() != date {
+            continue;
+        }
+        let (count, quantity) = match row.direction.as_str() {
+            "buy" => (&mut details.buy_fills, &mut details.buy_quantity),
+            "sell" => (&mut details.sell_fills, &mut details.sell_quantity),
+            _ => return Err("attribution detail contains an unsupported direction".into()),
+        };
+        *count = count
+            .checked_add(1)
+            .ok_or("attribution fill count overflow")?;
+        *quantity = quantity
+            .checked_add(row.quantity)
+            .ok_or("attribution quantity overflow")?;
+    }
+    let mut holdings =
+        std::collections::BTreeMap::<(String, SignalFamily), AttributionHolding>::new();
+    for lot in open {
+        let holding = holdings
+            .entry((lot.code.clone(), lot.family))
+            .or_insert_with(|| AttributionHolding {
+                code: lot.code.clone(),
+                family: lot.family,
+                quantity: 0,
+                cost_notional: 0.0,
+                close_price: prices
+                    .get(&lot.code)
+                    .copied()
+                    .filter(|p| p.is_finite() && *p > 0.0),
+                market_value: None,
+                unrealized_pnl: None,
+                suspicious: false,
+            });
+        holding.quantity = holding
+            .quantity
+            .checked_add(lot.remaining_qty)
+            .ok_or("attribution holding quantity overflow")?;
+        holding.cost_notional += lot.cost_price * lot.remaining_qty as f64;
+        if !holding.cost_notional.is_finite() {
+            return Err("attribution holding cost is non-finite".into());
+        }
+        holding.suspicious |= lot.suspicious;
+    }
+    for (_, mut holding) in holdings {
+        if let Some(price) = holding.close_price {
+            let value = price * holding.quantity as f64;
+            let pnl = value - holding.cost_notional;
+            if !value.is_finite() || !pnl.is_finite() {
+                return Err("attribution holding valuation is non-finite".into());
+            }
+            holding.market_value = Some(value);
+            holding.unrealized_pnl = Some(pnl);
+        }
+        details.holdings.push(holding);
+    }
+    details.holdings.sort_by(|a, b| {
+        b.unrealized_pnl
+            .unwrap_or(0.0)
+            .abs()
+            .partial_cmp(&a.unrealized_pnl.unwrap_or(0.0).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.code.cmp(&b.code))
+    });
+    Ok(details)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowAttribution {
     pub days: u32,
@@ -388,6 +493,7 @@ pub struct AttributionEpochDailyEvidence {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EpochDailyAttribution {
     daily: DailyAttribution,
+    details: DailyAttributionDetails,
     epoch: AttributionEpochDailyEvidence,
     database_authority: DatabaseConnectionAuthority,
 }
@@ -395,6 +501,10 @@ pub struct EpochDailyAttribution {
 impl EpochDailyAttribution {
     pub fn daily(&self) -> &DailyAttribution {
         &self.daily
+    }
+
+    pub fn details(&self) -> &DailyAttributionDetails {
+        &self.details
     }
 
     pub fn epoch(&self) -> &AttributionEpochDailyEvidence {
@@ -528,12 +638,15 @@ pub fn compute_epoch_daily(
     })?;
     let top_trades = top_trades(&attributions);
     let families = aggregate_families(&attributions, &open, prices);
+    let details = daily_attribution_details(date, &rows, &open, prices)
+        .map_err(|detail| runtime_integrity("attribution_epoch_details_failed", detail))?;
     Ok(EpochDailyAttribution {
         daily: DailyAttribution {
             date,
             families,
             top_trades,
         },
+        details,
         epoch,
         database_authority,
     })
@@ -1601,5 +1714,43 @@ mod tests {
             .find(|f| f.family == SignalFamily::PostCloseFundInflow)
             .expect("fund family");
         assert_eq!(fund.suspicious_lots, 1);
+    }
+    #[test]
+    fn daily_details_preserve_fill_activity_and_residual_position_from_same_fifo() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
+        let rows = vec![
+            AttributionFillRow {
+                id: 1,
+                code: "TEST_CODE_600000".into(),
+                direction: "buy".into(),
+                fill_price: Some(10.0),
+                quantity: 1000,
+                local_ts: "2026-10-08 10:00:00".into(),
+                plan_id: "TEST_CODE_entry".into(),
+                virtual_reason: "NewsCatalyst".into(),
+            },
+            AttributionFillRow {
+                id: 2,
+                code: "TEST_CODE_600000".into(),
+                direction: "sell".into(),
+                fill_price: Some(11.0),
+                quantity: 100,
+                local_ts: "2026-10-09 10:00:00".into(),
+                plan_id: "TEST_CODE_exit".into(),
+                virtual_reason: "ExitByRule".into(),
+            },
+        ];
+        let (trades, open) = fifo_match(&rows, date).unwrap();
+        let prices = HashMap::from([("TEST_CODE_600000".into(), 11.0)]);
+        let details = daily_attribution_details(date, &rows, &open, &prices).unwrap();
+        assert_eq!((details.buy_fills, details.buy_quantity), (0, 0));
+        assert_eq!((details.sell_fills, details.sell_quantity), (1, 100));
+        assert_eq!(details.holdings.len(), 1);
+        assert_eq!(details.holdings[0].quantity, 900);
+        assert_eq!(details.holdings[0].unrealized_pnl, Some(900.0));
+        assert_eq!(trades[0].pnl, 100.0);
+        let missing = daily_attribution_details(date, &rows, &open, &HashMap::new()).unwrap();
+        assert!(missing.holdings[0].unrealized_pnl.is_none());
+        assert!(missing.holdings[0].market_value.is_none());
     }
 }
