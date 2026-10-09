@@ -317,6 +317,9 @@ def prepare(repo, candidate, version, source_commit, build_log, base_commit=None
          'attestation': 'disk observations only; no live process, Gateway, PIT or physical delivery authority',
          'source_inputs': {name: identity(read(repo / name)) for name in subprocess.check_output(['git', 'ls-files', 'src', 'config', 'contracts', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'build_support'], cwd=repo, text=True).splitlines()},
          'files': {name: {**identity(read(bundle / name, True)), 'mode': oct(mode)} for name, mode in layout().items()}}
+    if base_commit == source_commit and (assistant_commit is None or assistant_commit == source_commit):
+        m['build'].pop('assistant_rebuild')
+        m['build']['fresh_selected_build'] = True
     if weekly_log is not None:
         m['build']['weekly_rebuild'] = {'source_commit': per_bin_sources['weekly_outcome_review'], 'selected_bins': ['weekly_outcome_review'], 'log': str(weekly_log), 'log_identity': identity(read(weekly_log)), 'reviewed_registry_blob_sha256': list(REGISTRY_BLOBS), 'shared_registry_delta': 'exact reviewed descriptor-loader/regression blobs; schema/parser/default bytes unchanged; library compilation recorded in build log'}
     write(bundle / 'manifest.json', json_bytes(m))
