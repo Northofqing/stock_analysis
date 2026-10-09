@@ -898,6 +898,11 @@ struct NativeWeeklyFixture {
     binding: stock_analysis::trading::paper_ledger::AccountBinding,
 }
 fn native_weekly_fixture() -> NativeWeeklyFixture {
+    // Use an explicit reason supported by the original legacy codec. This
+    // fixture tests a valid independent old scope, not missing strategy facts.
+    native_weekly_fixture_with_legacy_reason("NewsCatalyst")
+}
+fn native_weekly_fixture_with_legacy_reason(legacy_reason: &str) -> NativeWeeklyFixture {
     use serde_json::json;
     use std::os::unix::fs::MetadataExt;
     use stock_analysis::trading::paper_ledger::{Mark, Money, RiskPolicyV1, SeedLot, SeedManifest};
@@ -916,8 +921,8 @@ fn native_weekly_fixture() -> NativeWeeklyFixture {
             .execute_batch(&String::from_utf8(hex::decode(hex).unwrap()).unwrap())
             .unwrap();
     }
-    writer.execute_batch("INSERT INTO paper_trades(plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts) VALUES('TEST_CODE_old_trade','TEST_CODE_000001','TEST_CODE_fixture','buy',9,100,'Filled',9,'TEST_CODE_legacy','Normal','Full','2026-10-08 02:00:00');
-      INSERT INTO user_account_summary(effective_at,total_assets,securities_market_value,available_cash,position_ratio_pct,daily_pnl,source) VALUES('2026-10-09T21:13:00+08:00',11000,1000,10000,9.090909,-100,'TEST_CODE_user_confirmed_account');").unwrap();
+    writer.execute("INSERT INTO paper_trades(plan_id,code,name,direction,price,quantity,status,fill_price,virtual_reason,account_mode,data_mode,ts) VALUES('TEST_CODE_old_trade','TEST_CODE_000001','TEST_CODE_fixture','buy',9,100,'Filled',9,?1,'Normal','Full','2026-10-08 02:00:00')", [legacy_reason]).unwrap();
+    writer.execute_batch("INSERT INTO user_account_summary(effective_at,total_assets,securities_market_value,available_cash,position_ratio_pct,daily_pnl,source) VALUES('2026-10-09T21:13:00+08:00',11000,1000,10000,9.090909,-100,'TEST_CODE_user_confirmed_account');").unwrap();
     let input=stock_analysis::portfolio::user_position_snapshot::user_position_snapshot_input_from_json(
         r#"{"schema_version":1,"effective_at":"2026-10-09T21:13:00+08:00","confirm_empty":false,"items":[{"code":"TEST_CODE_000001","name":"TEST_CODE_fixture","quantity":100,"cost_price":12.0}]}"#,
         DateTime::parse_from_rfc3339("2026-10-09T21:20:00+08:00").unwrap()).unwrap();
@@ -1090,6 +1095,11 @@ fn weekly_native_snapshot_epoch_reports_accurate_independent_account_and_legacy_
     assert_eq!(account["daily_pnl_cny"]["status"], "unavailable");
     assert_eq!(review["verified_paper"]["value"]["source_fill_rows"], 0);
     assert_eq!(
+        review["legacy_verified_paper"]["status"], "available",
+        "bound legacy read failed: {}",
+        review["legacy_verified_paper"]
+    );
+    assert_eq!(
         review["legacy_verified_paper"]["value"]["source_fill_rows"],
         1
     );
@@ -1115,6 +1125,33 @@ fn weekly_native_snapshot_epoch_reports_accurate_independent_account_and_legacy_
         stale["paper_account"]["value"]["valuation_effective_at"],
         "2026-10-09T13:13:00Z"
     );
+    assert_eq!(std::fs::read(&fixture.original).unwrap(), original_before);
+    assert_eq!(std::fs::read(&fixture.snapshot).unwrap(), snapshot_before);
+}
+
+#[test]
+fn weekly_native_snapshot_unknown_legacy_family_stays_unavailable_and_independent() {
+    let fixture = native_weekly_fixture_with_legacy_reason("TEST_CODE_legacy");
+    let original_before = std::fs::read(&fixture.original).unwrap();
+    let snapshot_before = std::fs::read(&fixture.snapshot).unwrap();
+    let binding = serde_json::to_string(&fixture.binding).unwrap();
+    let review = native_weekly_child(
+        &fixture,
+        "unknown_legacy_family",
+        "2026-10-09T22:00:00+08:00",
+        Some(&binding),
+        None,
+        true,
+    );
+    assert_eq!(review["paper_account"]["status"], "available");
+    assert_eq!(review["verified_paper"]["value"]["source_fill_rows"], 0);
+    assert_eq!(review["legacy_verified_paper"]["status"], "unavailable");
+    assert!(review["legacy_verified_paper"]["value"].is_null());
+    assert!(review["legacy_verified_paper"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("entry strategy family unavailable"));
+    assert_eq!(review["raw_paper"]["value"]["historical_filled_rows"], 1);
     assert_eq!(std::fs::read(&fixture.original).unwrap(), original_before);
     assert_eq!(std::fs::read(&fixture.snapshot).unwrap(), snapshot_before);
 }
