@@ -197,15 +197,7 @@ fn scan(reader: &mut impl BufRead, manifest: &Manifest) -> Result<Observations, 
                 && env.ts.with_timezone(&zone).date_naive() == manifest.business_date,
             "future/wrong-date observation",
         )?;
-        if let Some(prior) = seen.get(&env.id) {
-            if prior != &raw {
-                output.conflicting_identities += 1;
-                return Err(format!("conflicting identity; observations={}, unique={}, identical_repeats={}, conflicting={}",output.observations,seen.len(),output.identical_repeated_identities,output.conflicting_identities));
-            }
-            output.identical_repeated_identities += 1;
-            continue;
-        }
-        if env.event_type == "risk.stop_input.observed.v1" {
+        let stop_input = if env.event_type == "risk.stop_input.observed.v1" {
             #[derive(Deserialize)]
             struct StopEnvelope {
                 payload: StopInput,
@@ -234,6 +226,20 @@ fn scan(reader: &mut impl BufRead, manifest: &Manifest) -> Result<Observations, 
                 .all(|p| p.is_finite() && p > 0.),
                 "invalid captured stop value",
             )?;
+            Some(input)
+        } else {
+            None
+        };
+        // Typed validation must precede the repeat fast path for every captured row.
+        if let Some(prior) = seen.get(&env.id) {
+            if prior != &raw {
+                output.conflicting_identities += 1;
+                return Err(format!("conflicting identity; observations={}, unique={}, identical_repeats={}, conflicting={}",output.observations,seen.len(),output.identical_repeated_identities,output.conflicting_identities));
+            }
+            output.identical_repeated_identities += 1;
+            continue;
+        }
+        if let Some(input) = stop_input {
             let signals = check_stops(
                 &input.code,
                 &input.name,
@@ -279,6 +285,9 @@ mod tests {
         serde_json::json!({"id":"TEST_CODE_e1","trace_id":"TEST_CODE_trace","source":"TEST_CODE_source","event_type":"risk.stop_input.observed.v1","version":1,"replay_of":null,"entity_key":"TEST_CODE_stock","ts":"2026-10-08T10:00:00+08:00","payload":{"version":1,"code":"TEST_CODE_stock","name":"fixture","current_price":8.,"cost_price":10.,"hard_stop":9.,"ma20":8.5,"ma60":9.5}})
     }
     fn run(events: &[serde_json::Value]) -> Result<Observations, String> {
+        run_lines(&events.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+    fn run_lines(events: &[String]) -> Result<Observations, String> {
         let bytes = events
             .iter()
             .map(|e| format!("{e}\n"))
@@ -319,6 +328,20 @@ mod tests {
                 .len(),
             3
         );
+    }
+    #[test]
+    fn repeated_stop_input_rejects_duplicate_fields_before_deduplication() {
+        let valid = event().to_string();
+        let invalid = valid.replace(
+            "\"current_price\":",
+            "\"current_price\":7,\"current_price\":",
+        );
+        assert_ne!(invalid, valid);
+        for rows in [vec![invalid.clone()], vec![valid, invalid]] {
+            assert!(run_lines(&rows)
+                .unwrap_err()
+                .contains("duplicate field `current_price`"));
+        }
     }
     #[test]
     fn rejects_conflict_future_wrong_date_identity_version_and_bounds() {

@@ -20,6 +20,8 @@ def compare(baseline, current):
             return {"status": "unavailable", "reason": "invalid textual identity"}
         if type(record["rows"]) is not int or record["rows"] < 0 or not isinstance(record["features"], list) or any(not isinstance(f, str) or not f.strip() for f in record["features"]):
             return {"status": "unavailable", "reason": "invalid row/features identity"}
+        if record["metric"] == "database_init" and record["stage"] == "attribution_pool" and record.get("available") is not True:
+            return {"status": "unavailable", "reason": "attribution_pool availability is missing, invalid or false"}
         if record.get("log_status", "ok") not in ("ok", "observed"):
             return {"status": "unavailable", "reason": "stage did not complete successfully"}
         value = record.get("value")
@@ -65,7 +67,13 @@ def collect(log, context):
             for metric, pattern in patterns:
                 match = pattern.search(line)
                 if match:
-                    records.append({**context, "version": 1, "metric": metric, "stage": match[1], "unit": "ms", "statistic": "sample", "value": float(match.groups()[-1]), "log_status": match[2] if metric == "startup" else "observed"})
+                    record = {**context, "version": 1, "metric": metric, "stage": match[1], "unit": "ms", "statistic": "sample", "value": float(match.groups()[-1]), "log_status": match[2] if metric == "startup" else "observed"}
+                    if metric == "database_init" and match[1] == "attribution_pool":
+                        availability = re.findall(r"\savailable=(\S+)", line[match.end():])
+                        # This producer always emits exactly one bool. Missing/invalid is not success.
+                        record["available"] = {"true": True, "false": False}.get(availability[0]) if len(availability) == 1 else None
+                        record["log_status"] = "observed" if record["available"] is True else "unavailable"
+                    records.append(record)
     return {"records": records, "review_duration": "unavailable_no_existing_stage_log", "validation_only": "unavailable_use_audit_fixture_harness", "note": "database acquisition phase includes schema work; startup includes its named stage only"}
 
 
