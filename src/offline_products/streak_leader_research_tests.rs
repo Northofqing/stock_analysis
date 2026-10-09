@@ -321,3 +321,40 @@ fn stable_hashes_export_scopes_and_safe_strings() {
     assert_eq!(r.denominator.qualified_days, 0);
     assert!(r.modeled_win_rate.is_none());
 }
+
+#[test]
+fn accepted_huge_commissions_censor_failed_economics_without_zero_headline() {
+    let mut q = authority();
+    q.fee = AShareFeePolicyV2::new(
+        q.fee.scope(),
+        FeeRate::new(3, 10000).unwrap(),
+        5_000_000_000_000_000_000,
+        FeeCoverage::initial_model(),
+        "test-huge-fee-boundary",
+    )
+    .unwrap();
+    let r = research(&pack(), Policy::default(), end(), Some(&q)).unwrap();
+    assert_eq!(r.denominator.picks, 3);
+    assert_eq!(r.denominator.executable_entries, 3);
+    assert_eq!(r.denominator.closed_trades, 0);
+    assert_eq!(r.denominator.censored_entries, 3);
+    assert_eq!(r.denominator.invalid_economics, 3);
+    assert!(r.modeled_win_rate.is_none());
+    assert!(r.modeled_covered_net_micro_cny.is_none());
+    assert!(r.metric_failure.is_some());
+    for row in &r.rows {
+        assert_eq!(
+            (row.entry_shares, row.closed_shares, row.censored_shares),
+            (100, 0, 100)
+        );
+        assert!(row.economic_failure.is_some());
+        assert!(row.exit_state.contains("economic net unavailable"));
+        assert!(row.modeled_covered_net_micro_cny.is_none());
+        assert!(row.exit_price_micro_cny.is_none());
+    }
+    let json = serde_json::to_value(&r).unwrap();
+    assert!(json["modeled_win_rate"].is_null());
+    assert!(json["modeled_covered_net_micro_cny"].is_null());
+    assert!(r.markdown().contains("经济计算失败"));
+    assert!(r.csv().contains("invalid_economics"));
+}

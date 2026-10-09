@@ -148,9 +148,16 @@ mod tests {
             markdown: Some(dir.path().join("out.md")),
         };
         run(args).unwrap();
-        let report: streak_leader_research::Study =
-            io::read_json(&dir.path().join("out.json")).unwrap();
-        assert!(report.modeled_win_rate.is_none());
+        let saved: serde_json::Value = io::read_json(&dir.path().join("out.json")).unwrap();
+        let pack: EvidencePack = io::read_json(&input).unwrap();
+        let report = streak_leader_research::research_observed(
+            &pack,
+            Policy::default(),
+            shanghai_clock("2026-09-28T15:05:00+08:00").unwrap(),
+        )
+        .unwrap();
+        assert!(saved["modeled_win_rate"].is_null());
+        assert_eq!(saved, serde_json::to_value(&report).unwrap());
         assert_eq!(
             report.markdown(),
             std::fs::read_to_string(dir.path().join("out.md")).unwrap()

@@ -72,3 +72,27 @@ impl Source {
         }
     }
 }
+
+#[cfg(test)]
+mod result_type_boundary_tests {
+    #[test]
+    fn trusted_results_cannot_deserialize_and_imports_cannot_serialize() {
+        // Inference becomes ambiguous (a compile error) if these public result
+        // types ever regain Deserialize, or an untrusted import gains Serialize.
+        trait NotDeserialize<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotDeserialize<()> for T {}
+        struct Deserializable;
+        impl<T: serde::de::DeserializeOwned> NotDeserialize<Deserializable> for T {}
+        let _ = <super::sell_reminder::Preview as NotDeserialize<_>>::check;
+        let _ = <super::streak_leader_research::Study as NotDeserialize<_>>::check;
+        trait NotSerialize<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotSerialize<()> for T {}
+        struct Serializable;
+        impl<T: serde::Serialize> NotSerialize<Serializable> for T {}
+        let _ = <super::sell_reminder::ImportedPreview as NotSerialize<_>>::check;
+    }
+}

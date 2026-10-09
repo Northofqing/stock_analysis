@@ -53,71 +53,74 @@ pub struct EvidencePack {
     pub schema: String,
     pub days: Vec<Day>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TradeRow {
-    pub decision_date: NaiveDate,
-    pub decision_at: Clock,
-    pub instrument: String,
-    pub source_known_at: Clock,
-    pub source_hash: String,
-    pub streak: Option<u32>,
-    pub amount_micro_cny: Option<i64>,
-    pub observed_rank: Option<usize>,
-    pub selected: bool,
-    pub reason: String,
-    pub entry_session: Option<NaiveDate>,
-    pub entry_at: Option<Clock>,
-    pub exit_at: Option<Clock>,
-    pub exit_session: Option<NaiveDate>,
-    pub entry_state: String,
-    pub exit_state: String,
-    pub entry_shares: u32,
-    pub closed_shares: u32,
-    pub censored_shares: u32,
-    pub entry_price_micro_cny: Option<i64>,
-    pub exit_price_micro_cny: Option<i64>,
-    pub buy_commission_micro_cny: Option<i64>,
-    pub buy_stamp_micro_cny: Option<i64>,
-    pub sell_commission_micro_cny: Option<i64>,
-    pub sell_stamp_micro_cny: Option<i64>,
-    pub modeled_covered_net_micro_cny: Option<i64>,
-    pub gross_observed_close_return_pct: Option<f64>,
-    pub actual_settled_net: Option<i64>,
-    pub evidence_hashes: Vec<String>,
+#[derive(Clone, Debug, Serialize)]
+struct TradeRow {
+    decision_date: NaiveDate,
+    decision_at: Clock,
+    instrument: String,
+    source_known_at: Clock,
+    source_hash: String,
+    streak: Option<u32>,
+    amount_micro_cny: Option<i64>,
+    observed_rank: Option<usize>,
+    selected: bool,
+    reason: String,
+    entry_session: Option<NaiveDate>,
+    entry_at: Option<Clock>,
+    exit_at: Option<Clock>,
+    exit_session: Option<NaiveDate>,
+    entry_state: String,
+    exit_state: String,
+    entry_shares: u32,
+    closed_shares: u32,
+    censored_shares: u32,
+    entry_price_micro_cny: Option<i64>,
+    exit_price_micro_cny: Option<i64>,
+    buy_commission_micro_cny: Option<i64>,
+    buy_stamp_micro_cny: Option<i64>,
+    sell_commission_micro_cny: Option<i64>,
+    sell_stamp_micro_cny: Option<i64>,
+    modeled_covered_net_micro_cny: Option<i64>,
+    gross_observed_close_return_pct: Option<f64>,
+    actual_settled_net: Option<i64>,
+    economic_failure: Option<String>,
+    evidence_hashes: Vec<String>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Denominators {
-    pub decision_days: usize,
-    pub qualified_days: usize,
-    pub observed_rows: usize,
-    pub picks: usize,
-    pub executable_entries: usize,
-    pub closed_trades: usize,
-    pub unfilled_entries: usize,
-    pub unknown_entries: usize,
-    pub censored_entries: usize,
+#[derive(Clone, Debug, Default, Serialize)]
+struct Denominators {
+    decision_days: usize,
+    qualified_days: usize,
+    observed_rows: usize,
+    picks: usize,
+    executable_entries: usize,
+    closed_trades: usize,
+    unfilled_entries: usize,
+    unknown_entries: usize,
+    censored_entries: usize,
+    invalid_economics: usize,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Study {
-    pub schema: String,
-    pub as_of: Clock,
-    pub policy: Policy,
-    pub strategy_hash: String,
-    pub input_hash: String,
-    pub fee_hash: Option<String>,
-    pub fee_descriptor: Option<String>,
-    pub fee_source: Option<Source>,
-    pub fill_hash: String,
-    pub authority: String,
-    pub headline: String,
-    pub denominator: Denominators,
-    pub unavailable_days: Vec<(NaiveDate, String)>,
-    pub rows: Vec<TradeRow>,
-    pub modeled_win_rate: Option<f64>,
-    pub modeled_covered_net_micro_cny: Option<i64>,
-    pub fee_scope: String,
-    pub fill_scope: String,
-    pub checked_store_artifacts: Vec<serde_json::Value>,
+    schema: String,
+    as_of: Clock,
+    policy: Policy,
+    strategy_hash: String,
+    input_hash: String,
+    fee_hash: Option<String>,
+    fee_descriptor: Option<String>,
+    fee_source: Option<Source>,
+    fill_hash: String,
+    authority: String,
+    headline: String,
+    metric_failure: Option<String>,
+    denominator: Denominators,
+    unavailable_days: Vec<(NaiveDate, String)>,
+    rows: Vec<TradeRow>,
+    modeled_win_rate: Option<f64>,
+    modeled_covered_net_micro_cny: Option<i64>,
+    fee_scope: String,
+    fill_scope: String,
+    checked_store_artifacts: Vec<serde_json::Value>,
 }
 // This is a research-only source boundary, not an execution capability. No
 // Deserialize or production constructor. Tests model independent contract proof;
@@ -171,6 +174,7 @@ fn research(
         fill_hash: hash(&(FILL_SCOPE, fill::MODEL_VERSION)),
         authority: if qualified.is_some() {"InternalQualifiedHistoricalResearch (never live admission)"} else {"ObservedOnly/NotAdmitted/PIT NotCertified"}.into(),
         headline: "不可用：没有合格的可执行历史样本".into(),
+        metric_failure: None,
         denominator: Denominators::default(), unavailable_days: vec![], rows: vec![],
         modeled_win_rate: None, modeled_covered_net_micro_cny: None,
         fee_scope: "ModeledComponentsOnly: explicit dated Shanghai MainA/StarA commission+stamp per fill; transfer/other excluded; actual settled net unavailable".into(),
@@ -265,6 +269,7 @@ fn research(
                 modeled_covered_net_micro_cny: None,
                 gross_observed_close_return_pct: None,
                 actual_settled_net: None,
+                economic_failure: None,
                 evidence_hashes: vec![o.source.sha256.clone()],
             };
             // A raw price comparison is explicitly descriptive, even when captured late.
@@ -308,9 +313,15 @@ fn research(
         if row.censored_shares > 0 {
             result.denominator.censored_entries += 1;
         }
-        if row.entry_shares > 0 && row.closed_shares == row.entry_shares {
-            result.denominator.closed_trades += 1;
+        if row.economic_failure.is_some() {
+            result.denominator.invalid_economics += 1;
+        }
+        if row.entry_shares > 0
+            && row.closed_shares == row.entry_shares
+            && row.economic_failure.is_none()
+        {
             if let Some(net) = row.modeled_covered_net_micro_cny {
+                result.denominator.closed_trades += 1;
                 sum += net as i128;
                 if net > 0 {
                     wins += 1;
@@ -318,10 +329,23 @@ fn research(
             }
         }
     }
-    if result.denominator.closed_trades > 0 {
-        result.modeled_covered_net_micro_cny = Some(checked(sum).map_err(|e| e.to_string())?);
-        result.modeled_win_rate = Some(wins as f64 / result.denominator.closed_trades as f64);
-        result.headline = "仅历史模型覆盖费用结果；非真实结算收益，缺失/截尾样本单列".into();
+    if result.denominator.invalid_economics > 0 {
+        result.metric_failure = Some("selected rows have unavailable checked economics".into());
+        result.headline = "不可用：存在经济计算失败，失败批次保留截尾，汇总收益及胜率不可用".into();
+    } else if result.denominator.closed_trades > 0 {
+        match checked(sum) {
+            Ok(net) => {
+                result.modeled_covered_net_micro_cny = Some(net);
+                result.modeled_win_rate =
+                    Some(wins as f64 / result.denominator.closed_trades as f64);
+                result.headline =
+                    "仅历史模型覆盖费用结果；非真实结算收益，缺失/截尾样本单列".into();
+            }
+            Err(e) => {
+                result.metric_failure = Some(format!("aggregate checked net unavailable: {e}"));
+                result.headline = "不可用：汇总净额超出整数范围".into();
+            }
+        }
     }
     Ok(result)
 }
@@ -438,6 +462,21 @@ fn model_trade(
                 }
                 ModelOutcome::Fill(fill) => fill,
             };
+            // FIFO single entry: proportional cost/fee truncation, remainder retained in censored lot.
+            let basis =
+                buy.notional_micro_cny as i128 * sell.quantity as i128 / buy.quantity as i128;
+            let fee =
+                buy.total_fee_micro_cny as i128 * sell.quantity as i128 / buy.quantity as i128;
+            let net = match checked(
+                sell.notional_micro_cny as i128 - basis - fee - sell.total_fee_micro_cny as i128,
+            ) {
+                Ok(net) => net,
+                Err(e) => {
+                    row.economic_failure = Some(e.to_string());
+                    return Err(format!("economic net unavailable: {e}"));
+                }
+            };
+            // Publish a closed modeled quantity and its economics as one successful result.
             row.closed_shares = sell.quantity;
             row.exit_at = Some(window.observed_at.with_timezone(as_of.offset()));
             row.censored_shares = buy.quantity - sell.quantity;
@@ -450,20 +489,7 @@ fn model_trade(
             row.exit_price_micro_cny = Some(sell.price_micro_cny);
             row.sell_commission_micro_cny = Some(sell.commission_micro_cny);
             row.sell_stamp_micro_cny = Some(sell.stamp_tax_micro_cny);
-            // FIFO single entry: proportional cost/fee truncation, remainder retained in censored lot.
-            let basis =
-                buy.notional_micro_cny as i128 * sell.quantity as i128 / buy.quantity as i128;
-            let fee =
-                buy.total_fee_micro_cny as i128 * sell.quantity as i128 / buy.quantity as i128;
-            row.modeled_covered_net_micro_cny = Some(
-                checked(
-                    sell.notional_micro_cny as i128
-                        - basis
-                        - fee
-                        - sell.total_fee_micro_cny as i128,
-                )
-                .map_err(|e| e.to_string())?,
-            );
+            row.modeled_covered_net_micro_cny = Some(net);
             row.evidence_hashes.push(hash(window));
             Ok(())
         })();
@@ -477,6 +503,9 @@ fn model_trade(
     }
 }
 impl Study {
+    pub fn headline(&self) -> &str {
+        &self.headline
+    }
     /// Integrity is supplied by the offline store reader, never source qualification.
     pub fn attach_checked_observation(&mut self, artifact: serde_json::Value) {
         self.checked_store_artifacts.push(artifact);
@@ -485,6 +514,13 @@ impl Study {
     pub fn markdown(&self) -> String {
         let d = &self.denominator;
         let mut out=format!("{}。\n\n资格：{}。决策日{}；合格日{}；观察记录{}；选中{}；可执行入场{}；完整平仓{}；未知入场{}；截尾{}。\n\n",escaped(&self.headline),escaped(&self.authority),d.decision_days,d.qualified_days,d.observed_rows,d.picks,d.executable_entries,d.closed_trades,d.unknown_entries,d.censored_entries);
+        if let Some(error) = &self.metric_failure {
+            out.push_str(&format!(
+                "经济计算失败：{}；无效样本{}。\n\n",
+                escaped(error),
+                d.invalid_economics
+            ));
+        }
         if !self.checked_store_artifacts.is_empty() {
             out.push_str("已核对存档字节完整性；下列记录仅是历史观察，不能恢复准入或证明历史可用时点。\n\n|存档哈希|原始记录数|\n|---|---:|\n");
             for a in &self.checked_store_artifacts {
@@ -549,6 +585,7 @@ impl Study {
             "modeled_covered_net_micro_cny",
             "gross_observed_close_return_pct",
             "actual_settled_net",
+            "economic_failure",
             "evidence_hashes",
         ];
         let mut headers = vec![
@@ -572,6 +609,8 @@ impl Study {
             "unfilled_entries",
             "unknown_entries",
             "censored_entries",
+            "invalid_economics",
+            "metric_failure",
             "headline",
             "modeled_win_rate",
             "modeled_total_covered_net_micro_cny",
@@ -608,6 +647,8 @@ impl Study {
                 self.denominator.unfilled_entries.to_string(),
                 self.denominator.unknown_entries.to_string(),
                 self.denominator.censored_entries.to_string(),
+                self.denominator.invalid_economics.to_string(),
+                self.metric_failure.clone().unwrap_or_default(),
                 self.headline.clone(),
                 self.modeled_win_rate
                     .map(|v| v.to_string())

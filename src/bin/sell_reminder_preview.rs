@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use stock_analysis::offline_products::{
     io,
-    sell_reminder::{self, EvidencePack, Preview},
+    sell_reminder::{self, EvidencePack, ImportedPreview},
     shanghai_clock, Clock,
 };
 #[derive(Parser)]
@@ -41,7 +41,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         let pack: EvidencePack = io::read_json(&path)?;
         sell_reminder::preview_observed(&pack, args.as_of)
     } else {
-        let report: Preview = io::read_json(args.reinspect.as_ref().unwrap())?;
+        let report: ImportedPreview = io::read_json(args.reinspect.as_ref().unwrap())?;
         sell_reminder::reinspect_imported(report, args.as_of).map_err(anyhow::Error::msg)?
     };
     if let Some(path) = args.json {
@@ -123,7 +123,13 @@ mod tests {
             handling_template: Some(dir.path().join("human.json")),
         };
         run(args()).unwrap();
-        let report: Preview = io::read_json(&dir.path().join("out.json")).unwrap();
+        let saved: serde_json::Value = io::read_json(&dir.path().join("out.json")).unwrap();
+        let pack: EvidencePack = io::read_json(&input).unwrap();
+        let report = sell_reminder::preview_observed(
+            &pack,
+            shanghai_clock("2026-09-28T15:05:00+08:00").unwrap(),
+        );
+        assert_eq!(saved, serde_json::to_value(&report).unwrap());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("out.md")).unwrap(),
             report.markdown()

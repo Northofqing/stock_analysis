@@ -159,7 +159,12 @@ fn temporal_window_exact_close_and_sticky_expiry() {
     assert!(r.reinspect(clock()).is_err());
     assert_eq!(r.state, State::Expired);
     assert_eq!(
-        reinspect_imported(qualified(&p), clock()).unwrap().state,
+        reinspect_imported(
+            serde_json::from_value(serde_json::to_value(qualified(&p)).unwrap()).unwrap(),
+            clock()
+        )
+        .unwrap()
+        .state,
         State::Unavailable
     );
 }
@@ -289,7 +294,7 @@ fn serialized_positive_report_cannot_reestablish_qualified_values_even_after_exp
     assert!(original.rows[0].net_scenario_pct.is_some());
     let bytes = serde_json::to_vec(&original).unwrap();
     for now in [clock(), at(clock().date_naive(), 15, 30)] {
-        let forged: Preview = serde_json::from_slice(&bytes).unwrap();
+        let forged: ImportedPreview = serde_json::from_slice(&bytes).unwrap();
         let imported = reinspect_imported(forged, now).unwrap();
         assert_eq!(
             imported.state,
@@ -309,6 +314,14 @@ fn serialized_positive_report_cannot_reestablish_qualified_values_even_after_exp
         assert!(imported.rows[0].covered_buy_fee_micro_cny.is_none());
         assert!(imported.rows[0].sell_fees.is_none());
         assert!(imported.markdown().contains("NotAdmitted"));
+        // Every public render/serialization path sees only the masked result.
+        let value = serde_json::to_value(&imported).unwrap();
+        assert_eq!(value["authority"], "ImportedReport/NotAdmitted");
+        assert!(value["rows"][0]["reference_close_micro_cny"].is_null());
+        assert!(value["rows"][0]["net_scenario_pct"].is_null());
+        assert!(value["rows"][0]["sell_fees"].is_null());
+        assert!(!imported.markdown().starts_with("有卖出候选"));
+        assert_eq!(imported.handling_template()["not_settlement"], true);
     }
     let mut trusted = original;
     trusted.reinspect(clock()).unwrap();

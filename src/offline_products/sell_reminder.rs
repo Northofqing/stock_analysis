@@ -105,43 +105,63 @@ pub enum State {
     Expired,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Row {
-    pub instrument: String,
-    pub account_ref: String,
-    pub lot_id: Option<String>,
-    pub acquired: Option<NaiveDate>,
-    pub state: State,
-    pub reason: String,
-    pub observed_total_shares: u32,
-    pub eligible_sellable: Option<u32>,
-    pub suggested_shares: u32,
-    pub observed_close_micro_cny: Option<i64>,
-    pub reference_close_micro_cny: Option<i64>,
-    pub net_scenario_pct: Option<f64>,
-    pub covered_buy_fee_micro_cny: Option<i64>,
-    pub sell_fees: Option<SellFees>,
-    pub missing: Vec<String>,
-    pub indicator_scope: String,
-    pub evidence_hashes: Vec<String>,
-    pub evidence: Vec<Source>,
+struct Row {
+    instrument: String,
+    account_ref: String,
+    lot_id: Option<String>,
+    acquired: Option<NaiveDate>,
+    state: State,
+    reason: String,
+    observed_total_shares: u32,
+    eligible_sellable: Option<u32>,
+    suggested_shares: u32,
+    observed_close_micro_cny: Option<i64>,
+    reference_close_micro_cny: Option<i64>,
+    net_scenario_pct: Option<f64>,
+    covered_buy_fee_micro_cny: Option<i64>,
+    sell_fees: Option<SellFees>,
+    missing: Vec<String>,
+    indicator_scope: String,
+    evidence_hashes: Vec<String>,
+    evidence: Vec<Source>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Preview {
-    pub schema: String,
-    pub state: State,
-    pub created_at: Clock,
-    pub inspected_at: Clock,
-    pub expires_at: Clock,
-    pub input_hash: String,
-    pub authority: String,
-    pub account_state: String,
-    pub account_snapshot: Option<Account>,
-    pub missing: Vec<String>,
-    pub rows: Vec<Row>,
-    pub semantics: String,
-    pub manual_notes: String,
-    pub execution: String,
-    pub next_open_comparison: String,
+    schema: String,
+    state: State,
+    created_at: Clock,
+    inspected_at: Clock,
+    expires_at: Clock,
+    input_hash: String,
+    authority: String,
+    account_state: String,
+    account_snapshot: Option<Account>,
+    missing: Vec<String>,
+    rows: Vec<Row>,
+    semantics: String,
+    manual_notes: String,
+    execution: String,
+    next_open_comparison: String,
+}
+/// Declared previous-report bytes. No renderer or serializer; conversion always masks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportedPreview {
+    schema: String,
+    state: State,
+    created_at: Clock,
+    inspected_at: Clock,
+    expires_at: Clock,
+    input_hash: String,
+    authority: String,
+    account_state: String,
+    account_snapshot: Option<Account>,
+    missing: Vec<String>,
+    rows: Vec<Row>,
+    semantics: String,
+    manual_notes: String,
+    execution: String,
+    next_open_comparison: String,
 }
 // Intentionally private, no Deserialize and no production issuer. A future reviewed
 // adapter must bind independent real-lot, close, lifecycle and quantity contracts.
@@ -602,6 +622,12 @@ fn indicators(s: &Security, close: i64) -> Result<Indicators, String> {
         scope:format!("bars={}; ATR mean-range CNY interpreted as percent (legacy); ATR fallback={}; MA60 substitutes MA20={}; Boll>=35={}",s.bars.len(),atr.is_none_or(|a| a<=0.),s.bars.len()<60,s.bars.len()>=35)})
 }
 impl Preview {
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+    pub fn expires_at(&self) -> Clock {
+        self.expires_at
+    }
     /// Monotonic in-memory inspection. Persisted reports are observations; use the import boundary below.
     pub fn reinspect(&mut self, now: Clock) -> Result<(), String> {
         if now < self.inspected_at {
@@ -688,7 +714,24 @@ impl Preview {
         serde_json::json!({"schema":"sell-human-observation/v1","preview_hash":hash(self),"not_settlement":true,"allowed_statuses":["declared","filled","partial","unfilled","handled-without-action"],"status":null,"observed_at":null,"broker_evidence_reference":null,"account_ref":null,"lot_ids":[],"declared_shares":null,"filled_shares":null,"actual_price":null,"commission":null,"stamp":null,"transfer":null,"other_fees":null,"notes":null,"execution_comparison":"unavailable until real receipts + qualified next prices + fees"})
     }
 }
-pub fn reinspect_imported(mut report: Preview, now: Clock) -> Result<Preview, String> {
+pub fn reinspect_imported(imported: ImportedPreview, now: Clock) -> Result<Preview, String> {
+    let mut report = Preview {
+        schema: imported.schema,
+        state: imported.state,
+        created_at: imported.created_at,
+        inspected_at: imported.inspected_at,
+        expires_at: imported.expires_at,
+        input_hash: imported.input_hash,
+        authority: imported.authority,
+        account_state: imported.account_state,
+        account_snapshot: imported.account_snapshot,
+        missing: imported.missing,
+        rows: imported.rows,
+        semantics: imported.semantics,
+        manual_notes: imported.manual_notes,
+        execution: imported.execution,
+        next_open_comparison: imported.next_open_comparison,
+    };
     report.reinspect(now)?;
     let imported_state = if report.state == State::Expired {
         State::Expired
