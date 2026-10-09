@@ -109,3 +109,7 @@ incremental = false
 # backtraces and symbols at debug=0.
 debug = 0
 incremental = false
+
+[[bench]]
+name = "intraday_tick"
+harness = false

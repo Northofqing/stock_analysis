@@ -461,37 +461,146 @@ fn validate_data_acquisition_audit_chain_rows(
 
     let mut previous = AUDIT_CHAIN_GENESIS.to_string();
     for (audit, evidence) in audits.iter().zip(chain.iter()) {
-        if audit.schema_version != AUDIT_SCHEMA_VERSION
-            || evidence.acquisition_audit_id != audit.id
-            || evidence.previous_hash != previous
-        {
-            return Err(audit_error(format!(
-                "BR-159 acquisition audit linkage/schema mismatch at audit id {}",
-                audit.id
-            )));
-        }
-        let expected = calculate_record_hash(&previous, audit)?;
-        if evidence.record_hash != expected {
-            return Err(audit_error(format!(
-                "BR-159 acquisition audit hash mismatch at audit id {}",
-                audit.id
-            )));
-        }
+        validate_audit_pair(audit, evidence, &previous)?;
         previous = evidence.record_hash.clone();
     }
     Ok(previous)
 }
 
+fn validate_audit_pair(
+    audit: &PersistedAcquisitionAudit,
+    evidence: &AuditChainRow,
+    previous: &str,
+) -> diesel::QueryResult<()> {
+    if audit.schema_version != AUDIT_SCHEMA_VERSION
+        || evidence.acquisition_audit_id != audit.id
+        || evidence.previous_hash != previous
+    {
+        return Err(audit_error(format!(
+            "BR-159 acquisition audit linkage/schema mismatch at audit id {}",
+            audit.id
+        )));
+    }
+    if evidence.record_hash != calculate_record_hash(previous, audit)? {
+        return Err(audit_error(format!(
+            "BR-159 acquisition audit hash mismatch at audit id {}",
+            audit.id
+        )));
+    }
+    Ok(())
+}
+
+const AUDIT_VALIDATION_PAGE_SIZE: i64 = 1024;
+
+fn load_audit_page(
+    conn: &mut SqliteConnection,
+    after: Option<i64>,
+    limit: i64,
+) -> diesel::QueryResult<Vec<PersistedAcquisitionAudit>> {
+    match after {
+        None => diesel::sql_query(format!("{LOAD_AUDIT_ROWS_SQL} LIMIT ?"))
+            .bind::<BigInt, _>(limit)
+            .load(conn),
+        Some(id) => diesel::sql_query(format!(
+            "{} LIMIT ?",
+            LOAD_AUDIT_ROWS_SQL.replace(" ORDER BY", " WHERE id > ? ORDER BY")
+        ))
+        .bind::<BigInt, _>(id)
+        .bind::<BigInt, _>(limit)
+        .load(conn),
+    }
+}
+fn load_chain_page(
+    conn: &mut SqliteConnection,
+    after: Option<i64>,
+    limit: i64,
+) -> diesel::QueryResult<Vec<AuditChainRow>> {
+    match after {
+        None => diesel::sql_query(format!("{LOAD_CHAIN_ROWS_SQL} LIMIT ?"))
+            .bind::<BigInt, _>(limit)
+            .load(conn),
+        Some(id) => diesel::sql_query(format!(
+            "{} LIMIT ?",
+            LOAD_CHAIN_ROWS_SQL.replace(" ORDER BY", " WHERE acquisition_audit_id > ? ORDER BY")
+        ))
+        .bind::<BigInt, _>(id)
+        .bind::<BigInt, _>(limit)
+        .load(conn),
+    }
+}
+
+#[derive(QueryableByName)]
+struct AuditRowCount {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
+/// The hook is a private deterministic test seam, called between the first audit and chain data pages.
+/// Production supplies a no-op. Both table EOFs and all hashing stay in this transaction.
+fn validate_audit_chain_paged(
+    conn: &mut SqliteConnection,
+    page_size: i64,
+    mut after_first_audit_page: impl FnMut(),
+) -> diesel::QueryResult<String> {
+    if !(1..=AUDIT_VALIDATION_PAGE_SIZE).contains(&page_size) {
+        return Err(audit_error("BR-159 invalid validation page size"));
+    }
+    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        // Preserve exact length diagnostics and their precedence, in the same snapshot.
+        let audit_count = diesel::sql_query("SELECT COUNT(*) AS count FROM data_acquisition_audit")
+            .get_result::<AuditRowCount>(conn)?
+            .count;
+        let chain_count =
+            diesel::sql_query("SELECT COUNT(*) AS count FROM data_acquisition_audit_chain")
+                .get_result::<AuditRowCount>(conn)?
+                .count;
+        if audit_count != chain_count {
+            return Err(audit_error(format!(
+                "BR-159 acquisition audit hash chain length mismatch: audit_rows={}, chain_rows={}",
+                audit_count, chain_count
+            )));
+        }
+        let mut audit_cursor = None;
+        let mut chain_cursor = None;
+        let mut previous = AUDIT_CHAIN_GENESIS.to_owned();
+        let mut validated = 0i64;
+        loop {
+            let audits = load_audit_page(conn, audit_cursor, page_size)?;
+            if audit_cursor.is_none() {
+                after_first_audit_page();
+            }
+            let chain = load_chain_page(conn, chain_cursor, page_size)?;
+            if audits.len() != chain.len() {
+                return Err(audit_error("BR-159 acquisition audit page length mismatch"));
+            }
+            if audits.is_empty() {
+                if validated != audit_count {
+                    return Err(audit_error(
+                        "BR-159 acquisition audit validated count mismatch",
+                    ));
+                }
+                return Ok(previous);
+            }
+            for (audit, evidence) in audits.iter().zip(&chain) {
+                if audit_cursor.is_some_and(|id| audit.id <= id)
+                    || chain_cursor.is_some_and(|id| evidence.acquisition_audit_id <= id)
+                {
+                    return Err(audit_error("BR-159 acquisition audit ID ordering mismatch"));
+                }
+                validate_audit_pair(audit, evidence, &previous)?;
+                previous.clone_from(&evidence.record_hash);
+                audit_cursor = Some(audit.id);
+                chain_cursor = Some(evidence.acquisition_audit_id);
+                validated += 1;
+            }
+        }
+    })
+}
+
 pub(super) fn validate_data_acquisition_audit_chain(
     conn: &mut SqliteConnection,
 ) -> diesel::QueryResult<String> {
-    // 2026-08-12: 两次 SELECT 包进同一 DEFERRED 事务, 保证同一快照 —
-    // 并发写者 (如回填工具 vs 运行中 monitor) 在两次读取之间提交时,
-    // 裸 SELECT 会看到 audit/chain 各一瞬, 误报 length mismatch。
-    let (audits, chain) = conn.transaction::<_, diesel::result::Error, _>(|conn| {
-        Ok((load_audit_rows(conn)?, load_chain_rows(conn)?))
-    })?;
-    validate_data_acquisition_audit_chain_rows(&audits, &chain)
+    validate_audit_chain_paged(conn, AUDIT_VALIDATION_PAGE_SIZE, || {})
 }
 
 fn verify_data_acquisition_receipt_snapshot(
@@ -909,6 +1018,14 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod paging_tests {
+        include!("data_acquisition_audit_paging_tests.rs");
+    }
+
+    mod performance_tests {
+        include!("data_acquisition_audit_performance_tests.rs");
+    }
 
     mod transaction_tests {
         include!("data_acquisition_audit_transaction_tests.rs");
