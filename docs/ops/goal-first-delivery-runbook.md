@@ -1,6 +1,6 @@
 # Goal-first 工具包交付（待安装）
 
-本包只包含五个离线工具与 Python 辅助脚本。`manifest.json` 固定 source commit、release/toolchain/编译 root、每文件字节数/SHA、原 registry/calendar/contracts、CLI/schema、安装前 monitor 输入树/二进制/任务文件哈希。初始五target构建与随后assistant-only输出上限修复重建分别记录source commit/日志/每bin身份；其他compiled inputs未改，不重建其余bin。哈希识别内容；不证明 Gateway、历史 PIT、交易资格、送达或当前进程身份。Python 为本机 `/usr/bin/python3` 3.9.6。
+本包只包含五个离线工具与 Python 辅助脚本。`manifest.json` 固定 source commit、release/toolchain/编译 root、每文件字节数/SHA、原 registry/calendar/contracts、CLI/schema、安装前 monitor 输入树/二进制/任务文件哈希。初始五target、assistant-only输出上限修复、weekly-only registry descriptor修复三次构建分别记录source commit/日志/每bin身份。第三次修复会改变被library借用的loader源码，library编译以日志为准；schema/parser/default bytes未改，复用其余四bin并保留其实际旧身份。旧候选包仅保留作历史证据，最终待安装包为 `/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c`。哈希识别内容；不证明 Gateway、历史 PIT、交易资格、送达或当前进程身份。Python 为本机 `/usr/bin/python3` 3.9.6。
 
 目录：`<candidate>/goal-first/<version>/{bin,scripts,resources,launchd,manifest.json,RUNBOOK.md}`；唯一发布位置为 `/Users/zhangzhen/.local/share/stock-analysis-runtime/tools/goal-first/<version>`。目录0700，release binary/launcher0500，普通脚本/文档/plist0600，原始资源0400。原 TOML/CSV bytes 与编译资源绑定；Rust calendar 是编译输入，修改复制 CSV 不会更新 binary。
 

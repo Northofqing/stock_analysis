@@ -82,6 +82,26 @@ class FixedDelivery(unittest.TestCase):
         with self.assertRaises(ValueError): d.install(self.bundle)
         self.assertEqual(extra.read_bytes(), b'local evidence')
 
+    def test_fixed_third_weekly_provenance_rejects_parser_or_unrelated_changes(self):
+        original = "schema/default\nimpl RegistryInput {old loader\n            None => (embedded)\n}\nimpl Registry {parser}\n"
+        fixed = "schema/default\nimpl RegistryInput {new loader\n            None => (embedded)\n}\n// Ordinary readable TOML\nhelper\nimpl Registry {parser}\nnew tests\n"
+        def git(args, **kwargs):
+            if args[1] == 'diff':
+                return 'src/bin/assistant_review.rs\n' if args[4] == 'assistant' else 'src/bin/weekly_outcome_review/registry.rs\n'
+            return original if args[2].startswith('assistant:') else fixed
+        with patch.object(d.subprocess, 'check_output', side_effect=git):
+            sources = d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log')
+            self.assertEqual(sources['weekly_outcome_review'], 'fixed')
+            self.assertEqual(sources['assistant_review'], 'assistant')
+            self.assertEqual(sources['sell_reminder_preview'], 'base')
+            with self.assertRaises(ValueError): d.binary_sources(self.root, 'fixed', 'base', 'assistant')
+            fixed = fixed.replace('parser', 'changed parser')
+            with self.assertRaises(ValueError): d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log')
+        with patch.object(d.subprocess, 'check_output', return_value='src/llm/bounded.rs\n'):
+            with self.assertRaises(ValueError): d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log')
+        with patch.object(d.subprocess, 'check_output', return_value='src/bin/assistant_review.rs\n'):
+            self.assertEqual(d.binary_sources(self.root, 'assistant', 'base')['weekly_outcome_review'], 'base')
+
     def test_hash_mismatch_and_escaped_version_refused(self):
         target = self.bundle / 'scripts/reliability_common.py'
         target.write_bytes(b'changed')

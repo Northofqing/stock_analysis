@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import hashlib
 import os
 from pathlib import Path
 import plistlib
@@ -7,6 +8,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     "weekly_outcome_review", Path(__file__).resolve().parents[1] / "weekly-outcome-review.py"
@@ -170,6 +172,76 @@ with os.fdopen(fd,'w') as stream: json.dump(report,stream)
             status = json.loads((next(reports.iterdir()) / "run-status.json").read_text())
             self.assertEqual(status["completed_artifacts"], [])
             self.assertEqual(source.read_bytes(), before)
+
+    def test_registry_descriptor_cap_permissions_and_raw_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "registry.toml"
+            source.write_bytes(b"# raw original bytes\n" + b" " * (128 * 1024 - 21))
+            source.chmod(0o644)
+            frozen_root = root / "frozen"
+            frozen_root.mkdir()
+            args = MODULE.registry_snapshot_args(source, frozen_root)
+            frozen = Path(args[1])
+            self.assertEqual(frozen.read_bytes(), source.read_bytes())
+            self.assertEqual(hashlib.sha256(frozen.read_bytes()).hexdigest(), hashlib.sha256(source.read_bytes()).hexdigest())
+            self.assertEqual(frozen.stat().st_mode & 0o777, 0o400)
+            frozen.unlink()
+            source.write_bytes(b" " * (128 * 1024 + 1))
+            with self.assertRaisesRegex(ValueError, "128 KiB"):
+                MODULE.registry_snapshot_args(source, frozen_root)
+            self.assertFalse(frozen.exists())
+            source.unlink()
+            source.symlink_to(root / "missing")
+            with self.assertRaises(OSError): MODULE.registry_snapshot_args(source, frozen_root)
+            with self.assertRaises(ValueError): MODULE.registry_snapshot_args(root, frozen_root)
+            self.assertEqual(MODULE.registry_snapshot_args(None, frozen_root), [])
+
+    def test_registry_growth_and_path_replacement_are_rejected_before_freeze(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "registry.toml"
+            frozen_root = root / "frozen"
+            frozen_root.mkdir()
+            real_read = os.read
+            for change in ("growth", "replacement"):
+                source.write_bytes(b"original")
+                def changed_read(fd, count):
+                    if change == "growth":
+                        with source.open("ab") as stream: stream.write(b" " * (128 * 1024))
+                    else:
+                        source.rename(root / "old.toml")
+                        source.write_bytes(b"original")
+                    return real_read(fd, count)
+                with patch.object(MODULE.os, "read", side_effect=changed_read):
+                    with self.assertRaises(ValueError): MODULE.registry_snapshot_args(source, frozen_root)
+                self.assertFalse((frozen_root / "signal_registry.toml").exists())
+
+    def test_registry_regular_to_fifo_replacement_has_finite_child_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "registry.toml"
+            source.write_bytes(b"original")
+            frozen_root = root / "frozen"
+            frozen_root.mkdir()
+            code = """
+import importlib.util, os, pathlib, sys
+from unittest.mock import patch
+spec=importlib.util.spec_from_file_location('weekly',sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+source=pathlib.Path(sys.argv[2]); frozen=pathlib.Path(sys.argv[3]); real_open=os.open
+def replaced(path,flags,*args):
+    if pathlib.Path(path)==source:
+        source.unlink(); os.mkfifo(source,0o600)
+    return real_open(path,flags,*args)
+with patch.object(m.os,'open',side_effect=replaced):
+    try: m.registry_snapshot_args(source,frozen)
+    except ValueError: sys.exit(0)
+sys.exit(1)
+"""
+            result = subprocess.run([os.sys.executable, "-B", "-c", code, SPEC.origin, str(source), str(frozen_root)], capture_output=True, text=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((frozen_root / "signal_registry.toml").exists())
 
     def test_wal_backup_includes_committed_rows_and_preserves_source_inode_catalog_and_data(self):
         with tempfile.TemporaryDirectory() as directory:

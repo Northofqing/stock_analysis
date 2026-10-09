@@ -89,13 +89,36 @@ def weekly_run(source: Path, binary: Path, output_root: Path, observed_at: str |
 def registry_snapshot_args(registry: Path | None, directory: Path) -> list[str]:
     if registry is None:
         return []  # CLI's embedded registry is independent of launchd cwd.
-    source = registry.resolve(strict=True)
-    if not source.is_file() or source.stat().st_size > 128 * 1024:
-        raise ValueError("registry must be a bounded regular TOML file (<=128 KiB)")
+    # Resolve only the parent: a substituted leaf symlink must never be followed.
+    source = registry.parent.resolve(strict=True) / registry.name
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("registry must be a bounded regular TOML file (<=128 KiB)")
+        data = bytearray()
+        while len(data) <= 128 * 1024:
+            chunk = os.read(descriptor, 128 * 1024 + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > 128 * 1024:
+            raise ValueError("registry exceeds 128 KiB bound")
+        def signature(info):
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        after = os.fstat(descriptor)
+        named = registry.lstat()
+        pinned = source.lstat()
+        if (not stat.S_ISREG(named.st_mode) or not stat.S_ISREG(pinned.st_mode)
+                or signature(before) != signature(after) or signature(before) != signature(named)
+                or signature(before) != signature(pinned) or len(data) != before.st_size):
+            raise ValueError("registry changed during read")
+    finally:
+        os.close(descriptor)
     frozen = directory / "signal_registry.toml"
     descriptor = os.open(frozen, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
     with os.fdopen(descriptor, "wb") as stream:
-        stream.write(source.read_bytes())
+        stream.write(data)
     return ["--registry", str(frozen)]
 
 
@@ -174,10 +197,11 @@ def main() -> int:
         os.chmod(directory, 0o700)
         backup = Path(directory) / "snapshot.db"
         read_only_backup(args.database, backup)
+        registry_args = registry_snapshot_args(args.registry, Path(directory))
         command = [str(binary), "--database", str(backup), "--from", args.start,
                    "--to", args.to, "--format", args.format or "markdown",
                    "--source-label", str(args.database.resolve(strict=True)),
-                   "--temporary-snapshot"] + registry_snapshot_args(args.registry, Path(directory))
+                   "--temporary-snapshot"] + registry_args
         if args.evidence_manifest:
             command.extend(["--evidence-manifest", str(args.evidence_manifest)])
         if args.observed_at:

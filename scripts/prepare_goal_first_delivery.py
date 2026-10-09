@@ -216,7 +216,37 @@ def install(bundle):
     return {'status': 'published', 'destination': str(destination), 'jobs': 'not_loaded'}
 
 
-def prepare(repo, candidate, version, source_commit, build_log, base_commit=None, assistant_log=None):
+def binary_sources(repo, source_commit, base_commit, assistant_commit=None, weekly_log=None):
+    # Fixed third build: only the reviewed registry loader may differ in the
+    # borrowed library module. Reused binaries never execute that loader.
+    compiled = ('src', 'config', 'contracts', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'build_support')
+    def changed(a, b):
+        return set(subprocess.check_output(['git', 'diff', '--name-only', a, b, '--', *compiled], cwd=repo, text=True).splitlines())
+    assistant_commit = assistant_commit or source_commit
+    if changed(base_commit, assistant_commit) - {'src/bin/assistant_review.rs'}:
+        raise ValueError('other compiled inputs changed since first release build')
+    sources = {name: assistant_commit if name == 'assistant_review' else base_commit for name in BINS}
+    if weekly_log is None:
+        if assistant_commit != source_commit:
+            raise ValueError('weekly build provenance required for newer source')
+        return sources
+    registry = 'src/bin/weekly_outcome_review/registry.rs'
+    if changed(assistant_commit, source_commit) != {registry}:
+        raise ValueError('third build must change only the weekly registry loader')
+    def blob(commit):
+        return subprocess.check_output(['git', 'show', commit + ':' + registry], cwd=repo, text=True)
+    old, new = blob(assistant_commit), blob(source_commit)
+    # Schema/constants, parser, defaults, family mapping and original schema tests
+    # remain byte-identical. Only load/helper and appended regression tests differ.
+    if (old.split('impl RegistryInput {')[0] != new.split('impl RegistryInput {')[0]
+            or old[old.index('            None => ('):old.index('impl Registry {')].rstrip() != new[new.index('            None => ('):new.index('// Ordinary readable TOML')].rstrip()
+            or not new[new.index('impl Registry {'):].startswith(old[old.index('impl Registry {'):])):
+        raise ValueError('shared registry schema/parser changed; reused binaries invalid')
+    sources['weekly_outcome_review'] = source_commit
+    return sources
+
+
+def prepare(repo, candidate, version, source_commit, build_log, base_commit=None, assistant_log=None, assistant_commit=None, weekly_log=None):
     if not version or len(version) > 64 or version in ('.', '..') or any(c not in 'abcdefghijklmnopqrstuvwxyz0123456789-.' for c in version):
         raise ValueError('version')
     repo = clean_path(repo)
@@ -224,9 +254,9 @@ def prepare(repo, candidate, version, source_commit, build_log, base_commit=None
         raise ValueError('clean committed source required')
     if not base_commit or len(base_commit) != 40 or any(c not in '0123456789abcdef' for c in base_commit) or assistant_log is None:
         raise ValueError('explicit two-build provenance required')
-    changed_binary_inputs = subprocess.check_output(['git', 'diff', '--name-only', base_commit, source_commit, '--', 'src', 'config', 'contracts', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'build_support'], cwd=repo, text=True).splitlines()
-    if set(changed_binary_inputs) - {'src/bin/assistant_review.rs'}:
-        raise ValueError('other compiled inputs changed since first release build')
+    if assistant_commit is not None and (len(assistant_commit) != 40 or any(c not in '0123456789abcdef' for c in assistant_commit)):
+        raise ValueError('exact assistant source commit required')
+    per_bin_sources = binary_sources(repo, source_commit, base_commit, assistant_commit, weekly_log)
     bundle = clean_path(candidate) / 'goal-first' / version
     if 'Desktop' in bundle.parts or bundle.exists():
         raise ValueError('fresh Desktop-external candidate required')
@@ -263,13 +293,15 @@ def prepare(repo, candidate, version, source_commit, build_log, base_commit=None
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--offline', '--format-version', '1'], cwd=repo))
     m = {'schema': 'goal-first-tools-package/v1', 'version': version, 'source_commit': source_commit, 'source_dirty': False,
          'runtime': str(RUNTIME), 'destination': str(destination), 'launchd_labels': list(LABELS),
-         'build': {'selected_bins': list(BINS), 'source_commit': base_commit, 'per_bin_source_commit': {name: source_commit if name == 'assistant_review' else base_commit for name in BINS}, 'assistant_rebuild': {'source_commit': source_commit, 'selected_bins': ['assistant_review'], 'log': str(assistant_log), 'log_identity': identity(read(assistant_log))}, 'profile': 'release', 'production_root': str(destination), 'rustc': subprocess.check_output(['rustc', '-Vv'], text=True), 'cargo': subprocess.check_output(['cargo', '-V'], text=True), 'log': str(build_log), 'log_identity': identity(read(build_log)), 'features': [], 'python': subprocess.check_output(['/usr/bin/python3', '--version'], text=True).strip(), 'metadata_target_count': len(metadata['packages'][0]['targets'])},
+         'build': {'selected_bins': list(BINS), 'source_commit': base_commit, 'per_bin_source_commit': per_bin_sources, 'assistant_rebuild': {'source_commit': per_bin_sources['assistant_review'], 'selected_bins': ['assistant_review'], 'log': str(assistant_log), 'log_identity': identity(read(assistant_log))}, 'profile': 'release', 'production_root': str(destination), 'rustc': subprocess.check_output(['rustc', '-Vv'], text=True), 'cargo': subprocess.check_output(['cargo', '-V'], text=True), 'log': str(build_log), 'log_identity': identity(read(build_log)), 'features': [], 'python': subprocess.check_output(['/usr/bin/python3', '--version'], text=True).strip(), 'metadata_target_count': len(metadata['packages'][0]['targets'])},
          'schemas': ['H16-descriptive-weekly-v1', 'weekly-signal-scorecard-v1', 'weekly-outcome-evidence-manifest-v1', 'assistant-phase-a-comparison-v1', 'sell-preview/v1-legacy-rule-units', 'streak-study/v1', 'monitor-health-runtime_snapshot-v2'],
          'preconditions': preconditions, 'rollback': rollback_files,
          'observed_activation_expected_config_hash': activation.get('expected_config_hash'),
          'attestation': 'disk observations only; no live process, Gateway, PIT or physical delivery authority',
          'source_inputs': {name: identity(read(repo / name)) for name in subprocess.check_output(['git', 'ls-files', 'src', 'config', 'contracts', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'build_support'], cwd=repo, text=True).splitlines()},
          'files': {name: {**identity(read(bundle / name, True)), 'mode': oct(mode)} for name, mode in layout().items()}}
+    if weekly_log is not None:
+        m['build']['weekly_rebuild'] = {'source_commit': source_commit, 'selected_bins': ['weekly_outcome_review'], 'log': str(weekly_log), 'log_identity': identity(read(weekly_log)), 'shared_registry_delta': 'descriptor loader and appended regressions only; schema/parser/default bytes unchanged; library compilation recorded in build log'}
     write(bundle / 'manifest.json', json_bytes(m))
     validate(bundle)
     return {'bundle': str(bundle), 'manifest': identity(read(bundle / 'manifest.json', True)), 'rollback': str(rollback)}
@@ -287,12 +319,14 @@ def main():
     p.add_argument('--build-log', type=Path)
     p.add_argument('--base-binary-source-commit')
     p.add_argument('--assistant-build-log', type=Path)
+    p.add_argument('--assistant-binary-source-commit')
+    p.add_argument('--weekly-build-log', type=Path)
     a = p.parse_args()
     try:
         if a.prepare:
             if a.install or a.bundle or not all((a.repo, a.candidate_root, a.version, a.source_commit, a.build_log, a.base_binary_source_commit, a.assistant_build_log)):
                 raise ValueError('explicit preparation arguments required')
-            result = prepare(a.repo, a.candidate_root, a.version, a.source_commit, a.build_log, a.base_binary_source_commit, a.assistant_build_log)
+            result = prepare(a.repo, a.candidate_root, a.version, a.source_commit, a.build_log, a.base_binary_source_commit, a.assistant_build_log, a.assistant_binary_source_commit, a.weekly_build_log)
         elif a.bundle:
             result = install(a.bundle) if a.install else {'status': 'checked_plan_only', 'destination': check(a.bundle)['destination'], 'jobs': 'not_loaded', 'changes': 'none'}
         else:
