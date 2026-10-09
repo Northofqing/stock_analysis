@@ -1,6 +1,6 @@
 # 永久交付证据索引
 
-本页是简短导航，全文证据在Desktop外private durable archive；不是生产receipt。源码/脚本交付commit `1ce18c2850d19b4bd0908bce6225049c61b0d19d`；首次5selected release source `f3761320cac5044999a53cdbd7a2acb57107a6de`，随后只重建assistant于1ce（其他compiled inputs不变、4bin旧hash一致）。版本名中f376是首构建标签，不冒充所有bin同一source。各报告头部旧pending是历史快照，最终独立rereview优先：Tasks1–5均local clean，Task4 3/0/0、Task5 2/0/0；Task6/wholebranchreview待root最终门禁。
+本页是简短导航，全文证据在Desktop外private durable archive；不是生产receipt。首次源码/脚本交付commit `1ce18c2850d19b4bd0908bce6225049c61b0d19d`；首次5selected release source `f3761320cac5044999a53cdbd7a2acb57107a6de`，随后只重建assistant于1ce（其他compiled inputs不变、4bin旧hash一致）。版本名中f376是首构建标签，不冒充所有bin同一source。各报告头部旧pending是历史快照，最终独立rereview优先：Tasks1–5均local clean，Task4 3/0/0、Task5 2/0/0；Task6独立审查PASS；wholebranchreview提出F-Q01，最终修复及F-R01已实现，待同一scoped rereview/root最终门禁。最终选用下述final-fix候选，首次两次构建的身份与测量仍保留。
 
 保存根：`/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6`。`task5-reproduction/`是完整75文件/1,009,488,344bytes，包含old/new executables、两份immutable DB、原55payload与18fix supplement、全部raw measurements/failed诊断。`task5-preservation-manifest.json`逐文件原source_path、length、SHA；没有在新路径重测。旧exe是复现证据，不能安装生产。
 
@@ -32,7 +32,7 @@ Ruling8的数字来源是 `discovery-artifact-join-report.md`：source-transcrib
 
 ## Task6实际交付
 
-候选版本：`/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first/v20261009-f3761320c`。`manifest.json` 374,368bytes，SHA-256 `1cfbacd046a658ac7afd2417e77a5aa81126b395100b1b7bc857e2d204ec581c`；28allowlisted文件21,144,247bytes、977runtime preconditions、990source inputhash。source/CLI/resource/schema/Python3.9.6/toolchain/profile/explicitroot/每bin两次buildprovenance在manifest。prepared/staged，未安装/加载/activation/restart。
+已被替代的历史候选：`/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first/v20261009-f3761320c`（字节保持不变，不用于最终安装）。`manifest.json` 374,368bytes，SHA-256 `1cfbacd046a658ac7afd2417e77a5aa81126b395100b1b7bc857e2d204ec581c`；28allowlisted文件21,144,247bytes、977runtime preconditions、990source inputhash。source/CLI/resource/schema/Python3.9.6/toolchain/profile/explicitroot/每bin两次buildprovenance在manifest。prepared/staged，未安装/加载/activation/restart。
 
 原weekly launcher412bytes SHA `dcd0a23ec6e5dbb1f7d447cf93c0f456dc0affda944565d183c6d4d7c0ab4ce6`、weekly plist1367bytes SHA `be8e22d72b7ac36ef26b17d7e839913de103e38529b0e9e386059eb827b06ed2` 在 `/Users/zhangzhen/.local/share/stock-analysis-candidates/rollback-v20261009-f3761320c` 的同basename文件0400保留；原watchdog plist absent。现有monitor/bridge/daily job/bin/source/config/activation仅read-onlyhash观察，无write。activation declared expected hash `a22dae891895e0082a44263b5e99eeb6dbb9b1fc95da8b19b6e9a6b90f754db7` 与 diskbinaryhash分列，非live process attestation。
 
@@ -47,11 +47,19 @@ HTML --draft/render和--draft --check均exit1 `file_set_mismatch pair=current`�
 立即查看保留的synthetic离线示例（不证明生产来源/收益）：
 
 ```sh
-/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first/v20261009-f3761320c/bin/assistant_review --report /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/release-probe/cli-review-76.json --manifest /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/release-probe/cli-manifest-76.json --registry /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first/v20261009-f3761320c/resources/signal_registry.toml --as-of 2026-10-08T16:00:00+08:00 --completed-session 2026-10-08
+/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c/bin/assistant_review --report /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/release-probe/cli-review-76.json --manifest /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/release-probe/cli-manifest-76.json --registry /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c/resources/signal_registry.toml --as-of 2026-10-08T16:00:00+08:00 --completed-session 2026-10-08
 ```
 
-默认installer的已跑plan命令为 `/usr/bin/python3 -B <上述bundle>/scripts/prepare_goal_first_delivery.py --bundle <上述bundle>`，只hash/check/输出plan；显式install仅原子发布version，job持久安装/加载仍独立步骤，见RUNBOOK。无重复weekly、RunAtLoad=false、无初始catchup；新watchdog60s/RunAtLoad=false使用已有早期只读health路径。
+最终候选默认installer的已跑plan命令为 `/usr/bin/python3 -B /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c/scripts/prepare_goal_first_delivery.py --bundle /Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c`，只hash/check/输出plan；显式install仅原子发布version，job持久安装/加载仍独立步骤，见RUNBOOK。无重复weekly、RunAtLoad=false、无初始catchup；新watchdog60s/RunAtLoad=false使用已有早期只读health路径。
 
 Losslessarchive实际保存并全member复核：117members / 12873491 raw bytes；archive 3584946bytes / SHA-256 `d426bf8304a44f279cdf351850b28e364fe1a572b80fd5cd6c53ef99555a4eb5`。逐memberlength/SHA与原路径在该root/review-evidence-manifest.json。原plan26216bytes/SHA `a0185c672e2f7932c963c0c9820de9f2601f3c442a982956ca331e5b5184c702` 与original-plan private copy/archive member核对一致。
 
 最终收尾时，由主任务追加保存 Task 6 后续审查、全分支最终审查与本地集成证明：[最终补充归档](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/late-review-evidence.tar.gz)及[逐文件长度与哈希清单](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/late-review-evidence-manifest.json)。这些文件将在最终收尾时写入并核验，最终结果以其中记录为准；此处不表示全分支审查或集成已经完成。既有不可变归档继续保留。
+
+最终修复候选：`/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/goal-first/v20261009-f3761320c`。manifest375227bytes/SHA-256 `eebdc2199d2890d5fa9955d5929103c1eb07cfc2fed30823f8f975e20a34080f`；28allowlisted payload files21,156,899bytes，含manifest共29文件21,532,126bytes，977preconditions/990source hashes。全局源码/packager `180248b02ad672a3eefa1131b2c06a60154514e1`；weekly实际第三次构建 `1dc5e6d877ecea4b9edea75b388381beab0e18f7`，assistant仍1ce，其余三bin仍f376。版本名仍是首次构建标签；计划目的地和编译root均未改变。原bin来源与实际运行源码身份不混记。
+
+F-Q01两处registry入口已使用单descriptor的regular/no-follow/nonblocking/128KiB+1/stability读取，0644原TOML/rawSHA/embedded default兼容；F-R01把借用模块例外严格固定为已审查完整blob SHA，helper/tail名称shadowing不再能通过。旧schema/parser/default/family mapping原字节保留。weekly29pass；Python wrapper+installer19pass（首次两个test fixture错误记录保留）；shared assistant21pass/编译7m15s/执行7.31s；唯一weekly release第三构建EXIT0/7m22s，确实重编library。pin后仅installer6pass/0.367s，无Rust重编。
+
+[最终修复证据](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/final-fix/pinned-package-check-results.json)包含最终各文件/来源核验和default/relocated plan各EXIT0；此前13项实际新weekly/wrapper/76预测双格式→离线assistant/FIFO等有限3秒检查复用，weekly与wrapper和所有其他包文件（除packager/manifest）SHA与执行版本一致。修复后weekly6847612bytes/SHA `5e64691601c84907486d9a88d23462788ab849669d96a22ef202aa21b6dc3168`；wrapper10519bytes/SHA `fc8c1dfa59fed61d0c36836e59e78d74556a7e3fa63e35561af119180e0498cb`。原四bin/resources/plists/launcher身份不变，来源fixture未改，默认0模型calls；旧41项其他包检查按未改字节复用。原全部证据/117memberarchive没有改写。
+
+修复中间包（13probe实际执行时仍在final-fix路径）仅在执行结束后整树迁至 `/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix-pre-pin`；保留manifest375024bytes/SHA `664a47e45809a07c4e6088348b6fadc53f42d7bfc1f11b6084b087beca9f8a59`。精确旧→新映射与probe日志/结果身份见[迁移记录](/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-evidence/20261009-task6/final-fix/interim-relocation.json)，历史命令中的原执行路径未改写，不宣称曾在迁移后路径执行。最终rollback副本在 `/Users/zhangzhen/.local/share/stock-analysis-candidates/goal-first-final-fix/rollback-v20261009-f3761320c`；字节与原保存一致。所有包均未安装/加载；最终scoped rereview、本地集成与late supplement待root收尾。
