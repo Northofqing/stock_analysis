@@ -355,6 +355,15 @@ pub(super) async fn call(
         };
         let actual = nonempty(&raw["model"]);
         let id = nonempty(&raw["id"]);
+        // Billing eligibility examines every supplied choice before failure selection.
+        // Ambiguous choices must not hide unsupported thinking in an unselected message.
+        let unsupported_thinking = raw["choices"].as_array().is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice["message"]
+                    .get("reasoning_content")
+                    .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+            })
+        });
         let choices = raw["choices"].as_array().filter(|v| v.len() == 1);
         let absent = Value::Null;
         let choice = choices.and_then(|c| c.first()).unwrap_or(&absent);
@@ -393,6 +402,9 @@ pub(super) async fn call(
         // Known cache partitions are non-additional prompt tokens; no discount is assumed.
 
         let validated_usage = (|| -> Result<Usage, BoundedFailure> {
+            if unsupported_thinking {
+                return Err(with_receipt("unexpected_thinking"));
+            }
             let usage = raw["usage"]
                 .as_object()
                 .ok_or_else(|| with_receipt("usage_missing"))?;
@@ -479,11 +491,7 @@ pub(super) async fn call(
         })();
         let completed_failure = |code| {
             let mut error = with_receipt(code);
-            error.usage = if code == "unexpected_thinking" {
-                None
-            } else {
-                validated_usage.as_ref().ok().cloned()
-            };
+            error.usage = validated_usage.as_ref().ok().cloned();
             error
         };
         if choices.is_none() {
@@ -515,10 +523,7 @@ pub(super) async fn call(
         {
             return Err(completed_failure("protocol"));
         }
-        if choice["message"]
-            .get("reasoning_content")
-            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
-        {
+        if unsupported_thinking {
             return Err(completed_failure("unexpected_thinking"));
         }
         let parsed = serde_json::from_str(&content);
@@ -867,6 +872,14 @@ mod tests {
             "extra",
             "missing",
             "empty_content",
+            "thinking_empty",
+            "thinking_over_cap",
+            "thinking_protocol",
+            "thinking_missing_receipt",
+            "thinking_missing_content",
+            "thinking_ambiguous",
+            "ambiguous_no_thinking",
+            "reasoning_tokens_empty",
         ] {
             let mut b = body();
             b["model"] = json!("deepseek-flash");
@@ -893,7 +906,32 @@ mod tests {
                         .remove("prompt_cache_miss_tokens");
                 }
                 "empty_content" => b["choices"][0]["message"]["content"] = json!(""),
+                "thinking_empty" => b["choices"][0]["message"]["content"] = json!(""),
+                "thinking_over_cap" => {
+                    b["choices"][0]["message"]["content"] =
+                        json!("x".repeat(limits().max_content_bytes + 1))
+                }
+                "thinking_protocol" => b["choices"][0]["finish_reason"] = json!("length"),
+                "thinking_missing_receipt" => b["id"] = Value::Null,
+                "thinking_missing_content" => b["choices"][0]["message"]["content"] = Value::Null,
+                "thinking_ambiguous" | "ambiguous_no_thinking" => {
+                    let mut second = b["choices"][0].clone();
+                    second["index"] = json!(1);
+                    second["message"]["reasoning_content"] = if kind == "thinking_ambiguous" {
+                        json!("hidden in second choice")
+                    } else {
+                        json!("")
+                    };
+                    b["choices"] = json!([b["choices"][0].clone(), second]);
+                }
+                "reasoning_tokens_empty" => {
+                    b["choices"][0]["message"]["content"] = json!("");
+                    b["usage"]["completion_tokens_details"]["reasoning_tokens"] = json!(1);
+                }
                 _ => (),
+            }
+            if kind.starts_with("thinking_") && kind != "thinking_ambiguous" {
+                b["choices"][0]["message"]["reasoning_content"] = json!("unexpected");
             }
             let (cfg, task) = server(http(&b), Duration::ZERO).await;
             let l = limits();
@@ -914,6 +952,7 @@ mod tests {
                     "user",
                 )
                 .unwrap();
+            let reserved = permit.reservation().maximum_micro_cny;
             let result = call(
                 &cfg,
                 "deepseek",
@@ -929,6 +968,9 @@ mod tests {
             let wire = task.await.unwrap();
             assert_eq!(wire["thinking"]["type"], "disabled");
             assert_eq!(wire["max_tokens"], l.max_output_tokens);
+            assert_eq!(budget.summary()["retained_maximum_micro_cny"], reserved);
+            assert_eq!(budget.summary()["refunds_micro_cny"], 0);
+            assert_eq!(budget.summary()["attempt_slots_issued"], 1);
             if kind == "valid" {
                 let r = result.unwrap();
                 assert_eq!(r.usage.cache.unwrap().cached_tokens, 3);
@@ -938,8 +980,49 @@ mod tests {
                 );
             } else {
                 let error = result.unwrap_err();
-                if kind == "content_thinking" {
-                    assert!(error.usage.is_none());
+                assert!(error.started, "{kind}");
+                if kind == "content_thinking"
+                    || kind.starts_with("thinking_")
+                    || kind == "reasoning_tokens_empty"
+                {
+                    assert!(error.usage.is_none(), "{kind}");
+                }
+                match kind {
+                    "thinking_empty" | "reasoning_tokens_empty" => {
+                        assert_eq!(error.code, "empty_response");
+                        assert_eq!(error.raw_content.as_deref(), Some(""));
+                        assert_eq!(error.receipt.as_ref().unwrap().response_sha256(), hash(b""));
+                    }
+                    "thinking_over_cap" => {
+                        assert_eq!(error.code, "content_limit");
+                        assert!(error.raw_content.is_none());
+                        assert_eq!(
+                            error.raw_content_state,
+                            "omitted_content_limit_full_hash_only"
+                        );
+                        assert_eq!(
+                            error.receipt.as_ref().unwrap().response_sha256(),
+                            hash(
+                                b["choices"][0]["message"]["content"]
+                                    .as_str()
+                                    .unwrap()
+                                    .as_bytes()
+                            )
+                        );
+                    }
+                    "thinking_protocol" => assert_eq!(error.code, "protocol"),
+                    "thinking_missing_receipt" => assert_eq!(error.code, "receipt_missing"),
+                    "thinking_missing_content" => assert_eq!(error.code, "empty_response"),
+                    "thinking_ambiguous" | "ambiguous_no_thinking" => {
+                        assert_eq!(error.code, "choices");
+                        assert!(error.raw_content.is_none());
+                        assert!(error.receipt.is_none());
+                        assert_eq!(error.raw_content_state, "unavailable");
+                        if kind == "ambiguous_no_thinking" {
+                            assert!(error.usage.is_some());
+                        }
+                    }
+                    _ => (),
                 }
                 if kind == "empty_content" {
                     assert_eq!(error.code, "empty_response");
