@@ -82,23 +82,39 @@ class FixedDelivery(unittest.TestCase):
         with self.assertRaises(ValueError): d.install(self.bundle)
         self.assertEqual(extra.read_bytes(), b'local evidence')
 
-    def test_fixed_third_weekly_provenance_rejects_parser_or_unrelated_changes(self):
-        original = "schema/default\nimpl RegistryInput {old loader\n            None => (embedded)\n}\nimpl Registry {parser}\n"
-        fixed = "schema/default\nimpl RegistryInput {new loader\n            None => (embedded)\n}\n// Ordinary readable TOML\nhelper\nimpl Registry {parser}\nnew tests\n"
+    def test_fixed_third_weekly_provenance_pins_full_reviewed_blobs(self):
+        import subprocess
+        repo = Path(__file__).resolve().parents[2]
+        original = subprocess.check_output(['git', 'show', '1ce18c2850d19b4bd0908bce6225049c61b0d19d:src/bin/weekly_outcome_review/registry.rs'], cwd=repo)
+        reviewed = (repo / 'src/bin/weekly_outcome_review/registry.rs').read_bytes()
+        current = reviewed
         def git(args, **kwargs):
             if args[1] == 'diff':
+                if args[3] == 'weekly': return ''
                 return 'src/bin/assistant_review.rs\n' if args[4] == 'assistant' else 'src/bin/weekly_outcome_review/registry.rs\n'
-            return original if args[2].startswith('assistant:') else fixed
+            return original if args[2].startswith('assistant:') else current
         with patch.object(d.subprocess, 'check_output', side_effect=git):
-            sources = d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log')
-            self.assertEqual(sources['weekly_outcome_review'], 'fixed')
+            sources = d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log', 'weekly')
+            self.assertEqual(sources['weekly_outcome_review'], 'weekly')
             self.assertEqual(sources['assistant_review'], 'assistant')
             self.assertEqual(sources['sell_reminder_preview'], 'base')
             with self.assertRaises(ValueError): d.binary_sources(self.root, 'fixed', 'base', 'assistant')
-            fixed = fixed.replace('parser', 'changed parser')
-            with self.assertRaises(ValueError): d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log')
+            # Both were admitted by the former protected-span comparison.
+            shadow = b'\nmod toml { pub fn from_str<T: serde::de::DeserializeOwned>(_: &str) -> Result<T, ::toml::de::Error> { ::toml::from_str(super::DEFAULT_REGISTRY) } }\n'
+            for current in (reviewed + shadow, reviewed.replace(b'fn same_registry_file', shadow + b'fn same_registry_file'), reviewed.replace(b'toml::from_str(raw)', b'toml::from_str(DEFAULT_REGISTRY)')):
+                with self.assertRaisesRegex(ValueError, 'exact reviewed registry blobs'):
+                    d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log', 'weekly')
+            current = reviewed
+            def changed_after_build(args, **kwargs):
+                return 'src/assistant_review.rs\n' if args[1] == 'diff' and args[3] == 'weekly' else git(args, **kwargs)
+            with patch.object(d.subprocess, 'check_output', side_effect=changed_after_build):
+                with self.assertRaisesRegex(ValueError, 'compiled inputs changed after weekly build'):
+                    d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log', 'weekly')
+            original += b'\n// unreviewed old source'
+            with self.assertRaisesRegex(ValueError, 'exact reviewed registry blobs'):
+                d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log', 'weekly')
         with patch.object(d.subprocess, 'check_output', return_value='src/llm/bounded.rs\n'):
-            with self.assertRaises(ValueError): d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log')
+            with self.assertRaises(ValueError): d.binary_sources(self.root, 'fixed', 'base', 'assistant', self.root / 'log', 'weekly')
         with patch.object(d.subprocess, 'check_output', return_value='src/bin/assistant_review.rs\n'):
             self.assertEqual(d.binary_sources(self.root, 'assistant', 'base')['weekly_outcome_review'], 'base')
 
