@@ -2,6 +2,8 @@
 
 依据 [当前范围](2026-10-07-active-scope.md)，接续 [实际已发布业务修复](2026-10-09-business-closeout-repair.md)。当前开发基线为 master `986141163b34701e4a5a297c13b25e868e1ba375`；现网行为源码 `af66e214` 与开发源码分开。
 
+**后继已上线**：该诊断已随 `5fb81f1f` 正式monitor发布，本轮核到自然code8日志及实际进程/制品归属，见 [10-10生产观察](2026-10-10-retained-production-observation.md)。下文“未安装/待候选”是10-09晨间开发阶段记录，不再作为当前待办。
+
 ## 实际缺口与本次改动
 
 Windows 只读报告已经确认：原 MoneyFlows/Tencent 的文字错误缺少原 request_id、数值 Status 和原 `magic-error-detail-bin`，不能判定网络、源数据或 worker 的最终原因。现有 `GrpcError` 严格解码后保留已验证 detail，Gateway 的消息却不包含这些上下文；畸形/不匹配 detail 被拒绝时，旧诊断无法关联客户端真实请求。
