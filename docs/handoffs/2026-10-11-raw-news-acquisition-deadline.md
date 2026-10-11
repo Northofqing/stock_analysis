@@ -43,3 +43,11 @@
 后续先收取 Windows 当前完整质量与精确同版恢复材料，匹配新的可审 source/descriptor/executable 后完成 Mac 必要窄候选、兼容回退、精确 activation 人审及单实例发布，观察实际采集恢复。H08 数据合格后再有界回填；新版自然周报仍待 10-16。已有账户初始化、19 条恢复和四条人工取消不重做；剩余 76 条 Uncertain 保留。
 
 私有证据与任务计划：开发工作树 `.planning/2026-10-11-retained-observation/`。本轮未进行新业务 RPC、发送测试消息、修改运行配置、回填、生产部署或新人工裁定。
+
+## 提交与新增同步结果
+
+源码/测试/本交接及主交接五件已提交 `b6063450677496d28a6ef3c4e1418daec4f10f31`、精确快进主目录 master 并 atomic push exit0；master/current business 分支远端完整 OID 实际回读一致，两个 worktree clean。原生产仍为 `5fb81f1f`。
+
+新公共包 `client-bundle/MAC_RAW_NEWS_ACQUISITION_DEADLINE_20261011.json` 实际 12394 bytes / SHA `2d620ebcf5db155f70adc28c06e2139f6ed577fe17f1b05821635e92209027e2`，含源码身份、46项结果、原自然采集故障及 V14/V15 消费状态；本机完整写入及 JSON 回读通过，原件不纳入 Git。
+
+发送续办消息时应用返回 `An earlier turn submission is not yet confirmed`，没有新 turn/message 标识。随后实际读回原 Windows turn 仍 inProgress，正在核验完整测量原件，尚未提及新包。**新消息送达和对端消费未确认**，不能把共享文件存在当作送达，未立即重复发送；原昨日包的精确接收回执仍有效。后继先读回队列及原任务再决定一次续办，不重复已获人审的动作或停止正在进行的回归。
