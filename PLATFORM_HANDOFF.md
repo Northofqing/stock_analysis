@@ -1,12 +1,12 @@
 # stock_analysis 开发与上线交接
 
-更新日期：2026-10-10（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
+更新日期：2026-10-11（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
 
 **当前执行范围以 [2026-10-07 用户范围裁定](docs/handoffs/2026-10-07-active-scope.md) 为准：保留 H08、outcome 合并/回填/观测和 monitor 止损/情报推送稳定性；冻结 H01/H02/H03/H09/H10/H14/H17 平台工程；H04–H06 复用现有 paper，H16 改为周报复盘。以下完整平台路线及接续段保留为历史记录，不再自动执行。**
 
-**最新实际现网见 [2026-10-10 推送格式发布](docs/handoffs/2026-10-10-push-clarity-and-account-details.md) 与 [本轮晨间只读观察](docs/handoffs/2026-10-10-retained-production-observation.md)**：行为源码 `5fb81f1f` 已安装，monitor PID89475/SHA `d459ec8e…`、独立bridge PID88699/SHA `a13ed075…` 与实际 executable inode匹配。新独立paper已按用户实际持仓建立，不再重复seed；原19条恢复和价格争议guard保留。原精确4条取消已在用户授权下完成，其余76条Uncertain保留。当前Frozen/Unsafe，四路raw news自然请求持续code8，Windows blocking槽/生产调用路径故障优先。
+**最新实际现网见 [2026-10-10 推送格式发布](docs/handoffs/2026-10-10-push-clarity-and-account-details.md) 与 [10-11 采集期限修复及恢复接续](docs/handoffs/2026-10-11-raw-news-acquisition-deadline.md)**：行为源码 `5fb81f1f` 仍在运行，monitor PID89475/SHA `d459ec8e…`、独立bridge PID88699/SHA `a13ed075…` 与实际 executable inode匹配。新独立paper已按用户实际持仓建立，不再重复seed；原19条恢复和价格争议guard保留。原精确4条取消已在用户授权下完成，其余76条Uncertain保留。当前Frozen/Unsafe；Windows最新公开状态为50051无监听、runtime尚未恢复，Mac自然四路新闻改报external_transport_unavailable。历史code8保留，先推进实际上游恢复。
 
-[Status失败关联](docs/handoffs/2026-10-09-rpc-failure-correlation.md) 的源码 `2a0ddb6a` 已随新monitor上线，并实际输出客户端请求哈希/数值code/carrier观察；完整历史身份不能追补。原 Windows 任务已收到新的续办消息并启动源码定位，尚未验收恢复。outcome日任务10-09自然exit1保持原周末错误和13deferred/24窗口，周报20:30自然exit0但不代替后来新账户/工具的自然验收。下文f517/4e、af66/79及诊断未安装等状态是对应时点的历史，不再执行其旧队列。
+[Status失败关联](docs/handoffs/2026-10-09-rpc-failure-correlation.md) 的源码 `2a0ddb6a` 已随现网monitor上线，完整历史身份不能追补。Windows已交付昨日Mac包的精确接收回执与heartbeat开发修复，最新原chat反馈v7关键覆盖率91.62%仍低于95%，完整正式检查和认证交接未闭合；不将193回归或历史分数当恢复。Mac本轮完成四路raw acquisition的35秒cooperative期限及46项定向检查，尚未安装。10-10 outcome自然exit1保持原周末错误和13deferred/24窗口；原20:30周报不代替后来新账户/工具的自然验收，下一自然新版周报10-16。下文f517/4e、af66/79及诊断未安装等状态是对应时点的历史，不再执行其旧队列。
 
 当前首轮开发见 [2026-10-08 收敛范围开发](docs/handoffs/2026-10-08-active-scope-development.md)：paper 休市扫描、原候选历史观测日期接线及周报基线。后继验证和提交身份以该交接的实际回执为准，旧全平台下一项不再执行。
 

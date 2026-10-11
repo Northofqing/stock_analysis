@@ -42,6 +42,11 @@ use std::sync::Arc;
 pub const REGISTERED_GLOBAL_NEWS_LIMIT: u32 = 20;
 pub const MAGIC_MARKET_DATA_REVISION: &str = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e";
 
+// The RPC deadline does not cover qualification queues or connection setup.
+// Bound each raw acquisition as a whole so an offline source cannot hold the
+// four-feed batch indefinitely. This is a cooperative local deadline.
+const RAW_GLOBAL_NEWS_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
 /// BR-166's stable event identity for an admitted provider/item pair. This is
 /// a pure value function; it grants no source admission or ingress receipt.
 pub fn br166_global_news_event_id(provider: GlobalNewsProvider, item_id: &str) -> String {
@@ -1369,7 +1374,34 @@ async fn fetch_registered_feed(
             };
         }
     };
-    let terminal = match port.fetch(provider, limit).await {
+    let result = match tokio::time::timeout(
+        RAW_GLOBAL_NEWS_ACQUISITION_TIMEOUT,
+        port.fetch(provider, limit),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let reason_code = "global_news_acquisition_timeout";
+            permit.finish(SourceTerminal::Unavailable {
+                reason_code,
+                retryable: true,
+            });
+            return RawGlobalNewsFeedAttempt {
+                registration,
+                attempted_at,
+                terminal: RawGlobalNewsTerminal::Unavailable(FeedUnavailable {
+                    failed_stage: "global_news_acquisition_deadline",
+                    diagnostic_code: "acquisition_deadline_exceeded",
+                    reason_code,
+                    retryable: true,
+                    available_evidence: None,
+                    source_record_count: 0,
+                }),
+            };
+        }
+    };
+    let terminal = match result {
         Ok(batch)
             if batch.evidence().provider != registration.provider.provider_id()
                 || batch.evidence().source != registration.source_contract =>

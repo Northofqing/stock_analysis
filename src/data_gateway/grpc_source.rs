@@ -1211,6 +1211,7 @@ pub fn is_known_global_news_recovery_reason(value: &str) -> bool {
                 | "external_health_not_ready"
                 | "external_expected_identity_missing"
                 | "external_build_identity_unverified"
+                | "global_news_acquisition_timeout"
         )
 }
 

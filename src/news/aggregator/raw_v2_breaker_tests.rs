@@ -83,10 +83,12 @@ enum Scripted {
     Available,
     VerifiedEmpty,
     InvalidEmptyEvidence,
+    Stalled,
 }
 
 struct ScriptedPort {
     calls: [AtomicUsize; 4],
+    cancelled: [AtomicUsize; 4],
     scripts: Mutex<[VecDeque<Scripted>; 4]>,
 }
 
@@ -94,6 +96,7 @@ impl ScriptedPort {
     fn new() -> Self {
         Self {
             calls: std::array::from_fn(|_| AtomicUsize::new(0)),
+            cancelled: std::array::from_fn(|_| AtomicUsize::new(0)),
             scripts: Mutex::new(std::array::from_fn(|_| VecDeque::new())),
         }
     }
@@ -104,6 +107,14 @@ impl ScriptedPort {
 
     fn calls(&self, provider: GlobalNewsProvider) -> usize {
         self.calls[index(provider)].load(Ordering::SeqCst)
+    }
+}
+
+struct PendingDrop<'a>(&'a AtomicUsize);
+
+impl Drop for PendingDrop<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -119,6 +130,10 @@ impl RawGlobalNewsPort for ScriptedPort {
             .pop_front()
             .unwrap_or(Scripted::VerifiedEmpty);
         match scripted {
+            Scripted::Stalled => {
+                let _pending = PendingDrop(&self.cancelled[index(provider)]);
+                std::future::pending().await
+            }
             Scripted::ExternalTransport => Err(
                 crate::data_gateway::grpc_source::map_external_connection_error(
                     crate::grpc_client::errors::GrpcError::Unavailable {
@@ -151,6 +166,121 @@ impl RawGlobalNewsPort for ScriptedPort {
             }
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn raw_news_acquisition_deadline_drops_all_stalled_feeds_without_source_evidence() {
+    let clock = TestClock::new();
+    let registry = GlobalNewsSourceRegistry::new_at(clock.now());
+    let port = ScriptedPort::new();
+    for provider in REGISTERED_PROVIDERS {
+        port.push(provider, Scripted::Stalled);
+    }
+    let started = tokio::time::Instant::now();
+    let batch = tokio::time::timeout(
+        std::time::Duration::from_secs(36),
+        tick(&port, &registry, &clock),
+    )
+    .await
+    .expect("TEST_CODE all feeds must terminate within the 35-second acquisition budget");
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(35));
+    assert!(!batch.sources_complete());
+    assert_eq!(batch.source_record_count(), 0);
+    for attempt in batch.attempts() {
+        let failed = attempt.terminal().unavailable().unwrap();
+        assert_eq!(failed.failed_stage(), "global_news_acquisition_deadline");
+        assert_eq!(failed.reason_code(), "global_news_acquisition_timeout");
+        assert!(failed.retryable());
+        assert_eq!(failed.available_evidence(), None);
+        let slot = index(attempt.registration().provider);
+        assert_eq!(port.calls[slot].load(Ordering::SeqCst), 1);
+        assert_eq!(port.cancelled[slot].load(Ordering::SeqCst), 1);
+    }
+    for source in registry.snapshot().unwrap() {
+        assert_eq!(source.last_successful_pull_at, None);
+        assert_eq!(source.consecutive_retryable_failures, 1);
+        assert_eq!(
+            source.last_reason_code,
+            Some("global_news_acquisition_timeout")
+        );
+        assert!(
+            crate::data_gateway::grpc_source::is_known_global_news_recovery_reason(
+                source.last_reason_code.unwrap()
+            )
+        );
+    }
+    let projection = project_news_flash_events(&batch);
+    assert_eq!(projection.verified_empty_feed_count(), 0);
+    assert_eq!(projection.available_feed_count(), 0);
+    assert_eq!(projection.failures().len(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn raw_news_acquisition_deadline_preserves_other_feeds_and_half_open_recovery() {
+    let clock = TestClock::new();
+    let registry = GlobalNewsSourceRegistry::new_at(clock.now());
+    let port = ScriptedPort::new();
+    for _ in 0..10 {
+        port.push(GlobalNewsProvider::Eastmoney, Scripted::Stalled);
+        port.push(GlobalNewsProvider::Cailianpress, Scripted::Available);
+        port.push(GlobalNewsProvider::Jin10, Scripted::Nonretryable);
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(36),
+            tick(&port, &registry, &clock),
+        )
+        .await
+        .expect("TEST_CODE a stalled source must not hide completed feeds");
+        assert_eq!(
+            batch.attempts()[1].terminal().kind(),
+            RawGlobalNewsTerminalKind::Available
+        );
+        assert_eq!(
+            batch.attempts()[2]
+                .terminal()
+                .unavailable()
+                .unwrap()
+                .reason_code(),
+            "operation_retired"
+        );
+        assert_eq!(
+            batch.attempts()[3].terminal().kind(),
+            RawGlobalNewsTerminalKind::VerifiedEmpty
+        );
+    }
+    assert_eq!(east(&registry).state, SourceBreakerState::Open);
+    let original_outage = east(&registry).outage_started_at;
+    clock.advance(60);
+    port.push(GlobalNewsProvider::Eastmoney, Scripted::Stalled);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(36),
+        tick(&port, &registry, &clock),
+    )
+    .await
+    .expect("TEST_CODE half-open stall must terminate and release its permit");
+    let failed = east(&registry);
+    assert_eq!(failed.state, SourceBreakerState::Open);
+    assert_eq!(failed.outage_started_at, original_outage);
+    assert_eq!(
+        failed.last_reason_code,
+        Some("global_news_acquisition_timeout")
+    );
+    assert_eq!(
+        failed.next_probe_at,
+        Some(clock.now() + chrono::Duration::seconds(60))
+    );
+    assert_eq!(port.cancelled[0].load(Ordering::SeqCst), 11);
+    tick(&port, &registry, &clock).await;
+    assert_eq!(port.calls(GlobalNewsProvider::Eastmoney), 11);
+    clock.advance(60);
+    port.push(GlobalNewsProvider::Eastmoney, Scripted::Available);
+    let recovered = tick(&port, &registry, &clock).await;
+    assert_eq!(
+        recovered.attempts()[0].terminal().kind(),
+        RawGlobalNewsTerminalKind::Available
+    );
+    assert_eq!(east(&registry).state, SourceBreakerState::Closed);
+    assert_eq!(east(&registry).consecutive_retryable_failures, 0);
+    assert_eq!(east(&registry).outage_started_at, None);
 }
 
 #[tokio::test]
