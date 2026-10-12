@@ -51,3 +51,7 @@
 新公共包 `client-bundle/MAC_RAW_NEWS_ACQUISITION_DEADLINE_20261011.json` 实际 12394 bytes / SHA `2d620ebcf5db155f70adc28c06e2139f6ed577fe17f1b05821635e92209027e2`，含源码身份、46项结果、原自然采集故障及 V14/V15 消费状态；本机完整写入及 JSON 回读通过，原件不纳入 Git。
 
 发送续办消息时应用返回 `An earlier turn submission is not yet confirmed`，没有新 turn/message 标识。随后实际读回原 Windows turn 仍 inProgress，正在核验完整测量原件，尚未提及新包。**新消息送达和对端消费未确认**，不能把共享文件存在当作送达，未立即重复发送；原昨日包的精确接收回执仍有效。后继先读回队列及原任务再决定一次续办，不重复已获人审的动作或停止正在进行的回归。
+
+## 后继状态（10-12）
+
+[10-12交接](2026-10-12-retained-recovery-and-release-candidate.md) 已核V17/V20对本轮12394-byte包的精确消费回执；应用message的原失败记录保留。现有46项证据复用，release、隔离dry-run和新的可审activation候选已封存，尚未安装。当前上游最新V58仍未达到当前95及完整恢复门，不执行本节之前的旧队列。

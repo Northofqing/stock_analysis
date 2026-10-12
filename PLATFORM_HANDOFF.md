@@ -1,8 +1,10 @@
 # stock_analysis 开发与上线交接
 
-更新日期：2026-10-11（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
+更新日期：2026-10-12（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
 
 **当前执行范围以 [2026-10-07 用户范围裁定](docs/handoffs/2026-10-07-active-scope.md) 为准：保留 H08、outcome 合并/回填/观测和 monitor 止损/情报推送稳定性；冻结 H01/H02/H03/H09/H10/H14/H17 平台工程；H04–H06 复用现有 paper，H16 改为周报复盘。以下完整平台路线及接续段保留为历史记录，不再自动执行。**
+
+**10-12最新接续见 [恢复与窄发布候选](docs/handoffs/2026-10-12-retained-recovery-and-release-candidate.md) 及 [精确审阅单](docs/ops/2026-10-12-raw-news-deadline-activation-review.md)**：四路raw35秒期限的正式release/隔离dry-run与候选材料已准备，尚未安装，原5fb现网及76 Uncertain保持。候选10-13 09:00 CST生效，待精确人审和动态门检查。Windows原修复包已有V17精确文件消费回执；当前原chat连接不可用/超时，公共V58继续更新。历史V13关键92.4653%仍低于95%，新源码尚无正式最终分数/恢复服务。下段10-11的91.62及新增包未消费是当时状态，按本段接续。
 
 **最新实际现网见 [2026-10-10 推送格式发布](docs/handoffs/2026-10-10-push-clarity-and-account-details.md) 与 [10-11 采集期限修复及恢复接续](docs/handoffs/2026-10-11-raw-news-acquisition-deadline.md)**：行为源码 `5fb81f1f` 仍在运行，monitor PID89475/SHA `d459ec8e…`、独立bridge PID88699/SHA `a13ed075…` 与实际 executable inode匹配。新独立paper已按用户实际持仓建立，不再重复seed；原19条恢复和价格争议guard保留。原精确4条取消已在用户授权下完成，其余76条Uncertain保留。当前Frozen/Unsafe；Windows最新公开状态为50051无监听、runtime尚未恢复，Mac自然四路新闻改报external_transport_unavailable。历史code8保留，先推进实际上游恢复。
 
