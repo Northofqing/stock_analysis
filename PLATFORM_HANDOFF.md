@@ -1,8 +1,10 @@
 # stock_analysis 开发与上线交接
 
-更新日期：2026-10-12（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
+更新日期：2026-10-13（Asia/Shanghai）。后续接续段更新开发状态；生产事实另附明确观察时间。
 
 **当前执行范围以 [2026-10-07 用户范围裁定](docs/handoffs/2026-10-07-active-scope.md) 为准：保留 H08、outcome 合并/回填/观测和 monitor 止损/情报推送稳定性；冻结 H01/H02/H03/H09/H10/H14/H17 平台工程；H04–H06 复用现有 paper，H16 改为周报复盘。以下完整平台路线及接续段保留为历史记录，不再自动执行。**
+
+**10-13新故障接续见 [monitor标的加载阻塞](docs/handoffs/2026-10-13-monitor-scanner-stall.md)。08:39实际旧制品monitor24054/bridge23932：进程心跳新鲜，但账户/数据banner停在10-12 10:51，raw新闻快照仍前一boot；旧Degraded不能当当前状态。OS sample定位主future同步watchlist metadata线程join，阻塞同一joined新闻/DataMode。窄修复把scanner加载移至spawn_blocking，并对元数据异步等待加35秒期限，保持资格及源错误；源码验证/新候选准备状态以新交接为准。生产仍5fb旧制品/原activation，76 Uncertain不重放。Windows原V2联调Mac prelaunch CLI1/RPC0后已关闭；原Mac任务已完成nullable PDF/public工具路径SOURCE修复和独审，但新live窗口/真实RPC未验收。此次新协调应用发送仍未确认。10-12自然outcome仍0验证/13deferred/24窗口；新周报等10-16。下述10-12候选不含scanner修复、未收到精确人审答复；09:00时点错过后不得沿用，不换旧候选字节或套用旧批准。**
 
 **10-12最新接续见 [恢复与窄发布候选](docs/handoffs/2026-10-12-retained-recovery-and-release-candidate.md) 及 [精确审阅单](docs/ops/2026-10-12-raw-news-deadline-activation-review.md)**：四路raw35秒期限的正式release/隔离dry-run与候选材料已准备，尚未安装，原5fb现网及76 Uncertain保持。候选10-13 09:00 CST生效，待精确人审和动态门检查。Windows原修复包已有V17精确文件消费回执；当前原chat连接不可用/超时，公共V58继续更新。历史V13关键92.4653%仍低于95%，新源码尚无正式最终分数/恢复服务。下段10-11的91.62及新增包未消费是当时状态，按本段接续。
 

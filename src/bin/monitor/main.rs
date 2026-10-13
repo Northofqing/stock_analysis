@@ -10189,6 +10189,69 @@ fn overlay_net_yi(
     overlay.get(&s.code).copied().or(s.main_net_yi)
 }
 
+async fn load_scanner_targets<T, F>(load: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    // The synchronous watchlist path joins its metadata thread. Keep that
+    // wait off the future shared by the news and DataMode loops.
+    tokio::task::spawn_blocking(load)
+        .await
+        .map_err(|_| "Scanner 标的加载线程异常".to_string())?
+}
+
+#[cfg(test)]
+mod scanner_target_loading_tests {
+    use super::load_scanner_targets;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_scanner_target_load_does_not_block_other_joined_loops() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (tick_tx, tick_rx) = tokio::sync::oneshot::channel();
+        let loops = tokio::spawn(async move {
+            tokio::join!(
+                biased;
+                load_scanner_targets(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err::<(), _>("TEST_CODE_metadata_unavailable".to_string())
+                }),
+                async move { tick_tx.send(()).unwrap(); }
+            )
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let tick = tokio::time::timeout(std::time::Duration::from_secs(1), tick_rx).await;
+        // Always release and join the test worker, including the failing predecessor.
+        release_tx.send(()).unwrap();
+        let (targets, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), loops)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(targets, Err("TEST_CODE_metadata_unavailable".to_string()));
+        tick.expect("other joined loops must progress while targets are blocked")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scanner_target_load_keeps_source_failure_and_reports_worker_panic() {
+        assert_eq!(
+            load_scanner_targets(|| Err::<(), _>("TEST_CODE_source_failure".to_string())).await,
+            Err("TEST_CODE_source_failure".to_string())
+        );
+        let error = load_scanner_targets(|| -> Result<(), String> {
+            panic!("TEST_CODE_target_worker_panic")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("Scanner 标的加载线程异常"));
+    }
+}
+
 async fn monitor_loop(paper_scans: &PaperScanSession) {
     // 全天候循环：非交易日等待，交易日自动进入扫描
 
@@ -11322,7 +11385,11 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
             log::info!("进入交易时段，开始监控");
 
-            let (_positions, targets) = match TieredScanner::load_portfolio_targets() {
+            let (_positions, targets) = match load_scanner_targets(|| {
+                TieredScanner::load_portfolio_targets()
+            })
+            .await
+            {
                 Ok(batch) => batch,
                 Err(error) => {
                     log::error!("[盘前] Scanner 标的批次加载失败，30 秒后重试: {}", error);

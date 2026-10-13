@@ -81,13 +81,30 @@ fn fetch_watchlist_metadata(
                 .enable_all()
                 .build()
                 .map_err(|error| format!("创建自选名称 Gateway runtime 失败: {error}"))?;
-            runtime
-                .block_on(MarketCapabilitiesGateway::new().security_identities(&codes))
-                .map_err(|error| format!("自选证券身份数据不可用: {error}"))
+            runtime.block_on(wait_for_watchlist_metadata(async move {
+                MarketCapabilitiesGateway::new()
+                    .security_identities(&codes)
+                    .await
+                    .map_err(|error| format!("自选证券身份数据不可用: {error}"))
+            }))
         })
         .map_err(|error| format!("启动自选名称 Gateway 线程失败: {error}"))?
         .join()
         .map_err(|_| "自选名称 Gateway 线程异常退出".to_string())?
+}
+
+async fn wait_for_watchlist_metadata<T, F>(fetch: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    // A cooperative deadline for the asynchronous source wait. Synchronous
+    // database work and remote worker closure are outside this boundary.
+    tokio::time::timeout(std::time::Duration::from_secs(35), fetch)
+        .await
+        .map_err(|_| {
+            "自选证券身份数据不可用: watchlist_metadata_acquisition_timeout deadline_seconds=35"
+                .to_string()
+        })?
 }
 
 /// 从 stock_position 表加载持仓
@@ -597,6 +614,46 @@ mod tests {
 
         assert!(error.contains("证券身份数据为空"));
         assert!(error.contains("TEST_CODE_empty_watchlist"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchlist_metadata_deadline_rejects_stalled_source_and_drops_future() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let held = Dropped(Arc::clone(&dropped));
+        let task = tokio::spawn(wait_for_watchlist_metadata(async move {
+            let _held = held;
+            std::future::pending::<Result<(), String>>().await
+        }));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(34)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "stalled metadata must finish at its deadline"
+        );
+        let error = task.await.unwrap().unwrap_err();
+        assert!(error.contains("watchlist_metadata_acquisition_timeout"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn watchlist_metadata_deadline_preserves_available_or_source_error() {
+        assert_eq!(wait_for_watchlist_metadata(async { Ok(17) }).await, Ok(17));
+        let unavailable = Err::<(), _>("TEST_CODE_source_unavailable".to_string());
+        assert_eq!(
+            wait_for_watchlist_metadata(async { unavailable.clone() }).await,
+            unavailable
+        );
     }
 
     #[test]
