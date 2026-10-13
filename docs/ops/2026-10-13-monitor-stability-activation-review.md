@@ -1,6 +1,14 @@
 # 2026-10-13 monitor 稳定性窄发布：精确激活审阅单
 
-状态：**已准备，等待精确人审，未安装**。此候选替代已错过10-13 09:00窗口的[旧raw-only候选](2026-10-12-raw-news-deadline-activation-review.md)，不更改旧封存文件或沿用旧批准。新发现的scanner同步等待会阻塞新闻与DataMode，旧候选不包含此修复。
+状态：**用户已批准本精确候选，待10-14切换，未安装**。此候选替代已错过10-13 09:00窗口的[旧raw-only候选](2026-10-12-raw-news-deadline-activation-review.md)，不更改旧封存文件或沿用旧批准。新发现的scanner同步等待会阻塞新闻与DataMode，旧候选不包含此修复。
+
+## 10-13 精确批准与执行安排
+
+用户在本chat对本页完整元组直接答复 **“批准这个精确候选（推荐）”**。批准问题标识为`["request_user_input_async","call_f6fa35734fc84e9e946874a2881cb60d",0]`；不重复请求同一元组批准。私有`human-approval-receipt.json`已写入制品目录并回读，SHA-256 `b8a31266bf02f089526510d798822d6151f9db7f45c9110592562482da085a41`。接收时实际核对1001项source/candidate构建输入、封存制品、activation、现网原静态输入及回退、bridge/env/launchd plist一致；这些只读检查不代替切换时动态门禁。
+
+专用同chat heartbeat **`monitor-10-14`** 已创建并回读为ACTIVE，安排 **2026-10-14 08:55 CST** 续办一次；09:00生效且门禁通过后启动新版本。原每日`automation`仍为08:30，10-14仅只读预检及准备，由专用任务担任唯一生产切换owner。结果记录后停用专用任务，保留日常维护。定时任务需要本机及应用在运行；错过时点按本页规则保留旧实例，不晚装。
+
+批准后未改封存候选字节、`reviewed_at`或生效时点，未安装、重启或写数据库。原`candidate-preparation.json`和`cutover-and-rollback-recipe.json`的未批准标记保留为准备时历史状态，后继授权以这份直接人审回执为准。批准范围不覆盖H08资格、Windows联调或真实送达。
 
 ## 精确候选
 
@@ -49,4 +57,4 @@ Windows今日独立联调窗口V1的公共关闭回执报告：Mac真实4个nati
 
 失败时停新实例、恢复原5份静态文件/monitor/activation和原job owner；不恢复活DB备份、不撤销自然账本/投递事件、不重seed、不重复原19恢复/4取消或76 Uncertain投递。精确步骤和回退材料在私有目录`cutover-and-rollback-recipe.json`及`rollback/`。
 
-**未批准、拟生效时点已过或动态门禁失败，保留旧实例，不擅自更换候选或晚装。** 当前自动维护仍保持，下一步等待本精确人审；[开发与双端交接](../handoffs/2026-10-13-monitor-scanner-stall.md)记录实际源码和余项。
+**拟生效时点已过或动态门禁失败，保留旧实例，不擅自更换候选或晚装。** 本精确人审已获批准，下一步按上述安排动态复核和切换；[开发与双端交接](../handoffs/2026-10-13-monitor-scanner-stall.md)记录实际源码和余项。

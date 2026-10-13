@@ -66,3 +66,11 @@ Windows 原会话10-13最新回合已可读，仍为停服、联调未通过。1
 Windows exact STOP0，final867B/SHA 25cd48840184a5923d686ddb146102e51cb229a94f4dc79aa016273187fcec17 为STOPPED/active0/primary_signaled/cleanup[]；01:02:28Z无50051监听是其点时证据。新窗口也已消耗并关闭，不重用GO、重试或延长。
 
 WINDOWS_MAC_TLS_FAILURE_DIAGNOSIS_RECEIVED_20261013_V1.md：2528B/SHA 81f763b149bc834721e95da56d089a64e2f576d186b44db74b3f986209fa3dd5 确认已读取3783B Mac安全诊断：只支持context_deadline_exceeded/failed_to_dial，明确certificate-required/TLS-alert/x509 marker均false，首次framing失败predicate未知。不能把超时/native1当TLS拒绝证明，TLS配置/网络根因仍未知。此处为已读取的owner公共证据，本轮不冒独立读取私密stderr或运行native控制。原恢复任务继续最小SOURCE-only诊断设计；不重复实施/换身份Token/降oracle或发起新live窗口。正式critical95、真实Caps/provider资格和五项业务仍未验收。
+
+## 后继：用户已批准精确候选，10-14续办切换
+
+用户10-13直接批准[新审阅单](../ops/2026-10-13-monitor-stability-activation-review.md)的完整元组：源码9cb3f2cba、1001输入8976972f…、正式monitor e30c721d…、配置abc6bc51…、activation af08a95e…，10-14 09:00 CST生效。私有human-approval-receipt.json SHA b8a31266bf02f089526510d798822d6151f9db7f45c9110592562482da085a41已留档并回读；不再索要相同批准。原准备记录未批准字段为历史，不覆写候选字节或reviewed_at。
+
+接收批准后只读核验1001项构建输入、封存制品、当前原静态输入、rollback、bridge/env/plist均一致。专用同chat heartbeat monitor-10-14已ACTIVE，一次安排10-14 08:55；原08:30日常任务只读预检，生产切换由专用任务独占。需重查实际单实例、DB/paper与原76Uncertain身份、来源和typed配置；按原精确安装与兼容回退步骤执行，09:00且gate enabled后启动。晚醒或门禁失败保留旧实例。结果后停专用任务，日常保留范围维护继续。
+
+本批准接收段没有生产安装、进程重启、DB写入、Windows消息/RPC或新的业务恢复证据。当前还需实际切换、新boot自然评估/新闻观察、H08真实业务资格及合格outcome回填。
