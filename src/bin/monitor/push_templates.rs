@@ -1394,6 +1394,21 @@ struct DataModeTextParams<'a> {
     missing_items: &'a str,
     restrictions: &'a [String],
     eta: Option<&'a str>,
+    /// 盘后细分时段（由调用方按市场挂钟时间计算后传入，避免渲染期读时钟）。
+    /// 仅用于文案区分「盘后窗口内实时报价停更」与「真实行情断流」，不参与任何判定。
+    after_hours: Option<stock_analysis::calendar::AfterHoursPhase>,
+}
+
+/// 盘后窗口的文案说明（仅呈现，不改变任何准入）。
+fn after_hours_restriction_note(phase: stock_analysis::calendar::AfterHoursPhase) -> &'static str {
+    use stock_analysis::calendar::AfterHoursPhase;
+    match phase {
+        AfterHoursPhase::FixedPrice => {
+            "盘后固定价格交易窗口 15:05-15:30：实时报价已停更，成交价按当日收盘价"
+        }
+        AfterHoursPhase::PostCloseGap => "盘后 15:00-15:05：固定价格交易尚未开始",
+        AfterHoursPhase::Settled => "盘后 15:30 之后：当日交易已结束",
+    }
 }
 
 /// New-message focus uses only this notification's actual restrictions and
@@ -1402,11 +1417,16 @@ struct DataModeTextParams<'a> {
 fn render_data_mode_focus(params: &DataModeTextParams<'_>) -> String {
     let state = if params.old == Some(params.new) {
         match params.new {
-            DataMode::Full => "当前行情状态维持",
-            DataMode::Degraded | DataMode::Unsafe => "行情限制仍在",
+            DataMode::Full => "当前行情状态维持".to_owned(),
+            DataMode::Degraded | DataMode::Unsafe => match params.after_hours {
+                // 盘后窗口内实时报价必然停更：把"限制仍在"的时段原因写清楚，
+                // 避免与真实行情断流混淆。**仅文案**，不参与任何准入判定。
+                Some(phase) => format!("行情限制仍在（{}）", after_hours_restriction_note(phase)),
+                None => "行情限制仍在".to_owned(),
+            },
         }
     } else {
-        "行情状态更新"
+        "行情状态更新".to_owned()
     };
     let restriction = if params.restrictions.is_empty() {
         if params.new == DataMode::Full {
@@ -1510,6 +1530,7 @@ pub fn render_data_mode(
             missing_items,
             restrictions,
             eta,
+            after_hours: stock_analysis::calendar::after_hours_phase(),
         },
         Some(&account_status),
     )
@@ -17697,6 +17718,7 @@ pub async fn push_data_mode_change(
                 missing_items: &missing_str,
                 restrictions: &restrictions,
                 eta: health.eta.as_deref(),
+                after_hours: stock_analysis::calendar::after_hours_phase(),
             },
             &LiveBannerExternalNoteSource,
         ),
@@ -20996,6 +21018,7 @@ mod tests {
                 missing_items: "Quote/MoneyFlow/News/OrderBook",
                 restrictions: &["禁出价格型建议".to_owned(), "仅保留风险类推送".to_owned()],
                 eta: None,
+                after_hours: None,
             },
             &NoBannerExternalNotes,
         );
@@ -21008,6 +21031,35 @@ mod tests {
     }
 
     #[test]
+    fn t02_focus_after_hours_fixed_price_window_names_the_session_reason() {
+        use stock_analysis::calendar::AfterHoursPhase;
+        let window = render_data_mode_focus(&DataModeTextParams {
+            hhmm: "15:08",
+            old: Some(DataMode::Unsafe),
+            new: DataMode::Unsafe,
+            missing_items: "Quote/MoneyFlow",
+            restrictions: &["禁出价格型建议".to_owned()],
+            eta: None,
+            after_hours: Some(AfterHoursPhase::FixedPrice),
+        });
+        assert!(window.contains("行情限制仍在（盘后固定价格交易窗口 15:05-15:30"));
+        assert!(window.contains("成交价按当日收盘价"));
+
+        // 盘后窗口之外（None）文案保持不变：不能把真实断流说成盘后，反之亦然。
+        let plain = render_data_mode_focus(&DataModeTextParams {
+            hhmm: "10:30",
+            old: Some(DataMode::Unsafe),
+            new: DataMode::Unsafe,
+            missing_items: "Quote",
+            restrictions: &["禁出价格型建议".to_owned()],
+            eta: None,
+            after_hours: None,
+        });
+        assert!(plain.starts_with("📡 行情限制仍在（10:30）"));
+        assert!(!plain.contains("盘后"));
+    }
+
+    #[test]
     fn t02_focus_full_keeps_account_and_trade_qualification_separate() {
         let text = render_data_mode_focus(&DataModeTextParams {
             hhmm: "09:45",
@@ -21016,6 +21068,7 @@ mod tests {
             missing_items: "(无)",
             restrictions: &[],
             eta: None,
+            after_hours: None,
         });
         assert!(text.starts_with("📡 行情状态更新（09:45）"));
         assert!(text.contains("账户与交易资格仍需单独核验"));
@@ -21028,6 +21081,7 @@ mod tests {
             missing_items: "",
             restrictions: &[],
             eta: None,
+            after_hours: None,
         });
         assert!(unknown.contains("本轮输出限制未披露"));
         assert!(unknown.contains("主要缺项：未披露"));
@@ -21080,6 +21134,7 @@ mod tests {
                 missing_items: "TEST_CODE_QUOTE_MISSING",
                 restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
                 eta: Some("TEST_CODE_FRESHNESS_RECOVERY"),
+                after_hours: None,
             },
             &source,
         );
@@ -21155,6 +21210,7 @@ mod tests {
                 missing_items: "(无)",
                 restrictions: &[],
                 eta: None,
+                after_hours: None,
             },
             &source,
         );
@@ -21209,6 +21265,7 @@ mod tests {
                 missing_items: "TEST_CODE_QUOTE_MISSING",
                 restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
                 eta: None,
+                after_hours: None,
             },
             &source,
         );
@@ -21278,6 +21335,7 @@ mod tests {
                 missing_items: "TEST_CODE_QUOTE_MISSING",
                 restrictions: &["禁出价格型建议".to_string(), "仅保留风险类推送".to_string()],
                 eta: Some("TEST_CODE_FRESHNESS_RECOVERY"),
+                after_hours: None,
             },
             &source,
         );

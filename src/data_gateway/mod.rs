@@ -47,6 +47,7 @@ pub mod review;
 pub mod security_lifecycle;
 pub mod sina_instrument_news;
 pub mod t0_evidence;
+pub mod t0_evidence_degradation;
 pub mod trading_facts_authority;
 
 #[cfg(test)]

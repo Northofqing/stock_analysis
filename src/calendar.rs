@@ -33,6 +33,15 @@ const AFTERNOON_START: NaiveTime = NaiveTime::from_hms_opt(13, 0, 0).unwrap();
 /// 下午收盘
 const AFTERNOON_END: NaiveTime = NaiveTime::from_hms_opt(15, 0, 0).unwrap();
 
+/// 盘后固定价格交易窗口开始。
+///
+/// 依据：上交所盘后固定价格交易「接受/撮合 15:05–15:30」，**15:00–15:05 尚未开始**；
+/// 成交价按当日收盘价。本仓 `src/offline_products/sell_reminder.rs` 的成交时段说明同源。
+/// 深市/北交所须以其来源确认的时段与数量合同为准，故本窗口只描述时段，不裁决交易所范围。
+pub const AFTER_HOURS_FIXED_PRICE_START: NaiveTime = NaiveTime::from_hms_opt(15, 5, 0).unwrap();
+/// 盘后固定价格交易窗口结束（15:30 之后当日交易全部结束）
+pub const AFTER_HOURS_FIXED_PRICE_END: NaiveTime = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+
 // ============================================================================
 // 交易时段枚举
 // ============================================================================
@@ -702,6 +711,68 @@ pub fn session_label() -> &'static str {
     current_session().label()
 }
 
+/// 盘后细分时段（`MarketSession::AfterHours` 内部）。
+///
+/// 只细化「15:00 之后」这一段，**不改变** `MarketSession` 的粗粒度判定，
+/// 因此不影响任何既有准入逻辑；供文案区分与后续口径切换使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterHoursPhase {
+    /// 15:00–15:05：已收盘，盘后固定价格交易尚未开始
+    PostCloseGap,
+    /// 15:05–15:30：盘后固定价格交易窗口（成交价按当日收盘价）
+    FixedPrice,
+    /// 15:30 之后：当日交易全部结束
+    Settled,
+}
+
+impl AfterHoursPhase {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AfterHoursPhase::PostCloseGap => "盘后·固定价格未开始",
+            AfterHoursPhase::FixedPrice => "盘后·固定价格交易",
+            AfterHoursPhase::Settled => "盘后·当日交易结束",
+        }
+    }
+}
+
+/// 给定时间落在**交易日 15:00 之后**时的盘后细分；未收盘或非交易日返回 `None`。
+///
+/// 入参语义与 [`session_at`] 一致：按市场本地挂钟时间解释。
+pub fn after_hours_phase_at(datetime: NaiveDateTime) -> Option<AfterHoursPhase> {
+    if !is_trading_day(datetime.date()) {
+        return None;
+    }
+    let time = datetime.time();
+    if time < AFTERNOON_END {
+        return None;
+    }
+    Some(if time < AFTER_HOURS_FIXED_PRICE_START {
+        AfterHoursPhase::PostCloseGap
+    } else if time < AFTER_HOURS_FIXED_PRICE_END {
+        AfterHoursPhase::FixedPrice
+    } else {
+        AfterHoursPhase::Settled
+    })
+}
+
+/// 当前的盘后细分时段（非交易日或未收盘为 `None`）
+pub fn after_hours_phase() -> Option<AfterHoursPhase> {
+    after_hours_phase_at(Local::now().naive_local())
+}
+
+/// 现在是否处于盘后固定价格交易窗口（交易日 15:05–15:30）
+pub fn is_after_hours_fixed_price_window() -> bool {
+    after_hours_phase() == Some(AfterHoursPhase::FixedPrice)
+}
+
+/// 细粒度时段标签：交易日 15:00 之后给出盘后细分，其余沿用 [`session_label`]。
+pub fn session_fine_label() -> &'static str {
+    match after_hours_phase() {
+        Some(phase) => phase.label(),
+        None => session_label(),
+    }
+}
+
 /// 现在是否可以交易（连续竞价时段）
 pub fn can_trade_now() -> bool {
     current_session().can_trade()
@@ -805,6 +876,55 @@ mod tests {
             .from_local_datetime(&date.and_hms_opt(hour, minute, second).unwrap())
             .single()
             .unwrap()
+    }
+
+    #[test]
+    fn br254_after_hours_phase_resolves_fixed_price_window_and_boundaries() {
+        let friday = NaiveDate::from_ymd_opt(2026, 8, 21).unwrap();
+        let saturday = NaiveDate::from_ymd_opt(2026, 8, 22).unwrap();
+        let at = |date: NaiveDate, hour: u32, minute: u32, second: u32| {
+            shanghai_at(date, hour, minute, second).naive_local()
+        };
+
+        // 收盘前与收盘整点之前不算盘后
+        assert_eq!(after_hours_phase_at(at(friday, 14, 59, 59)), None);
+        // 15:00-15:05：已收盘，盘后固定价格尚未开始
+        assert_eq!(
+            after_hours_phase_at(at(friday, 15, 0, 0)),
+            Some(AfterHoursPhase::PostCloseGap)
+        );
+        assert_eq!(
+            after_hours_phase_at(at(friday, 15, 4, 59)),
+            Some(AfterHoursPhase::PostCloseGap)
+        );
+        // 15:05-15:30：盘后固定价格交易窗口（两端边界）
+        assert_eq!(
+            after_hours_phase_at(at(friday, 15, 5, 0)),
+            Some(AfterHoursPhase::FixedPrice)
+        );
+        assert_eq!(
+            after_hours_phase_at(at(friday, 15, 29, 59)),
+            Some(AfterHoursPhase::FixedPrice)
+        );
+        // 15:30 起当日交易结束
+        assert_eq!(
+            after_hours_phase_at(at(friday, 15, 30, 0)),
+            Some(AfterHoursPhase::Settled)
+        );
+        assert_eq!(
+            after_hours_phase_at(at(friday, 23, 59, 59)),
+            Some(AfterHoursPhase::Settled)
+        );
+        // 非交易日没有盘后细分
+        assert_eq!(after_hours_phase_at(at(saturday, 15, 10, 0)), None);
+
+        // 本次细化不改变粗粒度会话判定：窗口内仍是 AfterHours（这是刻意的）
+        assert_eq!(session_at(at(friday, 15, 10, 0)), MarketSession::AfterHours);
+        assert_eq!(MarketSession::AfterHours.label(), "盘后");
+        assert_eq!(
+            after_hours_phase_at(at(friday, 15, 10, 0)).unwrap().label(),
+            "盘后·固定价格交易"
+        );
     }
 
     #[test]

@@ -6788,6 +6788,24 @@ async fn main() {
         let position_chain_refresh = tokio::spawn(position_chain_refresh_loop());
         let opening_static_readiness = tokio::spawn(opening_static_readiness_loop());
         let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
+        // T0Evidence 证据缺省降级事件（对端 3faa9d8 起在 Subscribe 通道推送）：
+        // **纯观测**订阅，只记录与计数，不参与任何准入门控。未配置外连 bundle 时
+        // 保持长驻（不返回），避免被生命周期监督当成提前结束；循环自身退避重连。
+        let t0_evidence_degradation = tokio::spawn(async move {
+            match std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE") {
+                Some(value) if !value.is_empty() => {
+                    stock_analysis::data_gateway::t0_evidence_degradation::
+                        run_degradation_subscriber(std::path::PathBuf::from(value))
+                        .await
+                }
+                _ => {
+                    log::info!(
+                        "[t0_evidence_degraded] 未配置 GRPC_MARKET_CLIENT_BUNDLE，观测订阅不启动"
+                    );
+                    std::future::pending::<()>().await
+                }
+            }
+        });
         let background_tasks = vec![
             (
                 "operational_heartbeat",
@@ -6811,6 +6829,10 @@ async fn main() {
             ("position_chain_refresh", position_chain_refresh),
             ("opening_static_readiness", opening_static_readiness),
             ("opening_live_readiness", opening_live_readiness),
+            (
+                "t0_evidence_degradation_subscriber",
+                t0_evidence_degradation,
+            ),
         ];
 
         let shutdown_signal = async {
@@ -11385,18 +11407,15 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
             log::info!("进入交易时段，开始监控");
 
-            let (_positions, targets) = match load_scanner_targets(|| {
-                TieredScanner::load_portfolio_targets()
-            })
-            .await
-            {
-                Ok(batch) => batch,
-                Err(error) => {
-                    log::error!("[盘前] Scanner 标的批次加载失败，30 秒后重试: {}", error);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-                    continue;
-                }
-            };
+            let (_positions, targets) =
+                match load_scanner_targets(|| TieredScanner::load_portfolio_targets()).await {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        log::error!("[盘前] Scanner 标的批次加载失败，30 秒后重试: {}", error);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                        continue;
+                    }
+                };
 
             log::warn!(
                 "[盘前][BR-192] capability_unavailable=premarket_daily_report_counted_binding_unavailable; \
