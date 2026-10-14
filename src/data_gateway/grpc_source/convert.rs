@@ -47,7 +47,21 @@ use serde_json::Value;
 /// bridge 缺证据时的 capability 标记 (audit_outcome=invalid_evidence)。
 const BRIDGE_CAPABILITY: &str = "GrpcBridge";
 const MAX_CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::seconds(2);
+/// 「实时」契约年龄：**仅作标注阈值**——超过即打 [时间不可信] WARN 并由推送方标注，本身不再决定拒绝。
 const LIVE_BATCH_MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(5);
+/// 严格路径（非 T0 实时能力：RealtimeMarketQuotes / MarketOrderBooks）的**拒绝**阈值。
+///
+/// 2026-10-14 用户指令「暂时不要五秒的限制」：由 5s 临时放宽为 300s。
+/// 实测依据（生产日志，连续交易时段 13:00–14:11）：批次年龄 min 5.04s / 中位 26–28s /
+/// p90 42–45s / max 102.7s，≤5s 占比 **0%** —— 5s 阈值下这两条路径必然全拒
+/// （本实例 15 次 `consumer 收到过期实时 batch`）。根因与 T0Evidence 2026-08-21 遇到的相同：
+/// 桥往返 + server 侧整批组装（该路径代码注释实测 11–55s），消费者按自己的 now 复查必然超 5s。
+///
+/// 300s 只作「明显停摆/损坏」的兜底；超 5s 的批次仍逐次打 [时间不可信] WARN，
+/// **不是静默放行**。未来时间 / source_at 晚于 observed_at 仍是硬错误（损坏 ≠ 延迟）。
+///
+/// 回退：改回 `chrono::TimeDelta::seconds(5)` 即恢复原严格语义。
+const LIVE_BATCH_REJECT_AGE: chrono::TimeDelta = chrono::TimeDelta::seconds(300);
 
 fn err(capability: &'static str, msg: impl Into<String>) -> GatewayError {
     GatewayError::invalid_evidence(capability, None, msg)
@@ -467,8 +481,9 @@ fn live_evidence_times(
     now: DateTime<Utc>,
 ) -> Result<(BatchEvidence, DateTime<Utc>, DateTime<Utc>), GatewayError> {
     let (evidence, source_at, observed_at, _) = live_evidence_times_lenient(q, capability, now)?;
-    // 非 T0 能力保持严格 age 门: lenient 变体仅对 age 放宽, 未来/倒挂仍硬错,
-    // 因此这里 _ 恒 false → 直接沿用严格语义。
+    // 2026-10-14 用户指令「暂时不要五秒的限制」：这里不再用 5s 复查 age —— 5s 只作标注阈值
+    // （lenient 变体已按它打 [时间不可信] WARN），拒绝阈值见 LIVE_BATCH_REJECT_AGE(300s)。
+    // 未来时间 / source_at 晚于 observed_at 仍是硬错误（validate_live_times 保留）。
     validate_live_times(
         capability,
         evidence.provider,
@@ -541,9 +556,10 @@ fn live_evidence_times_lenient(
         time_untrustworthy = true;
         log::warn!(
             "[{capability}][时间不可信] batch age_ns={} max_ns={} source_at={source_at} \
-             observed_at={observed_at} now={now} (桥组装延迟, 放宽 age 门, 推送须标注)",
+             observed_at={observed_at} now={now} (桥组装延迟; 5s 仅为标注阈值, 拒绝阈值 {}s, 临时放宽见 LIVE_BATCH_REJECT_AGE, 推送须标注)",
             age.num_nanoseconds().unwrap_or(i64::MAX),
             LIVE_BATCH_MAX_AGE.num_nanoseconds().unwrap_or(i64::MAX),
+            LIVE_BATCH_REJECT_AGE.num_seconds(),
         );
     }
     Ok((evidence, source_at, observed_at, time_untrustworthy))
@@ -580,14 +596,14 @@ fn validate_live_times(
         ));
     }
     let age = now.signed_duration_since(source_at);
-    if age > LIVE_BATCH_MAX_AGE {
+    if age > LIVE_BATCH_REJECT_AGE {
         return Err(live_time_error(
             capability,
             provider,
             format!(
-                "consumer 收到过期实时 {scope}: age_ns={} max_ns={}",
+                "consumer 收到过期实时 {scope}: age_ns={} 拒绝阈值_ns={}",
                 age.num_nanoseconds().unwrap_or(i64::MAX),
-                LIVE_BATCH_MAX_AGE.num_nanoseconds().unwrap_or(i64::MAX)
+                LIVE_BATCH_REJECT_AGE.num_nanoseconds().unwrap_or(i64::MAX)
             ),
         ));
     }
@@ -5538,7 +5554,10 @@ mod tests {
     }
 
     #[test]
-    fn br238_realtime_consumer_rejects_five_seconds_and_one_nanosecond_old() {
+    fn br243_realtime_consumer_flags_five_seconds_old_instead_of_rejecting() {
+        // 2026-10-14 用户指令「暂时不要五秒的限制」：与 T0Evidence(2026-08-21) 的处置对齐
+        // —— 5s 降为**标注**阈值，拒绝阈值放宽到 LIVE_BATCH_REJECT_AGE(300s)。
+        // 生产实测（连续交易时段）：批次年龄中位 26–28s、p90 42–45s、max 102.7s，≤5s 占比 0%。
         let now =
             Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap() + chrono::Duration::nanoseconds(1);
         let mut q = mk_quote_q(
@@ -5549,8 +5568,14 @@ mod tests {
         q.source_at = "2026-08-17T01:30:00Z".to_string();
         q.observed_at = "2026-08-17T01:30:00Z".to_string();
 
-        let error = realtime_quotes_at(&q, now)
-            .expect_err("consumer age 5s+1ns must fail the realtime freshness red line");
+        let batch = realtime_quotes_at(&q, now).expect(
+            "age 5s+1ns 已超标注阈值但未达拒绝阈值 → 接受并逐次告警, 不再拒绝 (2026-10-14 指令)",
+        );
+        assert_eq!(batch.records().len(), 1);
+
+        // 超过拒绝阈值仍是硬拒: 那是停摆/损坏, 不是延迟。
+        let stale_now = now + LIVE_BATCH_REJECT_AGE + chrono::Duration::nanoseconds(1);
+        let error = realtime_quotes_at(&q, stale_now).expect_err("超过拒绝阈值的实时批次必须拒绝");
         assert_eq!(error.reason_code(), "quote_stale");
         assert!(error.retryable());
     }
