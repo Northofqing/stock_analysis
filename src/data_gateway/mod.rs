@@ -34,6 +34,7 @@ pub(crate) mod historical_record_projection;
 pub mod index;
 pub mod instrument_identity;
 pub mod intraday_shape;
+pub mod live_age_policy;
 pub mod market_capabilities;
 pub mod market_data;
 pub mod ordinary_daily_change_window;
@@ -46,6 +47,7 @@ pub mod review;
 pub mod security_lifecycle;
 pub mod sina_instrument_news;
 pub mod t0_evidence;
+pub mod trading_facts_authority;
 
 #[cfg(test)]
 mod d15_attribution_tests;

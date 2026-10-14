@@ -741,9 +741,31 @@ impl QualifiedTradingFactsGateway {
         Self
     }
 
-    /// Production remains explicitly unavailable until an admitted authority
-    /// contract supplies lifecycle, band/tick and suspension coverage.
+    /// Production serves authority facts **published** by the peer adapter
+    /// (`trading_facts_authority`). No published record for the instrument
+    /// means the authority contract is still undelivered, so the behaviour is
+    /// unchanged and fail-closed.
     pub fn acquire(&self, request: QualifiedTradingFactsRequest) -> QualifiedTradingFacts {
+        if let Some(record) =
+            super::trading_facts_authority::lookup_authority_record(request.instrument())
+        {
+            return match QualifiedTradingFacts::admit(request.clone(), record) {
+                Ok(facts) => facts,
+                Err(error) => {
+                    log::warn!(
+                        "[trading-facts-authority] 已发布记录被 admit 拒绝: {error} (code={})",
+                        request.instrument().code()
+                    );
+                    QualifiedTradingFacts::all_unavailable(
+                        request,
+                        TradingFactUnavailableReason::Conflict,
+                        "published authority trading facts record failed admission",
+                        None,
+                        QUALIFIED_TRADING_FACTS_CONTRACT_V1.to_owned(),
+                    )
+                }
+            };
+        }
         QualifiedTradingFacts::all_unavailable(
             request,
             TradingFactUnavailableReason::ContractNotDelivered,
