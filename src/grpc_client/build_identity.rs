@@ -506,10 +506,10 @@ mod tests {
         );
         assert_eq!(
             receipt.raw_metadata_sha256,
-            // 2026-10-14 更新：contracts/external_v1_current/bundle-metadata.json 的
-            // binary_sha256 由 7407a03b… 改为服务端实测值 9658a0e1…（提交 ea4712863），
-            // 文件字节随之改变；此处钉的就是该文件当前字节的 sha256。
-            "f03c1ce144922ac72a3eb68a81f64672c932b1f9a5dbed8b45f3c55c22a6824f"
+            // 2026-10-14 更新：Windows 侧切到 3faa9d8（service_version 0.2.0 /
+            // source_revision 3faa9d87… / contract 不变 / binary 03bd59d6…），
+            // 钉死身份随之更新；此处钉的就是该文件当前字节的 sha256。
+            "337a20c6a73e2e10aa04d5f4f33e05ef8f2e1e7bae5e45835531a68567ba2a0d"
         );
         assert_eq!(
             receipt.compiled_descriptor_sha256,
@@ -553,7 +553,9 @@ mod tests {
         assert!(trust.recorded_health(policy, descriptor, &live).is_err());
         assert_eq!(
             live.build_identity.unwrap().source_revision,
-            "841e4ae7a9df62be0c4536fa9009c66089d282bf"
+            // 2026-10-14：Windows 侧现行部署身份（3faa9d8）——此断言刻画
+            // 「当前 live 身份与历史（1010.01/0928.2）身份不同源」。
+            "3faa9d87669f6921767c3d5bc2e54cf0a78a670d"
         );
     }
 

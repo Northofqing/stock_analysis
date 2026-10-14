@@ -69,14 +69,14 @@ fn candidate_b7_probe_compiled_policy_public_bytes_null_and_both_descriptor_scop
     assert_eq!(current.bundle_version, "2026-10-08.1");
     assert_eq!(
         current.policy_sha256,
-        // 2026-10-14：bundle-metadata.json 的 binary_sha256 更新（ea4712863）后，
-        // policy 哈希随之改变（旧值 a35bb3a0…）。
-        "b6203010cb666be0c2a5046cc3def1e50c7a1ffa8e782d4ffa6591815479c9c6"
+        // 2026-10-14：Windows 侧切到 3faa9d8 后同步更新钉死身份，policy 哈希随之改变
+        // （上一值 b6203010…，更早 a35bb3a0…）。
+        "73c6c85f7299c2e0740c40c2370e271d7e8d548f28175932082c5a369717ce00"
     );
     assert_eq!(
         current.raw_metadata_sha256,
-        // 同上：该文件当前字节的 sha256（旧值 ec307e5f…）。
-        "f03c1ce144922ac72a3eb68a81f64672c932b1f9a5dbed8b45f3c55c22a6824f"
+        // 同上：该文件当前字节的 sha256（上一值 f03c1ce1…，更早 ec307e5f…）。
+        "337a20c6a73e2e10aa04d5f4f33e05ef8f2e1e7bae5e45835531a68567ba2a0d"
     );
 }
 
@@ -185,6 +185,15 @@ fn candidate_b7_probe_full_identity_and_ready_cannot_be_replaced_by_health_claim
                     "TEST_CODE_remote_identity_error".into()
             }
             _ => changed.ready = false,
+        }
+        if field == 2 {
+            // 2026-10-14：binary_sha256 已降级为**观测信号**（服务端同源重编即变），
+            // 漂移不再使连接不合格；此处钉住该语义，防止把它误当硬门。
+            assert!(
+                trust.current_health(&changed).is_ok(),
+                "binary_sha256 drift must not disqualify the connection"
+            );
+            continue;
         }
         assert!(trust.current_health(&changed).is_err());
     }

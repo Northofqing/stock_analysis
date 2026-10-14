@@ -16,9 +16,9 @@
   "official_publication_schema_version": 1,
   "deployment_build_identity": {
     "service_version": "0.2.0",
-    "source_revision": "841e4ae7a9df62be0c4536fa9009c66089d282bf",
+    "source_revision": "3faa9d87669f6921767c3d5bc2e54cf0a78a670d",
     "contract_sha256": "abf28a3e0028488a7579da4d961e1a7c1408482bdc0500122c1956d225e480cf",
-    "binary_sha256": "9658a0e19e84ccd2fca657c3dcb5410b9a92a319c4deeabdd1ea4930d2c3acb5",
+    "binary_sha256": "03bd59d6688744771720895007c73ab873f25949c8a2c0b92b177f0fe0bda7c7",
     "contract_sha256_scope": "SHA-256 of the raw compiled FileDescriptorSet bytes returned by magic_market_grpc_contracts::v1::FILE_DESCRIPTOR_SET",
     "binary_sha256_scope": "SHA-256 of the exact deployed magic-market-grpc-server executable bytes"
   },
