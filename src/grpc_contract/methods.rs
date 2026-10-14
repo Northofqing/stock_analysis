@@ -64,13 +64,21 @@ impl ExternalMethod {
     }
 
     fn try_from_local_compat(operation: LocalOperation) -> Result<Self, UnknownMethod> {
-        let external = match operation {
-            LocalOperation::SecurityMetadata => ExternalOperation::SecurityMetadata,
-            LocalOperation::MarketAnnouncements => ExternalOperation::MarketAnnouncements,
-            LocalOperation::GlobalNews => ExternalOperation::GlobalNews,
-            LocalOperation::InstrumentNews => ExternalOperation::InstrumentNews,
-            _ => return Err(UnknownMethod),
-        };
+        // 本地专有 op：外部合同无对应名（外部 61/62/63 是拍卖/经济数据族）。必须显式拒绝——
+        // 若按 raw 序号透传，本地 61 CHAIN_BATCH / 62 BENCHMARK_BARS 会撞成外部的
+        // CURRENT_AUCTION_OBSERVATIONS / ECONOMIC_RELEASE_OBSERVATIONS。
+        if matches!(
+            operation,
+            LocalOperation::ChainBatch | LocalOperation::BenchmarkBars
+        ) {
+            return Err(UnknownMethod);
+        }
+        // 其余 op 在两份合同中同名同号（由 external_shared_operations_agree_by_name_and_number 守卫），
+        // 因此按序号对齐，并额外校验名字一致以拒绝未来单侧 proto 漂移。
+        let external = ExternalOperation::try_from(operation as i32).map_err(|_| UnknownMethod)?;
+        if external.as_str_name() != operation.as_str_name() {
+            return Err(UnknownMethod);
+        }
         Self::try_from_operation(external)
     }
 }
@@ -151,29 +159,73 @@ mod tests {
     fn grpc_dual_contract_method_identity_rejects_zero_and_profile_unknown_values() {
         assert_eq!(LocalMethod::try_from_raw(0), Err(UnknownMethod));
         assert_eq!(ExternalMethod::try_from_raw(0), Err(UnknownMethod));
+        // 本地枚举到 62（61/62 为本地专有扩展 CHAIN_BATCH / BENCHMARK_BARS）。
         assert_eq!(LocalMethod::try_from_raw(63), Err(UnknownMethod));
-        assert_eq!(ExternalMethod::try_from_raw(64), Err(UnknownMethod));
+        // 外部枚举到 65（61..65 为拍卖 / 经济数据 / 官方出版物族）。
+        // 原断言为 64，随外部 proto 扩到 65 后已陈旧——62 上验证过与本次改动无关。
+        assert!(ExternalMethod::try_from_raw(64).is_ok());
+        assert!(ExternalMethod::try_from_raw(65).is_ok());
+        assert_eq!(ExternalMethod::try_from_raw(66), Err(UnknownMethod));
     }
 
     #[test]
-    fn grpc_dual_contract_external_method_compatibility_is_closed_before_io() {
+    fn external_shared_operations_agree_by_name_and_number() {
+        // 守卫：本地 op 若在外部合同中存在，必须同名同号——否则按序号对齐会静默错配。
+        let mut shared = 0usize;
+        for raw in 0..=64i32 {
+            let Ok(local) = LocalOperation::try_from(raw) else {
+                continue;
+            };
+            if matches!(
+                local,
+                LocalOperation::ChainBatch | LocalOperation::BenchmarkBars
+            ) {
+                // 仅本地专有：外部同号位必须是别的名字。
+                if let Ok(external) = ExternalOperation::try_from(raw) {
+                    assert_ne!(external.as_str_name(), local.as_str_name());
+                }
+                continue;
+            }
+            let external = ExternalOperation::try_from(raw)
+                .expect("shared op must exist in external contract");
+            assert_eq!(external.as_str_name(), local.as_str_name());
+            shared += 1;
+        }
+        assert!(shared >= 60, "共有 op 数量异常: {shared}");
+    }
+
+    #[test]
+    fn grpc_dual_contract_external_shared_operations_route_to_external() {
+        // 扩展后：共有 op 在 ExternalV1 profile 下全部放行，且映射到同名方法。
         for operation in [
             LocalOperation::SecurityMetadata,
             LocalOperation::MarketAnnouncements,
             LocalOperation::GlobalNews,
             LocalOperation::InstrumentNews,
-        ] {
-            assert!(
-                MethodIdentity::from_client_operation(ContractProfile::ExternalV1, operation)
-                    .is_ok()
-            );
-        }
-        for operation in [
+            // 本次新增路由（此前被白名单拒绝）
             LocalOperation::RealtimeQuotes,
+            LocalOperation::HistoricalBars,
+            LocalOperation::MinuteData,
+            LocalOperation::MoneyFlows,
+            LocalOperation::OrderBooks,
             LocalOperation::BoardConstituents,
-            LocalOperation::ChainBatch,
-            LocalOperation::BenchmarkBars,
+            LocalOperation::BoardDirectory,
+            LocalOperation::TechnicalBars,
+            LocalOperation::FinancialStatements,
+            LocalOperation::CorporateActions,
         ] {
+            let identity =
+                MethodIdentity::from_client_operation(ContractProfile::ExternalV1, operation)
+                    .unwrap_or_else(|_| panic!("{operation:?} 应放行"));
+            assert_eq!(identity.profile(), ContractProfile::ExternalV1);
+            assert_eq!(identity.as_str_name(), operation.as_str_name());
+        }
+    }
+
+    #[test]
+    fn grpc_dual_contract_local_only_operations_are_rejected_before_io() {
+        // 仅本地专有 op：外部目录无对应名，必须仍在 IO 之前拒绝。
+        for operation in [LocalOperation::ChainBatch, LocalOperation::BenchmarkBars] {
             assert_eq!(
                 MethodIdentity::from_client_operation(ContractProfile::ExternalV1, operation),
                 Err(UnknownMethod)

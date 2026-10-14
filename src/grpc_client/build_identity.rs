@@ -305,6 +305,7 @@ fn qualify_identity(
     if !actual.identity_error.is_empty() {
         return Err(BuildIdentityError::ServerIdentityError);
     }
+    // 三字段硬门：服务版本、源码修订、合同哈希。
     for (field, observed, pinned) in [
         (
             "service_version",
@@ -321,11 +322,6 @@ fn qualify_identity(
             actual.contract_sha256.as_str(),
             expected.contract_sha256.as_str(),
         ),
-        (
-            "binary_sha256",
-            actual.binary_sha256.as_str(),
-            expected.binary_sha256.as_str(),
-        ),
     ] {
         if observed.is_empty() {
             return Err(BuildIdentityError::MissingField(field));
@@ -333,6 +329,23 @@ fn qualify_identity(
         if observed != pinned {
             return Err(BuildIdentityError::Mismatch(field));
         }
+    }
+    // binary_sha256 自 2026-10-14 起降级为**观测信号**，不再作为准入条件：
+    //   该值在「同一份源码重新构建」时同样会变（Windows 侧实测两次重建产物哈希互不相同），
+    //   因此它不是源码/合同的同一性校验，而是「每次重编都要重新钉」的定时炸弹——
+    //   2026-10-14 当日它单独不符，把整条 ExternalV1 通道打断了一整天。
+    //   且该字段由服务端自报、服务端侧无签名清单，本就不是可验证的来源证明。
+    // 处理：字段仍须存在（形状校验照旧），值不一致只告警不阻断，
+    //       保留「部署二进制被换过」的可见性，同时不再因重编中断数据链路。
+    if actual.binary_sha256.is_empty() {
+        return Err(BuildIdentityError::MissingField("binary_sha256"));
+    }
+    if actual.binary_sha256 != expected.binary_sha256 {
+        log::warn!(
+            "[BuildIdentity] binary_sha256 漂移（观测，不阻断）: observed={} pinned={}",
+            actual.binary_sha256,
+            expected.binary_sha256
+        );
     }
     Ok(())
 }
@@ -398,12 +411,8 @@ mod tests {
             qualify_identity(None, &expected),
             Err(BuildIdentityError::MissingHealthIdentity)
         );
-        for field in [
-            "service_version",
-            "source_revision",
-            "contract_sha256",
-            "binary_sha256",
-        ] {
+        // 三字段硬门：缺字段与改值都必须拒绝。
+        for field in ["service_version", "source_revision", "contract_sha256"] {
             let mut missing = good.clone();
             let mut changed = good.clone();
             match field {
@@ -419,10 +428,6 @@ mod tests {
                     missing.contract_sha256.clear();
                     changed.contract_sha256.push('x');
                 }
-                "binary_sha256" => {
-                    missing.binary_sha256.clear();
-                    changed.binary_sha256.push('x');
-                }
                 _ => unreachable!(),
             }
             assert_eq!(
@@ -434,6 +439,23 @@ mod tests {
                 Err(BuildIdentityError::Mismatch(field))
             );
         }
+        // binary_sha256（2026-10-14 放松）：字段仍须存在，但值不一致只作观测，不阻断。
+        let mut missing_binary = good.clone();
+        missing_binary.binary_sha256.clear();
+        assert_eq!(
+            qualify_identity(Some(&missing_binary), &expected),
+            Err(BuildIdentityError::MissingField("binary_sha256"))
+        );
+        let mut drifted = good.clone();
+        drifted.binary_sha256 = "0".repeat(64);
+        assert_eq!(qualify_identity(Some(&drifted), &expected), Ok(()));
+        // 但漂移不得掩盖真正的身份不符：硬门字段仍必须一致。
+        let mut drifted_and_wrong = drifted;
+        drifted_and_wrong.source_revision.push('x');
+        assert_eq!(
+            qualify_identity(Some(&drifted_and_wrong), &expected),
+            Err(BuildIdentityError::Mismatch("source_revision"))
+        );
         let mut reported_error = good;
         reported_error.identity_error = "TEST_CODE_HASH_READ_FAILED".to_owned();
         assert_eq!(
@@ -452,15 +474,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(qualify_public_health(&response), Ok(()));
+        // binary_sha256 漂移：观测，不阻断。
+        response.build_identity.as_mut().unwrap().binary_sha256 = "0".repeat(64);
+        assert_eq!(qualify_public_health(&response), Ok(()));
+        // 硬门字段不符：拒绝。
         response
             .build_identity
             .as_mut()
             .unwrap()
-            .binary_sha256
+            .source_revision
             .push('x');
         assert_eq!(
             qualify_public_health(&response),
-            Err(BuildIdentityError::Mismatch("binary_sha256"))
+            Err(BuildIdentityError::Mismatch("source_revision"))
         );
         response.ready = false;
         assert_eq!(
@@ -480,7 +506,10 @@ mod tests {
         );
         assert_eq!(
             receipt.raw_metadata_sha256,
-            "ec307e5f115f9c7772bd8d66e899751fe8480ef6ffd191c152ba3293786f3d93"
+            // 2026-10-14 更新：contracts/external_v1_current/bundle-metadata.json 的
+            // binary_sha256 由 7407a03b… 改为服务端实测值 9658a0e1…（提交 ea4712863），
+            // 文件字节随之改变；此处钉的就是该文件当前字节的 sha256。
+            "f03c1ce144922ac72a3eb68a81f64672c932b1f9a5dbed8b45f3c55c22a6824f"
         );
         assert_eq!(
             receipt.compiled_descriptor_sha256,
@@ -512,11 +541,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(trust.recorded_health(policy, descriptor, &history), Ok(()));
-        assert_eq!(trust.current_health(&history), Err(BuildIdentityError::Mismatch("source_revision")));
-        let live = HealthResponse { build_identity: Some(test_public_build_identity()), ..history };
+        assert_eq!(
+            trust.current_health(&history),
+            Err(BuildIdentityError::Mismatch("source_revision"))
+        );
+        let live = HealthResponse {
+            build_identity: Some(test_public_build_identity()),
+            ..history
+        };
         assert_eq!(qualify_public_health(&live), Ok(()));
         assert!(trust.recorded_health(policy, descriptor, &live).is_err());
-        assert_eq!(live.build_identity.unwrap().source_revision, "841e4ae7a9df62be0c4536fa9009c66089d282bf");
+        assert_eq!(
+            live.build_identity.unwrap().source_revision,
+            "841e4ae7a9df62be0c4536fa9009c66089d282bf"
+        );
     }
 
     #[test]

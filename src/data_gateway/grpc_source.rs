@@ -982,7 +982,7 @@ fn external_query_method(operation: Operation) -> Result<ExternalMethod, Gateway
             "invalid_request",
             "external_contract_rejected",
             false,
-            "ExternalV1 operation 未在当前三项 query allowlist 中",
+            "ExternalV1 无此 op（本地专有 op：CHAIN_BATCH/BENCHMARK_BARS）",
         )),
     }
 }
@@ -6961,10 +6961,9 @@ mod tests {
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();
 
-        let bridge = bridge_for("BoardConstituents").expect("bridge config");
-        let error =
-            block_on(bridge.query_external_op(Operation::BoardConstituents, serde_json::json!({})))
-                .expect_err("undelivered contract must be rejected before I/O");
+        let bridge = bridge_for("ChainBatch").expect("bridge config");
+        let error = block_on(bridge.query_external_op(Operation::ChainBatch, serde_json::json!({})))
+            .expect_err("undelivered contract must be rejected before I/O");
         assert_eq!(error.reason_code(), "external_contract_rejected");
         assert!(!error.retryable());
 

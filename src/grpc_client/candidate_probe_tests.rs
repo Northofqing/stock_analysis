@@ -69,11 +69,14 @@ fn candidate_b7_probe_compiled_policy_public_bytes_null_and_both_descriptor_scop
     assert_eq!(current.bundle_version, "2026-10-08.1");
     assert_eq!(
         current.policy_sha256,
-        "a35bb3a02fcc9d20564cdcfa8a1916ce41549195d237841896e5db6a59803075"
+        // 2026-10-14：bundle-metadata.json 的 binary_sha256 更新（ea4712863）后，
+        // policy 哈希随之改变（旧值 a35bb3a0…）。
+        "b6203010cb666be0c2a5046cc3def1e50c7a1ffa8e782d4ffa6591815479c9c6"
     );
     assert_eq!(
         current.raw_metadata_sha256,
-        "ec307e5f115f9c7772bd8d66e899751fe8480ef6ffd191c152ba3293786f3d93"
+        // 同上：该文件当前字节的 sha256（旧值 ec307e5f…）。
+        "f03c1ce144922ac72a3eb68a81f64672c932b1f9a5dbed8b45f3c55c22a6824f"
     );
 }
 

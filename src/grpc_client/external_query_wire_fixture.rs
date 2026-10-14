@@ -197,7 +197,9 @@ impl SystemService for ExternalQueryWireService {
             .clone();
         let mut build_identity = test_external_build_identity();
         if invalid_health_identity {
-            build_identity.binary_sha256 = "f".repeat(64);
+            // 必须改**硬门**字段：binary_sha256 自 2026-10-14 起只作观测（漂移不阻断），
+            // 改它不再使身份不合格。
+            build_identity.source_revision = "TEST_CODE_INVALID_HEALTH_IDENTITY".into();
         }
         Ok(Response::new(HealthResponse {
             request_id,
