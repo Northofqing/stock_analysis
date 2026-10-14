@@ -1,6 +1,6 @@
 # 2026-10-13 monitor 稳定性窄发布：精确激活审阅单
 
-状态：**用户已批准本精确候选，待10-14切换，未安装**。此候选替代已错过10-13 09:00窗口的[旧raw-only候选](2026-10-12-raw-news-deadline-activation-review.md)，不更改旧封存文件或沿用旧批准。新发现的scanner同步等待会阻塞新闻与DataMode，旧候选不包含此修复。
+状态：**已于 2026-10-14 09:19 CST 手工切换安装并启动（晚于拟生效时点 19 分钟，用户明确授权破例）**；实际执行记录见 `/Users/zhangzhen/.local/share/stock-analysis-deployments/20261013-monitor-stability/cutover-20261014-091932/04-outcome.md`。原排期 owner `monitor-10-14` 在切换时点前已不存在于本机调度存储，09:00 无自动切换发生。此候选替代已错过10-13 09:00窗口的[旧raw-only候选](2026-10-12-raw-news-deadline-activation-review.md)，不更改旧封存文件或沿用旧批准。新发现的scanner同步等待会阻塞新闻与DataMode，旧候选不包含此修复。
 
 ## 10-13 精确批准与执行安排
 
@@ -58,3 +58,15 @@ Windows今日独立联调窗口V1的公共关闭回执报告：Mac真实4个nati
 失败时停新实例、恢复原5份静态文件/monitor/activation和原job owner；不恢复活DB备份、不撤销自然账本/投递事件、不重seed、不重复原19恢复/4取消或76 Uncertain投递。精确步骤和回退材料在私有目录`cutover-and-rollback-recipe.json`及`rollback/`。
 
 **拟生效时点已过或动态门禁失败，保留旧实例，不擅自更换候选或晚装。** 本精确人审已获批准，下一步按上述安排动态复核和切换；[开发与双端交接](../handoffs/2026-10-13-monitor-scanner-stall.md)记录实际源码和余项。
+
+## 2026-10-14 实际切换结果（后补记录）
+
+- **时点偏离**：09:19 CST 手工安装并启动，晚于拟生效时点（01:00:00Z）约 19 分钟；用户明确授权破例（原文选择"现在手工执行"）。原条款"不晚装"本次被显式覆盖。
+- **门禁**：13 项只读门禁全部通过（封存 monitor `e30c721d…`/51929680B、lib `b07e254c…`、activation `af08a95e…`/265B、build-manifest `8976972f…` 均与配方逐字节一致）。
+- **安装核验**：装后 monitor `e30c721d…`、rlib `b07e254c…`、activation `af08a95e…`、5 份静态源码与候选 5/5 一致；正式 root 工具返回 `ACTUAL_RUNTIME_TYPED_HASH_AND_GATE_MATCH`（config_hash `abc6bc51…`、gate `enabled`、exit 0）。
+- **启动**：bridge 先起（PID 92789，init 17m27s 后就绪，GetHealth grpc-status 0 / live=1 ready=1 RUNNING），monitor 后起（PID 96160，lease 交接为 `96160:…`）。
+- **恢复证据**：主线程由 `load_watchlist → pthread_join`（切换前 859/859）变为正常 `CachedParkThread::block_on → Inner::park`；`pthread_join` 采样 0；0 panic；30 秒新增 36 行；同 boot 心跳与真实账户/数据评估均刷新（banner-v2 boot_id `96160:…`）。
+- **Scanner 修复生效**：由"无限同步等待"变为"失败后 30 秒重试"（`[盘前] Scanner 标的批次加载失败，30 秒后重试`）。
+- **未恢复（超出本候选范围）**：`external_transport_unavailable`（ExternalV1 证书）导致 `account_mode=Frozen`、`data_mode=Degraded`、`missing_capabilities=[Kline, MoneyFlow, News, OrderBook]`，推送仍受数据与 Frozen 限制。
+
+完整逐项证据：`/Users/zhangzhen/.local/share/stock-analysis-deployments/20261013-monitor-stability/cutover-20261014-091932/04-outcome.md`。
