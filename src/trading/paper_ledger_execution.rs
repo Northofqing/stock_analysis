@@ -127,7 +127,25 @@ pub(super) struct LotChange {
 }
 
 fn fresh(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<(), LedgerError> {
-    if at > now || now.signed_duration_since(at) > chrono::Duration::seconds(5) {
+    // 2026-10-14 用户指令「暂时不要五秒的限制」：拒绝阈值由 5s 临时放宽为 300s，
+    // 5s 保留为标注阈值（超限 warn）。未来时间仍是硬错误。回退：本常量改回 5。
+    const REALTIME_MARK_REJECT_AGE_SECONDS: i64 = 300;
+    const REALTIME_MARK_ANNOTATE_AGE_SECONDS: i64 = 5;
+    if at > now {
+        return Err(LedgerError::EvidenceUnavailable(
+            "realtime quote/mark timestamp is in the future after lock acquisition".into(),
+        ));
+    }
+    let age = now.signed_duration_since(at);
+    if age > chrono::Duration::seconds(REALTIME_MARK_ANNOTATE_AGE_SECONDS) {
+        log::warn!(
+            "[PaperLedger][时间不可信] realtime quote/mark age={:?} 超标注阈值 {}s；临时拒绝阈值 {}s (2026-10-14 用户指令)",
+            age,
+            REALTIME_MARK_ANNOTATE_AGE_SECONDS,
+            REALTIME_MARK_REJECT_AGE_SECONDS
+        );
+    }
+    if age > chrono::Duration::seconds(REALTIME_MARK_REJECT_AGE_SECONDS) {
         return Err(LedgerError::EvidenceUnavailable(
             "realtime quote/mark not fresh after lock acquisition".into(),
         ));
@@ -141,19 +159,29 @@ mod fresh_tests {
     use chrono::TimeZone;
 
     #[test]
-    fn quote_freshness_uses_exact_inclusive_five_second_window() {
+    fn quote_freshness_rejects_only_beyond_the_relaxed_window() {
+        // 2026-10-14 用户指令「暂时不要五秒的限制」：5s 降为标注阈值，拒绝阈值 300s。
         let now = Utc.with_ymd_and_hms(2026, 9, 29, 6, 30, 0).unwrap();
         assert!(fresh(now, now).is_ok());
         assert!(fresh(now - chrono::Duration::seconds(5), now).is_ok());
-        assert!(matches!(
-            fresh(now + chrono::Duration::nanoseconds(1), now),
-            Err(LedgerError::EvidenceUnavailable(_))
-        ));
+        // 超 5s 但未达拒绝阈值：接受（仅告警）——生产实测批次年龄常态 15–45s
+        assert!(fresh(
+            now - chrono::Duration::seconds(5) - chrono::Duration::nanoseconds(1),
+            now
+        )
+        .is_ok());
+        assert!(fresh(now - chrono::Duration::seconds(300), now).is_ok());
+        // 超拒绝阈值：拒绝
         assert!(matches!(
             fresh(
-                now - chrono::Duration::seconds(5) - chrono::Duration::nanoseconds(1),
+                now - chrono::Duration::seconds(300) - chrono::Duration::nanoseconds(1),
                 now
             ),
+            Err(LedgerError::EvidenceUnavailable(_))
+        ));
+        // 未来时间：仍硬错误
+        assert!(matches!(
+            fresh(now + chrono::Duration::nanoseconds(1), now),
             Err(LedgerError::EvidenceUnavailable(_))
         ));
     }

@@ -49,6 +49,14 @@ use std::sync::Arc;
 use thiserror::Error;
 
 const REALTIME_MAX_AGE_SECONDS: i64 = 5;
+
+/// 2026-10-14 用户指令「暂时不要五秒的限制」：盘中快照的行情**拒绝**阈值由 5s 临时放宽为 300s。
+///
+/// 5s (`REALTIME_MAX_AGE_SECONDS`) 保留为**标注**阈值——超限逐次 warn，不再拒绝。
+/// 依据：生产实测行情批次年龄 min 5.04s / 中位 26–28s / p90 42–45s / max 102.7s，≤5s 占比 0%
+/// （同一根因：桥往返 + server 侧整批组装）。未来/时序倒挂仍是硬错误。
+/// 回退：把 `REALTIME_REJECT_AGE_SECONDS` 改回 5 即恢复原严格语义。
+const REALTIME_REJECT_AGE_SECONDS: i64 = 300;
 /// 数据证据时间戳 vs 分析时刻的容差(秒)。TDX servertime 与本地时钟存在
 /// 结构性偏差(6-63s, 见 tdx_server_probe.rs), 且 server 端批次的
 /// observed_at 是请求时刻而 source_at 是 provider 响应时刻 —— 证据时间戳
@@ -2632,11 +2640,18 @@ fn validate_quote(
     {
         return Err(market_error("quote timestamps are out of order"));
     }
-    if as_of.signed_duration_since(quote.source_at)
-        > chrono::Duration::seconds(REALTIME_MAX_AGE_SECONDS)
-    {
+    let quote_age = as_of.signed_duration_since(quote.source_at);
+    if quote_age > chrono::Duration::seconds(REALTIME_MAX_AGE_SECONDS) {
+        log::warn!(
+            "[NewsAI][时间不可信] 盘中快照 quote source_at 超标注阈值: age={:?} 标注阈值 {}s；临时拒绝阈值 {}s (2026-10-14 用户指令)",
+            quote_age,
+            REALTIME_MAX_AGE_SECONDS,
+            REALTIME_REJECT_AGE_SECONDS
+        );
+    }
+    if quote_age > chrono::Duration::seconds(REALTIME_REJECT_AGE_SECONDS) {
         return Err(NewsAiError::StaleQuote(format!(
-            "quote age exceeds {REALTIME_MAX_AGE_SECONDS} seconds"
+            "quote age exceeds {REALTIME_REJECT_AGE_SECONDS} seconds"
         )));
     }
     Ok(())
@@ -3306,9 +3321,13 @@ mod tests {
     }
 
     #[test]
-    fn br172_production_intraday_snapshot_enforces_five_second_quote_freshness() {
+    fn br243_production_intraday_snapshot_flags_six_second_quote_and_rejects_beyond_relaxed_threshold(
+    ) {
+        // 2026-10-14 用户指令「暂时不要五秒的限制」：5s 由拒绝阈值降为标注阈值，
+        // 拒绝阈值改为 REALTIME_REJECT_AGE_SECONDS(300s)。
         let as_of = instant("2026-07-27T01:30:10Z");
-        let error = NewsMarketSnapshot::try_from_admitted(
+        // 6 秒：超标注阈值但未达拒绝阈值 → 接受（仅逐次告警）
+        NewsMarketSnapshot::try_from_admitted(
             "TEST_CODE_600519",
             NewsMarketContext::Intraday,
             as_of,
@@ -3319,7 +3338,20 @@ mod tests {
                 as_of - chrono::Duration::seconds(5),
             )),
         )
-        .expect_err("TEST_CODE a six-second-old quote must fail");
+        .expect("TEST_CODE 6 秒行情超标注阈值但未达拒绝阈值 → 必须接受");
+        // 超拒绝阈值：拒绝
+        let error = NewsMarketSnapshot::try_from_admitted(
+            "TEST_CODE_600519",
+            NewsMarketContext::Intraday,
+            as_of,
+            admitted_daily_bars("TEST_CODE_600519", as_of, 20, true),
+            Some(admitted_realtime_quote(
+                "TEST_CODE_600519",
+                as_of - chrono::Duration::seconds(REALTIME_REJECT_AGE_SECONDS + 1),
+                as_of - chrono::Duration::seconds(REALTIME_REJECT_AGE_SECONDS),
+            )),
+        )
+        .expect_err("TEST_CODE 超拒绝阈值必须拒绝");
         assert_eq!(error.reason_code(), "stale_quote");
     }
 

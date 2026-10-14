@@ -344,10 +344,17 @@ fn validate_stored_canonical(
     for quote in quotes {
         let source_at = parse_stored_time(&quote["source_at"])?;
         let observed_at = parse_stored_time(&quote["observed_at"])?;
+        let quote_age = now.signed_duration_since(source_at);
+        if stock_analysis::data_gateway::live_age_policy::is_annotation_only(quote_age) {
+            stock_analysis::data_gateway::live_age_policy::annotate_superseded_age(
+                "RetainedMarketObservation",
+                quote_age,
+            );
+        }
         if source_at > now
             || observed_at > now
             || source_at > observed_at
-            || now.signed_duration_since(source_at) > chrono::Duration::seconds(5)
+            || stock_analysis::data_gateway::live_age_policy::exceeds_reject_threshold(quote_age)
             || source_at.with_timezone(&shanghai()).date_naive() != slot.business_date
         {
             return Err("retained_observation_original_quote_expired".into());
@@ -708,11 +715,14 @@ mod tests {
             validate_stored_canonical(&old, &old_request, now).unwrap_err(),
             "retained_observation_original_quote_expired"
         );
-        assert_eq!(
-            validate_stored_canonical(&fresh, &request, now + chrono::Duration::nanoseconds(1))
-                .unwrap_err(),
-            "retained_observation_original_quote_expired"
-        );
+        // 2026-10-14 用户指令「暂时不要五秒的限制」：5s+1ns 只标注，不再过期；
+        // 「超拒绝阈值仍过期」由上面的 old（约 12 分钟前）用例覆盖（拒绝阈值见 live_age_policy）。
+        assert!(validate_stored_canonical(
+            &fresh,
+            &request,
+            now + chrono::Duration::nanoseconds(1)
+        )
+        .is_ok());
         let (future, future_request) = make("2026-10-08T05:42:01Z", "2026-10-08T05:42:01Z");
         assert_eq!(
             validate_stored_canonical(&future, &future_request, now).unwrap_err(),

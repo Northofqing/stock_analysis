@@ -14,7 +14,12 @@
 # ── 数据新鲜度阈值 (AGENTS 2.4) ──
 # 数据陈旧时间超过阈值 → 视为缺失 (AGENTS.md 2.2: 缺失数据禁止静默填充)
 # 影响: 触发器 (T-01) 决策依据, 缺失时降级到 Hold 模式
-dq_quote_stale_sec = 5         # 实时行情 (秒): AGENTS 2.4 / BR-148 / BR-153 / BR-156
+dq_quote_stale_sec = 300     # 实时行情 (秒): 2026-10-14 用户指令「暂时不要五秒的限制」
+                             # 原值 5 (依据 AGENTS 2.4 / BR-148 / BR-153 / BR-156), 现改为 300:
+                             # 5s 仅由 live_age_policy 作标注(逐次 warn), 300s 才是拒绝阈值。
+                             # 依据: 生产实测批次年龄 min 5.04s / 中位 26-28s / p90 42-45s / max 102.7s,
+                             # <=5s 占比 0% —— 5s 硬拒会让 scanner tick 与 pipeline 在真实链路上全被丢弃。
+                             # 回退: 改回 5 (并同步 live_age_policy 的拒绝阈值)。
 dq_position_stale_sec = 30     # 持仓/资金 (秒): 30s 容忍
 dq_nav_stale_sec = 86400       # 净值 (秒): 1 个交易日, 86400 = 24h
 dq_daily_stale_sec = 86400     # 日线/历史数据 (秒): 1 个交易日

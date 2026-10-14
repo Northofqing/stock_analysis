@@ -13,7 +13,8 @@ use chrono::{DateTime, Duration, Utc};
 use log::info;
 use std::sync::atomic::Ordering;
 
-const SCANNER_QUOTE_MAX_AGE: Duration = Duration::seconds(5);
+// 行情 age 门口径见 `crate::data_gateway::live_age_policy`
+// （2026-10-14 用户指令「暂时不要五秒的限制」：5s 仅标注、300s 才拒绝）。
 
 /// Why an actual admitted quote cannot be consumed by this scanner now.
 /// These checks grant no suspension, volume, board-limit or order authority.
@@ -237,17 +238,24 @@ impl TieredScanner {
         now: DateTime<Utc>,
     ) -> Result<CheckedScannerQuote<'quote>, ScannerQuoteUnavailable> {
         self.dq_stats.total_ticks.fetch_add(1, Ordering::Relaxed);
+        let quote_age = now.signed_duration_since(quote.source_at());
         let temporal_failure = if quote.source_at() > now {
             Some(ScannerQuoteUnavailable::SourceFuture)
         } else if quote.observed_at() > now {
             Some(ScannerQuoteUnavailable::ObservedFuture)
         } else if quote.source_at() > quote.observed_at() {
             Some(ScannerQuoteUnavailable::TimestampInversion)
-        } else if now.signed_duration_since(quote.source_at()) > SCANNER_QUOTE_MAX_AGE {
+        } else if crate::data_gateway::live_age_policy::exceeds_reject_threshold(quote_age) {
             Some(ScannerQuoteUnavailable::Expired)
         } else {
             None
         };
+        if crate::data_gateway::live_age_policy::is_annotation_only(quote_age) {
+            crate::data_gateway::live_age_policy::annotate_superseded_age(
+                "ScannerQuotes",
+                quote_age,
+            );
+        }
         if let Some(reason) = temporal_failure {
             self.dq_stats.rejected_stale.fetch_add(1, Ordering::Relaxed);
             return Err(reason);
@@ -402,12 +410,32 @@ mod tests {
     }
 
     #[test]
-    fn scanner_quote_five_seconds_plus_one_nanosecond_rejects_without_truncation() {
+    fn br243_scanner_quote_five_seconds_plus_one_nanosecond_is_annotated_not_rejected() {
+        // 2026-10-14 用户指令「暂时不要五秒的限制」：5s 仅标注，300s 才拒绝。
         let source = scanner_quote_source_time();
         let quote = scanner_quote_fixture(source, source, 10.0, 10.0, 0.0);
         let scanner = TieredScanner::new(vec![]);
         let _clock =
             ScannerQuoteClockGuard::set(source + Duration::seconds(5) + Duration::nanoseconds(1));
+        let checked = scanner
+            .validate_admitted_quote(&quote)
+            .expect("TEST_CODE 5s+1ns 超标注阈值但未达拒绝阈值 → 必须接受");
+        assert_eq!(checked.source_at(), source);
+        let stats = scanner.dq_stats.snapshot();
+        assert_eq!((stats.total, stats.passed, stats.rejected_stale), (1, 1, 0));
+    }
+
+    #[test]
+    fn br243_scanner_quote_beyond_reject_threshold_still_expires() {
+        let source = scanner_quote_source_time();
+        let quote = scanner_quote_fixture(source, source, 10.0, 10.0, 0.0);
+        let scanner = TieredScanner::new(vec![]);
+        let _clock = ScannerQuoteClockGuard::set(
+            source
+                + Duration::seconds(
+                    crate::data_gateway::live_age_policy::LIVE_QUOTE_REJECT_AGE_SECONDS + 1,
+                ),
+        );
         assert_eq!(
             scanner.validate_admitted_quote(&quote).unwrap_err(),
             ScannerQuoteUnavailable::Expired
@@ -520,7 +548,10 @@ mod tests {
         tokio::task::yield_now().await;
         SCANNER_QUOTE_TEST_NOW.with(|clock| {
             clock.set(Some(
-                source + Duration::seconds(5) + Duration::nanoseconds(1),
+                source
+                    + Duration::seconds(
+                        crate::data_gateway::live_age_policy::LIVE_QUOTE_REJECT_AGE_SECONDS + 1,
+                    ),
             ))
         });
         let mut downstream_calls = 0;
@@ -546,8 +577,15 @@ mod tests {
         let first = scanner.validate_admitted_quote(&quote).unwrap();
         assert_eq!(first.source_at(), source);
         tokio::task::yield_now().await;
-        SCANNER_QUOTE_TEST_NOW
-            .with(|clock| clock.set(Some(source + Duration::milliseconds(5_001))));
+        SCANNER_QUOTE_TEST_NOW.with(|clock| {
+            clock.set(Some(
+                source
+                    + Duration::seconds(
+                        crate::data_gateway::live_age_policy::LIVE_QUOTE_REJECT_AGE_SECONDS,
+                    )
+                    + Duration::milliseconds(1),
+            ))
+        });
         assert_eq!(
             scanner.validate_admitted_quote(&quote).unwrap_err(),
             ScannerQuoteUnavailable::Expired

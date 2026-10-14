@@ -6962,8 +6962,9 @@ mod tests {
         reset_bridge();
 
         let bridge = bridge_for("ChainBatch").expect("bridge config");
-        let error = block_on(bridge.query_external_op(Operation::ChainBatch, serde_json::json!({})))
-            .expect_err("undelivered contract must be rejected before I/O");
+        let error =
+            block_on(bridge.query_external_op(Operation::ChainBatch, serde_json::json!({})))
+                .expect_err("undelivered contract must be rejected before I/O");
         assert_eq!(error.reason_code(), "external_contract_rejected");
         assert!(!error.retryable());
 

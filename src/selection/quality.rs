@@ -1,7 +1,6 @@
 use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-const MAX_QUOTE_AGE_SECONDS: i64 = 5;
 const CONTINUITY_RELATIVE_TOLERANCE: f64 = 0.000_001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,13 +124,16 @@ pub fn validate_quote(
         ));
     }
     let age = now.signed_duration_since(quote.source_at);
-    if age > chrono::Duration::seconds(MAX_QUOTE_AGE_SECONDS) {
+    if crate::data_gateway::live_age_policy::is_annotation_only(age) {
+        crate::data_gateway::live_age_policy::annotate_superseded_age("SelectionQuality", age);
+    }
+    if crate::data_gateway::live_age_policy::exceeds_reject_threshold(age) {
         return Err(error(
             "quote_stale",
             format!(
-                "quote age {}ms exceeds {}s",
+                "quote age {}ms exceeds {}ms",
                 age.num_milliseconds(),
-                MAX_QUOTE_AGE_SECONDS
+                crate::data_gateway::live_age_policy::LIVE_QUOTE_REJECT_AGE_MILLIS
             ),
         ));
     }
@@ -386,9 +388,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stale_intraday_quote_after_five_seconds() {
+    fn br243_accepts_intraday_quote_beyond_five_seconds_and_rejects_beyond_relaxed_threshold() {
+        // 2026-10-14 用户指令「暂时不要五秒的限制」：5s 仅标注，300s 才拒绝。
         let now = at(2026, 7, 23, 10, 0);
-        let quote = SelectionQuote {
+        let beyond_annotation = SelectionQuote {
             code: "TEST_CODE_000001".to_string(),
             price: 10.0,
             previous_close: 9.8,
@@ -400,9 +403,20 @@ mod tests {
             volume: 1_000.0,
             amount: 10_000.0,
         };
+        assert!(
+            validate_quote(&beyond_annotation, now).is_ok(),
+            "TEST_CODE 6 秒行情超标注阈值但未达拒绝阈值 → 必须接受"
+        );
 
+        let beyond_reject = SelectionQuote {
+            source_at: now
+                - chrono::Duration::seconds(
+                    crate::data_gateway::live_age_policy::LIVE_QUOTE_REJECT_AGE_SECONDS + 1,
+                ),
+            ..beyond_annotation
+        };
         assert_eq!(
-            validate_quote(&quote, now).unwrap_err().code(),
+            validate_quote(&beyond_reject, now).unwrap_err().code(),
             "quote_stale"
         );
     }

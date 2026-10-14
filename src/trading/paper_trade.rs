@@ -232,9 +232,21 @@ impl PaperTradeStatus {
 
 const REALTIME_QUOTE_MAX_AGE_MILLIS: i64 = 5_000;
 
+/// 2026-10-14 用户指令「暂时不要五秒的限制」：成交授权的**拒绝**阈值由 5s 临时放宽为 300s。
+///
+/// 5s (`REALTIME_QUOTE_MAX_AGE_MILLIS`) 保留为**标注**阈值——超限逐次 warn，不再拒绝。
+/// 依据（生产实测，连续交易时段）：行情批次年龄 min 5.04s / 中位 26–28s / p90 42–45s /
+/// max 102.7s，≤5s 占比 0% —— 5s 硬拒会让成交授权路径在真实链路上永不成立。
+/// 未来时间仍是硬错误（损坏 ≠ 延迟）。
+/// 回退：把本常量改回 `5_000` 即恢复原严格语义。
+const REALTIME_QUOTE_REJECT_AGE_MILLIS: i64 = 300_000;
+
 /// AGENTS 2.4: a realtime quote may authorize a PaperTrade transition only
 /// while it is no more than five seconds old. Provider timestamps in the
 /// future are invalid evidence rather than "negative age" freshness.
+///
+/// 2026-10-14: age 门按用户指令放宽——5s 降为标注阈值，拒绝阈值见
+/// `REALTIME_QUOTE_REJECT_AGE_MILLIS`。
 fn validate_realtime_quote_freshness(
     quote_observed_at: chrono::DateTime<chrono::Utc>,
     evaluated_at: chrono::DateTime<chrono::Utc>,
@@ -248,8 +260,15 @@ fn validate_realtime_quote_freshness(
         .signed_duration_since(quote_observed_at)
         .num_milliseconds();
     if age > REALTIME_QUOTE_MAX_AGE_MILLIS {
+        log::warn!(
+            "[PaperTrade][时间不可信] realtime quote age_ms={age} 超标注阈值 {}ms；临时拒绝阈值 {}ms (2026-10-14 用户指令)",
+            REALTIME_QUOTE_MAX_AGE_MILLIS,
+            REALTIME_QUOTE_REJECT_AGE_MILLIS
+        );
+    }
+    if age > REALTIME_QUOTE_REJECT_AGE_MILLIS {
         return Err(format!(
-            "realtime quote is stale: age_ms={age} max_ms={REALTIME_QUOTE_MAX_AGE_MILLIS}"
+            "realtime quote is stale: age_ms={age} max_ms={REALTIME_QUOTE_REJECT_AGE_MILLIS}"
         ));
     }
     Ok(())
@@ -1565,21 +1584,38 @@ mod tests {
     }
 
     #[test]
-    fn br192_realtime_quote_freshness_accepts_five_seconds_and_rejects_bad_time() {
+    fn br243_realtime_quote_freshness_flags_five_seconds_and_rejects_beyond_the_relaxed_threshold()
+    {
+        // 2026-10-14 用户指令「暂时不要五秒的限制」：5s 由拒绝阈值降为标注阈值，
+        // 拒绝阈值改为 REALTIME_QUOTE_REJECT_AGE_MILLIS(300s)。
         let evaluated_at = chrono::DateTime::parse_from_rfc3339("2026-07-30T09:31:05+08:00")
             .unwrap()
             .with_timezone(&chrono::Utc);
+        // 边界 5s：接受（原语义）
         assert!(validate_realtime_quote_freshness(
             evaluated_at - chrono::Duration::seconds(5),
             evaluated_at
         )
         .is_ok());
+        // 超 5s 但未达拒绝阈值：接受（仅逐次告警）——生产实测常态 15–45s
         assert!(validate_realtime_quote_freshness(
             evaluated_at - chrono::Duration::milliseconds(5_001),
             evaluated_at
         )
+        .is_ok());
+        assert!(validate_realtime_quote_freshness(
+            evaluated_at - chrono::Duration::milliseconds(REALTIME_QUOTE_REJECT_AGE_MILLIS - 1),
+            evaluated_at
+        )
+        .is_ok());
+        // 超拒绝阈值：拒绝
+        assert!(validate_realtime_quote_freshness(
+            evaluated_at - chrono::Duration::milliseconds(REALTIME_QUOTE_REJECT_AGE_MILLIS + 1),
+            evaluated_at
+        )
         .unwrap_err()
         .contains("stale"));
+        // 未来时间：仍是硬错误（损坏 ≠ 延迟）
         assert!(validate_realtime_quote_freshness(
             evaluated_at + chrono::Duration::milliseconds(1),
             evaluated_at
