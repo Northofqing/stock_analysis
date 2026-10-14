@@ -450,6 +450,13 @@ async fn open_stream(bundle: &Path) -> Result<tonic::Streaming<MarketEventEnvelo
     let mut client = GrpcMarketClient::connect_client_bundle(bundle)
         .await
         .map_err(|error| format!("connect {}", safe_reason(&error)))?;
+    // 与网关同序：先做一次 GetHealth 连接资格确认。`subscribe_external` 只检查资格
+    // 状态（require_external_qualification），不会自行确认；跳过这一步会稳定得到
+    // external_connection_unqualified（2026-10-14 实测）。
+    client
+        .get_external_health()
+        .await
+        .map_err(|error| format!("qualify {}", safe_reason(&error)))?;
     client
         .subscribe_external(
             EventFilter {
