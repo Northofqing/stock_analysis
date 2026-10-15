@@ -1542,10 +1542,12 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         category,
         // 🚨紧急类 (风控/持仓事件) 不受静默期抑制, 其余尊重 02:00-06:00 静默
         quiet_hours_respect: !kind.level().is_emergency(),
-        // 2026-09-21 评估 #11 恢复: 交易动作类 kind 在 Frozen 下被 L5 拦截;
-        // 状态卡/复盘/新闻/运维类保持出声 (v17.1 全量放行撤销, 拦截面收敛
-        // 到真正触发交易动作的 kind).
-        frozen_mode_respect: is_live_trading_kind(kind),
+        // 2026-10-15 决策: Frozen 不再拦截任何推送 (交易动作类也放行).
+        //   理由: 账户 Frozen 的恢复依赖减仓/调仓, 而恢复需要操作建议可见;
+        //   拦截交易推送会死锁 (看不到建议 → 无法恢复 → Frozen 不解除).
+        //   仓位大不代表不能加仓/没有机会, 目标是盈利而非被熔断锁死.
+        //   账户状态仍以 banner (🔴 Frozen) + account_mode_log 保留可见性.
+        frozen_mode_respect: false,
         // 2026-08-06 用户决策 (C 方案): 未接入券商, 参考级推送 data_mode_min
         // 放宽到 Down —— 但 2026-09-21 评估 #11 指出 Down 为最大枚举值,
         // data_quality 门禁算术不可达. 折中: 交易动作类收紧到 Degraded
@@ -2134,41 +2136,44 @@ mod tests {
     }
 
     #[test]
-    fn retained_observation_profile_exempts_only_quote_facts_and_keeps_advice_frozen() {
+    fn retained_observation_profile_matches_frozen_release_policy() {
         let observation = retained_observation_profile();
         assert!(!observation.frozen_mode_respect);
         assert_eq!(observation.data_mode_min, DataMode::Down);
         assert_eq!(observation.cooldown_secs, 900);
-        assert!(default_profile_for_kind(PushKind::IntradayMarket).frozen_mode_respect);
-        assert!(default_profile_for_kind(PushKind::T0Advice).frozen_mode_respect);
-        assert!(default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
+        // 2026-10-15 决策: Frozen 不再拦截任何 kind（含交易动作类）。
+        assert!(!default_profile_for_kind(PushKind::IntradayMarket).frozen_mode_respect);
+        assert!(!default_profile_for_kind(PushKind::T0Advice).frozen_mode_respect);
+        assert!(!default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
         assert_eq!(default_profile_for_kind(PushKind::IntradayMarket).data_mode_min, DataMode::Degraded);
     }
 
     #[test]
-    fn auction_input_operational_profile_keeps_data_down_and_frozen_policy_without_advice_exemption() {
+    fn auction_input_operational_profile_keeps_data_down_policy() {
         let operational = default_profile_for_kind(PushKind::DataMode);
         assert_eq!(operational.category, stock_analysis::push_l2::TemplateCategory::DataSource);
         assert_eq!(operational.data_mode_min, DataMode::Down);
         assert!(operational.always_send_on_data_source_down);
         assert!(!operational.frozen_mode_respect);
         assert_eq!(operational.cooldown_secs, 0);
-        assert!(default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
+        // 2026-10-15 决策: Frozen 不拦截 AuctionVolume（交易动作类也放行）。
+        assert!(!default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
         assert_eq!(default_profile_for_kind(PushKind::AuctionVolume).data_mode_min, DataMode::Degraded);
     }
 
     #[test]
-    fn only_live_trading_kinds_respect_frozen_deny() {
-        // 2026-09-21 评估 #11 恢复: Frozen 拦截收敛到交易动作类 kind;
-        // 状态卡/复盘/新闻保持出声.
+    fn no_kind_respects_frozen_deny_after_2026_10_15_release() {
+        // 2026-10-15 决策: Frozen 不再拦截任何推送（含交易动作类）。
+        // 恢复链路依赖操作建议可见，拦截会造成死锁；账户状态以 banner 保留可见性。
         for kind in [
             PushKind::T0Advice,
             PushKind::HoldingPlan,
             PushKind::PaperSell,
+            PushKind::IntradayMarket,
         ] {
             assert!(
-                default_profile_for_kind(kind).frozen_mode_respect,
-                "{kind:?} 应在 Frozen 下被拦截"
+                !default_profile_for_kind(kind).frozen_mode_respect,
+                "{kind:?} 在 Frozen 下应放行"
             );
         }
         for kind in [

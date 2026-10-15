@@ -3411,6 +3411,29 @@ const LIMIT_POOL_FIELDS: &[&str] = &[
     "evidence",
 ];
 
+/// v2 (bundle 2026-10-15.1): v1 字段 + is_st（源提供真值，可空，绝不从名称推导）。
+const LIMIT_POOL_FIELDS_V2: &[&str] = &[
+    "kind",
+    "instrument",
+    "trading_date",
+    "price",
+    "change",
+    "volume",
+    "turnover",
+    "sealed_amount",
+    "first_seal_at",
+    "last_seal_at",
+    "break_count",
+    "streak",
+    "industry",
+    "board_name",
+    "seal_state",
+    "reseal_count",
+    "reason",
+    "is_st",
+    "evidence",
+];
+
 /// Complete LocalBridge LimitPools contract. Optional provider fields must be
 /// present as explicit nulls; serde performs the typed positive-price and
 /// finite-ratio validation after the closed field-set check.
@@ -3453,7 +3476,7 @@ pub fn limit_pools(
     }
     let payload = &q.records[0];
     if payload.schema != LIMIT_POOL_SCHEMA
-        || payload.schema_version != 1
+        || !(1..=2).contains(&payload.schema_version)
         || payload.content_type != CANONICAL_JSON_CONTENT_TYPE
     {
         return Err(err(
@@ -3480,12 +3503,20 @@ pub fn limit_pools(
         let object = value
             .as_object()
             .ok_or_else(|| err(capability, "LimitPoolEntry 必须是 JSON object"))?;
-        if object.len() != LIMIT_POOL_FIELDS.len()
-            || LIMIT_POOL_FIELDS
+        let expected_fields: &[&str] = if payload.schema_version == 1 {
+            LIMIT_POOL_FIELDS
+        } else {
+            LIMIT_POOL_FIELDS_V2
+        };
+        if object.len() != expected_fields.len()
+            || expected_fields
                 .iter()
                 .any(|field| !object.contains_key(*field))
         {
-            return Err(err(capability, "LimitPoolEntry fields 与 schema@1 冲突"));
+            return Err(err(
+                capability,
+                format!("LimitPoolEntry fields 与 schema@{} 冲突", payload.schema_version),
+            ));
         }
         let record: LimitPoolEntry = serde_json::from_value(value)
             .map_err(|error| err(capability, format!("LimitPoolEntry 类型校验失败: {error}")))?;
@@ -3957,14 +3988,22 @@ pub fn t0_evidence_batch_at(q: &QueryResult, now: DateTime<Utc>) -> Result<T0Bat
                 .unwrap_or(record.source_at),
         );
     }
-    if !batch.records.is_empty() && minimum_record_source_at != Some(batch.source_at) {
-        return Err(err(
-            capability,
-            format!(
-                "batch.source_at 必须等于最早 record.source_at: batch={} minimum={:?}",
-                batch.source_at, minimum_record_source_at
-            ),
-        ));
+    // 2026-10-15 决策: batch.source_at 放宽为「不得晚于最早 record.source_at」。
+    //   桥组装 batch.source_at ≈ 请求发起时刻, record.source_at = 数据获取时刻;
+    //   数据获取有延迟时 batch 时间早于最早 record 1-7 秒 (生产实测 ~7% 批次,
+    //   10-09 起 249 次), 旧校验「严格等于」把这些批次全部拒绝
+    //   (invalid_evidence, retryable=false → 该周期 T0Advice 不推)。
+    //   方向安全: batch 时间偏早 → 下游新鲜度判断保守, 不会高估。
+    if let Some(minimum) = minimum_record_source_at {
+        if batch.source_at > minimum {
+            return Err(err(
+                capability,
+                format!(
+                    "batch.source_at 不得晚于最早 record.source_at: batch={} minimum={:?}",
+                    batch.source_at, minimum
+                ),
+            ));
+        }
     }
     // 2026-08-21 用户指令: 拿不到可信时间 → 跳过 age 门但必须标注, 推送方据
     // time_untrustworthy 打印「时间不可信」, 禁止静默放行。
@@ -6313,6 +6352,28 @@ mod tests {
         let batch = t0_evidence_batch_at(&q, now)
             .expect("T0 source age 5s+1ns must be flagged, not rejected (2026-08-21 指令)");
         assert!(batch.time_untrustworthy, "age 超门批次必须标注 时间不可信");
+        assert_eq!(batch.records.len(), 1);
+    }
+
+    #[test]
+    fn br253_t0_v2_allows_batch_source_at_earlier_than_earliest_record() {
+        // 2026-10-15 决策: 桥组装 batch.source_at ≈ 请求时刻, record.source_at = 数据获取时刻,
+        // 数据延迟时 batch 早于最早 record 1-7 秒 (生产实测 ~7% 批次, 10-09 起 249 次)。
+        // 旧校验「严格等于」全部拒绝 → 放宽为「不得晚于最早 record」。
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 1, 30, 5).unwrap();
+        let mut q = live_t0_q();
+        // batch 时间提前 2 秒 (record 保持 01:30:00Z)
+        q.source_at = "1786930198.000000000".to_string();
+        let mut view: Value = serde_json::from_slice(&q.records[0].data).unwrap();
+        view["source_at"] = Value::String("1786930198.000000000".to_string());
+        q.records[0].data = serde_json::to_vec(&view).unwrap();
+
+        let batch = t0_evidence_batch_at(&q, now)
+            .expect("batch.source_at 早于最早 record 必须放行 (2026-10-15 决策)");
+        assert_eq!(
+            batch.source_at,
+            Utc.with_ymd_and_hms(2026, 8, 17, 1, 29, 58).unwrap()
+        );
         assert_eq!(batch.records.len(), 1);
     }
 
