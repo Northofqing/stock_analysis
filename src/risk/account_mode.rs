@@ -196,8 +196,19 @@ pub fn evaluate(
 /// v17.5 §5.10 / BR-021: 8:30 盘前重置信号 helper.
 ///
 /// 返回 `true` 当:
-///   1. `now_local` 落在 `[08:30:00, 08:31:00)` 1 分钟窗口内,
+///   1. `now_local` 落在**盘前窗口** `[08:30:00, 09:15:00)` 内,
 ///   2. 且 `prev` 是 `Some(AccountMode::Frozen)`.
+///
+/// **右边界为何是 09:15 而不是 08:31**(2026-10-14 修正):
+/// 原实现是 1 分钟窗口 `[08:30:00, 08:31:00)`,与 caller 注释承诺的
+/// "错过 8:30 不放弃(含启动时补偿)"冲突 —— 只要进程在 08:30:00-08:30:59
+/// 这一分钟内不在位(重启/发布/崩溃/休眠),当日重置就静默失去机会,
+/// Frozen 再粘滞一天。实例: 2026-10-14 monitor 09:19 才起来,19:00 的
+/// "含错过补偿"调用被 1 分钟窗口拒绝,库中 account_mode_log 当日无新行。
+/// 右边界取 09:15(集合竞价开始)与本项目既有补偿先例一致
+/// (main.rs 链路分析窗口 "9:05-9:14, 9:15 后错过竞价参考意义"),
+/// 同时**保住 BR-021 粘滞语义**: 09:15 之后(盘中)触发的 Frozen
+/// 不能被当日任何后续评估清掉,只能等下一交易日盘前。
 ///
 /// 否则返回 `false`.
 ///
@@ -211,7 +222,9 @@ pub fn evaluate(
 /// caller 集成代码 ~3 行 (e.g. `if should_reset...() { next_eval_prev = None }`).
 pub fn should_reset_at_8_30(prev: Option<AccountMode>, now_local: NaiveTime) -> bool {
     let window_start = NaiveTime::from_hms_opt(8, 30, 0).expect("08:30:00 valid");
-    let window_end = NaiveTime::from_hms_opt(8, 31, 0).expect("08:31:00 valid");
+    // 盘前窗口右边界 = 集合竞价开始 (09:15). 09:15 之后不接受重置, 盘中
+    // 触发的 Frozen 只能等下一交易日盘前 (BR-021 粘滞语义).
+    let window_end = NaiveTime::from_hms_opt(9, 15, 0).expect("09:15:00 valid");
     if now_local < window_start || now_local >= window_end {
         return false;
     }
@@ -497,14 +510,33 @@ mod tests {
         assert!(should_reset_at_8_30(Some(AccountMode::Frozen), at_8_30_45));
     }
 
+    /// 2026-10-14 补偿修正: 08:31-09:14:59 之间起来/恢复的进程仍能补做当日
+    /// 盘前重置 (原 1 分钟窗口会静默丢掉这次机会, 见 should_reset_at_8_30 文档).
+    #[test]
+    fn should_reset_at_8_30_compensates_late_process_start_before_auction() {
+        for hms in [(8, 31, 0), (8, 45, 0), (9, 0, 0), (9, 14, 59)] {
+            let at = NaiveTime::from_hms_opt(hms.0, hms.1, hms.2).unwrap();
+            assert!(
+                should_reset_at_8_30(Some(AccountMode::Frozen), at),
+                "{at} 应在盘前补偿窗口内"
+            );
+        }
+    }
+
     #[test]
     fn should_reset_at_8_30_false_outside_window() {
         let at_8_29 = NaiveTime::from_hms_opt(8, 29, 59).unwrap();
-        let at_8_31 = NaiveTime::from_hms_opt(8, 31, 0).unwrap();
+        let at_9_15 = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
         let at_9_30 = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        // 盘中/盘后触发过的 Frozen 必须继续粘滞到下一交易日盘前 (BR-021):
+        // 若在 14:00 或 19:00 也能重置, 当日盘中熔断会被随后的评估清掉.
+        let at_14 = NaiveTime::from_hms_opt(14, 0, 0).unwrap();
+        let at_19 = NaiveTime::from_hms_opt(19, 0, 0).unwrap();
         assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_8_29));
-        assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_8_31));
+        assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_9_15));
         assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_9_30));
+        assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_14));
+        assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_19));
     }
 
     #[test]
@@ -553,8 +585,8 @@ mod tests {
     #[test]
     fn one_evaluation_snapshot_controls_the_reset_boundary() {
         let metrics = m(0.2, 0, 4);
-        let before_end = NaiveTime::from_hms_opt(8, 30, 59).unwrap();
-        let at_end = NaiveTime::from_hms_opt(8, 31, 0).unwrap();
+        let before_end = NaiveTime::from_hms_opt(9, 14, 59).unwrap();
+        let at_end = NaiveTime::from_hms_opt(9, 15, 0).unwrap();
 
         let reset = evaluate_with_reset(&metrics, Some(AccountMode::Frozen), &t(), before_end);
         let retained = evaluate_with_reset(&metrics, Some(AccountMode::Frozen), &t(), at_end);
