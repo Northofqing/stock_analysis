@@ -81,6 +81,1153 @@
 | `src/grpc_client` / `grpc_contract` | 3,074 / 930 | 外部 provider-host 的网络、认证、错误和合同接缝 |
 | `src/market_domain` | 1,968 | 本仓拥有的 provider-neutral 市场领域类型 |
 
+### 2.4 活性全景:设计态 vs 运行态(2026-10-11 增量审计)
+
+§3–§17 描述**设计态**(系统被设计成什么样);本节标注同一张架构图的**运行活性**(今天实际跑成什么样)。状态词汇沿用 §1 标签定义。证据:2026-10-11 全库四轮源码普查(新闻/技术/交易链路深查 + 全模块活性扫面,逐模块核对生产调用方);修复路线见 [新闻智能层统一设计](plans/2026-10-11-news-intelligence-unified-analysis-design.md)(含决策记录 D1–D3)。
+
+```mermaid
+flowchart TB
+    subgraph EXT["EXTERNAL"]
+        host["provider-host VM\n行情/快讯/公告/资金流/龙虎榜"]
+        llm["LLM APIs\nGemini / DeepSeek / 豆包"]
+        feishu["飞书 magiclaw"]
+    end
+    subgraph ING["接入与准入 ~83k 行"]
+        grpc["grpc_client 32k\ntyped gRPC · 40 ops"]
+        gw["data_gateway 49k\nfail-closed + BatchEvidence"]
+    end
+    subgraph MDT["行情通道 · fail-closed"]
+        qt["实时报价 ExecutionQuote 含涨跌停价\n日K HistoricalBars · 分钟线 · 5档盘口"]
+    end
+    subgraph ANA["分析域(monitor 常驻)"]
+        news["news 8k · 4路快讯+公告\n120s 轮询"]
+        trackA["通路A: LLM提取ticker→入池\n9-24 起断流零新增"]
+        trackB["通路B: NewsAI 五档评估\n只推送不影响交易(D1已批准修订)"]
+        tech["trend_analyzer 技术评分\nRSI口径分裂 · ATR非标准 · 无形态识别"]
+        sel["selection admission-v1\n纯量价二元门 · 无 ranking\n北交所/ST 静默缺失"]
+        mkt["market_analyzer\n大盘 regime · 板块共振"]
+    end
+    subgraph DEC["决策与交易(虚拟盘全自动)"]
+        tick["intraday_monitor 30s tick\n6 策略打分 ≥6.0\nNewsCatalyst 常数 7.0"]
+        paper["PaperLedger 虚拟盘 trading 46k\n买入固定 100 股 · T+1\n卖出: FIFO 账本 + 四大铁律 30s"]
+        reg["registry 策略注册表\n注册在跑 · 弱消费"]
+        dead["死代码: decide() 864行 · VetoChain · sector_score\nevent_extractor(决策D2删除) · impact.rs\nbus骨架 · paper_engine(BR-211) · alert.rs大半"]
+    end
+    subgraph REAL["真钱环(人工 · 无券商接口)"]
+        human["人看飞书卡片\n手动券商下单"]
+        snap["import_*_snapshot CLI\n真实持仓回填"]
+        watch["真实持仓监控\nholding_plan · t0做T · T-16 ST预警"]
+    end
+    subgraph DELIV["投递域 ~200k 行"]
+        pushf["push_foundation 140k\nintent store · activation fence · finalization"]
+        p456["push_l4 去重 → l5 治理 → l6 sink\nL2 trait 0 实现 · L3 缺失"]
+        dur["durable_delivery 60k\n21 表状态机 · fence · 幂等"]
+    end
+    subgraph REV["复盘与验证"]
+        review["review R02-R12\nR05/R06 Disabled"]
+        pred["prediction_tracker 76 条\n停更 07-17 · T+1 命中 17/64 = 26.6%"]
+        perf["performance 19k\n归因 · 经济头寸"]
+    end
+    subgraph RES["研究/回测域(CLI 手动)"]
+        bt["BacktestEngine + runner 3.6k\n多因子/布林/RSI · R-12 路径研究\nwinrate 模拟(BR-006 关停 7 个 0% 主题)"]
+        sreg["signal_registry 6 信号\n全部 info_only/watch · 从未回测"]
+    end
+    subgraph CLIP["CLI 旁路(非常驻)"]
+        app["app + pipeline 30k\n单次分析 · 报告"]
+        deep["deep_analyzer + agent 深研\nAI 分析 IC=-0.0775(2026-06 实测)"]
+    end
+    subgraph STORE["存储与审计"]
+        db[("业务 SQLite · database 146k\nDiesel/rusqlite 双栈")]
+        ddb[("durable SQLite 独立库")]
+        jsonl["JSONL 哈希链\nevent_audit / durable_audit"]
+    end
+    host --> grpc --> gw
+    gw --> qt
+    gw --> news
+    gw --> sel
+    gw --> mkt
+    qt ==> tick
+    qt ==> tech
+    news --> trackA
+    news --> trackB
+    trackA --> llm
+    trackB --> llm
+    trackA -. "断流" .-> tick
+    sel -. "半接线" .-> tick
+    tech --> tick
+    mkt --> tick
+    tick --> reg
+    tick --> paper
+    tick --> pushf
+    trackB --> pushf
+    watch --> pushf
+    pushf --> p456 --> dur --> feishu
+    feishu -. "人工环" .-> human
+    human --> snap --> watch
+    paper --> perf
+    tick --> review
+    review --> pred
+    gw --> db
+    tick --> db
+    dur --> ddb
+    dur --> jsonl
+    app --> deep
+    app --> llm
+    app --> bt
+    bt --> sreg
+    sreg -. "从未回测生产信号" .-> tick
+    classDef alive fill:#173627,stroke:#62d7a2,color:#eaf5ff
+    classDef degraded fill:#3a2f1a,stroke:#f3b251,color:#eaf5ff
+    classDef deadcode fill:#3a1f24,stroke:#ff7a86,color:#eaf5ff
+    class host,llm,feishu,grpc,gw,qt,news,mkt,paper,pushf,p456,dur,db,ddb,jsonl,perf alive
+    class trackA,trackB,tech,sel,tick,review,pred,reg,app,deep,bt,sreg,watch degraded
+    class dead,human,snap deadcode
+```
+
+交易循环(行情 → 买入 → 持仓 → 卖出 → 归因)单独成图:
+
+```mermaid
+flowchart LR
+    subgraph MKT["行情数据 provider-host → data_gateway"]
+        quote["实时报价 ExecutionQuote\n含涨跌停价 · fail-closed"]
+        kline["日K HistoricalBars\nselection 特征 / trend_analyzer"]
+        minute["分钟线 MarketMinutePoint\n60min/15min 入场确认"]
+        book["5档盘口 OrderBook"]
+    end
+    subgraph BUY["买入 · 虚拟盘全自动"]
+        pool["pushed_stocks 候选池\n通路A新闻 / selection / D-01"]
+        tick["intraday_monitor 30s tick\nv16_4 打分 ≥ 6.0"]
+        limit["涨跌停闸门 BR-134\n涨停不买 跌停不卖"]
+        risk["risk_adapter 4 硬检\n账户模式 · 单票10% · 现金底15% · 数据模式"]
+        buy["PaperLedger.buy\n固定 100 股 · T+1"]
+    end
+    subgraph SELL["持仓与卖出 · 虚拟盘全自动"]
+        ledger["FIFO 批次账本\npaper_lot_ledger"]
+        scan["paper_sell 30s 扫描\nPAPER_SELL_DISABLED 逃生口"]
+        rules["四大铁律\nATR止损 · 破MA5止盈\n14天换股 · 布林上轨"]
+        sell["PaperLedger.sell\n卖出 → 飞书推送 → 归因"]
+    end
+    subgraph REAL["真钱环 · 人工 · 无券商接口"]
+        card["飞书卡片\nD-01 个股卡 / 卖出提醒"]
+        human["人手动券商下单"]
+        snap["import_*_snapshot CLI\n真实持仓回填"]
+        watch["真实持仓监控\nholding_plan 三预案 · t0做T · T-16 ST预警"]
+    end
+    quote --> tick
+    quote --> scan
+    pool --> tick
+    tick --> limit --> risk --> buy --> ledger
+    ledger --> scan --> rules --> sell
+    kline --> rules
+    minute --> tick
+    book -. 仅观测 .-> tick
+    sell --> card
+    card --> human --> snap --> watch --> card
+    classDef alive fill:#173627,stroke:#62d7a2,color:#eaf5ff
+    classDef degraded fill:#3a2f1a,stroke:#f3b251,color:#eaf5ff
+    classDef deadcode fill:#3a1f24,stroke:#ff7a86,color:#eaf5ff
+    class quote,kline,minute,tick,limit,risk,buy,ledger,scan,rules,sell alive
+    class pool,book,card,watch degraded
+    class human,snap deadcode
+```
+
+图例:绿=CURRENT(生产在用),黄=CONDITIONAL(半活/降级),红=INACTIVE(死代码/断流)。
+
+#### 2.4.1 全模块活性普查(按代码量排序)
+
+| 模块 | Rust 行数 | 职责 | 活性 | 证据与备注 |
+| --- | ---: | --- | --- | --- |
+| `database` | 145,584 | schema/attestation/repository/审计链 | `CURRENT` | Diesel+r2d2 与 rusqlite 双栈并存 |
+| `push_foundation` | 139,851 | 推送地基:intent store、activation fence、N02 绑定、finalization SLA | `CURRENT` | monitor 启动与 N02/chain 推送在用;体量中大量为 schema 迁移测试 |
+| `bin/` | 115,617 | monitor 编排 + 40 个工具/探针/研究入口 | `CURRENT` | main.rs 10.3k 行单文件过重;bins 分类见下表 |
+| `durable_delivery` | 60,584 | 投递状态机(21 表)、fence、幂等、恢复 | `CURRENT` | §12 |
+| `data_gateway` | 48,981 | 远程 wire 转换 + fail-closed 证据准入 | `CURRENT` | §6;质量最高的一层 |
+| `trading` | 46,547 | PaperLedger 虚拟盘、FIFO 账本、T+1 | `CURRENT` | 2026-10-09 绑定真实持仓;`paper_engine` 被 BR-211 硬禁用 |
+| `monitor`(lib) | 40,257 | 可复用监控域能力 | `CONDITIONAL` | `alert.rs` 大半死亡(push_alert/aggregate_alerts/send_alert 零调用) |
+| `grpc_client` | 31,917 | 外部 provider-host 网络/认证/错误 | `CURRENT` |  |
+| `selection` | 26,960 | 事件驱动选股 admission-v1 | `CONDITIONAL` | 纯量价二元门;无 ranking;outcome 仅 shadow;北交所/ST 静默缺失 |
+| `pipeline` | 24,840 | CLI 宽分析管道 | `CONDITIONAL` | 生产 monitor 不经此路,仅 CLI 使用;内含 backtest_runner(多因子/布林/RSI 回测) |
+| `performance` | 19,201 | 归因、经济头寸、业绩报告 | `CURRENT` | replay 子路径偏研究/回填 |
+| `event` | 15,152 | EventEnvelope bus + History/Replay | `CURRENT` | 三套总线并存:event/bus 与 monitor/event_bus 活,`src/bus` 骨架死 |
+| `decision` | 11,544 | 盘中监控 + 决策 | `CONDITIONAL` | `intraday_monitor` 活(30s tick);`decide()` 864 行零调用、`sector_score` 未接线 |
+| `strategy` | 11,307 | v16_4 八策略 + 回测策略 | `CONDITIONAL` | 八策略在跑但常数分;`BacktestEngine`(core.rs 1.9k)+`backtest_runner`(1.7k)仅 CLI/研究;**生产 8 信号从未回测(signal_registry 全 watch)**;`model_change_draft_v1` 零调用 |
+| `news` | 8,403 | 新闻采集/聚合/分类 | `CONDITIONAL` | 采集强;`impact.rs` 打分链死;快讯事件分类空投影 |
+| `opportunity` | 7,198 | 候选机会 | `INACTIVE` | `auction_agent` test-only;`event_extractor` 已决策删除(D2) |
+| `review` | 6,378 | 盘后复盘 R02-R12 | `CONDITIONAL` | R05/R06 Disabled;prediction_tracker 停更 2026-07-17;含 R-12 15min 路径研究(`review/backtest.rs` 1.9k,仅研究) |
+| `app` | 5,723 | CLI 主流程 bootstrap/modes/schedule | `CURRENT` | monitor 复用其 chain_schedule |
+| `notification` | 5,508 | 通知服务(feishu/email/wechat) | `CONDITIONAL` | 仅 CLI 侧;monitor 不经 NotificationService;`send_daily_report` 零调用 |
+| `search_service` | 4,643 | 网页搜索(SerpApi/Bocha/Tavily) | `CONDITIONAL` | ResearchOnly;规则 NLP 关键词级 |
+| `market_analyzer` | 4,585 | 大盘复盘/板块/涨停池 | `CURRENT` |  |
+| `evidence_retention` | 4,349 | 证据留存 outbox | `INACTIVE` | 唯一调用方是两个死模块(paper_funding_review_v1 / model_change_draft_v1) |
+| `agent` | 4,304 | Agent 工具带 + 多角色深研 | `CONDITIONAL` | CLI/手动触发;不在自动选股→深研链路 |
+| `risk` | 4,156 | 风控 | `CONDITIONAL` | monitor 侧 risk_adapter 活;lib 侧 VetoChain 从未实例化 |
+| `offline_products` | 3,489 | sell_reminder + streak_leader 研究 | `CONDITIONAL` | 仅手动 bin,无调度 |
+| `analyzer` | 3,241 | GeminiAnalyzer 等 AI 分析 | `CONDITIONAL` | v19.2 确诊 IC=-0.0775 反向指标;三套 LLM 设施并行 |
+| `llm` | 2,503 | LLM provider 抽象 + ticker 提取 | `CURRENT` | extract_tickers 无 receipt(待 P1 修复) |
+| `data_provider` | 2,256 | 筹码/一致预期/停复牌/涨跌停状态/news_item | `CURRENT` | 本地 provider 移除后明显收缩 |
+| `market_domain` | 1,970 | provider-neutral 领域类型 | `CURRENT` | 150+ 文件引用 |
+| `indicators` | 1,399 | MACD/KDJ/RSI/背离 | `CONDITIONAL` | RSI 双实现、ATR 非标准、无形态识别 |
+| `portfolio` | 1,197 | 持仓计划存储 | `CURRENT` | PositionSizer 不进生产 monitor |
+| `push_l1/l4/l5/l6/l7` | 3,624 | 推送分层 | `CURRENT` | L4-L7 活;`push_l2` 316 行 trait 0 实现,L3 目录不存在 |
+| `signal` | 585 | market_event + push_recorder | `CONDITIONAL` | 顶层 Signal 类型已删 |
+| `breakout` | 510 | 放量启动检测 | `CURRENT` | 盘中/盘后双模式 |
+| `bus` | — | v16.4 三总线骨架 | `INACTIVE` | 唯一生产发布方 paper_engine 已硬禁用 |
+| `magic_compat` | 0 | 空目录残留 | `INACTIVE` | lib.rs 未声明,可直接删 |
+| `gate_d_*`(5 文件) | 475 | Gate-D 验收回归 | `—` | 全部 #[cfg(test)] 挂载,生产零参与(正常) |
+
+#### 2.4.2 src/bin 41 个 binary 分类
+
+| 类别 | bins |
+| --- | --- |
+| launchd 生产关键 | `monitor`(常驻);`weekly_outcome_review`+`assistant_review`;`backfill_daily`+`backfill_predictions` |
+| 生产运维(手动) | import_*×3、paper_account_activate、run_closing_valuation、confirm_daily_change、resolve_stale_uncertain、selection_activation_prepare、migrate_selection_v2、chain_schedule_resolve、day_capture_check、durable_schema14_snapshot_check、attribution_backfill、strategy_attribution、backfill_catalyst_watchlist、paper_adjudication_preview、sell_reminder_producer/preview |
+| 诊断探针(手动) | account_metrics/announcement/board_directory/economic_position/gateway_quote/grpc_bundle/grpc_candidate_bundle/grpc_failure/grpc_local_readiness/historical_observed 各 probe、lhb_query |
+| 研究/回测 | boll_macd_backtest、rsi_optimize、winrate_simulator、streak_leader_research、produce_winrate_samples、deep_analyze |
+| 一次性/开发 | agent_test、v14_e2e |
+
+#### 2.4.3 本次普查新发现的死代码/断流(超出设计文档记录)
+
+- `monitor/alert.rs` 大半死亡:push_alert/aggregate_alerts/send_alert 零调用,仅 format_alert 经 alert_log 活
+- `src/bus` 骨架死亡:唯一生产发布方 `paper_engine::run_once` 被 BR-201/BR-211 硬禁用(main.rs:10145 有断言隔离)
+- `src/magic_compat/` 空目录残留,lib.rs 未声明
+- `strategy/model_change_draft_v1` + `trading/paper_funding_review_v1` 零生产调用 → evidence_retention 断流的根因
+- 三套总线并存:`event/bus.rs`(活)、`monitor/event_bus.rs`(活)、`src/bus`(死),替代关系未完成
+- `lib.rs` 的 `pub mod cli` 冗余:bin 用各自本地 mod cli,lib 侧零外部调用方
+
+#### 2.4.4 模块详析(2026-10-11 全模块普查,逐模块核对生产调用方)
+
+##### `src/database/`
+
+- **职责:** SQLite 持久化核心——`DatabaseManager` 单例（`OnceCell`, diesel+r2d2 连接池） + descriptor-attested 连接证明（fd/inode 级防伪， BR-001/016/017/050/066/129) + 全库 schema 定义与各业务表存取子模块。
+- **内部结构:** `mod.rs`(7037, 连接池/descriptor attestation/单例/retention material proof)、`global_schema_v1.rs`(15583, 主 schema)、`selection_v2.rs`(7194)、`news_ai.rs`(4816, 另有 news_ai/ 子目录）、`selection.rs`(2060)、`kline.rs`(1304)；另有约 20 个 `global_schema_*` 版本化 schema 文件及 attribution/paper/audit 系列子模块。
+- **生产调用链:** 入口双侧接线——monitor 启动 `DatabaseManager::init/init_retained_monitor` (src/bin/monitor/main.rs:4514-4516),CLI `stock_analysis` 启动 (src/main.rs:66-69)；运行时各 loop 经 `get()/try_get()` 消费（src/bin/monitor/health.rs:7, market_data.rs:179, push_templates.rs:274/1316/7840, news_aggregator_init.rs:1393, durable_delivery_runtime.rs:6713, holding_plan.rs:188);lib 侧 src/monitor/*、src/data_gateway/*、src/pipeline/*、src/trading/*、src/selection/* 全面引用（308 处 grep 命中）。
+- **活性:** CURRENT — monitor 主流程启动即 init，主循环与 CLI 全程可达。
+- **问题/缺口:**
+  - `DatabaseManager` 两个字段 `selection_connection_source`/`selection_schema_authority` 标 `#[allow(dead_code)]` 保留未消费（src/database/mod.rs:431-434)。
+  - `DatabaseAuthorityError::code()` 标 `#[allow(dead_code)]`(src/database/mod.rs:748-749)。
+  - `DatabaseManager::get()` 未初始化即 panic("数据库未初始化，请先调用 DatabaseManager::init()", src/database/mod.rs:3475)，依赖 init 时序约定；多数生产调用方用 `try_get` 兜底，但 `get()` 裸调用仍散布在 monitor 多处（如 holding_plan.rs:188, market_data.rs:179)。
+  - mod.rs 单文件 7037 行，descriptor attestation、只读快照复制、业务查询、测试 hook 基建混在一起，维护面过大。
+
+##### `src/event/`
+
+- **职责:** 事件基础设施——`DomainEvent`/`EventEnvelope` 信封、有界广播 `EventBus`、BR-091 权威 JSONL hash-chain 审计写（`AuditDispatcher`)、NewsFlash 投递权威（attempt/terminal/failure 追加 + reconcile)、历史查询与 replay。
+- **内部结构:** `dispatcher.rs`(2785)、`envelope.rs`(2082)、`push_record.rs`(1984)、`durable_delivery_append.rs`(1841)、`mod.rs`(3536, NewsFlash authority snapshot/reconcile 主体）、`history.rs`(1092)、`replay.rs`+`cli.rs`(453+451, events history/replay 子命令）。
+- **生产调用链:** monitor 启动 `spawn_blocking(preflight_runtime_delivery_audit)` 关门（src/bin/monitor/main.rs:5805) → `global_bus()`(main.rs:5922, health.rs:36) → `JsonlWriter::spawn`(main.rs:5937)；投递审计写入 `publish_delivery*`(main.rs:3471, notify.rs:2420/2809, news_ai_shadow.rs:396)、`publish_news_flash_attempt/terminal/failure`(notify.rs:2927/2995, news_aggregator_init.rs:991/1592/1609);`AuditDispatcher` 注入 durable delivery 运行时（durable_delivery_runtime.rs:1066/1164);`EventCommand` 子命令 history/replay 接线于 main.rs:5659/6016-6055。
+- **活性:** CURRENT — monitor 启动预检、主循环推送审计、CLI 子命令均实际可达。
+- **问题/缺口:**
+  - `delivery_settlement.rs` 整文件（47 行， BR-145）是死导出： `settle()`(src/event/delivery_settlement.rs:15）仅被自身测试调用（同文件：40),`DeliverySettlement`/`IdentityAction` 经 mod.rs:22 re-export 后无任何消费方；news_aggregator_init.rs 里的 `gate.settle` 是另一类型的同名方法，不构成调用。
+  - NewsFlash reconcile 主体（~1200 行）直接堆在 `mod.rs`(src/event/mod.rs:1279-1545）而非子模块，与 3536 行的 mod.rs 规模不匹配。
+  - src/bin/monitor/main.rs:13914 测试注释 "This test will fail until main() wires event::cli::parse_args" 已过期——接线实际存在于 main.rs:5659/6016。
+
+##### `src/evidence_retention/`
+
+- **职责:** 自声明"有界、未验证的历史材料"(src/evidence_retention/mod.rs:1-2)——retention package draft / stored receipt / incomplete daily root 三类载体的纯值编解码与 claim 一致性校验，加本地 outbox 落盘；明确无 I/O、无 owner seal、无签名、不转换为交易/留存权威。
+- **内部结构:** `mod.rs`(936, draft/receipt/root 类型与校验器）、`codec_v1.rs`(1027, Work 计量的有界编解码）、`outbox_v1.rs`(1442, 本地 outbox 打开/入队）、`tests.rs`(587)+`outbox_v1_tests.rs`(357)。
+- **生产调用链:** `pub(crate)`(src/lib.rs:34)；调用方仅 `trading::paper_funding_review_store_v1`(src/trading/paper_funding_review_store_v1.rs:7)、`strategy::model_change_draft_store_v1`(src/strategy/model_change_draft_store_v1.rs:7)，以及 `database::open_retention_material` 签名（src/database/mod.rs:6992，被 outbox_v1.rs:456 调用）；而这两个 store 模块自身（均为 pub(crate), src/trading/mod.rs:14-15, src/strategy/mod.rs:31）也只被各自 `#[path]` 测试模块引用（src/trading/paper_funding_review_v1.rs:870 位于 tests 子模块内； src/strategy/model_change_draft_v1_tests.rs:1)。src/bin/ 与 monitor 零引用。
+- **活性:** INACTIVE — 零生产调用方，整条可达链终点全是 cfg(test)/#[path] 测试。
+- **问题/缺口:**
+  - 模块自我定位为预留的留存基础设施，尾部注明 "no remote dispatcher or seal issuer"(src/evidence_retention/mod.rs:933-934)，从未接入任何生产 pipeline。
+  - 唯一非测试消费方（paper_funding_review_store_v1 / model_change_draft_store_v1）自身也仅测试可达，形成两层死代码链；database/mod.rs:6956-7037 的 retention material proof 代码仅经 outbox_v1.rs:456 服务于此链。
+  - 代码质量本身未见问题（有完整有界计量与一致性测试），缺口是"从未接线"而非缺陷。
+
+> **本组总评:** `src/database/` 是生产主体的持久化基石，CURRENT 且调用面最大，主要债是 mod.rs 巨型化与零星 `#[allow(dead_code)]` 残留；`src/event/` 承载 BR-091/192/244 投递审计权威写路径，CURRENT，但 `delivery_settlement.rs` 是孤立死导出且 reconcile 逻辑淤积在 mod.rs;`src/evidence_retention/` 是设计完备但完全未接线的留存草案/outbox 设施，连其仅有的两个 store 调用方也只被测试引用，整体 INACTIVE，属"预留能力"而非在役代码。
+
+##### `src/push_foundation/`
+
+- **职责:** v14.x "推送地基"持久化层 — 业务意图存储（BusinessIntentStore)、激活/就绪/终态/对账原语，外加 N02 快讯预约绑定和盘前/盘后链调度 shadow 观察器。
+- **内部结构:** `intent_store.rs` (2993 行） + `intent_store/` 子目录 (89 个文件， 含 `chain_post_close.rs` 4598 行 + v1–v15 SQL 迁移 + `n02_binding/v2.rs` 344 行）; `activation_fence.rs` (1040 行）; `dedicated_transport.rs` (799 行）; `generic_transport.rs` (770 行）; `chain_preopen_shadow.rs`/`chain_post_close_shadow.rs`; 约 40 个体量常超实现的 `*_tests.rs`。
+- **生产调用链:** 极窄 — ① monitor 主循环盘前/盘后链调度旁路： `src/bin/monitor/main.rs:10495` `observe_chain_post_close_shadow`、`main.rs:11253` `observe_chain_preopen_shadow`（在 `run_scheduled_chain_analysis` 调用之后， 只打对比日志）; ② 新闻快讯 N02 路径： `src/bin/monitor/news_aggregator_init.rs:292` `N02ReservationBindingV1::try_from_reservation_material` → `src/monitor/push_job/n02_source.rs:19`; ③ `src/app/chain_schedule.rs:447` `project_chain_schedule_snapshot`（同为 shadow 投影）。
+- **活性:** CONDITIONAL — 仅 shadow 观察器（只读、不落库）和 N02 绑定类型生产可达； 激活/就绪/对账/终态/传输全套（约占体量 90%）零生产调用方， 仅模块内互调+测试。
+- **问题/缺口:**
+  - `mod.rs:1` 自述 "Additive push-foundation persistence. No production database is selected or migrated here" — Foundation schema 未接管任何生产库。
+  - `BusinessIntentStore` 无任何模块外生产调用方： grep 命中全部位于 `src/push_foundation/**`（如 `reconciler.rs:19`、`finalization_sla.rs:28` 内部 use）及 `*_tests.rs`。
+  - shadow 是 log-only: `main.rs:10501` 与 `chain_schedule.rs:462` 日志固定 `foundation_persisted=false`, 不产生影响。
+  - pub 导出的 `ActivationManifest`/`inspect_raw_activation_facts`(`mod.rs:49,52`）只在模块内与测试使用， 属死导出。
+  - 测试体量远超实现（如 `finalization_sla_tests.rs` 81KB vs `finalization_sla.rs` 22KB), 维护成本高而当前生产价值为零。
+
+##### `src/push_l1/`
+
+- **职责:** v14.2 L1 信号源层 — `SignalEvent`(L1→L4 唯一信号载体）+ `SignalSource`/`SignalPayload` 强类型枚举 + sha256 event_id 派生。
+- **内部结构:** `event.rs` (436 行） + `mod.rs` (15 行）。
+- **生产调用链:** `src/bin/monitor/v14_adapter.rs:31-38` import(`make_source_fact_event_id` 在 :490/:531/:568/:609/:651/:796/:1417 共 7 处） → `notify.rs:2356` 等 → monitor 推送主链路； `news_aggregator_init.rs:2510`。
+- **活性:** CURRENT — 每条生产推送过 `v14_gate` 时都构造 SignalEvent。
+- **问题/缺口:**
+  - `mod.rs:4-5` 自述 "后续 W3-W4 会加 market_session_emitter, preopen_window_emitter" — emitter 层从未实现； 事件实际由 `v14_adapter.rs:1304/1384` 的 `signal_event_for_kind` 从 PushKind 逆推构造， 方向与"L1 源 → L4"的设计相反。
+  - event_id 含 1–10s 时间桶， 同业务事件跨桶 ID 不同， `dispatcher.rs:7-9` 注释自述"按 id 去重形同虚设", dedup 已改用 （kind,code) 键， event_id 仅剩跨层关联用途。
+
+##### `src/push_l2/`
+
+- **职责:** v14.2 L2 模板注册层 — `Template` trait + `TemplateMetadata`/`DataMode`/`RenderedText` 等流通类型。
+- **内部结构:** `template.rs` (303 行） + `mod.rs` (13 行）。
+- **生产调用链:** 仅类型被 `v14_adapter.rs:35`(DataMode/RenderedText/TemplateMetadata)、`push_l5/governance.rs:19`、`push_l7`、`l6_sink.rs:39` 使用。
+- **活性:** CONDITIONAL — DataMode/RenderedText/TemplateMetadata 是生产治理与 analytics 的流通类型； 但 `Template` trait 全仓库无 `impl Template for`（零实现）, `TemplateCategory`/`BannerContext`/`FailureStrategy` 只出现在 `src/bin/v14_e2e.rs` 和 governance 测试。
+- **问题/缺口:**
+  - `mod.rs:5` 自述 "W3.2 会加 build.rs + TOML 解析 + 静态注册 inventory" — 模板注册表从未建； `src/lib.rs:64` 注释确认 "L3 Render 暂缺， 渲染走 push_templates::render_xxx"。
+  - `Template`/`Validate`/`FailureStrategy`(`template.rs:93-112`）与 `BannerContext`(`template.rs:179`）为死代码。
+
+##### `src/push_l4/`
+
+- **职责:** v14.2 L4 仲裁层 — Dispatcher dedup 闭环： reserve/commit/rollback 三段式， 键 (kind, code, sub_kind), 冷却窗口来自 `PushKind::cooldown_secs()`。
+- **内部结构:** `dispatcher.rs` (584 行： DashMap 内存 dedup 表 + `DispatcherStats` 原子计数 + `sub_kind_dedup_key`) + `mod.rs` (11 行）。
+- **生产调用链:** `v14_adapter.rs:989/991` reserve + `:1085/1087` commit(V14Stack 全局单例， `v14_adapter.rs:45`) ← `notify.rs` 全部推送入口 → monitor 主循环。
+- **活性:** CURRENT — 每条推送的速率限制实际在此执行。
+- **问题/缺口:**
+  - dedup 表是进程内存 `DashMap`(`dispatcher.rs:44`), 重启即丢； 跨重启幂等完全依赖 durable_delivery/push_job 层兜底， L4 自身不持久化。
+  - 便捷方法 `dispatch()`(`dispatcher.rs:210`）生产无人调用， 仅 `v14_e2e.rs`/测试使用（生产走 reserve/commit 两段）。
+
+##### `src/push_l5/`
+
+- **职责:** v14.2 L5 治理层 — `GovernanceEngine::check_governance`: 静默期（02:00–06:00)/Frozen 模式/data_mode 门禁/每日上限。
+- **内部结构:** `governance.rs` (543 行， 含 Frozen warn 60s 节流 `FROZEN_WARN_THROTTLE_SECS`) + `mod.rs`。
+- **生产调用链:** `v14_adapter.rs:37`(V14Stack 单例 `governance` 字段） → gate 内先判 L5(`v14_adapter.rs:877`), ctx 由 `current_governance_ctx()`(:1572）从 `LATEST_BANNER` + 本地时钟构造。
+- **活性:** CURRENT — 每条推送过闸都执行。
+- **问题/缺口:**
+  - data_mode 门禁对多数 kind 实际不拦： BR-249 实测 Full 门恒不可达（`v14_adapter.rs:1453-1458`), 参考级推送 `data_mode_min` 被放宽到 Down(`v14_adapter.rs:1554-1557`, "2026-08-06 用户决策 C 方案"), L5 实际有效约束主要是 quiet_hour/daily_limit/紧急豁免。
+  - `mod.rs:6` 注释仍写 "后续 W5.2/W6 会加 monitor_loop 集成 + GovernanceContext 构造" — 该集成已由 v14_adapter 完成， 文档漂移未更新。
+
+##### `src/push_l6/`
+
+- **职责:** v14.2 L6 投递层 — `Sink` trait + `SinkRouter` + `ConsoleSink`; `external_sinks` 提供 Wechat/Feishu/Http sink。
+- **内部结构:** `sink.rs` (394 行） + `external_sinks.rs` (536 行， v15.1 起 HttpSink 有真实 reqwest POST) + `mod.rs`。
+- **生产调用链:** `src/bin/monitor/l6_sink.rs:40` import, `sink_router()`(:136）单例只注册 ConsoleSink + MagiclawSink ← `notify.rs:2388-2391` 真实投递后 `route(&msg)`。
+- **活性:** CURRENT(Sink trait/Router/ConsoleSink 部分）, 但三个外部 sink 生产零注册， 属 CONDITIONAL/部分死代码。
+- **问题/缺口:**
+  - `WechatSink`/`FeishuSink`/`HttpSink` 从未在生产注册： 扩展入口 `init_with_extra_sinks`(`l6_sink.rs:182`）无生产调用方， 仅 `l6_sink.rs:21-24` 注释里的示例用法。
+  - L6 route 是投递后的旁路（`notify.rs:2388` 在 `push_wechat` 成功后才 build/route), 真实外发不走 L6 — L6 不是投递执行层而是留痕/回声层。
+  - `HttpSink::health_check` 恒返回 true(`external_sinks.rs:140-142`), 无真实探测。
+
+##### `src/push_l7/`
+
+- **职责:** v14.2 L7 分析层 — `PushAnalytics` 记录 + `AnalyticsStore` trait + `SqliteStore`（持久化到 `data/push_analytics.db`) + `InMemoryStore`。
+- **内部结构:** `analytics.rs` (504 行） + `sqlite_store.rs` (658 行） + `mod.rs`。
+- **生产调用链:** `v14_adapter.rs:47` `V14Stack.store = Mutex<SqliteStore>` → `v14_record_delivery`(`v14_adapter.rs:1195`）每次投递后 `record()`; daily-limit 读取走 `count_today_pushed_for_user_and_template`(`v14_adapter.rs:906` → `sqlite_store.rs:67`)。
+- **活性:** CURRENT — 写路径+每日计数读路径在每条生产推送上执行。
+- **问题/缺口:**
+  - `SqliteStore::set_global`/`global()`(`sqlite_store.rs:31-44`）全仓库无调用方， 死 API。
+  - 分析读 API(`query_by_time_range`/`count_by_governance`/`push_rate`）无生产消费者， 仅测试和 `v14_e2e.rs:308` — analytics 只写不读， 无报表/看板出口。
+  - `InMemoryStore`(`analytics.rs:114`）仅 `v14_e2e.rs:256` 与测试使用； `count_today_for_user`(`sqlite_store.rs:47`）亦无生产调用方（生产用带 template 的变体）。
+
+> **本组总评:** v14.2 七层中 L1/L4/L5/L7 已通过 `v14_adapter` 真实接入 monitor 推送主链路（`notify.rs` → `v14_gate` → 真实投递 → `v14_record_delivery`), 是全仓库少数"架构与运行一致"的部分； L2/L6 只落地了类型与骨架， 模板注册表和外部 sink 从未实装， L6 实际只是投递后留痕。push_foundation 是另一极： 约 140K 的激活/就绪/终态/对账持久化体系几乎零生产调用方， 仅 N02 快讯绑定类型和两个 log-only shadow 观察器被 monitor 引用， 属"为 Foundation 未来接管预留、当前纯测试驱动"的大型储备代码。
+
+##### `src/durable_delivery/`
+
+- **职责:** BR-192 持久化计数投递暗核：物理隔离的 SQLite 投递状态机（预留账本、fencing、冻结审计载荷、预算/冷却、复盘终局重放），为 monitor 全部 counted 推送提供恰好一次的决策/回执证据。
+- **内部结构:** `coordinator.rs`(10954 行，主状态机 DurableDeliveryCoordinator)、`model.rs`(2416,Envelope/DecisionState/策略目录）、`schema.rs`(1647,SCHEMA_VERSION=14，约 19 张核心表）+ `schema_g5b_cohort.rs`/`schema_p05_unit*.rs` 扩展表、10 个领域子协调器（`coordinator_g5b_physical_seal.rs` 4839、`coordinator_p05_unit_runtime.rs` 2234 等）、`monitor_schema9.rs`(101，生产保留库只读校验）、`tests.rs`(14349)+20 余个专项测试文件。
+- **生产调用链:** bin 侧适配器 `src/bin/monitor/durable_delivery_runtime.rs` → monitor 启动序列 `src/bin/monitor/main.rs:5796`(validate_runtime_delivery_mode)、`main.rs:5844`(eager_bind)、`main.rs:6162`(ensure_startup_reconciled)；P-01、复盘 R03-R13/A10/A01、holding_plan、news_ai 等 counted 推送经 `deliver_counted_binding` → MagiclawAuthoritativeSink(`durable_delivery_runtime.rs:1063`)。CLI:`src/bin/resolve_stale_uncertain.rs`、`src/bin/durable_schema14_snapshot_check.rs`。
+- **活性:** CURRENT — 生产 monitor 启动即绑定 Production 命名空间并强制完成 startup reconcile(`main.rs:6162`)，生产库以 `open_existing_monitor_schema9` 打开（`durable_delivery_runtime.rs:2268`)，全部 counted 推送主流程实际可达。
+- **问题/缺口:**
+  1. 头注释过时：`src/durable_delivery/mod.rs:1-6` 仍称"deliberately does not wire a production provider, renderer or sink; production activation is an all-or-nothing follow-up"，但 bin 侧早已接线生产 sink(`durable_delivery_runtime.rs:1063-1160`)并在生产中运行 — 文档漂移。
+  2. 库为 Schema14(`schema.rs:9`)，生产保留库锁死 Schema9 且禁迁移/禁修复（`monitor_schema9.rs:12-16`、`durable_delivery_runtime.rs:2268`);schema10-14 承载的 P05 Unit / G5B v2 等平台能力被 `frozen_platform_features_enabled()` 整体冻结（`durable_delivery_runtime.rs:1213-1215`，仅 Test namespace 为 true)，生产只用 v9 子集。
+  3. `CountedDeliveryOrigin::InternalDurable` 注释（`durable_delivery_runtime.rs:215-218`）称"no production producer has migrated into it yet"，但生产路径 `main.rs:10087-10093` 已构造 InternalDurable binding，且 `validate_p01_text`(`durable_delivery_runtime.rs:440`）强制要求该变体 — 注释与实际不符。
+  4. 巨型文件维护风险：`coordinator.rs` 443KB/10954 行、`tests.rs` 529KB/14349 行（非行为缺陷）。
+
+##### `src/p05_auction_unit.rs`
+
+- **职责:** P05 竞价候选 Unit 的可恢复观察门面：把 09:20-09:25 观察到的一批候选固化为不可变 intent(A-02 竞价重推 + P-05 候选台 + T-08 失效三类子投递）,restore/prepare/resume/finalize 全部经 coordinator CAS；不做源资格认定。
+- **内部结构:** 单文件 372 行：`P05AuctionUnit` 句柄、`P05UnitObservation`/`P05ProspectiveObservation` 观察类型、`P05ChildDispatchView`/`P05PreparedChild` 子投递、`pub(crate) read_p05_outcome_unit`(`p05_auction_unit.rs:366`)。
+- **生产调用链:** `src/bin/monitor/durable_delivery_runtime/p05_unit.rs` → `src/bin/monitor/push_templates/p05_shared_unit.rs::tick/initialize_before_window` → `main.rs:6578/6581`（常驻服务入口）与 `main.rs:11321`（盘前等待后）；子投递经 `src/bin/monitor/notify.rs:3162 push_p05_unit_child`。
+- **活性:** CONDITIONAL — 主循环调用点存在，但 `p05_shared_unit.rs:23/35` 的 `frozen_platform_features_enabled()` 门在 Production namespace 恒为 false(`durable_delivery_runtime.rs:1213-1215`、148-150)，生产只打 "disabled reason=user_scope_frozen" 即返回；新建批次另限 09:20-09:25 时间窗（`p05_shared_unit.rs:126-133`)。全链路仅 Test namespace 实际运行。
+- **问题/缺口:**
+  1. 生产冻结：initialize/tick 在生产恒 no-op(`p05_shared_unit.rs:22-37`)，旧入口 `dispatch_auction_repush`/`dispatch_candidate_board` 也直接 blocked(`push_templates.rs:9871-9875`、`10442-10446`)→ A-02/P-05/T-08 三类推送生产实际不发。
+  2. 模块内唯一生产活跃部分是 `read_p05_outcome_unit`(`p05_auction_unit.rs:366-372`)，经 `prediction_outcome_tracker.rs:512` 在盘后报告中可达（`push_templates.rs:12538`)；写入路径全冻结，生产读到的通常为空。
+
+##### `src/p05_candidate_board_link.rs`
+
+- **职责:** 只读跨库证据对账：把 prediction 库的 v2 候选台冻结与 counted 库的 CandidateBoard 卡片观察逐字段比对，产出 Absent/UnlinkedV1/FrozenOnly/VerifiedV2 链接结论；不做写入、准入或 sink 调用。
+- **内部结构:** 单文件 198 行：`pub read_candidate_board_occurrence_link`(:71)、`pub(crate) link_candidate_board_snapshot`(:109)、`pub(crate) frozen_candidate_board_envelope`(:182)、`CandidateBoardOccurrenceLinkV1` 枚举（:32)。
+- **生产调用链:** `link_candidate_board_snapshot` → `src/monitor/prediction_outcome_tracker.rs:12`(OutcomeTracker)→ `src/monitor/prediction.rs:23-27` re-export → `src/bin/monitor/durable_delivery_runtime.rs:6697 log_prediction_outcome_report` → `push_templates.rs:12538` 盘后复盘日报（仅非 test);`frozen_candidate_board_envelope` → `src/durable_delivery/coordinator_p05_unit.rs`。
+- **活性:** CONDITIONAL — 批量核对路径经盘后 OutcomeTracker 报告生产可达；但 pub 主入口 `read_candidate_board_occurrence_link` 零生产调用方，仅测试引用（`durable_delivery/tests.rs:7724-7933`、`push_templates/p05_counted_producer_tests.rs:238/371`)。
+- **问题/缺口:**
+  1. pub 入口 `read_candidate_board_occurrence_link`(`p05_candidate_board_link.rs:71`）生产零调用，公共 API 与生产使用脱节。
+  2. VerifiedV2 分支需 counted 卡片 + prediction 冻结双证据（`p05_candidate_board_link.rs:130-176`)，而上游 P05 卡片写入在生产被 user_scope_frozen 冻结 → 生产实际只能产出 Absent/UnlinkedV1，对账价值受限。
+  3. 头注释（`p05_candidate_board_link.rs:1-5`）明示两次 SQLite 读非原子快照、pending 结论为保守值 — 设计内 caveat，非缺陷。
+
+> **本组总评:** durable_delivery 库本体是生产 counted 投递的现役核心（启动 reconcile + 全量 counted 推送），但库头注释仍停在"未接线生产"的旧叙事，且生产库被锁在 Schema9、Schema10-14 的 P05/G5B 平台能力被 user_scope_frozen 整体冻结。因此 p05_auction_unit 与 p05_candidate_board_link 处于"接线完整、生产禁跑"状态，生产真正触达它们的只有 OutcomeTracker 盘后只读报告这条窄路径。
+
+##### `src/trading/`
+
+- **职责:** 交易执行抽象层——统一的 `TradeExecutionGateway` trait + `SimulatedExecutionGateway`（写 `stock_position`，原子落 `order_audit`)，以及独立虚拟盘账本 PaperLedger 全家桶（paper_ledger / paper_sell / paper_trade / paper_book_v2)。
+- **内部结构:**（按规模）
+  - `paper_book_v2_execution.rs`(5505)+ 测试（3579)——book v2 成交执行
+  - `paper_ledger.rs`(3886)+ `paper_ledger_execution.rs`(1284)+ `paper_ledger_adjudication.rs`(1302)+ 测试（4461)——PaperLedger 账本核心
+  - `paper_trade.rs`(2114)——BR-023 虚拟腿，只写 `paper_trades`，零写 `stock_position`;`portfolio_state` 供 bin/lib 共用
+  - `paper_sell.rs`(1198)——BR-134 虚拟仓卖出闭环，复用 `pipeline::position_tracker::evaluate_sell_rules_with_net_return`
+  - `paper_funding_review_v1.rs`(1260)+ codec/store（共约 3800 行）
+  - `mod.rs`(724)——trait 定义 + SimulatedExecutionGateway 实现
+- **生产调用链:**
+  - monitor 主循环（`src/bin/monitor/main.rs`):`paper_sell` 盘中/盘后扫描（main.rs:10256/10398,import 于 158)、`paper_ledger_runtime` 账户指标与收盘结算（3067/10228/10304，受 env 门控）、`risk_adapter::print_startup_banner`(5875)、`paper_trade::portfolio_state`(push_templates.rs:28085)
+  - `decision::intraday_monitor`(monitor 循环 10209–10253 驱动）用 `paper_ledger_runtime` + `paper_trade::PaperSignal`(intraday_monitor.rs:22-24)
+  - `SimulatedExecutionGateway` 只在 `pipeline::position_tracker.rs:295` 构造 ← `pipeline/analyze.rs:1292` ← `AnalysisPipeline` ← `app::run_analysis`(src/main.rs:104,CLI)+ `app/schedule.rs:262`;**monitor 主循环不经过此路径**
+  - `paper_snapshot_activation` 仅 `src/bin/paper_account_activate.rs`（运维 CLI)
+- **活性:** CONDITIONAL——paper_sell 在 monitor 主循环可达但带 `PAPER_SELL_DISABLED` 关闭开关（main.rs:9810-9827）且依赖激活 epoch;`paper_ledger_runtime` 整条账户指标/结算链硬门控于 env `PAPER_LEDGER_ACCOUNT_BINDING`(paper_ledger_runtime.rs:13, main.rs:3067)
+- **问题/缺口:**
+  - `paper_engine`(927 行）已被 BR-211 从生产循环隔离，main.rs:10145 有断言保证 monitor 循环不含 `paper_engine::run_once(`(main.rs:10200-10206)——仅测试引用
+  - `paper_funding_review_v1` 全家（v1+codec+store，约 3800 行）在 `src/trading` 之外**零生产调用方**(grep 全仓仅命中 trading 内部），属死代码
+  - `paper_book_v2_execution`(5505 行，全模块最大文件）唯一非测试引用是 `src/performance/paper_decision_outcomes_v1.rs:10`，而后者除 `performance/mod.rs:9` 声明外**无任何生产调用方**——实质未接线
+  - `SimulatedExecutionGateway::cancel_order` 是永拒绝桩（mod.rs:376-392,"simulated gateway does not support pending-order cancel")，仅用于审计留痕
+  - 买卖路径对同一 `order_safety::validate` 用请求价和执行价重复校验两次（mod.rs:210-231 / 307-328)，逻辑冗余
+
+##### `src/portfolio/`
+
+- **职责:** 系统唯一 Position/Trade/Ledger 定义与纯函数 API——持仓、自选（STOCK_LIST 兼容）、T+1 锁仓、净值快照/权益曲线，底层走 SQLite(store.rs)。
+- **内部结构:** `store.rs`(699,SQLite 读写）、`mod.rs`(265，公共类型+API)、`closing_valuation.rs`(134，收盘估值视图）、`user_position_snapshot.rs`(99，用户快照输入）
+- **生产调用链:** monitor 主循环大量直连——`get_st_positions`(main.rs:1976)、`is_t1_locked`(12129)、`get_positions`(9378/13092)、`get_trade_history`(13489)、`get_equity_curve_as_of`(13501);`monitor::scanner`(main.rs:49 import,scanner.rs:283-284);`closing_valuation` 供 monitor 收盘估值与 `bin/run_closing_valuation.rs`;`user_position_snapshot` 供 `bin/import_user_position_snapshot.rs` 及 holding_plan;`live_rolling_sharpe` 供 `review/report.rs:166`
+- **活性:** CURRENT——monitor 主循环、扫描器、收盘估值、CLI 导入工具均实际调用
+- **问题/缺口:**
+  - `get_st_positions` 文档注释自称"只返回 code 列表避免 deep clone"，实现却返回 `Vec<Position>`(mod.rs:159-166)——注释与实现漂移；且 is_st/star_st 永远默认 false,"真实来源待 broker 接入"(mod.rs:155-157),ST 提醒数据源实为空的
+  - `Position.sector` 默认"其他"(mod.rs:42-44)，板块集中度检查（single_sector_max_pct）在未填板块时实质失效
+  - `get_watchlist` 仍走 STOCK_LIST 环境变量兼容路径（mod.rs:117)，与"不再各自读环境变量"的模块头注释自相矛盾
+
+##### `src/broker.rs`
+
+- **职责:** 唯一实时行情网关 seam——`QuoteProvider` trait + `PublicQuoteProvider`(→ `data_gateway` 远端行情 + 涨跌停带校验）,fail-closed；提供 `execution_quote`（含 5s 新鲜度门）、ST 类型推断、`detect_and_register` 启动注册。
+- **内部结构:** 单文件 213 行——`BrokerStType`/`BrokerSource`/`ExecutionQuote` 类型、`PublicQuoteProvider` 实现、`QUOTE_PROVIDER` OnceLock 注册点、测试用 `FreshTestQuoteProvider`
+- **生产调用链:** monitor 启动时 `detect_and_register`(main.rs:6279,BROKER_SOURCE 仅支持 "public"，其他值硬报错）;monitor 盘中 ST 持仓取价（main.rs:1985);`decision::intraday_monitor` 候选买/卖取价（intraday_monitor.rs:254/546);`trading::paper_sell`、`trading::paper_trade`、`pipeline::position_tracker` 经此取执行价
+- **活性:** CURRENT——monitor 主循环启动即注册，盘中取价路径每 tick 可达
+- **问题/缺口:**
+  - `execution_quote` 的 5 秒硬新鲜度门（broker.rs:151-159）对非连续竞价时段（午间休市、盘前）必然报错，调用方需自行规避时段
+  - `BrokerStType::from_name` 纯靠名称前缀启发式（broker.rs:27-35)，与 portfolio 侧 ST 字段"默认 false 待接入"叠加，ST 判定链整体不可靠
+  - `QUOTE_PROVIDER` OnceLock 禁止运行时替换（broker.rs:131-135)，上游行情源故障时进程内无法切换，只能重启
+
+> **本组总评:** portfolio 与 broker 是 monitor 主循环的真实活跃底座，接线干净但 ST/sector 等数据面仍是占位实现；trading 体量大（46k 行）却冷热悬殊——paper_sell/paper_ledger_runtime/paper_trade 在 monitor 可达但受 env 门控与激活状态约束，paper_engine 已按 BR-211 隔离，而 paper_funding_review、paper_book_v2_execution+paper_decision_outcomes 约 9k 行实质零生产调用，是最主要的死代码堆积区；旧的 `SimulatedExecutionGateway` 写 `stock_position` 路径只剩 CLI/schedule 入口，与 PaperLedger 新账本的长期并存关系值得在架构层面收敛。
+
+##### `src/selection/`
+
+- **职责:** BR-174 receipt-verified schema-v2 事件级选股上下文 — 生产激活门槛、源接入、审计哈希链、结果（outcome）结算所有权。
+- **内部结构:** `schema_v2.rs`(10288，纯校验/preimage 基础库）、`audit.rs`(3366)、`outcome_v2.rs`(2885，结算 owner)、`ingress_v2.rs`(2044)、`config_activation_v2.rs`(1982)、`acquisition_v2.rs`(1695)；另有 `process_bootstrap.rs`(862)、`trading_calendar_v2.rs`(820)。
+- **生产调用链:** `src/bin/monitor/main.rs:5619` `bootstrap_selection_process()`（每次 monitor 启动无条件执行，解析 CLI + 评估激活门）→ `main.rs:5745` 得出 `selection_v2_enabled` → 门控三个运行点： 新闻管线初始化（`main.rs:5897`)、Track A 候选入池（`main.rs:9307`)、`OutcomeSettlementOwner::settle_tick`(`main.rs:7550`,post_session_review_scheduler 60s loop)。另有 CLI `src/bin/selection_activation_prepare.rs:156`。
+- **活性:** CONDITIONAL — 受 `activation_gate.rs:42` 仓库内激活材料控制；当前 `config/selection/selection_activation.v1.json` effective_from=2026-09-28（已过）、board artifact expires=2026-10-22（未到，见 provider_board_bindings.v1.json)→ 当前应为 Enabled，但 **2026-10-22 后自动 fail-closed**(`activation_gate.rs:65-68`)。
+- **问题/缺口:**
+  1. 源接入/生成写入链未接入 monitor 运行时： `persistence_v2.rs:105` `commit_source_ingress` 全仓零生产调用方；新闻 loop 的 `candidate_ingest_from_news`(`src/bin/monitor/news_aggregator_init.rs:1302`）只经 `signal::push_recorder` 写旧 `pushed_stocks` 池，不写 selection-v2 表 → 结算 owner 没有新样本来源，outcome 侧实质只有 recovery/空转（与已知"outcome 仅 shadow"一致）。
+  2. `database/selection_v2_generation_journal.rs` 仅被 `database/mod.rs:2817` 声明、无任何调用方 → `acquisition_v2.rs` 的生成侧类型（cadence receipt、freeze feed plan 等）无运行时消费者。
+  3. `relation.rs`/`model.rs` 零外部调用方（`crate::selection::relation` 全仓仅自引用）;`admission.rs`/`features.rs`/`quality.rs` 仅通过 `config_activation_v2.rs:16-17` 的版本常量进入配置哈希，逻辑无运行时执行路径。
+  4. `activation_gate.rs:17-19` 注释自述"生产库目前无 selection-v2 表（BR-180 未发布）是设计内状态" → outcome settle tick 每次大概率只产出空 summary。
+
+##### `src/opportunity/`
+
+- **职责:** 产业链挖掘 + 机会发现的遗留上下文；BR-174 后正式选股迁往 selection,mod.rs 声称只保留"仍有独立生产职责"的子模块。
+- **内部结构:** `candidate_panel.rs`(1142)、`bom_kb.rs`(743)、`chain_mapper.rs`(617)、`impact.rs`(592)、`launch_gate.rs`(482)、`auction_agent.rs`(450)；另 `event_extractor/`(5 文件）、`scheduler.rs`(269)。
+- **生产调用链:**（分子模块）
+  - `launch_gate` → `src/bin/monitor/notify.rs:2327/2490-2492/2627/2853/3086/3144/3195/3254/3314/3347`（每条推送的 stage 门）+ 启动 banner(`main.rs:5868`)→ **CURRENT**。
+  - `candidate_panel`/`candidate_state` → `src/durable_delivery/coordinator_p05_unit.rs:5`、`src/p05_auction_unit.rs:9`、`src/bin/monitor/push_templates.rs:4956/8075/17509`(merge/format/require_live_promotion,P-05 推送链）→ **CURRENT**。
+  - `chain_mapper` + `real_alpha::Confidence` → `src/monitor/attribution.rs:17-20` → `main.rs:12246` 盘中 detector 扫描 G5a 同步归因 → **CURRENT**。
+  - `scheduler` → `main.rs:1881`(`--push` CLI 的 `run_daily_pushes`)+ `manual_push.rs:1` → **CURRENT**(CLI 主流程）。
+  - `event_extractor`、`impact`、`auction_agent`、`virtual_reason`、`bom_kb`、`hit_case`、`score`、`winrate`、`discover` → 全部零生产调用方 → **INACTIVE**。
+- **活性:** 混合型 — 4 条活调用链与 9 个死子模块共存于同一 `mod.rs`。
+- **问题/缺口:**
+  1. `mod.rs:3-5` 声明"仅保留仍有独立生产职责的子模块"，实测仍挂 9 个零调用模块，声明与事实不符（event_extractor/impact 死代码为已知结论，此处补齐完整清单）。
+  2. `real_alpha.rs` 仅 `Confidence` 类型被 `attribution.rs:20` 使用；`compute_real_alpha`(`real_alpha.rs:15`）零生产调用，只剩自测。
+  3. `score.rs:104` `compute_dual_score`、`winrate.rs:90` `load_reason_winrate` 零调用；`winrate_simulator` bin 自行计算、不引用该模块。
+  4. `auction_agent.rs:20` import `virtual_reason`，两个死模块互相引用，会在粗粒度 grep 中制造"被使用"的假象；`registry/mod.rs:3` 与 `strategy/v16_4/mod.rs:3` 均注明 VirtualReason 已被替代。
+
+##### `src/signal/`
+
+- **职责:** 市场事件类型底座（`MarketEvent`/`Direction`/`EventType`/simhash)+ `pushed_stocks` 推送入池记录器。
+- **内部结构:** `market_event.rs`(343)、`push_recorder.rs`(229)、`mod.rs`(13)。
+- **生产调用链:**
+  - `market_event` → `src/news/aggregator/{mod,feed,raw_v2,projection_v2,classifier,source_event}.rs` + `src/news/{dispatcher,impact,stock_mapper,sink}.rs` → monitor `news_monitor_loop`(`main.rs:6729` 常驻 spawn)；注意全局新闻管线 init 被 `selection_v2_enabled` 门控（`main.rs:5897`)。
+  - `push_recorder` → `src/decision/intraday_monitor.rs:1067-1422`(7 处，盘中 loop `main.rs:10207-10210`)、`push_templates.rs:4624/5151`、`news_aggregator_init.rs:1342` → monitor 常驻盘中 loop 无条件可达。
+- **活性:** CURRENT — push_recorder 在盘中 loop 实际执行；market_event 经新闻管线流通（主消费者受 activation 门控）。
+- **问题/缺口:**
+  1. `mod.rs:9-10` 自述模块名是历史包袱（"market_event 可移到 event/ 顶层"的迁移至今未做）。
+  2. `market_event` 的声明消费者之一是死代码 `opportunity::event_extractor`(`event_extractor/mod.rs:9,21,26`)；其生产主路径（新闻聚合器）随 selection-v2 activation 门控 — 2026-10-22 board artifact 过期、激活 fail-closed 后，聚合器不再初始化，`market_event` 将只剩 dispatcher/impact 的类型级引用。
+
+> **本组总评:** selection 是架构上的"正式未来"(BR-174 schema-v2)，激活门当前处于 Enabled 窗口期，但运行时未闭环 — 源接入/生成写入链没接进 monitor，只有 outcome 结算在空转，且 2026-10-22 材料过期后整体 fail-closed。opportunity 是"半活半墓园": 推送门（launch_gate)、P-05 候选（candidate_panel/candidate_state)、调度（scheduler)、G5a 归因（chain_mapper）真活，其余 9 个 pub 子模块零生产调用方，与 mod.rs 自述不符。signal 小而活： push_recorder 是 pushed_stocks 池的实际写入者，market_event 是新闻管线的类型底座，但其最大生产消费者的开关握在 selection 激活门手里。
+
+##### `src/decision/`
+
+- **职责:** 策略决策引擎 — 盘中推送票池消费评分、做T建议、板块分档；外加一套 v1 投资决策 codec/schema 底座。
+- **内部结构:** `intraday_monitor.rs`(1473，生产核心） / `t0_advisor.rs`(1142，生产） / `investment_decision_codec_v1.rs`(1617)+`pushed_candidate_scope_v1.rs`(920)+`candidate_scope_observation_v1.rs`(371)+`investment_decision_v1.rs`(341)（纯 schema/codec) / `sector_score.rs`(269，生产） / `action_fact_snapshot.rs`(593)+`trading_fact_denial.rs`(468)（仅自测） / v11-v12 决策台死代码簇（`decision_decide.rs`864、`decision_panel.rs`299、`decision_render.rs`323、`exclusion.rs`525、`pre_trade_filter.rs`363、`rotation.rs`308、`capital_verify.rs`289、`leader.rs`257、`live_plan.rs`327、`holding_plan.rs`、`layers.rs`)
+- **生产调用链:** ①`src/bin/monitor/main.rs:10209-10253` monitor_loop 的 intraday_loop → `IntradayMonitor::tick`（每30s)/`evening_review`/`recover_saved_candidate_buys`;②`main.rs:9834` `prepare_t0_messages` ← `main.rs:12415` 主扫描循环 30s 做T分支 → T-05 推送；③`src/bin/monitor/push_templates.rs:3713` `grade_sectors` ← `load_sector_snapshot_real`(3712) ← I-01 盘中 dispatcher(3800-3806)
+- **活性:** CONDITIONAL — 三条链都在 monitor 常驻进程内，但 intraday 链被两道闸控制：banner 风险上下文可得（`main.rs:10225-10247`)+ `PAPER_LEDGER_ACCOUNT_BINDING` env(`intraday_monitor.rs:179` `active_binding()` 未激活直接 Err;`recover_saved_candidate_buys` 未激活静默返回0,`:154`);t0/sector_score 链无条件可达
+- **问题/缺口:**
+  1. **v11/v12 决策台整簇死代码约 4.0k 行（占模块 35%)**:`decision_decide.rs`、`decision_panel.rs`、`decision_render.rs`、`exclusion.rs`、`leader.rs`、`rotation.rs`、`capital_verify.rs`、`pre_trade_filter.rs`、`live_plan.rs`、`holding_plan.rs`、`layers.rs` 外部调用方为 0（全库 grep 仅 mod.rs 声明与自测；注意 `src/bin/monitor/holding_plan.rs` 是 bin 本地同名模块，与 `decision::holding_plan` 无关）
+  2. `action_fact_snapshot`/`trading_fact_denial` 零外部调用，`evaluate_production_trading_fact_denial`(`trading_fact_denial.rs:155`）只有自测
+  3. 投资决策 codec 底座仅测试可达：`capture_pushed_candidate_scope`(`pushed_candidate_scope_v1.rs:87`）无生产调用方，仅 `_for_test` 变体被 `database/global_schema_*_tests.rs` 使用；`pushed_candidate_scope_v1.rs:268-269` cost/liquidity model 硬编码 `"unavailable_formal_*_not_delivered"`
+  4. `risk/action_gate.rs:7` 注释声称 "holding_plan / t0_advisor / live_plan 在产出建议前调 authorize" — 实际三者中仅死代码 `live_plan.rs:13` 调authorize；生产 t0_advisor 不经过 action gate，注释与实现漂移
+  5. BINDING_ENV 未设置时 tick 每 30s 刷一条 warn(`main.rs:10253`)，无降噪
+
+##### `src/risk/`
+
+- **职责:** 决策硬约束层 — 账户模式评估、环境隔离、实时否决链、纸交易门控；与 `monitor/risk.rs`（实时计算）并存。
+- **内部结构:** `veto_rules_live.rs`(636)+`veto_chain.rs`(403)+`veto_execution_engine_v1.rs`(346)+`veto_execution_report_v1.rs`(607+552测试） / `account_mode.rs`(567) / `action_gate.rs`(260)+`cash_guard.rs`(84) / `limits.rs`(254，死） / `stop_loss.rs`(193) / `env_guard.rs`(132) / `sector_exit.rs`(93，死）
+- **生产调用链:** ①`env_guard` 被全库 ~40 处生产调用（`bin/monitor/main.rs:698`、`durable_delivery_runtime.rs:1218`、`event/dispatcher.rs:338` 等）;②`account_mode::evaluate/evaluate_with_reset` ← `main.rs:2794/2924` evaluate_account_mode_hook（常驻 banner 刷新）;③VetoChain ← `src/pipeline/analyze.rs:634-686` `apply_configured_veto` ← `analyze.rs:859-878` ← `AnalysisPipeline` ← `src/app/modes.rs:53`/`schedule.rs:262`(CLI 主流程）;④`action_gate::authorize` ← `trading/paper_ledger_execution.rs:617`（生产函数，非测试）+ `trading/risk_adapter.rs`（其 `pre_trade_check` ← `paper_trade.rs:1221` ← intraday_monitor tick);⑤`stop_loss::check_stops` ← `pipeline/position_tracker.rs:27`(CLI analyze,env `POSITION_TRACKING_ENABLED` 默认开， `analyze.rs:1262`)
+- **活性:** CURRENT（核心）；否决链需特别修正：**证据表明它不是死代码** — analyze pipeline 实接线，且 checked-in `config/strategy.toml:43-45` 显式 `[live_veto] enabled=true mode="live"`,`analyze.rs:649-671` 在 live 模式下真实拦截（force_hold 压分到 55/改 BuySignal::Hold);action_gate 链为 CONDITIONAL（随 BINDING_ENV 激活）
+- **问题/缺口:**
+  1. `limits.rs` 整文件死代码（254行）：唯一真实导入方是死代码 `decision_decide.rs:33`;`limits.rs:38` 注释自述现金底线已迁移 `cash_guard`
+  2. `sector_exit.rs`(93行）零外部调用方，仅自测
+  3. 双风控链并存无统一入口：CLI analyze 走 VetoChain,monitor 盘中走 risk_adapter 4 项检查（`intraday_monitor.rs:253`),VetoChain 不覆盖 monitor 实时路径
+  4. live 否决的 fail-closed 分支（报告构造失败压分到 55,`analyze.rs:668-671`）只在 CLI 路径生效；`veto_execution_report_v1` 另有消费者是死/休眠的 `decision/investment_decision_codec_v1.rs:6`
+
+##### `src/strategy/`
+
+- **职责:** 策略接口与实现层 — K线/基本面策略 trait、回测引擎、盘中 v16_4 八策略打分、反向择时/布林MACD 信号；另含 research v2 与 model-change 草稿两套 codec。
+- **内部结构:** `core.rs`(1910,BacktestEngine/Summary) / `rsi/`(2972:standard 1394+precision 769+common 309)+`bollinger_zscore.rs`(772)+`multi_factor.rs`(321) / `v16_4/`(573:mod 209+8 个 33-46 行 impl) / `boll_macd.rs`(460)+`contrarian.rs`(142)+`multi_timeframe.rs`(292)+`lot.rs`(104) / `research_run_descriptor_v2.rs`(952)+`research_portfolio_v2.rs`(604)+`research_fill_v2.rs`(576) / `model_change_draft_v1.rs`(387)+store(576)+tests(897)
+- **生产调用链:** ①回测三件套 ← `pipeline/backtest_runner.rs`(`pub(super)` 方法） ← `src/pipeline/mod.rs:610/640/658` 在 `AnalysisPipeline::run` 非 dry_run 时执行 ← CLI `app/modes.rs:53`;②`boll_macd` ← `analyze.rs:744/1416`、`position_tracker.rs:28`、`trading/paper_sell.rs:31`、`offline_products/sell_reminder.rs:5`、bin `boll_macd_backtest.rs:20`;③`contrarian` ← `analyze.rs:1253`;④`multi_timeframe::MinuteBar` ← `pipeline/multi_timeframe.rs:10` → analyze mtf_section;⑤`v16_4` ← `decision/intraday_monitor.rs:17-21`,`register_all()` 在 monitor 启动 `main.rs:6301`;⑥`rsi::common::compute_sma_vec` ← `trend_analyzer.rs:351`
+- **活性:** CURRENT — CLI 分析主流程 + monitor 盘中打分均实际可达；v16_4 打分的下游成交受 BINDING_ENV 门控（见 decision 卡）;bin/rsi_optimize、boll_macd_backtest 为手工研究工具
+- **问题/缺口:**
+  1. **research v2 三件套（2132行）+ model_change_draft 两件套（963行+897测试）零生产调用方** — 全库 grep 仅 strategy 内部互引与自测，无生产 writer/reader 接线
+  2. `HybridStrategy` 及 `KlineStrategy`/`FundamentalStrategy` trait object 层（`mod.rs:121-236`）从未被实例化：`HybridStrategy::builder()` 无调用方，backtest_runner 直接用具体类型，聚合器是纯粹脚手架
+  3. `register_all()`(`v16_4/mod.rs:41`）在 monitor 启动无条件执行，但 8 策略的 `score` 只在 BINDING_ENV 激活后才会被 tick 消费 — 注册与消费之间存在静默空转窗口
+  4. `mod.rs` 头部架构图（3-19行）未提 v16_4/research/model_change 三组后加模块，文档漂移
+
+##### `src/breakout/`
+
+- **职责:** 多维度放量启动识别引擎（盘中 Gateway 事实模式 + 盘后 K 线模式）。
+- **内部结构:** `engine.rs`(351) / `signal.rs`(108) / `position.rs`(42)，共 510 行
+- **生产调用链:** **无** — `crate::breakout` / `stock_analysis::breakout` 全库 grep 零匹配；仅 `src/lib.rs:15` `pub mod breakout` 导出。注意名字撞车：`strategy::v16_4::breakout::BreakoutStrategy`(34行）是另一个模块，与本引擎无关
+- **活性:** INACTIVE — 零生产/零测试调用方，2026-08-16 后无改动（git mtime 与全仓 8 月冻结一致）
+- **问题/缺口:**
+  1. 510 行完全死代码，`mod.rs:1-5` 自述的"盘中统一引擎"职责实际由 `decision/intraday_monitor.rs` + `strategy/v16_4` 承担
+  2. 与 `strategy/v16_4/breakout.rs` 同名易混淆，删除前需确认无外部 crate 依赖（lib.rs 公开导出）
+
+> **本组总评:** 四个模块合计约 27.5k 行，真实生产活水集中在三条链：monitor 的 `intraday_monitor`+`t0_advisor`+`sector_score`(env 门控的纸交易链）、CLI analyze 的 VetoChain+position_tracker+boll_macd/contrarian（实拦截已开 live)、以及 strategy 回测三件套；其余约 40% 是 v11/v12 决策台、research/model_change codec、breakout 引擎等成建制死代码或仅测试可达的休眠底座。两处与既有认知冲突的证据需复核：`risk::veto_chain` 并非死代码（`config/strategy.toml:45` `mode="live"` 真拦截，`analyze.rs:649-671`),`decision::sector_score` 亦非死代码（`push_templates.rs:3713` ← I-01 生产 dispatcher `push_templates.rs:3806`)。建议优先删除/归档 decision 死簇（~4k 行）+ breakout(510 行）+ strategy research/model_change 休眠层（~3.9k 行），并修正 `action_gate.rs:7` 与 `strategy/mod.rs` 头部的漂移注释。
+
+##### `src/news/`
+
+- **职责:** v15.1 业务核心——统一全球新闻采集（raw_v2 四源收敛）、通知投影（projection_v2)、分类（classifier)；BR-166/BR-172/BR-174 体系。
+- **内部结构:** `aggregator/raw_v2.rs`(2995行，采集核心）、`aggregator/source_event.rs`(841)、`aggregator/classifier.rs`(652)、`aggregator/analyst_state.rs`(393)、`dispatcher.rs`(185)+`impact.rs`(190)+`sink.rs`(67)+`stock_mapper.rs`(198，均为 v15 旧链路）、`ipo/supply_chain.rs`(191)。
+- **生产调用链:** `src/bin/monitor/news_aggregator_init.rs:37` + `src/bin/monitor/main.rs:5898`（启动注册） → `news_monitor_loop`(main.rs:8991）逐 tick 采集 → 消费方为 `src/monitor/news_ai.rs:18`、`src/monitor/push_job/n02_source.rs:15`、`src/selection/ingress_v2.rs:9`；`classifier`/`analyst_state` 经 `src/bin/monitor/v17_sources.rs:19-24` 路由；`ipo::supply_chain` 被 `src/bin/monitor/push_templates.rs:19265` 直接用于 IPO 推送。
+- **活性:** CONDITIONAL — `main.rs:5897-5906` 明确仅当 `selection_v2_enabled` 时才初始化 BR-174 采集管线（注释： "only initialize … after selection-v2 activation is released")，开关来自 CLI(main.rs:5745)；`ipo` 与 v17 classifier 部分无条件活跃。
+- **问题/缺口:**
+  - `dispatcher.rs:62 decide()`、`sink.rs:11 install()`、`stock_mapper.rs`、`impact.rs:73 score_event()` 在 src 内零外部调用方（仅互相引用+测试），即已知死代码，仍 `pub mod` 挂在 mod.rs:15-18 形成"业务核心"假象。
+  - `news_aggregator_init.rs:25-28` 模块级 `#![allow(dead_code)]`，自承"BR-183 forbids constructing a production receipt while that capability is disabled"——receipt-gated 投影整段保留未启用。
+  - `aggregator/feed.rs` 的 `NewsFeed` trait 已被 mod.rs:50-52 自我标注为"not the BR-174 acquisition scheduler"的兼容遗留，生产仅 raw_v2 直连。
+
+##### `src/announcement.rs`
+
+- **职责:** 公告标题分类（AnnLevel 紧急/重要/利好/跳过）+ CNInfo EventCalendar 批次的保证据投影（BR-059/105/137/168)；采集归 data_gateway。
+- **内部结构:** 单文件 219 行：`Announcement`/`AnnouncementBatch` 模型、`project_event_calendar_batch`(:78)、`classify_title`(:108)、`extract_reduction_pct`(:135)。
+- **生产调用链:** `src/bin/monitor/main.rs:9499`(`news_monitor_loop` 公告分支，`market_announcements` 拉取后投影） → `src/monitor/news_monitor.rs:9`(NewsMonitor 索引处理） + `src/bin/monitor/v17_sources.rs:325 route_announcement_batch`（归一化路由推送）。
+- **活性:** CURRENT — `news_monitor_loop` 在 monitor 主循环无条件 spawn(main.rs:6729)，公告分支不受 selection-v2 门控。
+- **问题/缺口:**
+  - 投影只保留标题/时间/URL，`name`/`summary`/`content` 恒空（announcement.rs:90-94,CNInfo 不供详情），下游若有按名称/正文匹配的需求会静默落空；`main.rs:9548` 还需 `resolve_code_by_name(&ann.name)` 对空 name 做补救查询。
+  - `classify_title` 纯关键词包含匹配（announcement.rs:108-133),`extract_reduction_pct` 用字符切分猜百分比（:135-147)，对"减持不超过0.5%"类表述靠特判豁免，脆弱但已有测试兜底（:213)。
+
+##### `src/search_service/`
+
+- **职责:** 统一新闻/网页搜索聚合（Tavily/SerpAPI/Bocha 经 data_gateway 薄适配），多 provider 轮询、缓存、快讯事实投影。
+- **内部结构:** `service.rs`(2184，聚合器+`get_search_service` 单例：1638)、`types.rs`(712)、`macro_news/legacy.rs`(703)+`macro_news/runner.rs`(561)、`providers/general_web.rs`(123,BR-175 无网络适配）、`macro_news.rs`(322)。
+- **生产调用链:** `src/pipeline/mod.rs:381` + `src/pipeline/analyze.rs:18`(CLI 单次分析主流程） → `src/pipeline/chain_analysis/mod.rs:751` / `preparation.rs:1569`（产业链扫描，monitor `news_monitor_loop` 8:00-22:00 窗口经 `main.rs:11138 run_chain_analysis`) → `src/market_analyzer/mod.rs:15`（涨停复盘） → `src/agent/tools_news.rs:2`（深度研判工具）。
+- **活性:** CURRENT — 生产 monitor 与 CLI 均可达；可用性取决于搜索 key env，缺失时 `pipeline/mod.rs:386` 仅降级提示不阻断。
+- **问题/缺口:**
+  - `macro_news/runner.rs`+`legacy.rs`(1264行）的生产消费方只有 `push_foundation/intent_store/chain_post_close*.rs`，而 monitor 对 chain_post_close 只有 shadow 观察（`main.rs:10495 observe_chain_post_close_shadow`，日志自承 `foundation_persisted=false`,main.rs:10501),`src/bin/monitor/` 内无非 shadow 调用——这一千多行实质是 shadow-only。
+  - `opportunity/event_extractor/*` 引用 `SearchResult`(mod.rs:8）但该模块已知死代码，构成虚引用。
+  - `service.rs` 2184 行单文件，缓存/健康度/快讯投影/宏快讯混居，guard 注释（:4-8）显示历史审计债。
+
+##### `src/llm/`
+
+- **职责:** 多 Provider LLM 抽象（DeepSeek/MiniMax,OpenAI 兼容协议），按 role 选择 + 强制 provider 回执（ModelCallReceipt）绑定的证据化模型调用。
+- **内部结构:** `bounded.rs`(1155，有界调用）、`mod.rs`(565,trait+receipt 协议）、`providers.rs`(437)、`ticker_extractor.rs`(211)、`registry.rs`(135,env 装配）。
+- **生产调用链:** `src/bin/monitor/news_ai_shadow.rs`("BR-172 默认启用，2026-08-11 起取消 env 开关") → `src/monitor/news_ai.rs:13`(news_monitor_loop 内 NewsAI 分析）;`src/bin/monitor/g5b_v2.rs:173`+`src/monitor/g5b_analysis_v2.rs:14`+`src/monitor/attribution_deep.rs:19`(g5b 盘后归因，main.rs:11000 `run_tick`);`src/bin/monitor/news_aggregator_init.rs:1306-1314`(BR-183 候选入池 extract_tickers);`src/durable_delivery/coordinator_g5b_cohort.rs:7`。
+- **活性:** CURRENT — NewsAI 默认开启且在 `news_monitor_loop` 每 tick 调度（main.rs:9350);g5b/深度归因走 `g5b_should_analyze` 15:05–15:20 时间窗（main.rs:181-184)，属正常定时窗而非禁用。
+- **问题/缺口:**
+  - `bounded.rs` 1155 行（全模块最大文件）在 src/monitor、src/bin/monitor 内零引用，唯一生产形态是离线 bin `src/bin/assistant_review.rs`("Offline by default")——对常驻 monitor 而言是离线工具代码。
+  - `registry.rs:38-43` 只装配 DeepSeek/MiniMax 两家，与 mod.rs:1 宣称的"DeepSeek / MiniMax / OpenAI / Gemini / Claude 可插拔"不符，扩展承诺未兑现。
+  - provider 缺失时各消费方各自 fail-open/fail-closed 语义不一（news_aggregator_init.rs:1308 warn 跳过 vs news_ai ModelUnavailable 错误），无统一降级策略。
+
+##### `src/analyzer/`
+
+- **职责:** AI 个股分析器（Gemini/DeepSeek/豆包三家 HTTP 封装），技术面+消息面生成分析报告；Quick/Deep 双模式路由；宏观新闻荐股。
+- **内部结构:** `analyze.rs`(1196，主分析+`run_text_pipeline` 宿主）、`client.rs`(572，三家 HTTP 重试）、`mod.rs`(528,GeminiAnalyzer+env 装配）、`prompts.rs`(447)、`macro_rec.rs`(267，宏观 4 专家）、`types.rs`(231)。
+- **生产调用链:** CLI `src/main.rs` → `app/modes.rs:53 AnalysisPipeline` → `pipeline/mod.rs:372` 装配 `ai_analyzer` → `pipeline/analyze.rs:913` 逐股调用；宏观推荐：`app/bootstrap.rs:458 analyze_macro_recommendations`(macro_rec.rs:78)；深度研判复用见 agent 卡片；另 `decision/leader.rs:51`、`opportunity/chain_mapper.rs:226` 直接 `from_env`。
+- **活性:** CURRENT — CLI 主流程与 monitor 复盘 AI 均可达。
+- **问题/缺口:**
+  - **装配门控不一致**: `pipeline/mod.rs:372` 只在 `GEMINI_API_KEY` 存在时才创建 `GeminiAnalyzer::from_env()`，而 from_env 本身支持 DeepSeek/豆包（analyzer/mod.rs:329-341)——只配 DEEPSEEK/DOUBAO key 时 pipeline 整段 AI 分析静默缺失；但 `app/bootstrap.rs:442` 的宏观推荐走 `get_analyzer()` 单例不受此限，同进程两条路径行为分裂。
+  - `prompts.rs` 整个模块被 `#[allow(dead_code)]` 保留（analyzer/mod.rs:19-23,"legacy JSON dashboard parser retained")，属明示死代码。
+  - `GeminiAnalyzer` 用 `RefCell` 持可变状态（mod.rs:87-88,`!Sync`)，迫使 monitor 复盘 AI 在 `push_templates.rs:11432-11441` 为每只股票 spawn 独立 current-thread runtime，是真实的架构债。
+
+##### `src/agent/`
+
+- **职责:** Agent 工具体系（财务/研报/资金/筹码/板块/新闻 6 工具）+ 多角色分析流水线（6 分析师→多空辩论→仲裁）+ 旧 ReAct 单 Agent 循环。
+- **内部结构:** `loop_runner.rs`(715,AgentRunner)、`multi_agent/slices.rs`(1087)+`analysts.rs`(408)+`arbitrator.rs`(285)+`cost_board.rs`(270)+`debate.rs`(189)+`trace.rs`(190)、`tools_*.rs`(6 个工具文件）、`validation.rs`(157)、`auction_agent.rs`(124)。
+- **生产调用链:** **multi_agent（活）**: `pipeline/mod.rs:468/475`(`enrich_key_stocks_with_deep_analysis`，门控 main 流程 `ai_analyzer.is_some()` 且非 dry_run,mod.rs:602)+ `src/bin/monitor/push_templates.rs:11438`（盘后复盘 AI,fail-open 于无 key,11402-11406)+ `app/modes.rs:30`/`bin/deep_analyze.rs:34`(CLI)——均经 `deep_analyzer.rs:405 run_multi_agent_analysis` → `build_slices` → `run_text_pipeline`(multi_agent/mod.rs:38);**tools_sector（活）**: `pipeline/chain_analysis/fetchers.rs:1141 render_membership_batch`（产业链扫描）;**loop_runner**: 仅 `bin/agent_test.rs:136`(dev 工具）与 `deep_analyzer.rs:352 run_react_analysis`（自注"旧路径，保留备用"，零生产调用方）。
+- **活性:** CONDITIONAL — multi_agent 与工具层真实接线但受 AI key env + 重点股过滤（pipeline/mod.rs:430-440)+ 复盘开关多重门控；`loop_runner`/`auction_agent` 实质闲置。
+- **问题/缺口:**
+  - **文档与实现矛盾**: `multi_agent/mod.rs:4-6` 头注声称"已从个股分析路径中摘除……待改造为宏观专属后再启用"，且模块级 `#![allow(dead_code)]`(mod.rs:19)，但实际被 pipeline/mod.rs:468 与 push_templates.rs:11438 生产调用——头注是过期信息，会误导后续维护者误判死活。
+  - `agent/auction_agent.rs`(v12 MVP-4 §7.8）零调用方（grep 全仓库无 `agent::auction_agent` 引用；活跃竞价逻辑在 `opportunity/auction_agent.rs`),124 行死代码。
+  - `AgentRunner`(715 行，最大单文件）生产上只剩 deep_analyzer 的备用路径引用，等于靠 dev bin 续命；`validation.rs`/`context.rs`/`toolbelt.rs` 随之仅在 ReAct 旧路径可达。
+
+> **本组总评:** 六个模块全部真实接线、无一整体闲置，但活性成色分层明显——announcement 与 search_service 主干、llm+NewsAI 是 monitor 每日实跑的核心；news 的 BR-174 采集链与 agent 的 multi_agent 分别受 selection-v2 激活和 AI key env 门控（CONDITIONAL)。共同的债务模式是"新旧链路并存、旧件靠 `#[allow(dead_code)]` 续命":news 的 dispatcher/impact/sink/stock_mapper、llm 的 bounded.rs(1155 行仅离线 bin)、analyzer 的 prompts.rs、agent 的 loop_runner/auction_agent, 合计约 3000+ 行死/半死代码；另有 `multi_agent/mod.rs` 头注与实现直接矛盾、`pipeline/mod.rs:372` 只认 GEMINI_API_KEY 两处会导致维护者误判的具体缺口。
+
+##### `src/data_gateway/`
+
+- **职责:** BR-164 证据保留型生产数据网关，统一持有全部外部金融/新闻获取；gRPC 桥（`grpc_source`）fail-closed 接远端 market-data host，绝不静默回退 library。
+- **内部结构:**（49k 行，60+ 文件） `grpc_source.rs`(7055 行，gRPC 桥核心）、`benchmark.rs`(3884)、`review.rs`(3377，统一准入/证据/审计）、`outcome_daily_bars.rs`(2847)、`qualified_trading_facts.rs`(1043)、`board.rs`(1144)；另有 `grpc_source/convert.rs` 与约 15 个 `*_tests.rs`。
+- **生产调用链:** 135 个外部文件 import。`src/bin/monitor/main.rs:9878`(`bridge_for("T0Evidence")`)、`main.rs:12493`(BoardDataGateway)、`main.rs:9485`(EventCalendarGateway 新闻 loop)、`main.rs:5354`(refresh_position_chains);`src/monitor/news_monitor.rs`/`scanner.rs`/`data_quality.rs`/`news_ai.rs`;`src/pipeline/data.rs`/`analyze.rs`/`chain_analysis/*` → monitor 主循环 + 各 scheduler loop + CLI 分析链路。
+- **活性:** CURRENT — monitor 开盘 readiness(`main.rs:4701` `external_static_opening_diagnostics`）与 T0/资金流/板块采集均实际经此桥，启动 banner(`grpc_source.rs:2458`）在 monitor 启动时打印。
+- **问题/缺口:**
+  - `grpc_source.rs` 单文件 7055 行/266KB，承载全部 op 桥接+准入+审计，是仓库最大单文件之一，可维护性风险高（`src/data_gateway/grpc_source.rs:1`)。
+  - CFFEX 期货交割 live 能力不可用：`cffex_futures_delivery_live_supported()` 在 monitor 启动时走 warn 分支，EventCalendar sink 保持 blocked(`src/bin/monitor/main.rs:5757-5763`)。
+  - 公告分页"断点 B-2"未彻底修复：上游 max_pages 未放开，客户端以 limit=300 变通覆盖全天（`src/bin/monitor/main.rs:9486-9491` 注释）。
+  - `OutcomeDailyBarsGateway` 仅服务 selection outcome_v2 shadow 结算，`settle_tick` 在 `selection_v2_enabled` 门内运行（`src/bin/monitor/main.rs:7545-7552`，与已知"outcome 仅 shadow"一致）。
+  - `benchmark.rs`(3884)/`review.rs`(3372)/`outcome_daily_bars.rs`(2847）均为巨型文件；`benchmark` 的生产消费方主要是回测/归因链路（`pipeline/backtest_runner.rs`、`performance/attribution_replay.rs`)，非盘中主路径。
+
+##### `src/grpc_client/`
+
+- **职责:** gRPC 客户端网络层（合同 grpc-external-api.md),`GrpcMarketClient` 实现 24 个 op 查询、能力准入、错误分类保真与 mTLS/bundle 身份。
+- **内部结构:**（32k 行） `client.rs`(2114，客户端+#[path] 子模块挂点）、`errors.rs`(2602,status→错误映射）、`external_query_transport.rs`(1136)、`external_v1.rs`(931)、`candidate_probe.rs`(2069)、`envelope.rs`(431);loopback fixture 与大型 *_tests 均为 `#[cfg(test)]`(`client.rs:41-79`)。
+- **生产调用链:** `data_gateway/grpc_source.rs:39,2878`(`GrpcMarketClient::connect` 桥接全部 gateway op);`push_foundation/intent_store/chain_post_close_{macro,board,dragon_tiger}*` → `src/monitor/push_job.rs` → monitor 主循环；`search_service/macro_news/*` → monitor 新闻链路；诊断 bin(`grpc_bundle_probe` 等）。
+- **活性:** CURRENT — 生产桥（grpc_source）与 push_foundation 盘后 macro/board RPC 均经此层；`external_decoder`/`historical_external` 在 macro codec 生产路径解码归档 descriptor(`chain_post_close_macro_codec.rs:2`)。
+- **问题/缺口:**
+  - `candidate_probe.rs` 2069 行+2629 行测试仅服务诊断 bin `grpc_candidate_bundle_probe.rs` 与 client 内部（`client.rs:44`)，属探针工具而非生产采集路径。
+  - `errors.rs` 2602 行/99KB，错误分类 taxonomy 过于庞大集中。
+  - `archived_external_20260928.rs`/`archived_external_20261001.rs` 为冻结 descriptor 兼容层，仅被 `build_identity.rs:96-101` 与 `external_decoder.rs:35-38` 引用做归档识别，属只增不减的历史包袱。
+
+##### `src/grpc_contract/`
+
+- **职责:** gRPC 合同注册表——方法身份（Local/External 双 profile)、schema 名/版本冻结、请求 params 契约、payload 校验；服务端与客户端共享。
+- **内部结构:**（~1.1k 行） `methods.rs`(183,ContractProfile/MethodIdentity)、`schema.rs`(266,24 个生产 op 冻结 schema)、`params.rs`(407，默认值表与 monitor 生产惯例对齐）、`ops.rs`(168)、`validate.rs`(91，未知 schema/version 必须拒绝）。
+- **生产调用链:** 被 `grpc_client/envelope.rs:6`、`errors.rs`、`client.rs`、`unary_attempt.rs` 及 `data_gateway/grpc_source.rs:46`(`ExternalMethod`)import → 随 grpc_client 进入 monitor 全部 gRPC 路径；`news/aggregator/raw_v2.rs` 亦直接引用。
+- **活性:** CURRENT — 每次 gRPC query 信封构造/响应校验都经 `schema_for`/`validate_payload`，是桥的硬依赖。
+- **问题/缺口:** 未发现明显问题（模块小、职责单一；schema 注释自述"后续扩展至 41 op"属计划而非缺陷，`schema.rs:4-6`)。
+
+##### `src/market_domain/`
+
+- **职责:** 纯领域类型层——K 线/证据/标的标识/生命周期/榜单/数值约束类型，无 IO 无逻辑副作用。
+- **内部结构:**（~1.9k 行） `evidence.rs`(355,SourceEvidence)、`lifecycle.rs`(346)、`record.rs`(306,DataBatch/Provenance)、`bars.rs`(290)、`market.rs`(217)、`value.rs`(163，受限数值类型）。
+- **生产调用链:** 128 个文件 import(`ProviderId`/`InstrumentId`/`LimitPoolEntry` 等遍及 pipeline、monitor、database、grpc_source);monitor 直接消费见 `src/bin/monitor/main.rs:966,10039`。
+- **活性:** CURRENT — 是全仓数据流的词汇表，生产与测试共同依赖。
+- **问题/缺口:** 未发现明显问题（`tdx.rs` 仅 21 行但 `SecurityBar` 被 grpc_source 使用，非死代码）。
+
+##### `src/data_provider/`
+
+- **职责:** 兼容层——保留 `KlineData` 领域模型与本地派生计算（筹码分布、一致预期投影、涨跌停校验）；外部获取已统一上交 data_gateway,`service.rs` 是进程级 TTL 缓存单飞层。
+- **内部结构:**（2.2k 行） `service.rs`(662,`DataFetchService` 缓存）、`limit_status.rs`(519)、`chip_distribution.rs`(470)、`mod.rs`(305,`KlineData`/`AdjustType`)、`halt_status.rs`(158)、`news_item.rs`(50)。
+- **生产调用链:** 58 个文件 import。`DataFetchService::service()`(`service.rs:327`)← `src/agent/tools*.rs`、`src/pipeline/extra_context.rs`;`KlineData` 遍布 monitor(`main.rs:909-966`)、pipeline、database → monitor 主循环与 ReAct Agent 工具。
+- **活性:** CURRENT — KlineData/缓存层是分析与交易链路的数据载体；但含一个死子模块（下条）。
+- **问题/缺口:**
+  - `halt_status.rs` 158 行零调用方：全仓库（含测试）除 `mod.rs:8` 声明外无任何 `halt_status`/`HaltStatus` 引用，确认死代码。
+  - `mod.rs:120-253` 内置约 130 行 `#[cfg(test)] TestHttpServer` 基建，测试设施堆在模块根部（其他模块已移到独立 fixture 文件）。
+
+> **本组总评:** 五个模块全部活性在线（除 data_provider/halt_status 一个死子模块），构成"gRPC 合同 → 客户端 → 网关 → 领域类型"的完整生产数据链，monitor 开盘 readiness、T0、盘后 push_job 均实际可达。主要风险是规模失控而非失活：grpc_source.rs(7055 行）、review/benchmark/outcome_daily_bars（各 3-4k 行）、errors.rs(2602 行）等巨型文件集中了过多职责；另有 CFFEX 交割、公告分页（断点 B-2）两处上游能力缺口仍靠变通维持。
+
+##### `src/monitor/` (lib 层）
+
+- **职责:** 实盘监控核心库——盘中异动检测/信号状态机/预测闭环/新闻 AI/G5b 归因/数据健康降级，供 `src/bin/monitor` 常驻进程消费。
+- **内部结构:** `news_ai.rs`(4546) + `news_ai/`;`attribution_deep.rs`(3093);`data_mode.rs`(1489) 数据健康门；`data_quality.rs`(1139);`news_monitor.rs`(1042);`prediction.rs` 经 `#[path]` 吸收 prediction_samples/verifier/horizons/outcome_tracker 四个姊妹文件；另有 `g5b_*_v2` 系列、`alert_log.rs`(871)、`scanner.rs`(714)、`detector.rs`(669)、`push_job.rs`+`push_job/`。
+- **生产调用链:** `src/bin/monitor/main.rs:43-51` import detector/prediction/scanner/signal_state → `monitor_loop`(main.rs:10192)、`news_monitor_loop`(main.rs:8991)、`data_mode_monitor_loop`(main.rs:3623);`attribution::apply_attribution`(main.rs:12246)、`signal_fusion`(main.rs:11375)、`event_bus`(main.rs:6275)、`outcome_data`(main.rs:7603);`alert_log`/`g5b_*` ← `src/durable_delivery/coordinator*.rs`;`push_job` ← `src/notification/service.rs:17`、`src/pipeline/cli_identity.rs:7`;`risk` ← `src/pipeline/position_tracker.rs:26`;`data_quality` ← `src/pipeline/data.rs:21`、`src/bin/monitor/freshness.rs:14`。
+- **活性:** CURRENT — 主循环+新闻循环+durable delivery 均实际可达，`news_ai` 经 `news_ai_shadow` BR-172 默认启用（`src/bin/monitor/news_ai_shadow.rs:1`)。
+- **问题/缺口:**
+  - `alert.rs`(321 行）零生产调用方，仅 `integration.rs:40,101,129`(`#[cfg(test)]`）引用；生产告警走 `detector::AlertEvent` + push_templates 直发。
+  - `auction.rs` 唯一非测试引用是 `src/opportunity/auction_agent.rs`，而后者自身零调用方（`auction_agent::` 全仓无外部匹配）,agent/opportunity 链路未接入 bin/monitor。
+  - `adaptive.rs`(276 行）与 `checklist.rs`(259 行）全仓零引用，仍挂在 `mod.rs:16,22`。
+  - `integration.rs` 是纯 `#[cfg(test)]` 文件（`integration.rs:6`）却占着一个 mod 槽位（`mod.rs:32`)。
+  - `mod.rs:1` 头注释宣称 "Phase 0-5 全部实现" 并列出 alert/checklist 等，与上述死代码现状不符。
+  - `news_ai.rs` 单文件 4546 行，可维护性差。
+
+##### `src/market_analyzer/`
+
+- **职责:** 大盘指数/涨跌统计/板块榜概览 + 涨停池获取 + 板块/连板监控，供盘中与盘后推送使用。
+- **内部结构:** `limit_up.rs`(1351) 涨停池 Gateway 投影；`sector_monitor.rs`(1115) 板块榜；`market_stage_confidence.rs`(410);`review.rs`(374) 模板复盘；`async_overview.rs`(304);`mod.rs`(171) MarketAnalyzer 门面。
+- **生产调用链:** `MarketAnalyzer::get_limit_up_stocks` ← `src/bin/monitor/main.rs:11116`（产业链 15:00 断点 A);`get_limit_up_observation` ← main.rs:11728（盘中涨停池）+ `push_templates.rs:8445`（竞价量能）;`sector_monitor` ← `push_templates.rs:2298,3714,18706`;`limit_chain_review` ← `main.rs:13270`(R-03 涨停池装载）+ `push_templates.rs:4337,15173`;`get_market_overview` ← `src/app/modes.rs:95`(CLI `--market_review` 模式）。
+- **活性:** CURRENT — 涨停池/板块/连板路径在 monitor 主循环实际可达；但约 1/3 文件为死代码（见下）。
+- **问题/缺口:**
+  - `async_overview.rs`(304 行）: `mod.rs:41` re-export 两个 blocking 函数，全仓零调用方。
+  - `market_stage_confidence.rs`(410 行，v12 MVP4-4.1)、`post_close_review.rs`(165 行，MVP4-4.4)、`performance_feedback.rs`(254 行，MVP5-5.1）三个 v12 规划件均零调用方。
+  - `review.rs`(374 行）仅被 `run_daily_review`(mod.rs:165）调用，而 `run_daily_review`/`search_market_news` 全仓零调用方——整条"大盘复盘报告"链已死。
+  - BR-164: `north_flow` 恒为 `None` 且每次调用都 warn(mod.rs:85-86)，属已知契约缺口。
+  - `sector_monitor` 同时被已知死代码 `src/decision/sector_score.rs`、`src/decision/leader.rs` 引用，不影响活性结论。
+
+##### `src/review/`
+
+- **职责:** 盘后复盘纯消费者——R-03~R-13 各复盘任务的计算/渲染库，读 portfolio + data_provider，输出报告文本。
+- **内部结构:** `backtest.rs`(1932, R-12);`journal.rs`(672);`watchlist_tracking.rs`(669, R-13);`catalyst_review.rs`(641, A-10);`factor_ic.rs`(637)+`factor_report.rs`(230);`equity.rs`(286)+`report.rs`(257)；其余 R-xx 小件。
+- **生产调用链:** R-12 ← `push_templates.rs:11919,11986`(`dispatch_r12_backtest_outcome`，经 `main.rs:5444` review_batch 调度）+ `src/pipeline/backtest_runner.rs`;R-13 ← `push_templates.rs:12336,12354,19555`;R-07 ← `push_templates.rs:10685`;`catalyst_review` ← `push_templates.rs:8659`(pub use)+ `src/bin/backfill_catalyst_watchlist.rs`。
+- **活性:** CONDITIONAL — 只有 R-07/R-12/R-13/catalyst 四个任务面经 review_batch 调度真实可达；R-05/R-06 dispatcher 被 BR-110 显式禁用，journal/equity/report 仅测试可达，其余模块零接线。
+- **问题/缺口:**
+  - `journal.rs`/`equity.rs`/`report.rs`（合计 ~1215 行）唯一调用方是 `src/bin/monitor/main.rs:13484` 的 `#[cfg(test)] fn build_close_review_report`（注意 main.rs:13483 的 cfg 属性）——生产不可达。
+  - `factor_ic.rs:285` `run_diagnostic` 文档自称"用于 --review 复盘路径"，实际全仓零调用方；`factor_ic`↔`factor_report` 互相引用（`factor_ic.rs:288`）形成死岛。
+  - R-05 禁用： `push_templates.rs:15942-15947` `dispatch_r05_signal_review_real` 恒返回 false(`disabled=no_signal_..._source`, BR-110) → `signal_review.rs` 死。
+  - R-06 禁用： `push_templates.rs:15951-15956` 同构 → `failure_attribution.rs` 死。
+  - R-04 dispatcher 直接用 `DragonTigerGateway`(`push_templates.rs:15737-15749`)，从未调用 `lhb_review.rs` → 死。
+  - `market_stage.rs`/`limit_chain_review.rs`/`performance_feedback.rs` 仅内部互相引用（`limit_chain_review.rs:5`、`performance_feedback.rs:5`)，无外部入口；`sop.rs` 零调用。死/禁用合计约 3700/6378 行（~58%)。
+
+##### `src/performance/`
+
+- **职责:** 绩效与归因引擎——每日结算快照、epoch 归因计算/重放、经济头寸（净盈亏）、费率策略与证据。
+- **内部结构:** `attribution_replay.rs`(10721，占模块 58%);`attribution.rs`(1756);`economic_position.rs`(1662);`attribution_epoch.rs`(1108);`fee_policy.rs`(837)+`fee_evidence.rs`(520);`report.rs`(648)+`report/paper_account.rs`;`snapshot.rs`(449)。`attribution_effective.rs` 不在 mod.rs，经 `#[path]` 被 `attribution_replay.rs:19` 吸收。
+- **生产调用链:** `PerformanceEngine::daily_settlement` ← `main.rs:10563`(monitor_loop 内 15:05 cron);`attribution::{compute_epoch_daily,persist_epoch_daily}` + `report::render_*` ← `main.rs:10594-10598`(15:05-15:20 重试窗口）;`attribution_replay::ReplayErrorClass` ← `main.rs:10694`;`attribution_epoch` ← `src/bin/monitor/attribution_epoch_runtime.rs:8`，接线于 `main.rs:6684` 启动校验；`economic_position::compute_economic_position_report` ← `main.rs:3128`;`snapshot` ← `src/bin/monitor/health.rs`、`src/trading/paper_ledger_snapshot.rs`;`fee_policy`/`fee_evidence` ← `src/trading/paper_book_v2*.rs`、`src/strategy/core.rs`、`src/pipeline/position_tracker.rs`。
+- **活性:** CURRENT — 15:05 结算+归因 cron、启动 epoch 校验、经济头寸均在 monitor 主流程实际运行。
+- **问题/缺口:**
+  - `paper_decision_outcomes_v1.rs`(297 行）仅被 `src/trading/paper_book_v2_execution_tests.rs:3376+` 引用，生产零调用，仍 `pub mod` 挂在 `mod.rs:9`。
+  - `attribution_replay.rs` 单文件 10721 行，为全 src 最大文件之一，维护风险高。
+  - `fee_policy`/`fee_evidence` 的主要消费面在 trading paper_book 链（paper_engine 已被 BR-211 禁用），生产可达性现依赖 strategy research 与 CLI `position_tracker`，属半接线状态。
+
+> **本组总评:** `src/monitor/` lib 是生产主干（检测/新闻/归因/数据健康全部在线），但拖着 `alert`/`auction`/`adaptive`/`checklist` 四块约千行死肉且头注释失真；`market_analyzer` 与 `review` 均有三分之一到一半是 v12 规划后未接线或被 BR-110 显式禁用的死代码（review 的 journal/equity/report 甚至只剩 cfg(test) 调用方）;`performance` 最健康、全部 cron 接线真实，唯需警惕 10.7k 行的 `attribution_replay.rs` 巨型文件和 test-only 的 `paper_decision_outcomes_v1`。
+
+##### `src/pipeline/`(24,840 行，含测试）
+
+- **职责:** 股票分析流程调度器（BR-213)，协调 数据获取 → 趋势分析 → AI 分析 → 通知推送；并承载产业链联动分析 `chain_analysis`。
+- **内部结构:** `mod.rs`(1137 行，`AnalysisResult` god-struct + 调度主循环）;`analyze.rs`(~110k，单股分析主逻辑）;`chain_analysis/`(mod 108k + fetchers 64k + preparation 86k + p01_projection 47k + 测试 134k);`backtest_runner.rs`(68k，多因子/布林带/RSI 三回测）;`position_tracker.rs`(51k，模拟持仓+卖出铁律）;`summary_notify.rs`/`reporting.rs`/`score_breakdown.rs`/`veto_rules.rs` 等支撑件。
+- **生产调用链:** `src/main.rs:104` → `app::run_analysis` → `src/app/modes.rs:53` `AnalysisPipeline::new` → `run_with_producer`；定时模式 `src/app/schedule.rs:262`;monitor 进程在 `src/bin/monitor/main.rs:11138` 直接调 `pipeline::chain_analysis::run_chain_analysis`,`p01_projection` 被 `src/bin/monitor/p01.rs:15` 引用。
+- **活性:** CURRENT — CLI 单次/定时模式与 monitor 产业链 loop 均可达。
+- **问题/缺口:**
+  - `analyze.rs` 仍 ~2900 行，是遗留巨石；`position_tracker.rs`(51k）为 `pub(super)`(mod.rs:26)，除 analyze.rs 外仅被已禁用的 paper_sell 和离线 sell_reminder 使用。
+  - `score_to_advice` 已标注 "AI评分已禁用"(src/pipeline/mod.rs:306-314)，但深度研判优先级 `key_stock_priority`(src/pipeline/mod.rs:319）仍用 ranking_score/veto/涨停打分，sentiment_score 仍在摘要排序（modes.rs:73)，新旧评分体系并存。
+  - 三个回测在每次非 dry_run 分析后必跑（src/pipeline/mod.rs:608-671)，失败仅 `error!` 记日志不阻塞，回测开销与主分析耦合。
+  - 深度研判预算由 env `DEEP_ANALYSIS_MAX`（默认 15)、`DEEP_ANALYSIS_CONCURRENCY`（默认 3）控制（src/pipeline/mod.rs:421-453)，无配置文件入口。
+
+##### `src/app/`
+
+- **职责:** CLI 应用层：`bootstrap` 启动校验+自选股装配，`modes` 三种运行模式（单次/大盘复盘/龙虎榜）,`schedule` 定时调度，`chain_*` 产业链调度的采集/审计/shadow 指纹。
+- **内部结构:** `modes.rs`(45k);`chain_schedule.rs`(44k，调度状态机）;`chain_shadow_input.rs`(38k，只读指纹）;`chain_acquisition.rs`(35k);`bootstrap.rs`(23k);`chain_cli_send_audit.rs`(19k);`schedule.rs`(11k)。
+- **生产调用链:** `src/main.rs:80/86/91/99/102/104` → `app::{run_scheduled_analysis, run_chain_analysis_mode, build_stock_list, run_lhb_analysis, run_market_review_only, run_analysis}`;monitor 在 `src/bin/monitor/main.rs:36` 引 `chain_schedule`;`push_foundation/chain_preopen_shadow.rs:11`、`chain_post_close_shadow.rs:6` 同引。
+- **活性:** CURRENT(CLI 主入口直达）;`chain_shadow_input` 为 **CONDITIONAL/shadow** — 自述 "Read-only fingerprint … not Foundation shadow parity",`COVERAGE = "incomplete"`(src/app/chain_shadow_input.rs:1,17)。
+- **问题/缺口:**
+  - 并发默认值不一致：`app::get_max_workers` 默认 6(src/app/mod.rs:30),`PipelineConfig::default` 默认 3(src/pipeline/mod.rs:249)，实际生效取前者，后者成摆设。
+  - `schedule.rs` 进程内常驻 cron，但生产 launchd 仅常驻 monitor binary(plist ProgramArguments 仅 monitor),`stock_analysis --schedule` 模式无 plist，生产可达性依赖手工/外部触发。
+
+##### `src/notification/`
+
+- **职责:** 日报 Markdown 生成 + 10 渠道推送（企微/飞书/邮件/Telegram/Pushover/钉钉/Slack/Discord/Custom/Server酱）。
+- **内部结构:** `service.rs`(53k,`NotificationService` 主入口）;`report.rs`(45k，日报渲染）;`feishu.rs`(23k);`email.rs`(14k);`wechat.rs`(9.9k);`send_report_tests.rs`(41k，测试）。
+- **生产调用链:** `src/pipeline/summary_notify.rs:7`、`src/pipeline/analyze.rs:1360+`（单股推送）、`src/app/modes.rs:103/267`、chain 链路 `src/app/chain_shadow_input.rs:7`;lib 侧 `src/monitor/alert.rs:7`。
+- **活性:** CURRENT(CLI 分析推送主链路）；注意 monitor bin 并不 import notification（自有 feishu_delivery 体系），且 `monitor/alert.rs` 的推送扩展无调用方（见下）。
+- **问题/缺口:**
+  - `send_daily_report`(src/notification/service.rs:960）全仓零调用方，是死的便捷 API。
+  - `src/monitor/alert.rs:160` 对 `NotificationService` 的告警级别路由扩展：`push_alert` 全仓 grep 零调用方，属死接线。
+  - `report.rs` 单文件 45k，与 service.rs 同为巨石。
+
+##### `src/indicators/`
+
+- **职责:** MACD(6/13/5)/SKDJ(40/5)/RSI/KDJ 计算、顶底背离检测、金叉/死叉共振，输出 0-100 综合评分。
+- **内部结构:** `mod.rs`(567 行，`analyze_indicators` 综合入口）;`kdj.rs`/`macd.rs`/`rsi.rs`/`skdj.rs`/`cross.rs`/`divergence.rs`;`multi_period.rs`（日/周/月聚合）。
+- **生产调用链:** `src/trend_analyzer.rs:341` `analyze_indicators`;`src/strategy/boll_macd.rs:18`(calc_macd/detect_divergence);`src/strategy/multi_timeframe.rs:15`;`src/agent/multi_agent/slices.rs:7`(calc_skdj)。
+- **活性:** CURRENT。
+- **问题/缺口:**
+  - `kdj.rs::calc_kdj` 全仓零生产调用（仅 mod.rs:41 re-export + 内部测试）——实际生产用的是 SKDJ，注释自述 "藏于只 kdj_* 字段名中以保持下游 API 兼容"(src/indicators/mod.rs:72)，典型兼容包袱+死代码。
+  - `analyze_indicators` 在数据 <30 根时静默返回默认 50 分（src/indicators/mod.rs:144-147)，下游无感。
+
+##### `src/trend_analyzer.rs`(1047 行）
+
+- **职责:** 趋势交易分析器：均线多头排列、乖离率（不追高）、量能形态、买卖点信号，输出 `TrendAnalysisResult`。
+- **内部结构:** 单文件；`TrendStatus` 七态枚举、`BuySignal`、`StockTrendAnalyzer`、内嵌指标分析调用。
+- **生产调用链:** `src/pipeline/mod.rs:51,263`(`Arc<StockTrendAnalyzer>`)+ `src/pipeline/analyze.rs` 多处；次要调用方 `src/trading/paper_sell.rs:33`(BR-211 已禁用）、`src/offline_products/sell_reminder.rs:7`。
+- **活性:** CURRENT(pipeline 主链每只股票必经）。
+- **问题/缺口:** 次要调用方均非生产主路径（paper_sell 已被 BR-211 禁用；sell_reminder 仅 preview/producer 离线 bin)，模块活性完全系于 pipeline 一处。
+
+##### `src/deep_analyzer.rs`(832 行）
+
+- **职责:** 机构级多智能体深度研判：6 工具取数（财务/研报/资金/筹码/板块/新闻）→ DomainSlices → 6 分析师+多空辩论+仲裁，落盘 `reports/details/`。
+- **内部结构:** 单文件；`run_multi_agent_analysis`（主）、`run_multi_agent_analysis_with_seed`（复用主流程种子）、`run_react_analysis`（备用）、`run_and_save`;K 线 freshness gate(BR-010)。
+- **生产调用链:** `src/pipeline/mod.rs:468/475`（重点股 enrich);`src/app/modes.rs:30`(`--deep-analysis`);`src/bin/deep_analyze.rs:34`;monitor 复盘 `src/bin/monitor/push_templates.rs:11438`（持仓 AI 研判）。
+- **活性:** CURRENT — CLI 与 monitor 复盘双路可达。
+- **问题/缺口:**
+  - `run_react_analysis`(src/deep_analyzer.rs:352）自述 "保留备用"，全仓零生产调用，死路径。
+  - 失败/超时（300s）仅保留标准分析静默降级（src/pipeline/mod.rs:486-493)。
+  - monitor 复盘路径为每只持仓单起 current-thread runtime(BR-242 注释，push_templates.rs:11430+),90s 超时，LLM 调用密集。
+
+##### `src/chart_generator.rs`(162 行）
+
+- **职责:** 用 plotters 生成汇总 PNG（评分 TOP15 柱状图 + 操作建议分布条）。
+- **内部结构:** 单文件单 struct;`generate_summary_chart` + 两个私有绘制函数。
+- **生产调用链:** 唯一调用点 `src/pipeline/summary_notify.rs:89`(CLI 汇总通知）。
+- **活性:** CONDITIONAL — 在汇总通知路径上执行，但返回值赋给 `_chart_path` 被丢弃，`chart_path: None`(src/pipeline/summary_notify.rs:88-89,239)，图片不并入任何通知。
+- **问题/缺口:** 生成结果无人使用（下划线丢弃）;"sans-serif" 字体在无中文字体环境标题/标签会缺字形；无 env 开关，白跑 IO。
+
+##### `src/sharpe_calculator.rs`(136 行）
+
+- **职责:** 夏普比率计算 + 全系统统一无风险利率常量（默认 3%，可 env 覆盖）。
+- **内部结构:** 单文件；`DEFAULT_RISK_FREE_RATE`、`calculate_sharpe_ratio`、近 N 日封装、K 线回填函数。
+- **生产调用链:** 生产代码仅 `src/strategy/core.rs:1134` 引用常量；`calculate_sharpe_ratio` 只被本文件内部（:101/:106/:134）调用。
+- **活性:** CONDITIONAL — 常量活、计算主体死。
+- **问题/缺口:** `calculate_sharpe_ratio` 及 :134 的 K 线 sharpe 回填全仓零外部调用，整个计算能力是死代码；`AnalysisResult.sharpe_ratio` 的取值来源在别处（data_provider),`src/portfolio/store.rs:412` 还另写了一份 rf=0.03 的并行实现。
+
+##### `src/company_financials.rs`(482 行）
+
+- **职责:** BR-115/137/168/210 财务指标域模型与保守投影（缺失字段保持 absent)，含 `assess_quality` 财务质量评估。
+- **内部结构:** 单文件；`FinancialPeriod`、`Financials`、`FinancialProjectionEvidence`、`QualityReport`/`assess_quality`、`project_income_statements`。
+- **生产调用链:** `src/pipeline/analyze.rs:144/949`、`src/analyzer/analyze.rs:636`、`src/agent/multi_agent/slices.rs:679`、`src/data_provider/service.rs:20`、monitor `src/bin/monitor/v17_sources.rs:1062`。
+- **活性:** CURRENT。
+- **问题/缺口:** 未发现明显问题（纯域投影，契约清晰）。
+
+##### `src/company_metrics.rs`(41 行）
+
+- **职责:** BR-119/120 行业对标与估值历史的纯值对象（`IndustryBenchmark`/`ValuationHistory`)，不含取数。
+- **内部结构:** 单文件两个 struct。
+- **生产调用链:** `src/data_provider/mod.rs:22`（装配）→ `src/pipeline/analyze.rs:298/395`(render)、`src/analyzer/analyze.rs`、`src/agent/multi_agent/slices.rs`、`src/pipeline/veto_rules.rs:186`。
+- **活性:** CURRENT（纯类型，被主分析链贯穿）。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/capital_flow.rs`(208 行）
+
+- **职责:** BR-118 资金流域投影：`MoneyFlowDay/Summary`、`IntradayShape`、`format_for_prompt`；取数归 `data_gateway`，本模块只做投影。
+- **内部结构:** 单文件；两个核心 struct + prompt 渲染。
+- **生产调用链:** `src/pipeline/extra_context.rs:37`、`src/pipeline/score_breakdown.rs:9`、`src/pipeline/veto_rules.rs:19`、`src/risk/veto_rules_live.rs:149`、`src/agent/tools_money_flow.rs:2`、`src/data_provider/service.rs:19`。
+- **活性:** CURRENT。
+- **问题/缺口:** `MoneyFlowDay.pct_chg` 刻意不做 join(capital_flow.rs:20-25)，需要涨跌幅的下游必须另查已审计价格批次——设计性缺口（注释已声明，但 veto 规则等消费方需自行注意）。
+
+##### `src/lhb_analyzer.rs`(202 行）
+
+- **职责:** BR-162 龙虎榜复盘纯打分（`analyze_dragon_tiger_review`)+ CLI 日期解析；不含取数/缓存/DB。
+- **内部结构:** 单文件；`LhbAnalysis`、`parse_dragon_tiger_date`、打分函数。
+- **生产调用链:** `src/app/modes.rs:1031` `run_lhb_analysis` ← `src/main.rs:99`(`--lhb-mode` 或 `LHB_MODE=true`);`src/bin/lhb_query.rs:12`;`src/lib.rs:98` re-export。
+- **活性:** CONDITIONAL — 仅 CLI lhb_mode 可达，非每日主流程，无自动调度。
+- **问题/缺口:** 无 launchd/schedule 接线，纯手工触发；打分结果不落库（纯返回 `LhbAnalysis`)。
+
+##### `src/assistant_review.rs`(1487 行）
+
+- **职责:** H16 周度证据复盘的只读 Phase-A 三臂对照（离线模板 / 无历史结果模型 / 含冻结结果模型），有界 LLM 调用 + 回执验证 + 全链路哈希一致性，产出只读 Markdown。
+- **内部结构:** 单文件；`FrozenPack`（冻结证据包校验）、`compare`（三臂执行+预算预留）、`markdown`（渲染）、`read_private`/`write_new_private`（私有文件 IO)；约一半为测试。
+- **生产调用链:** `src/bin/assistant_review.rs`（唯一调用方）← launchd `com.stockanalysis.weekly-outcome-review` → `run-weekly-outcome-review.sh` 以 `--assistant-binary assistant_review` 间接调用。
+- **活性:** CONDITIONAL — 经周度 launchd 间接可达，但 bin 自述 "Offline by default; explicit --model enables reviewed bounded assistant_review role only"(src/bin/assistant_review.rs:1)，无 `--model` 时仅确定性模板臂在跑。
+- **问题/缺口:** 花费上限由 CLI 参数 `--ceiling-micro-cny` 决定（assistant_review.rs:26-33)，非配置审计；monitor 主进程无内嵌调用，价值依赖人工是否启用 --model。
+
+##### `src/assistant_review_integration.rs`(244 行）
+
+- **职责:** assistant_review 的跨任务生产者/消费者集成测试（合成 fixture，无生产语义）。
+- **内部结构:** 单文件测试；`LocalFake` provider + 跨 weekly_outcome_review 组件的端到端用例。
+- **生产调用链:** 仅被 `src/assistant_review.rs:36-37` 以 `#[cfg(test)] #[path] mod integration` 引入。
+- **活性:** INACTIVE — 纯 `cfg(test)` 模块，生产构建不编译、零运行入口。
+- **问题/缺口:** 未发现明显问题；但文件名 "integration" 易让读者误以为存在生产集成点，实际只是测试。
+
+> **本组总评:** 这一组构成 `stock_analysis` CLI 的分析主链路（main.rs → app → pipeline → trend_analyzer/indicators/company_*/capital_flow → notification)，整体 CURRENT 且被 monitor 进程选择性复用（chain_analysis、deep_analyzer、company_financials)。主要缺口集中在"半死代码":sharpe_calculator 只剩常量活着、chart_generator 出图即弃、indicators/kdj.rs 零调用、monitor/alert.rs 的 NotificationService 扩展零调用、deep_analyzer 的 ReAct 备用路径闲置；另有一批模式（schedule 定时、lhb、assistant_review 模型臂）依赖手工或低频 launchd 触发，活性为 CONDITIONAL。pipeline/analyze.rs 与 notification 双 45k+ 巨石仍是最大的可维护性风险。
+
+###### 顶层支撑散文件
+
+##### `src/calendar.rs`
+
+- **职责:** A股交易日历与时段门控（交易日判断、集合竞价/连续竞价/午休时段、上/下一交易日），并内嵌 BR-194/BR-251 的"已核验 SSE 日历"不可变权威（带 SHA-256 authority hash）供审计回放用。
+- **内部结构:** 运行时节假日表 `HOLIDAYS`(:85，含 `config/a_share_market_holidays.csv` + `TRADING_HOLIDAYS` env)；不可变 `VERIFIED_TRADING_CALENDAR`(:128,fail-closed);`MarketSession` 枚举（:41);replay 校准段（:145-214)；测试（:797-1170)。
+- **生产调用链:** `stock_analysis::calendar::{is_trading_day,current_session}` → `src/bin/monitor/main.rs:6444,9046,9289`（主循环时段门控）、`src/bin/monitor/health.rs:81-86`（健康检查日期解析）、`src/monitor/scanner.rs:165`、`src/app/bootstrap.rs:142`(CLI)。
+- **活性:** CURRENT — monitor 主循环每个 tick 都过 `current_session()`/`is_trading_day()`。
+- **问题/缺口:**
+  - 双日历并存：可变 `HOLIDAYS`(RwLock，可被 env/运行时注入）与不可变 `VERIFIED_TRADING_CALENDAR` 语义不同，调用方需自选，存在误用面（src/calendar.rs:85 vs :128);
+  - `verified_a_share_calendar_authority_hash` 为 `pub(crate)` 且仅服务于紧急回滚（:589)，覆盖面窄；
+  - 日历覆盖年仅到 checked-in CSV 所列年份，越界 fail-closed(:574)，跨年需手工更新 CSV。
+
+##### `src/config.rs`
+
+- **职责:** 启动配置加载 — `load_all()` 单次读 `config/strategy.toml`(Risk/Monitor 投影）+ `config/chain.toml`（产业链规则/公告关键词/排除板块/BR-160 合同）,ArcSwap 全局快照分发。
+- **内部结构:** `MonitorConfig`(:180，含 news/dq/opportunity/live_veto/position_sizing/factor_feedback/air_refuel/v17_7_earnings);`ChainRuleConfig`(:69);`AccountModeConfig`(:556);5 个 `ArcSwap` 静态（:498-507);`load_all`(:736)。
+- **生产调用链:** `config::load_all()` 仅被 `src/bin/monitor/main.rs:5987` 调用；读取方 `get_monitor_config()` 遍布 monitor 主循环（:662,9106,11458,12925)、`src/monitor/news_monitor.rs:124`、`src/search_service/service.rs:14` 等。
+- **活性:** CURRENT — monitor 启动即加载，热路径全量消费。
+- **问题/缺口:**
+  - **stock_analysis CLI 路径从不调 `load_all()`**(grep 全仓仅 monitor main 一处）,CLI 模式下 `app/modes.rs:40`、`app/schedule.rs:200` 拿到的是编译期默认 `MonitorConfig` 而非 strategy.toml 实际值；
+  - `load_risk_config` 已 deprecated 但仍导出（src/config.rs:725-731);
+  - chain.toml 读取/解析失败时 rules/boards "保留先前快照"(:678-694)，首次启动即失败则规则为空，依赖 `chain_mapper` 端显式 unavailable 报错兜底。
+
+##### `src/auth/`
+
+- **职责:** CLI operator 密码认证（BR-028/BR-074),PAM 验证，3 次失败/无 TTY → exit 1;`MONITOR_AUTH_REQUIRED=1` opt-in 启用，默认禁用。
+- **内部结构:** `mod.rs`(6 行，仅导出头注释）;`operator.rs`(240 行，`require_monitor_operator_auth` :79、`load_auth_config` :52、PAM 封装 :138)。
+- **生产调用链:** `src/main.rs:30`(CLI 启动闸）+ `src/bin/winrate_simulator.rs:101`。
+- **活性:** CONDITIONAL — 默认 `MONITOR_AUTH_REQUIRED` 未设即跳过（operator.rs:81-89)；且**生产 monitor 进程（src/bin/monitor）根本不调用它**,`mod.rs:3` 注释声称 "monitor 启动前调用" 与实际不符。
+- **问题/缺口:**
+  - 文档漂移：src/auth/mod.rs:3 与 src/auth/operator.rs:4 均写 "monitor … 启动前调用"，实际 grep 仅 main.rs:30 与 winrate_simulator.rs:101 两个手动入口，常驻 monitor 无认证闸；
+  - 默认禁用 + eprintln 提醒（:84）依赖 operator 看 stderr,launchd 场景该提醒进 stderr log 易被淹没。
+
+##### `src/bus/`
+
+- **职责:** v16.4 的 SignalBus/TradingBus/SystemBus 三个 broadcast channel 骨架 + UUID 风格 ID 生成器（SignalId/OrderId 等）。
+- **内部结构:** 3 个事件枚举（:27-80);5 个 ID 生成器（:96-110);3 个 `OnceCell` 全局 bus(:122-166);6 个单测（:168-271)。
+- **生产调用链:** 唯一生产 publish 在 `src/trading/paper_engine.rs:350`(TradingBus)，但 paper_engine 已被 BR-211 禁用；`new_*_id` 被 paper_engine(:337-339）与 v16_4 的 `impl_strategy_id!` 宏（src/strategy/v16_4/mod.rs:88-97）使用；monitor bin 内零引用。
+- **活性:** INACTIVE — mod.rs:15-17 自承 "仅落地 3 Bus 骨架，业务接入推 v16.4 #5";SignalBus/SystemBus 零生产 publish/subscribe,TradingBus 唯一发布者已禁用（与已知结论一致）。
+- **问题/缺口:**
+  - 骨架空转：无消费者，publish 即丢弃（src/bus/mod.rs:133 `let _ = self.tx.send(event)`);
+  - v16.4 #5 接入计划（SignalBus→intraday_monitor 等，:16-17）从未落地，intraday_monitor 实际直调 strategy 结构体。
+
+##### `src/registry/`
+
+- **职责:** v16.4 StrategyRegistry — DashMap 动态注册 StrategyMeta(name/version/virtual_reason)，替代 v16.3 硬编码 8 enum 的运行时路由设想。
+- **内部结构:** `StrategyMeta`(:21);`StrategyRegistry`(:31,register/lookup/list_active/deactivate);`register_v16_3_strategies`(:118);5 单测。
+- **生产调用链:** 注册入口实际是 `src/strategy/v16_4/mod.rs:41 register_all()` → `src/bin/monitor/main.rs:6301`(monitor 启动）；唯一生产读取方 `src/bin/monitor/health.rs:37`(`list_all().len() >= 8` 健康判据）。
+- **活性:** CONDITIONAL — 启动时确实注册、健康检查确实读，但 registry 从不参与信号路由：生产 dispatch 在 `src/decision/intraday_monitor.rs:433-440` 用硬编码 match 直接实例化 8 个 strategy，绕过 registry 的 lookup/list_active。
+- **问题/缺口:**
+  - 注册即终点：`lookup`/`list_active`/`deactivate` 无生产消费者，"动态注册/热加载" 设计目标（:5-6）未实现；
+  - `register_v16_3_strategies`(:118）生产零调用（仅自身测试 :180)，与 `register_all` 功能重复的死 API;
+  - 健康判据 `len() >= 8`(health.rs:37）只证明注册动作发生过，不证明策略可用。
+
+##### `src/production_root.rs`
+
+- **职责:** 构建期锁定生产数据根（`STOCK_ANALYSIS_BUILD_PRODUCTION_ROOT` env 或 CARGO_MANIFEST_DIR)，运行时 env/CWD 不参与；test/prod 命名空间分流。
+- **内部结构:** `select_build_root`(:4，绝对路径+纯 normal component 校验）;`production_root()`(:28);`root_for_mode`(:35);2 单测。
+- **生产调用链:** 被 `src/bin/monitor/main.rs`、`src/durable_delivery/coordinator*.rs`、`src/selection/config_activation_v2.rs`、`src/data_gateway/historical_observed_store.rs`、`src/event/dispatcher.rs` 等 ~29 处引用。
+- **活性:** CURRENT — monitor 与 durable delivery/selection 激活路径每次启动都经它定位数据根。
+- **问题/缺口:** 未发现明显问题（纯函数 + option_env，测试覆盖路径校验齐全）。
+
+##### `src/util.rs`
+
+- **职责:** 三个跨模块小工具：`truncate_chars`(char 级截断）、`strip_html_tags`（简单高亮标签剥离）、`recover_lock_or_warn`(Mutex poison 恢复）。
+- **内部结构:** 单文件 45 行，3 个 pub fn。
+- **生产调用链:** `src/notification/service.rs`、`src/monitor/news_monitor.rs`、`src/push_l7/analytics.rs`、`src/push_l7/sqlite_store.rs`(`src/opportunity/event_extractor/mod.rs` 是已知死代码）。
+- **活性:** CURRENT — 通知发送与新闻监测热路径在用。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/http_client.rs`
+
+- **职责:** 3 个预配置共享 reqwest Client（默认 30s / 通知禁跳转 30s / 快讯 5s)，替代 28 处散落 builder(Top10#7 修复）。
+- **内部结构:** 单文件 52 行，3 个 `Lazy<Client>` 静态（:20/:32/:44)。
+- **生产调用链:** `src/notification/service.rs`、`src/push_l6/external_sinks.rs`、`src/bin/monitor/webhook_alert.rs`。
+- **活性:** CURRENT — 通知/告警外发通道在用。
+- **问题/缺口:** 未发现明显问题（.no_proxy() 与禁跳转语义都有注释说明）。
+
+##### `src/models.rs`
+
+- **职责:** Diesel ORM 模型 — stock_daily/lhb_daily/analysis_result/stock_position/trades/ledger 六表的 Queryable/Insertable/AsChangeset 结构 + `MaStatus` 均线形态分析。
+- **内部结构:** `StockDaily`/`NewStockDaily`/`UpdateStockDaily`(:26-104);`LhbDaily`(:217);`AnalysisResultRecord`/`NewAnalysisResult`(:242-285);`StockPosition`(:312);`TradeRecord`(:359)。
+- **生产调用链:** `src/database/mod.rs`、`src/database/repository.rs`、`src/trading/paper_engine.rs`、`src/pipeline/position_tracker.rs`;lib.rs:94 对外的 `pub use models::{...}`。
+- **活性:** CURRENT — 所有 DB 读写路径的载体。
+- **问题/缺口:**
+  - `trades` 表 schema 已有 commission/stamp_tax/slippage/realized_pnl/strategy_tag/signal_id 六列（src/schema.rs:155-160)，但 `TradeRecord`/`NewTradeRecord`(:359-383）未映射这些列，归因字段在 ORM 层不可达；
+  - `paper_trades`/`execution_tracking`/`position_adjustments`/`account_mode_log` 四表在 schema.rs 有定义（:90-191）但 models.rs 无对应结构（散落在各专属模块），双轨制。
+
+##### `src/schema.rs`
+
+- **职责:** Diesel CLI 生成的 10 张表 schema(stock_daily/lhb_daily/analysis_result/stock_position/paper_trades/execution_tracking/position_adjustments/trades/ledger/account_mode_log)。
+- **内部结构:** 单文件 201 行，10 个 `table!` + `allow_tables_to_appear_in_same_query!`(:193，仅含 7 表）。
+- **生产调用链:** `src/models.rs:13` → database/repository → 全 DB 路径。
+- **活性:** CURRENT — Diesel 编译期查询检查的根基。
+- **问题/缺口:**
+  - `paper_trades`/`execution_tracking`/`position_adjustments` 未加入 `allow_tables_to_appear_in_same_query!`(:193-201)，跨表 join 编译期不可用；
+  - 与 `src/database/global_schema_v1.rs` 的手写 SQL schema 并存，两套 schema 事实源。
+
+##### `src/traits.rs`
+
+- **职责:** 两个共享 trait:`ScoreDisplay`(sentiment_score → emoji/评级标签）与 `AiContentGenerator`(AI 生成抽象）。
+- **内部结构:** 单文件 95 行，2 个 trait(:31/:83)。
+- **生产调用链:** `src/pipeline/mod.rs:50,206`(AnalysisResult impl)→ 分析报告推送；`src/market_analyzer/mod.rs:20` 把 `AiContentGenerator` re-export 为 `AiAnalyzer`。
+- **活性:** CURRENT — pipeline 评分展示与大盘复盘 AI 抽象在用。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/types.rs`
+
+- **职责:** 领域 newtype 试探 — `StockCode`(6 位 0/3/6 校验）、`Price`、`Percent`；注释自述 "渐进迁移策略：新代码使用 newtype"。
+- **内部结构:** 单文件 69 行，3 个 newtype。
+- **生产调用链:** 无。grep `StockCode::new|types::Price|types::Percent` 全仓零命中（除自身）。
+- **活性:** INACTIVE — 2026-08-16 引入后迁移从未发生，全仓仍用裸 String/f64。
+- **问题/缺口:** 死代码：没有任何生产/测试调用方，"渐进迁移"(src/types.rs:3）从未启动，建议删除或重新立项。
+
+##### `src/enums.rs`
+
+- **职责:** 单一枚举 `ReportType`(Simple/Full，报告格式选择）。
+- **内部结构:** 单文件 60 行，1 枚举 + FromStr + display_name + 2 单测。
+- **生产调用链:** 无。grep `enums::ReportType` 全仓零命中（除自身）；注释称 "用于 API 触发分析"，但无 API 模块消费。
+- **活性:** INACTIVE — 零调用方的孤儿枚举。
+- **问题/缺口:** 死代码：注释承诺的 API 消费者不存在（src/enums.rs:9)，建议删除。
+
+##### `src/errors.rs`
+
+- **职责:** 四个具名错误枚举（ProviderError/DbError/SearchError/TradeError),anyhow 渐进迁移的终点设想。
+- **内部结构:** 单文件 82 行，4 枚举；`TradeError` 含 6 个交易红线变体（:64-82)。
+- **生产调用链:** `TradeError` ← `src/trading/mod.rs:26,130`(DuplicateOrder 实构造）;`DbError` ← `src/database/repository.rs:8`（全文件返回类型）;`ProviderError`/`SearchError` 零调用方。
+- **活性:** CONDITIONAL — 一半（DbError/TradeError）在交易/仓储路径实达，一半（ProviderError/SearchError）是死类型。
+- **问题/缺口:**
+  - `ProviderError`(:9)/`SearchError`(:51）全仓零构造零匹配，死代码；
+  - `TradeError` 6 变体中仅 `DuplicateOrder` 被实际构造（trading/mod.rs:130)，其余 5 变体（资金不足/数量非法/价格超限等）无构造点，写入侧红线校验未落在该类型上。
+
+##### `src/market_data.rs`
+
+- **职责:** 大盘数据结构 — `MarketIndex`（指数）、`MarketOverview`（涨跌家数/板块/涨停榜）、`TopStock`、`SectorInfo`，纯数据 + 少量展示辅助。
+- **内部结构:** `MarketIndex`(:11，含振幅计算）;`MarketOverview`(:108，含 market_mood);`TopStock`(:141);2 单测。
+- **生产调用链:** `src/market_analyzer/*`(indices/async_overview/statistics/review)、`src/pipeline/chain_analysis/*`、`src/bin/monitor/{market_data,intraday_market,auction_input_alerts}.rs`。
+- **活性:** CURRENT — 大盘复盘与 monitor 盘中/竞价链路共用。
+- **问题/缺口:** 未发现明显问题（north_flow 的 None-缺失语义 :126-128 已按 BR-012 修复）。
+
+##### `src/main.rs`
+
+- **职责:** `stock_analysis` CLI 主入口（default-run)—— env 加载、operator 认证闸、日志、DB 初始化、按参数分派五种模式（schedule/chain_analysis/lhb/market_review/默认分析）,SIGINT 优雅关闭。
+- **内部结构:** 单文件 120 行；本地 `mod app; mod cli;`(:15-16)；模式分派 :76-109。
+- **生产调用链:** 自身即入口；调度方式 = **仅手动**(launchd 仅装 monitor/verify/weekly 三个 job;runtime `bin/` 目录无 stock_analysis 二进制）。
+- **活性:** CURRENT — CLI 主流程完整可达（`cargo run` / 手动二进制），但非常驻生产路径。
+- **问题/缺口:**
+  - CLI 路径不调 `config::load_all()`（全仓仅 monitor main.rs:5987 调），五种模式下的 MonitorConfig 全是编译期默认值；
+  - 认证闸（:30）默认禁用，与 auth 模块注释 "monitor 启动前调用" 的承诺错位（真正常驻的 monitor 反而无此闸）。
+
+##### `src/cli.rs`
+
+- **职责:** clap 参数结构 `Args`(debug/dry_run/stocks/schedule/interval/lhb_mode/chain_analysis/deep_analysis 等 16 项）。
+- **内部结构:** 单文件 85 行，1 个 `#[derive(Parser)]` 结构。
+- **生产调用链:** `src/main.rs:35` 解析；同时被库内 `src/app/` 复用（lib.rs:23 注释）;monitor bin 有自己独立参数解析，不用它。
+- **活性:** CURRENT — CLI 每次启动必解析。
+- **问题/缺口:** 未发现明显问题。
+
+###### src/bin/ 全部 binary
+
+##### `src/bin/monitor/` （生产主体）
+
+- **职责:** launchd 常驻实盘监控进程 — 行情扫描、新闻/公告、产业链调度、盘中 intraday 策略、归因、收盘估值、durable delivery、健康检查、飞书推送的总装。
+- **内部结构:** `main.rs`(15026 行，含 40+ 内嵌 mod/测试模块）;`closing_valuation_runtime.rs`(:18 `run_closing_valuation_once`);`health.rs`(152 行启动健康检查）;`durable_delivery_runtime/`(7 文件）;`push_templates/`(8 文件）;`news_ai_shadow.rs`/`intraday_market.rs`/`auction_input_alerts.rs` 等。
+- **生产调用链:** `scripts/launchd/com.stockanalysis.monitor.plist`(KeepAlive=true，指向 release/monitor)→ `main.rs:5555 fn main` → `config::load_all`(:5987)→ `v16_4::register_all`(:6301)→ `health::health_check`(:6304)→ 各时段 loop（收盘估值 :6447/:7661、intraday tick :10250、chain 调度 :10447+)。
+- **活性:** CURRENT — 生产唯一常驻进程。
+- **调度方式:** **launchd 常驻**(KeepAlive,ThrottleInterval=60s)。
+- **问题/缺口:**
+  - main.rs 单文件 15026 行、40+ 内嵌测试模块，可维护性风险集中；
+  - 启动健康检查失败仅告警不阻断（main.rs:6316-6321 error + webhook 后继续），降级运行的边界靠各 loop 自行 fail-closed。
+
+##### `src/bin/weekly_outcome_review.rs` (+ weekly_outcome_review/)
+
+- **用途:** H16 每周选股结果描述性复盘（读分离快照，绝不初始化/回填/发送/改配置）。
+- **调度方式:** **launchd** `com.stockanalysis.weekly-outcome-review` 周五 20:30 → run-weekly-outcome-review.sh → weekly-outcome-review.py（先 ro 备份再跑 JSON+Markdown 双格式）。
+- **活性:** CURRENT — runtime `bin/weekly_outcome_review` 已部署在役。
+- **内部结构:** 主文件 233 行 + `paper_account.rs`/`registry.rs`/`report.rs`/`scorecard.rs`/`tests.rs`。
+- **问题/缺口:** 未发现明显问题（只读快照 + 私有备份设计完整）。
+
+##### `src/bin/assistant_review.rs`
+
+- **用途:** 周报复盘的离线 AI 对比审阅（默认离线，显式 `--model` 才启用受限 assistant 角色）,483 行 + 库内 `src/assistant_review.rs`(66k 行 FrozenPack 体系）。
+- **调度方式:** 设计上是 weekly launchd 的子步骤（repo 版 scripts/run-weekly-outcome-review.sh:9-10 传 `--assistant-binary/--assistant-script`,weekly-outcome-review.py:168-172 条件调用）;**但当前已部署 runtime 的 run-weekly-outcome-review.sh 未带该参数、runtime/bin 也无 assistant_review 二进制** → 实际仅手动。
+- **活性:** CONDITIONAL — 仓库侧接线完成，部署侧未安装；且离线默认。
+- **问题/缺口:** 部署漂移：repo 脚本与 runtime 已装脚本不一致（runtime 版缺 --assistant-binary),weekly 复盘当前不产 AI 对比件。
+
+##### `src/bin/backfill_daily.rs`
+
+- **用途:** stock_daily 停更时一次性全量回填日线（Magic TDX→腾讯→新浪→百度 fallover),`--outcomes` 模式补 outcome 窗口。
+- **调度方式:** **launchd** `com.stockanalysis.prediction-verify` 每日 21:17 → daily_prediction_verify.sh:64（对 prediction_tracker 中尚有 NULL 窗口的证券批量调用）。
+- **活性:** CURRENT — 每日定时任务第一棒。
+- **问题/缺口:** 脚本只汇总退出码，"exit0 不证明窗口成熟/资格到位"(daily_prediction_verify.sh:21-22)，需人工看 backfill-daily.log。
+
+##### `src/bin/backfill_predictions.rs` (+ backfill_predictions/tests.rs)
+
+- **用途:** 按最近已完成上海交易日扫描全部到期 pending 预测并 verify 回填（旧 days 位置参数已弃用）。
+- **调度方式:** **launchd** 同上 21:17 → daily_prediction_verify.sh:76。
+- **活性:** CURRENT — 每日定时任务第二棒。
+- **问题/缺口:** 失败行保持 pending 且仅 stderr 提示（脚本 :83)，无告警通道。
+
+##### `src/bin/import_real_account_snapshot.rs / import_user_account_summary.rs / import_user_position_snapshot.rs`
+
+- **用途:** 三个一次性人工导入器 — BR-103 真实账户快照（用户举证的 evidence manifest)、BR-146 用户确认账户汇总、BR-146+BR-215 用户确认持仓快照（导入后 reconciliation `stock_position` 投影）。
+- **调度方式:** **仅手动**(operator 显式 `--database/--evidence|--summary|--snapshot`)。
+- **活性:** CONDITIONAL — 代码在役但依赖人工举证事件触发；属账户事实源的唯一入口。
+- **问题/缺口:** 无调度无提醒，账户快照过期靠 monitor 侧 stale 门（dq_position_stale_sec 等）间接暴露。
+
+##### `src/bin/paper_account_activate.rs`
+
+- **用途:** 已确认快照的 paper epoch 激活 — preview/apply 两段式，apply 需携带 prepared source hash(89 行薄壳，逻辑在 `trading::paper_snapshot_activation`)。
+- **调度方式:** **仅手动**(operator 仪式）。
+- **活性:** CONDITIONAL — 仅激活窗口期使用；paper 主引擎已被 BR-211 禁用，激活后实际驱动面收窄。
+- **问题/缺口:** 与 BR-211 禁用状态的关系未在 bin 层注释说明，operator 需自行知道当前 paper 链路哪些还活着。
+
+##### `src/bin/run_closing_valuation.rs`
+
+- **用途:** BR-147 一次性收盘估值 runner（用户确认快照 + 已准入未复权收盘价）,230 行。
+- **调度方式:** **仅手动** — 生产收盘估值由 monitor 内嵌 `closing_valuation_runtime::run_closing_valuation_once`(main.rs:6447/:7661）自动执行，该 bin 是独立补跑/审计入口。
+- **活性:** CONDITIONAL — 手动补跑工具，与 monitor 内嵌路径同源不同入口。
+- **问题/缺口:** 双入口（monitor 内嵌 vs 独立 bin）各自维护调用装配，长期有漂移风险（bin 用 `portfolio::closing_valuation`,monitor 用 closing_valuation_runtime 模块）。
+
+##### `src/bin/confirm_daily_change.rs`
+
+- **用途:** BR-171 离线审阅持久化的日度变更候选，operator 确认/拒绝只绑定原候选与 token，绝不重取 RPC 数据。
+- **调度方式:** **仅手动**（交互式 stdin 确认）。
+- **活性:** CONDITIONAL — 有候选才需要跑；属每日变更治理的人工闸门。
+- **问题/缺口:** 未发现明显问题（证据绑定设计明确）。
+
+##### `src/bin/resolve_stale_uncertain.rs`
+
+- **用途:** 2026-09-21 一次性处置：把卡死的 `UncertainManualReview` HoldingPlan 决议置为 Rejected，释放 cooldown head 让当日周期可重新准入。
+- **调度方式:** **仅手动（已执行过的一次性工具）**。
+- **活性:** INACTIVE — 头部注释自述为 2026-09-21 单次事件（:1-6)，目的已达成，保留作审计。
+- **问题/缺口:** 一次性工具滞留 bin 目录，无清理机制（同类还有 migrate_selection_v2)。
+
+##### `src/bin/selection_activation_prepare.rs`
+
+- **用途:** BR-183/193 selection-v2 激活材料准备仪式（seal-board 封存板块绑定 / print-activation 输出 expected_config_hash + activation JSON，全 src+config 可执行指纹）。
+- **调度方式:** **仅手动**(operator 仪式，TDX 不可用即 fail-closed)。
+- **活性:** CONDITIONAL — 仅 selection 激活/再激活时使用；激活消费方在 monitor。
+- **问题/缺口:** executable_revision 覆盖全 src+config(:16-17)，任何无关代码改动都使 hash 失效，仪式成本高（设计使然，但无增量豁免）。
+
+##### `src/bin/migrate_selection_v2.rs`
+
+- **用途:** BR-180 固定根、fail-closed 的 selection-v2 schema 迁移命令（16 行薄壳，逻辑在 `database::run_selection_v2_migration_command`)。
+- **调度方式:** **仅手动（一次性迁移）**。
+- **活性:** CONDITIONAL — 迁移完成后即休眠，拒绝重复执行的 fail-closed 设计使其天然一次性。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/bin/chain_schedule_resolve.rs`
+
+- **用途:** 人工检视/解決 chain 报告定时发送的 uncertain 状态（查外部渠道日志后置 delivered/retry),**自身绝不发送通知**。
+- **调度方式:** **仅手动**。
+- **活性:** CONDITIONAL — 仅当 monitor 的 chain 调度（main.rs:10447+）留下 uncertain 存根时使用。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/bin/day_capture_check.rs`
+
+- **用途:** 有界离线观察 — 读事件 JSONL(≤64MB/10 万行上限）跑止损检查重放，无 publisher/DB/时钟/provider。
+- **调度方式:** **仅手动**(goal-first 交付包成员，prepare_goal_first_delivery.py:17 BINS 列表，无 launchd 条目）。
+- **活性:** CONDITIONAL — 离线取证工具，按需手动。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/bin/durable_schema14_snapshot_check.rs`
+
+- **用途:** schema14 扩展的只读预检 — 只接受无 WAL/SHM 的隔离封存副本，绝不指向活库、不做迁移/批准。
+- **调度方式:** **仅手动**（上线前仪式）。
+- **活性:** CONDITIONAL — schema 演进窗口使用。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/bin/attribution_backfill.rs`
+
+- **用途:** BR-255 归因手动补跑 — 生产归因只在 15:05-15:20 窗口自动执行，窗口错过（如上游崩溃）当天永久缺失，本工具事后补算；早于 epoch effective_date 的日期走只读重建。
+- **调度方式:** **仅手动**。
+- **活性:** CONDITIONAL — 故障补偿工具，2026-09-01 实战使用过。
+- **问题/缺口:** 工具自己不激活 epoch(:19-21 注释明确），operator 需严格遵守 "激活归生产 15:35-15:50 tick" 的分工，误用代价是占用唯一激活额度。
+
+##### `src/bin/strategy_attribution.rs`
+
+- **用途:** BR-251 中文买卖策略历史归因 CLI(2849 行，全 bin 目录最大）—— 只读重放 verified 日历范围、HS300 基准对比、epoch 绑定报告。
+- **调度方式:** **仅手动**。
+- **活性:** CONDITIONAL — 研究/审计按需；依赖 `calendar::resolve_verified_*` 不可变权威。
+- **问题/缺口:** 2849 行单文件 CLI，子命令/报告/格式化全堆一处，维护面大。
+
+##### `src/bin/backfill_catalyst_watchlist.rs`
+
+- **用途:** T+1 关注票名单快照一次性回填（取"最早落库"visible batch 忠实还原推送当晚名单，内容哈希幂等）。
+- **调度方式:** **仅手动**(R-13 首推前使用）。
+- **活性:** CONDITIONAL — 补数工具，71 行薄壳。
+- **问题/缺口:** 未发现明显问题。
+
+##### `src/bin/paper_adjudication_preview.rs`
+
+- **用途:** paper adjudication 的只读 operator 预览（apply 裁决是另一个独立动作，Task10)。
+- **调度方式:** **仅手动**。
+- **活性:** CONDITIONAL — 依赖 paper 链路；BR-211 禁用后适用面收窄。
+- **问题/缺口:** 与 BR-211 禁用状态的关系同 paper_account_activate，未在 bin 层标注。
+
+##### `src/bin/sell_reminder_producer.rs / sell_reminder_preview.rs`
+
+- **用途:** 独立盘后卖出提醒 — producer 在 15:02 产观察包（来源未准入即 NotReady，只读无发送）;preview 离线只读预览（显式快照/观察包输入）。
+- **调度方式:** **仅手动** — 两者在 goal-first 交付清单（prepare_goal_first_delivery.py:17)，但无任何 launchd/cron 条目；docs/Project_Architecture_Blueprint.md:268 归入 "生产运维（手动）"。
+- **活性:** CONDITIONAL — 属 offline_products 体系，等待调度接线或保持手动。
+- **问题/缺口:** "15:02 producer" 的时间语义靠人工遵守，无调度器保证；runtime/bin 当前未部署这两个二进制。
+
+##### 11 个 probe（一次性合并卡片）
+
+- **用途与调度:**（全部 **仅手动** 诊断/探针，零 launchd/零脚本引用）
+  - `account_metrics_probe.rs`(443 行）— 账户模式 metrics 装配只读探针（2026-09-21 评估 #12)。
+  - `announcement_probe.rs`(75 行）— 验证 cninfo 公告批次排序（最新优先 vs 正序）。
+  - `board_directory_probe.rs`(41 行）— TDX 概念板块目录打印，A-11 关键词校准。
+  - `economic_position_probe.rs`(156 行）— BR-248 经济仓位只读历史探针（READ_ONLY 打开）。
+  - `gateway_quote_probe.rs`(38 行）— 验证 TDX→腾讯→新浪 fallover 的 Quote 能力链。
+  - `grpc_bundle_probe.rs`(1255 行）— 认证 bundle 的 opening-readiness + 选定原生查询探针（脱敏）。
+  - `grpc_candidate_bundle_probe.rs`(561 行 + tests.rs)— 候选 bundle 显式诊断，不得选定生产 provider。
+  - `grpc_failure_probe.rs`(371 行）— loopback 单发 LocalBridgeV1 flow + GetHealth 失败诊断。
+  - `grpc_local_readiness_probe.rs`(423 行）— 本地 gRPC 通道就绪探针（4 必备 Operation 准入摘要）。
+  - `historical_observed_probe.rs`(192 行）— 单次精确窗口历史观察入隔离证据目录。
+  - `src/bin/monitor/data_mode_probe.rs`(monitor 内嵌模块，非独立 bin)— BR-148 capability 探针接缝，随 monitor 主进程编译（`main.rs:162 mod data_mode_probe`),`#[allow(dead_code)]` 标注显示生产接线是占位式。
+- **活性:** 前 10 个 CONDITIONAL（排障/验收时手动跑，grpc_* 系列近期随 BR-196 交付活跃）;data_mode_probe 是 monitor 的 CONDITIONAL 内嵌件。
+- **问题/缺口:** probe 无统一登记处，新 operator 只能从文件名猜用途；grpc_bundle_probe 1255 行已超 "探针" 体量，接近半个验收工具。
+
+##### 研究/回测/开发 bin（合并卡片）
+
+- **用途与调度:**（全部 **仅手动**，无自动化引用）
+  - `boll_macd_backtest.rs`(394 行）— 布林+MACD 信号在 136 笔已平仓数据上的胜率回测。
+  - `rsi_optimize.rs`(670 行）— RSI 策略 preset 迭代对比，结果追加 reports/rsi_optimization_log.md。
+  - `winrate_simulator.rs`(427 行）— 基于 prediction_tracker 已 verify 数据模拟 "关停 X 主题后胜率"（带 operator 认证闸 :101)。
+  - `streak_leader_research.rs`(170 行）— StreakLeader 离线观察/研究导出（goal-first 交付包成员）。
+  - `produce_winrate_samples.rs`(229 行）— BR-017 从 prediction_tracker 导出已验证胜率样本。
+  - `deep_analyze.rs`(39 行）— 单股多角色 AI 深研 CLI，走生产同款 deep_analyzer::run_and_save。
+  - `agent_test.rs`(211 行）— Agent 工具链（财务/筹码/资金流/新闻/研报/板块）手动联调。
+  - `v14_e2e.rs`(397 行）— v14.2 七层推送架构（L1→L4→L5→L6→L7）端到端实测。
+  - `lhb_query.rs`(154 行，不在任务清单但同目录）— BR-162 龙虎榜证据保留查询。
+- **活性:** 全部 CONDITIONAL — 研究期活跃、无生产消费者；其中 agent_test/v14_e2e 接近一次性验收工具。
+- **问题/缺口:** 回测三件套（boll_macd/rsi/winrate）与样本导出（produce_winrate_samples）口径各自为政，无共享胜率计算库；研究结论靠 reports/*.md 人工沉淀，无回收机制。
+
+> **本组总评:** 顶层支撑文件整体健康且在监控主循环实达（calendar/config/models/schema/market_data/util/http_client/production_root 均 CURRENT)，但存在三块明确的死重：`types.rs` 与 `enums.rs` 零调用方，`errors.rs` 半数变体/枚举从未构造，`bus` 三总线空转、`registry` 注册后无人路由（策略分发仍硬编码）。bin 层的调度事实清晰：launchd 仅三条自动链（monitor 常驻、每日 21:17 的 backfill_daily+backfill_predictions、周五 20:30 的 weekly_outcome_review)，其余 30+ 工具全部手动；值得注意的部署漂移是 repo 版 weekly 脚本已接线 assistant_review 而 runtime 已装版本尚未跟上。
+
+> 备注:agent-14 组内 `# 顶层支撑散文件` 与 `# src/bin/ 全部 binary` 两个分组小标题以六级标题保留;该组 src/bin 各卡片按其任务口径使用「用途/调度方式」等字段(而非统一的五字段卡片),已原样保留;`src/opportunity/` 活性判定词为「混合型」,11 个 probe 与研究 bin 两张合并卡片的活性表述亦非单一判定词,HTML 侧仅对「活性」字段内首个 CURRENT/CONDITIONAL/INACTIVE 判定词着 status-chip,正文中的英文不转换;各 subagent 块的序言客套行、agent-7/agent-13 的组标题行与块内 `---` 分隔线不含事实内容,未纳入。11 组卡片齐全,无缺卡、无格式破损。
+
+**一句话:**数据流入(接入/准入)与推送流出(投递域)是机构级且活得好;中间的价值生产段(新闻理解、技术信号、选股排序、真实交易)要么常数分占位、要么死代码、要么断流;复盘环骨架齐全但多数 Disabled 或停更。能量流向是「采集 → 审计 → 推送」,而不是「分析 → 决策 → 收益归因」。
+
 ## 3. C4 Level 1：系统上下文
 
 ```mermaid
