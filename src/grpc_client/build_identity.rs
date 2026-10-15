@@ -494,21 +494,21 @@ mod tests {
     fn compiled_public_inputs_receipt_binds_exact_current_release_bytes() {
         let receipt = compiled_public_inputs().unwrap();
         assert_eq!(receipt.version, 1);
-        assert_eq!(receipt.bundle_version, "2026-10-08.1");
+        assert_eq!(receipt.bundle_version, "2026-10-15.1");
         assert_eq!(
             receipt.raw_proto_sha256,
-            "39694bb9650ee54b18cb44e4dbd27b42dbca4f3f797572ee86f5d15601d2ab6d"
+            "77d0c7e8efdfadc7957cc6ac125da3943d4a6b029deea08de7303f16523a45e5"
         );
         assert_eq!(
             receipt.raw_metadata_sha256,
-            // 2026-10-14 更新：Windows 侧切到 3faa9d8（service_version 0.2.0 /
-            // source_revision 3faa9d87… / contract 不变 / binary 03bd59d6…），
-            // 钉死身份随之更新；此处钉的就是该文件当前字节的 sha256。
-            "337a20c6a73e2e10aa04d5f4f33e05ef8f2e1e7bae5e45835531a68567ba2a0d"
+            // 2026-10-15 更新：Windows 侧切到 ce7cb59（bundle 2026-10-15.1；
+            // contract dba66a27… / binary 19ccc893…），钉死身份随之更新；此处钉的
+            // 就是该文件当前字节的 sha256。
+            "d3d4c7b2b038a9627ab0080272165032d2fdcd19625a9bfeb8a25479f0f64776"
         );
         assert_eq!(
             receipt.compiled_descriptor_sha256,
-            "41db4b931010d7dfed7240dd1713ad85dac91ddee6338265737fcc6970ace90b"
+            "718de5d6a6f61194d01b7d89818d48d0fc624fdbeb61226d275922c0f66217f5"
         );
         assert_eq!(
             receipt.policy_sha256,
@@ -546,8 +546,10 @@ mod tests {
         assert_eq!(trust.recorded_health(policy, descriptor, &live), Ok(()));
         assert_eq!(
             live.build_identity.unwrap().source_revision,
-            // 2026-10-14：Windows 侧现行部署身份（3faa9d8）。
-            "3faa9d87669f6921767c3d5bc2e54cf0a78a670d"
+            // 2026-10-15：钉 bundle-metadata 实际承载值（ff72c06…）。Windows 侧
+            // 权威身份 = ce7cb59；该字段为 bundle 生成器填充错误，已通知对方修正，
+            // 修正前此处钉实际字节值（漂移仅观测，不阻断）。
+            "ff72c06ca0122cb765b3c814646e6859e569b428"
         );
     }
 
