@@ -2262,7 +2262,7 @@ const REQUIRED_SQLITE_CONFIGURATION: SqliteConnectionConfiguration =
     SqliteConnectionConfiguration {
         foreign_keys: 1,
         synchronous: 2,
-        busy_timeout: 5_000,
+        busy_timeout: 30_000,
         wal_autocheckpoint: 1_000,
     };
 
@@ -2276,7 +2276,7 @@ struct ReadonlySqliteConnectionConfiguration {
 const REQUIRED_READONLY_SQLITE_CONFIGURATION: ReadonlySqliteConnectionConfiguration =
     ReadonlySqliteConnectionConfiguration {
         foreign_keys: 1,
-        busy_timeout: 5_000,
+        busy_timeout: 30_000,
         query_only: 1,
     };
 
@@ -2313,7 +2313,7 @@ fn invalid_input(error: String) -> std::io::Error {
 fn configure_sqlite_connection(conn: &mut SqliteConnection) -> Result<(), ConnectionManagerError> {
     for (label, statement) in [
         ("foreign_keys=ON", "PRAGMA foreign_keys = ON"),
-        ("busy_timeout=5000", "PRAGMA busy_timeout = 5000"),
+        ("busy_timeout=30000", "PRAGMA busy_timeout = 30000"),
         ("synchronous=FULL", "PRAGMA synchronous = FULL"),
         (
             "wal_autocheckpoint=1000",
@@ -2337,7 +2337,7 @@ fn configure_readonly_sqlite_connection(
     for (label, statement) in [
         ("query_only=ON", "PRAGMA query_only = ON"),
         ("foreign_keys=ON", "PRAGMA foreign_keys = ON"),
-        ("busy_timeout=5000", "PRAGMA busy_timeout = 5000"),
+        ("busy_timeout=30000", "PRAGMA busy_timeout = 30000"),
     ] {
         diesel::sql_query(statement)
             .execute(conn)
@@ -2937,7 +2937,7 @@ impl DatabaseManager {
 
         // Close the bootstrap before creating either real descriptor pool.
         let mut bootstrap = SqliteConnection::establish(&origin.path.to_string_lossy())?;
-        diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut bootstrap)?;
+        diesel::sql_query("PRAGMA busy_timeout = 30000").execute(&mut bootstrap)?;
         let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
             .get_result::<JournalModeRow>(&mut bootstrap)?
             .journal_mode;
@@ -3006,7 +3006,7 @@ impl DatabaseManager {
         // WAL is database-wide and requires a lock. Configure it once before
         // r2d2 opens connections concurrently.
         let mut bootstrap_conn = SqliteConnection::establish(&database_url)?;
-        diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut bootstrap_conn)?;
+        diesel::sql_query("PRAGMA busy_timeout = 30000").execute(&mut bootstrap_conn)?;
         let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
             .get_result::<JournalModeRow>(&mut bootstrap_conn)?
             .journal_mode;
@@ -3056,7 +3056,7 @@ impl DatabaseManager {
         );
 
         info!(
-            "SQLite PRAGMAs 已设置: WAL + foreign_keys=ON + synchronous=FULL + busy_timeout=5000"
+            "SQLite PRAGMAs 已设置: WAL + foreign_keys=ON + synchronous=FULL + busy_timeout=30000"
         );
 
         // 创建 agent_scratchpad 表 (Agent 内部思考和工具执行记录)
@@ -5713,7 +5713,7 @@ mod tests {
             .expect("read configured wal_autocheckpoint")
             .wal_autocheckpoint;
 
-        assert_eq!(busy_timeout, 5000);
+        assert_eq!(busy_timeout, 30000);
         assert_eq!(foreign_keys, 1);
         assert_eq!(synchronous, 2);
         assert_eq!(wal_autocheckpoint, 1000);
