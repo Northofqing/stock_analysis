@@ -196,6 +196,27 @@ impl NotificationService {
             .await
     }
 
+    /// 2026-10-15 用户决策: 产业链报告「整理简化 → 只推飞书 (magiclaw CLI)」。
+    ///
+    /// 与 [`Self::send_report_observing_http_bodies`] 的差异:
+    /// - 不做 `available_channels` 探测, 固定单渠道 Feishu CLI (`magiclaw send`);
+    /// - payload 为调用方给定的文本 (报告简化版), 不发送完整报告;
+    /// - 返回的报告记录单条 Feishu attempt: CLI 退出码 0 → Accepted → 调度
+    ///   状态机得到 `AllAccepted` (弱接受), 与原邮件弱接受语义一致; 失败 →
+    ///   Unknown → `AllFailed`, 发送窗口保持开放供重试。
+    pub async fn send_report_via_feishu_cli(&self, text: &str) -> NotificationSendReport {
+        let mut attempts = Vec::new();
+        let result = match super::feishu_cli::send_text_to_feishu(text).await {
+            Ok(()) => Ok(true),
+            Err(detail) => {
+                error!("[产业链][飞书] magiclaw CLI 发送失败: {detail}");
+                Ok(false)
+            }
+        };
+        observe_attempt(&mut attempts, NotificationChannel::Feishu, result);
+        NotificationSendReport::from_attempts(attempts)
+    }
+
     async fn send_report_inner(
         &self,
         content: &str,

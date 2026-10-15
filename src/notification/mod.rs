@@ -20,6 +20,7 @@
 pub mod config;
 pub mod email;
 pub mod feishu;
+pub mod feishu_cli;
 mod http_body_observation;
 pub mod report;
 pub mod send_report;

@@ -1419,6 +1419,64 @@ mod report_focus_tests {
         );
         assert!(report.contains("不表示行情或交易条件已满足"));
     }
+
+    #[test]
+    fn simplify_report_for_push_keeps_decision_sections_and_caps_mainline_rows() {
+        let full = "\
+# 产业链主线决策参考 2026-10-15
+
+## 先看三项重点
+
+完整评分与结论：1 / 3 个概念分组。 已有完整分析均未达到报告 60 分门槛，不能据此形成参与结论。
+
+1. **主线甲**：模型评分 70/100，涨停 3 只，近 10 自然日出现 2 天。
+
+> 涨停 **6** 只｜主线 **3** 条（深度分析 0 条 + 简化分析 1 条）｜孤立 **0** 只。概念标签来自东财 F10 存在蹭概念污染，结论为倾向性参考而非交易指令。
+
+## 一页纸决策摘要
+
+| 主线 | 涨停数 | 近10自然日上榜 | 评分 | 阶段 | 参与 | 补涨候选 |
+|---|---|---|---|---|---|---|
+| 主线甲 | 3 | 2天 | 70 | 发酵 | 参与 | 数据不可用 |
+| 主线乙 | 2 | 1天 | 55 | 扩散 | 观望 | 数据不可用 |
+| 主线丙 | 1 | 1天 | 40 | 首日启动 | 回避 | 数据不可用 |
+
+## 补涨候选数据状态
+
+- **主线甲**：（冗长噪声，不应出现在简化版）
+
+## 持仓主线诊断
+
+| 持仓 | 收益% | 今日涨停 | 主线归属 | 主线评分 | 近10自然日上榜 |
+|---|---|---|---|---|---|
+| 测试股(600000) | 暂无 | — | 主线甲 | 70 | 2天 |
+
+## 今日主线全景研判
+
+### 核心矛盾与主线优先级
+
+（LLM 长文，不应出现在简化版）
+";
+        let simplified = simplify_report_for_push(full, 2);
+        assert!(simplified.starts_with("# 产业链主线决策参考 2026-10-15"));
+        assert!(simplified.contains("> 涨停 **6** 只"));
+        assert!(simplified.contains("## 先看三项重点"));
+        assert!(simplified.contains("1. **主线甲**：模型评分 70/100"));
+        assert!(simplified.contains("## 一页纸决策摘要"));
+        assert!(simplified.contains("| 主线甲 | 3 |"));
+        assert!(simplified.contains("| 主线乙 | 2 |"));
+        assert!(
+            !simplified.contains("| 主线丙 | 1 |"),
+            "超出 max_mainlines 的数据行必须省略"
+        );
+        assert!(simplified.contains("共 3 条主线"));
+        assert!(simplified.contains("## 持仓主线诊断"));
+        assert!(simplified.contains("测试股(600000)"));
+        assert!(!simplified.contains("## 补涨候选数据状态"));
+        assert!(!simplified.contains("冗长噪声"));
+        assert!(!simplified.contains("## 今日主线全景研判"));
+        assert!(!simplified.contains("LLM 长文"));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1697,6 +1755,73 @@ fn build_report(
 
     md.push_str("---\n*报告由产业链联动分析模块自动生成。评分基于 LLM 对五维指标的评估，为倾向性参考而非交易指令。孤立涨停的一日游风险显著高于主线内涨停；主线内 [C] 级标的请勿当作产业链逻辑成立的依据。*\n");
     md
+}
+
+/// 2026-10-15 用户决策: 产业链报告「整理简化 → 推送到 magiclaw CLI (飞书)」。
+///
+/// 完整 `build_report` 输出仍走邮件 (NotificationService); 飞书推送保留
+/// 决策最相关的部分:
+///   1. 标题行 (`# 产业链主线决策参考 ...`)
+///   2. 统计行 (`> 涨停 N 只｜主线 M 条 ...`)
+///   3. 「## 先看三项重点」整段 (模型评分焦点)
+///   4. 「## 一页纸决策摘要」表 (表头 + 前 `max_mainlines` 行 + 省略提示)
+///   5. 「## 持仓主线诊断」整段 (若有)
+///
+/// 章节缺失时优雅跳过, 不 panic; 输入为 `build_report` 的输出。
+pub fn simplify_report_for_push(full: &str, max_mainlines: usize) -> String {
+    fn section_range(lines: &[&str], name: &str) -> Option<(usize, usize)> {
+        let heading = format!("## {name}");
+        let start = lines.iter().position(|line| *line == heading)?;
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.starts_with("## "))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(lines.len());
+        Some((start, end))
+    }
+
+    let lines: Vec<&str> = full.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+
+    if let Some(title) = lines.iter().find(|line| line.starts_with("# ")) {
+        out.push(title.to_string());
+    }
+    if let Some(stat) = lines.iter().find(|line| line.starts_with("> 涨停")) {
+        out.push(String::new());
+        out.push(stat.to_string());
+    }
+
+    if let Some((start, end)) = section_range(&lines, "先看三项重点") {
+        out.push(String::new());
+        out.extend(lines[start..end].iter().map(|line| line.to_string()));
+    }
+
+    if let Some((start, end)) = section_range(&lines, "一页纸决策摘要") {
+        out.push(String::new());
+        out.push(lines[start].to_string());
+        out.push(String::new());
+        let table: Vec<&str> = lines[start + 1..end]
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with('|'))
+            .collect();
+        // 前两行是表头与分隔行, 其余为数据行。
+        let data_rows = table.len().saturating_sub(2);
+        let kept = data_rows.min(max_mainlines);
+        for line in table.iter().take(2 + kept) {
+            out.push((*line).to_string());
+        }
+        if data_rows > kept {
+            out.push(format!("…（共 {data_rows} 条主线，完整表格见邮件报告）"));
+        }
+    }
+
+    if let Some((start, end)) = section_range(&lines, "持仓主线诊断") {
+        out.push(String::new());
+        out.extend(lines[start..end].iter().map(|line| line.to_string()));
+    }
+
+    out.join("\n")
 }
 
 #[cfg(test)]

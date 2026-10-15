@@ -3567,6 +3567,63 @@ pub async fn push_wechat(text: &str) -> bool {
     }
 }
 
+/// 2026-10-15 用户决策: 产业链报告「整理简化 → 推送到 magiclaw CLI (飞书)」。
+///
+/// 调度器 (`chain_schedule`) 把完整报告写到 `reports/chain_analysis_schedule_{date}_{phase}_*.md`
+/// (cwd = 运行根)。本函数找该 phase/日期的最新报告文件, 抽取决策核心
+/// (`simplify_report_for_push`), 经 [`push_wechat`] (SEND_TYPE=feishu → magiclaw CLI)
+/// 推送。失败只返回 false 并记日志, 不影响邮件主路径。
+pub async fn push_chain_report_simplified(phase: &str, date: &str) -> bool {
+    let dir = std::path::Path::new("reports");
+    let prefix = format!("chain_analysis_schedule_{date}_{phase}_");
+    let newest = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".md"))
+            })
+            .max_by_key(|entry| entry.file_name()),
+        Err(error) => {
+            log::error!(
+                "[产业链][飞书简化] 读取报告目录失败 dir={} error={error}",
+                dir.display()
+            );
+            return false;
+        }
+    };
+    let Some(entry) = newest else {
+        log::warn!("[产业链][飞书简化] 未找到报告文件 prefix={prefix} (跳过简化推送)");
+        return false;
+    };
+    let path = entry.path();
+    let full = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            log::error!(
+                "[产业链][飞书简化] 读取报告失败 path={} error={error}",
+                path.display()
+            );
+            return false;
+        }
+    };
+    let simplified =
+        stock_analysis::pipeline::chain_analysis::simplify_report_for_push(&full, 8);
+    if simplified.trim().is_empty() {
+        log::warn!("[产业链][飞书简化] 简化结果为空, 跳过推送");
+        return false;
+    }
+    log::info!(
+        "[产业链][飞书简化] 推送简化版 ({} -> {} 字符) path={}",
+        full.chars().count(),
+        simplified.chars().count(),
+        path.display()
+    );
+    push_wechat(&simplified).await
+}
+
 async fn push_wechat_with_attempt_marker(
     text: &str,
     mut marker: Option<&mut dyn PhysicalSinkAttemptMarker>,

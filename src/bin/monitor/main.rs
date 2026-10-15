@@ -10541,7 +10541,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 .await
                 {
                     Ok(ChainScheduleOutcome::WeakAccepted) => log::info!(
-                        "[产业链][盘后15:30] 新闻+AI 链分析完成，渠道弱接受 (date={})",
+                        "[产业链][盘后15:30] 新闻+AI 链分析完成，飞书弱接受 (date={})",
                         today
                     ),
                     Ok(ChainScheduleOutcome::AlreadyClosed) => {}
@@ -10568,6 +10568,42 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     Err(error) => log::error!(
                         "[产业链][盘后15:30] 错过窗口记录失败 date={}: {error}", chain_today
                     ),
+                }
+            }
+            // 2026-10-15 用户决策 B: 每日选股/候选清单 → 飞书 (盘前 9:16, 集合竞价)。
+            // 候选台装配依赖实时行情批次 (5 秒新鲜度门): 收盘 15:35 后 provider 停更
+            // (source_at 冻结 → quote_stale → 全 provider 熔断), 盘后无法装配;
+            // 集合竞价 9:15 起行情新鲜可用, 此时 chain_daily 为昨日落库的最新主线。
+            // static 日期去重; 失败保留重试资格 (下一 tick 重试, 窗口内)。
+            if calendar::is_trading_day(chain_today)
+                && chain_now.time()
+                    >= chrono::NaiveTime::from_hms_opt(9, 16, 0)
+                        .expect("valid daily candidate window")
+                && chain_now.time()
+                    < chrono::NaiveTime::from_hms_opt(9, 30, 0)
+                        .expect("valid daily candidate window")
+            {
+                static DAILY_CANDIDATE_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                    std::sync::Mutex::new(None);
+                let already = DAILY_CANDIDATE_LAST
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|d| d == chain_today)
+                    .unwrap_or(false);
+                if !already {
+                    match push_templates::dispatch_daily_candidate_board_to_feishu().await {
+                        Ok(true) => {
+                            *DAILY_CANDIDATE_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(chain_today);
+                            log::info!("[每日候选] 候选清单已推送 date={chain_today}");
+                        }
+                        Ok(false) => log::warn!(
+                            "[每日候选] 候选清单未推送 (空表或投递失败), 保留重试 date={chain_today}"
+                        ),
+                        Err(error) => log::warn!(
+                            "[每日候选] 候选台装配失败, 保留重试 date={chain_today}: {error}"
+                        ),
+                    }
                 }
             }
             // Compare policies after the legacy send and missed-window paths.
@@ -11251,12 +11287,17 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             }
             // BR-021 §5.10 / commit 08cca47 + caller wire: 8:30 盘前重置 cron.
             // 调一次 push_account_mode_change 触发 evaluate(), 内部 should_reset_at_8_30
-            // (Frozen + 8:30 窗口) → 强制 prev=None → evaluate 重判 → 落库 + 推 T-01.
+            // (Frozen + 盘前窗口) → 强制 prev=None → evaluate 重判 → 落库 + 推 T-01.
             // 用 Mutex<Option<NaiveDate>> 防当日重复 (跟 15:05 / 15:30 同 pattern).
-            // 2026-08-07 用户决策 (补偿原则): 错过 8:30 不放弃 — 条件放宽为
-            // "本地时间 >= 8:30 且当日未跑" (含启动时补偿: 8:30 后启动会立即
-            // 补做当日重置)。8:30 之前启动时仍需等到 8:30 (重置语义依赖
-            // 盘前窗口)。仅约束: 当日一次 + 失败保留重试。
+            // 2026-08-07 用户决策 (补偿原则): 错过 8:30 不放弃 — 外层条件放宽为
+            // "本地时间 >= 8:30 且当日未跑"; 内层由 lib 的 should_reset_at_8_30
+            // 限定在盘前窗口 [08:30:00, 09:15:00) 内, 因此 8:31-9:14:59 之间起来
+            // 的进程仍能补做当日重置 (2026-10-14 修正: 原来内层是 1 分钟窗口,
+            // 会把这份补偿抵消掉, 只要 08:30:00-08:30:59 那一分钟不在位就静默
+            // 丢掉当日机会 — 见 src/risk/account_mode.rs 该函数文档)。
+            // 09:15 (集合竞价) 之后不再补做: 盘中触发的 Frozen 必须粘滞到下一
+            // 交易日盘前 (fail-closed), 不能当日被清。8:30 之前启动时仍需等到 8:30。
+            // 仅约束: 当日一次 + 失败保留重试。
             if now.time() >= chrono::NaiveTime::from_hms_opt(8, 30, 0).unwrap() {
                 static BR021_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> =
                     std::sync::Mutex::new(None);
@@ -11298,7 +11339,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 .await
                 {
                     Ok(ChainScheduleOutcome::WeakAccepted) => log::info!(
-                        "[产业链][盘前9:05] 新闻+AI 链分析完成，渠道弱接受 (date={})",
+                        "[产业链][盘前9:05] 新闻+AI 链分析完成，飞书弱接受 (date={})",
                         today
                     ),
                     Ok(ChainScheduleOutcome::AlreadyClosed) => {}
@@ -11716,26 +11757,20 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let limit_pool_date = chrono::Local::now().date_naive();
                         let auction_hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
                         let notified_at_tick_start = auction_vol_notified.clone();
-                        // 保留完整tick（含原始来源观察），供P-02借用。
-                        // 不在这里拆走两个投影字段后丢弃同次采集的证据。
+                        // v37-op61: P-02 竞价量能榜改用 op 61（CurrentAuctionObservations）竞价观测。
+                        // 竞价时段当日涨停池为空（涨停是盘中形成），票列表改用昨日涨停池，
+                        // op 61 拿竞价量比。op 61 是 async，直接 await（不再 spawn_blocking 包 sync 涨停池）。
                         let auction_tick_data =
-                            match tokio::task::spawn_blocking(move || -> Result<_, String> {
-                                push_templates::load_auction_volume_tick_real(
-                                    &auction_hhmm,
-                                    limit_pool_date,
-                                    &notified_at_tick_start,
-                                )
-                            })
+                            match push_templates::load_auction_volume_tick_from_auction_observations(
+                                &auction_hhmm,
+                                limit_pool_date,
+                                &notified_at_tick_start,
+                            )
                             .await
                             {
-                                Ok(Ok(tick_data)) => Some(tick_data),
-                                Ok(Err(error)) => {
-                                    log::error!("[竞价] 涨停池批次拒绝: {}", error);
-                                    auction_input_alerts::volume_failure(chrono::Utc::now()).await;
-                                    None
-                                }
+                                Ok(tick_data) => Some(tick_data),
                                 Err(error) => {
-                                    log::error!("[竞价] 涨停池后台任务失败: {}", error);
+                                    log::error!("[竞价] 竞价观测批次拒绝: {}", error);
                                     auction_input_alerts::volume_failure(chrono::Utc::now()).await;
                                     None
                                 }

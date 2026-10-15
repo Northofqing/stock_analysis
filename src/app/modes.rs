@@ -266,7 +266,11 @@ async fn run_chain_analysis_mode_with_observation_inner(
 
     let notifier = std::sync::Arc::new(NotificationService::from_env());
     let save_notifier = notifier.clone();
-    let available = notifier.is_available();
+    // 2026-10-15 用户决策: 产业链报告「整理简化 → 只推飞书 (magiclaw CLI)」。
+    //   渠道判定从多渠道探测 (NotificationService::is_available) 改为
+    //   "飞书 CLI 收件人已配置", 与 send_report_via_feishu_cli 的真实发送
+    //   路径一致; 未配置时 NoConfiguredChannel 抑制 (保持窗口开放供重试)。
+    let available = stock_analysis::notification::feishu_cli::resolve_feishu_target().is_some();
     // 文件名带时段: 9:05 盘前 (business_date=昨日) / 15:30 盘后 (当日) / CLI
     // 各时段独立文件, 避免 9:05 盘前报告覆盖昨日盘后报告 (2026-08-07 接入时间线)。
     let default_filename = format!(
@@ -283,22 +287,14 @@ async fn run_chain_analysis_mode_with_observation_inner(
         before_send,
         move |report| {
             Box::pin(async move {
-                let mut wechat_observation =
-                    stock_analysis::notification::WechatHttpBodyObservation::default();
-                let mut feishu_observation =
-                    stock_analysis::notification::FeishuHttpBodyObservation::default();
-                let result = notifier
-                    .send_report_observing_http_bodies(
-                        report,
-                        &mut wechat_observation,
-                        &mut feishu_observation,
-                    )
-                    .await;
-                Ok(ChainSendResult::from_report(
-                    result,
-                    wechat_observation.finish(),
-                    feishu_observation.finish(),
-                ))
+                // 2026-10-15 用户决策: 产业链报告「整理简化 → 只推飞书 (magiclaw CLI)」。
+                //   完整报告仍写入 reports/ 文件留档; 推送 payload 为简化版
+                //   (标题+统计+焦点+摘要 Top8+持仓主线), 不再走 NotificationService
+                //   的多渠道 (邮件等)。
+                let simplified =
+                    stock_analysis::pipeline::chain_analysis::simplify_report_for_push(report, 8);
+                let result = notifier.send_report_via_feishu_cli(&simplified).await;
+                Ok(ChainSendResult::from_report(result, None, None))
             })
         },
         send_notify,

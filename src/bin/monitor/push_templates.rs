@@ -5071,6 +5071,29 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
     )
 }
 
+/// 2026-10-15 用户决策 B: 每日选股/候选清单 → 飞书。
+///
+/// 复用候选台装配 (`load_real_candidate_batch`): chain_daily 涨停主线头股 +
+/// P5 源文件 → `merge_candidates` → 实时行情批次 + 市场统计批次。渲染
+/// [`stock_analysis::opportunity::candidate_panel::format_candidate_board`] 后
+/// 经 `crate::notify::push_wechat` (SEND_TYPE=feishu → magiclaw CLI) 推送。
+/// 候选台为空时返回 Ok(false) 不推送。
+pub async fn dispatch_daily_candidate_board_to_feishu() -> Result<bool, String> {
+    let batch = load_real_candidate_batch().await?;
+    if batch.entries.is_empty() {
+        log::info!("[每日候选] 候选台为空 (链来源无合格行且无 P5 源文件), 跳过推送");
+        return Ok(false);
+    }
+    let board =
+        stock_analysis::opportunity::candidate_panel::format_candidate_board(&batch.entries);
+    log::info!(
+        "[每日候选] 候选 {} 只, 渲染 {} 字符",
+        batch.entries.len(),
+        board.chars().count()
+    );
+    Ok(crate::notify::push_wechat(&board).await)
+}
+
 /// v16.4+v13.6.2+v14.2: 真实数据集成 — 从候选台取 top 1 candidate
 /// 联接 opportunity::candidate_panel::merge_candidates
 /// v14.2 改进: P5 源文件化 (data/p5_sources/*.jsonl)
@@ -8476,6 +8499,79 @@ pub fn load_auction_volume_tick_real(
         limit_stocks,
         snapshot,
         source_observation: Some(source_observation),
+    })
+}
+
+/// P-02 竞价量能榜改用 op 61（CurrentAuctionObservations）竞价观测。
+///
+/// 竞价时段(9:20-9:25)当日涨停池必然为空（涨停是盘中 9:30 后才形成），
+/// 票列表改用昨日涨停池（昨日涨停票是竞价时段该看的"热点池"，连板预期）。
+/// op 61 提供竞价观测（auction_pct/volume_ratio/amount），竞价中(Live)实时可用，
+/// 不依赖 TDX 实时行情（RealtimeQuotes）。字段一一对应 P-02 快照所需字段。
+pub async fn load_auction_volume_tick_from_auction_observations(
+    hhmm: &str,
+    trading_date: chrono::NaiveDate,
+    notified: &std::collections::HashSet<String>,
+) -> Result<AuctionVolumeTickData, String> {
+    use stock_analysis::data_gateway::current_auction_observations::{
+        AuctionStage, CurrentAuctionObservationsGateway, CurrentAuctionRequest,
+    };
+    use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
+
+    let prev_date = stock_analysis::calendar::prev_trading_day(trading_date);
+    let analyzer = stock_analysis::market_analyzer::MarketAnalyzer::new(None)
+        .map_err(|error| format!("竞价量能 analyzer 初始化失败: {error}"))?;
+    let prev_observation = analyzer
+        .get_limit_up_observation(prev_date)
+        .map_err(|error| format!("昨日涨停池({prev_date})获取失败: {error}"))?;
+    let prev_stocks = prev_observation.stocks();
+    if prev_stocks.is_empty() {
+        return Err(format!("昨日涨停池({prev_date})为空"));
+    }
+
+    // op 61 需给定票列表：昨日涨停票（仅沪深 A 股, 6→沪 0/3→深）。
+    let instruments: Vec<InstrumentId> = prev_stocks
+        .iter()
+        .filter_map(|stock| {
+            let exchange = match stock.code.as_bytes().first() {
+                Some(b'6') => Exchange::Shanghai,
+                Some(b'0' | b'3') => Exchange::Shenzhen,
+                _ => return None,
+            };
+            InstrumentId::new(exchange, stock.code.clone(), AssetClass::Equity).ok()
+        })
+        .collect();
+    if instruments.is_empty() {
+        return Err("op 61 票列表为空(昨日涨停池无沪深A股)".to_string());
+    }
+    let request = CurrentAuctionRequest::new(instruments, AuctionStage::Live)
+        .map_err(|error| format!("op 61 请求构造失败: {error}"))?;
+
+    let batch = CurrentAuctionObservationsGateway::new()
+        .fetch(&request)
+        .await
+        .map_err(|error| format!("op 61 竞价观测获取失败: {error}"))?;
+
+    // op 61 → TopStock 字段映射（P-02 快照消费 code/name/change_pct/price/volume_ratio）：
+    // auction_pct→高开幅度、auction_price→竞价价、auction_volume_ratio→竞价量比。
+    let limit_stocks: Vec<stock_analysis::market_data::TopStock> = batch
+        .records()
+        .iter()
+        .map(|obs| stock_analysis::market_data::TopStock {
+            code: obs.instrument.code().to_string(),
+            name: obs.name.clone().unwrap_or_default(),
+            change_pct: obs.auction_pct.unwrap_or(f64::NAN),
+            price: obs.auction_price.unwrap_or(f64::NAN),
+            volume_ratio: obs.auction_volume_ratio,
+            main_net_yi: None,
+        })
+        .collect();
+
+    let snapshot = prepare_auction_volume_snapshot(hhmm, &limit_stocks, notified);
+    Ok(AuctionVolumeTickData {
+        limit_stocks,
+        snapshot,
+        source_observation: None,
     })
 }
 
