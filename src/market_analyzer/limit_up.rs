@@ -611,6 +611,7 @@ mod tests {
             seal_state: None,
             reseal_count: None,
             reason: None,
+            is_st: None,
             evidence: SourceEvidence::new(ProviderId::Eastmoney, TEST_OBSERVED_AT, batch_id)
                 .unwrap()
                 .with_source_at(TEST_DATE)

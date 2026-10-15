@@ -305,7 +305,15 @@ fn qualify_identity(
     if !actual.identity_error.is_empty() {
         return Err(BuildIdentityError::ServerIdentityError);
     }
-    // 三字段硬门：服务版本、源码修订、合同哈希。
+    // 全部降级为观测信号 (2026-10-15 决策): 不做任何身份钉的准入校验。
+    //
+    // 背景: binary_sha256 同一份源码重编也会变(Windows 实测); source_revision 随重建
+    // 拉新 commit 变; service_version 随发版变; contract_sha256 随 proto 合同变 ——
+    // 这四者都是服务端自报的观测信号, 钉任何一颗都是「每次变更都要重新钉」的定时炸弹。
+    //
+    // 处理: 不做准入校验, 漂移只告警不阻断。接口兼容性交给 gRPC 层面保证:
+    //   接口没变 → 调用正常, 断线自动重连; 接口变了 → 方法/字段不存在自然报错暴露。
+    // 形状校验(非空)照旧, 保证服务端自报了这些字段的最低形状。
     for (field, observed, pinned) in [
         (
             "service_version",
@@ -322,30 +330,23 @@ fn qualify_identity(
             actual.contract_sha256.as_str(),
             expected.contract_sha256.as_str(),
         ),
+        (
+            "binary_sha256",
+            actual.binary_sha256.as_str(),
+            expected.binary_sha256.as_str(),
+        ),
     ] {
         if observed.is_empty() {
             return Err(BuildIdentityError::MissingField(field));
         }
         if observed != pinned {
-            return Err(BuildIdentityError::Mismatch(field));
+            log::warn!(
+                "[BuildIdentity] {} 漂移（观测，不阻断）: observed={} pinned={}",
+                field,
+                observed,
+                pinned
+            );
         }
-    }
-    // binary_sha256 自 2026-10-14 起降级为**观测信号**，不再作为准入条件：
-    //   该值在「同一份源码重新构建」时同样会变（Windows 侧实测两次重建产物哈希互不相同），
-    //   因此它不是源码/合同的同一性校验，而是「每次重编都要重新钉」的定时炸弹——
-    //   2026-10-14 当日它单独不符，把整条 ExternalV1 通道打断了一整天。
-    //   且该字段由服务端自报、服务端侧无签名清单，本就不是可验证的来源证明。
-    // 处理：字段仍须存在（形状校验照旧），值不一致只告警不阻断，
-    //       保留「部署二进制被换过」的可见性，同时不再因重编中断数据链路。
-    if actual.binary_sha256.is_empty() {
-        return Err(BuildIdentityError::MissingField("binary_sha256"));
-    }
-    if actual.binary_sha256 != expected.binary_sha256 {
-        log::warn!(
-            "[BuildIdentity] binary_sha256 漂移（观测，不阻断）: observed={} pinned={}",
-            actual.binary_sha256,
-            expected.binary_sha256
-        );
     }
     Ok(())
 }
@@ -403,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn public_identity_rejects_missing_and_changed_deployment_fields() {
+    fn public_identity_requires_present_fields_and_treats_drift_as_observational() {
         let expected = expected();
         let good = actual(&expected);
         assert_eq!(qualify_identity(Some(&good), &expected), Ok(()));
@@ -411,8 +412,13 @@ mod tests {
             qualify_identity(None, &expected),
             Err(BuildIdentityError::MissingHealthIdentity)
         );
-        // 三字段硬门：缺字段与改值都必须拒绝。
-        for field in ["service_version", "source_revision", "contract_sha256"] {
+        // 2026-10-15 决策: 四字段仅做形状校验（必须存在），值漂移只观测不阻断。
+        for field in [
+            "service_version",
+            "source_revision",
+            "contract_sha256",
+            "binary_sha256",
+        ] {
             let mut missing = good.clone();
             let mut changed = good.clone();
             match field {
@@ -428,34 +434,26 @@ mod tests {
                     missing.contract_sha256.clear();
                     changed.contract_sha256.push('x');
                 }
+                "binary_sha256" => {
+                    missing.binary_sha256.clear();
+                    changed.binary_sha256.push('x');
+                }
                 _ => unreachable!(),
             }
             assert_eq!(
                 qualify_identity(Some(&missing), &expected),
                 Err(BuildIdentityError::MissingField(field))
             );
-            assert_eq!(
-                qualify_identity(Some(&changed), &expected),
-                Err(BuildIdentityError::Mismatch(field))
-            );
+            assert_eq!(qualify_identity(Some(&changed), &expected), Ok(()));
         }
-        // binary_sha256（2026-10-14 放松）：字段仍须存在，但值不一致只作观测，不阻断。
-        let mut missing_binary = good.clone();
-        missing_binary.binary_sha256.clear();
-        assert_eq!(
-            qualify_identity(Some(&missing_binary), &expected),
-            Err(BuildIdentityError::MissingField("binary_sha256"))
-        );
+        // 四字段同时漂移也不阻断。
         let mut drifted = good.clone();
+        drifted.service_version.push('x');
+        drifted.source_revision.push('y');
+        drifted.contract_sha256.push('z');
         drifted.binary_sha256 = "0".repeat(64);
         assert_eq!(qualify_identity(Some(&drifted), &expected), Ok(()));
-        // 但漂移不得掩盖真正的身份不符：硬门字段仍必须一致。
-        let mut drifted_and_wrong = drifted;
-        drifted_and_wrong.source_revision.push('x');
-        assert_eq!(
-            qualify_identity(Some(&drifted_and_wrong), &expected),
-            Err(BuildIdentityError::Mismatch("source_revision"))
-        );
+        // identity_error 仍须阻断。
         let mut reported_error = good;
         reported_error.identity_error = "TEST_CODE_HASH_READ_FAILED".to_owned();
         assert_eq!(
@@ -465,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_does_not_override_missing_or_wrong_identity() {
+    fn readiness_gate_holds_while_identity_drift_is_observational() {
         let expected = expected();
         let mut response = HealthResponse {
             live: true,
@@ -474,20 +472,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(qualify_public_health(&response), Ok(()));
-        // binary_sha256 漂移：观测，不阻断。
+        // 2026-10-15 决策: 字段漂移（含 source_revision）观测，不阻断。
         response.build_identity.as_mut().unwrap().binary_sha256 = "0".repeat(64);
         assert_eq!(qualify_public_health(&response), Ok(()));
-        // 硬门字段不符：拒绝。
         response
             .build_identity
             .as_mut()
             .unwrap()
             .source_revision
             .push('x');
-        assert_eq!(
-            qualify_public_health(&response),
-            Err(BuildIdentityError::Mismatch("source_revision"))
-        );
+        assert_eq!(qualify_public_health(&response), Ok(()));
+        // not ready 仍须阻断。
         response.ready = false;
         assert_eq!(
             qualify_public_health(&response),
@@ -528,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn oct1_history_retains_its_policy_but_cannot_qualify_latest_windows_live() {
+    fn oct1_history_policy_is_stable_while_drift_is_observational() {
         let trust = BuildIdentityTrust::bundled().unwrap();
         let descriptor = super::super::archived_external_20261001::DESCRIPTOR_SHA256;
         let policy = "a7bf22f2693e768349f8e53ec5180bf88128f88992966264377c69ec288c2fa8";
@@ -541,26 +536,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(trust.recorded_health(policy, descriptor, &history), Ok(()));
-        assert_eq!(
-            trust.current_health(&history),
-            Err(BuildIdentityError::Mismatch("source_revision"))
-        );
+        // 2026-10-15 决策: 身份漂移不再阻断 current_health（只观测）。
+        assert_eq!(trust.current_health(&history), Ok(()));
         let live = HealthResponse {
             build_identity: Some(test_public_build_identity()),
             ..history
         };
         assert_eq!(qualify_public_health(&live), Ok(()));
-        assert!(trust.recorded_health(policy, descriptor, &live).is_err());
+        assert_eq!(trust.recorded_health(policy, descriptor, &live), Ok(()));
         assert_eq!(
             live.build_identity.unwrap().source_revision,
-            // 2026-10-14：Windows 侧现行部署身份（3faa9d8）——此断言刻画
-            // 「当前 live 身份与历史（1010.01/0928.2）身份不同源」。
+            // 2026-10-14：Windows 侧现行部署身份（3faa9d8）。
             "3faa9d87669f6921767c3d5bc2e54cf0a78a670d"
         );
     }
 
     #[test]
-    fn sep28_recorded_identity_cannot_qualify_current_live_connection() {
+    fn sep28_identity_drift_is_observational_for_current_connection() {
         let trust = BuildIdentityTrust::bundled().unwrap();
         let descriptor = super::super::archived_external_20260928::DESCRIPTOR_SHA256;
         let policy = "de9a897d7e35f35bdd475b4133f002b27e9dfb40cb029aeb81d590ac3e70f54a";
@@ -576,17 +568,19 @@ mod tests {
             trust.recorded_health(policy, descriptor, &old_health),
             Ok(())
         );
-        assert!(trust.historical_health(&old_health).is_err());
-        assert!(trust.current_health(&old_health).is_err());
-        assert!(qualify_public_health(&old_health).is_err());
+        // 2026-10-15 决策: 身份漂移只观测不阻断（含历史身份 vs 当前 live）。
+        assert_eq!(trust.historical_health(&old_health), Ok(()));
+        assert_eq!(trust.current_health(&old_health), Ok(()));
+        assert_eq!(qualify_public_health(&old_health), Ok(()));
+        // descriptor/policy 组合匹配本身不可跨用（hash 表匹配，不是身份钉）。
         assert!(!trust.accepts_recorded_policy(policy, trust.current_descriptor()));
         assert!(!trust.accepts_recorded_policy(&trust.current_policy_sha256(), descriptor));
 
         let live = super::super::connection_qualification::ConnectionGeneration::new(trust.clone());
-        assert!(live
-            .observe_health(&old_health.request_id, &old_health)
-            .is_err());
-        assert!(live.require_qualified().is_err());
+        // 契约形状齐备即可 observe/qualify（漂移不再阻断）。
+        live.observe_health(&old_health.request_id, &old_health)
+            .unwrap();
+        live.require_qualified().unwrap();
         let new_health = HealthResponse {
             build_identity: Some(test_public_build_identity()),
             ..old_health
@@ -595,18 +589,20 @@ mod tests {
         live.observe_health(&new_health.request_id, &new_health)
             .unwrap();
         live.require_qualified().unwrap();
-        assert!(trust
-            .recorded_health(policy, descriptor, &new_health)
-            .is_err());
-        assert!(trust
-            .recorded_health(
+        assert_eq!(
+            trust.recorded_health(policy, descriptor, &new_health),
+            Ok(())
+        );
+        assert_eq!(
+            trust.recorded_health(
                 &trust.current_policy_sha256(),
                 trust.current_descriptor(),
                 &HealthResponse {
                     build_identity: Some(actual(&trust.archived_20260928)),
                     ..new_health
                 }
-            )
-            .is_err());
+            ),
+            Ok(())
+        );
     }
 }

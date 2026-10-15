@@ -3051,6 +3051,7 @@ mod tests {
             reseal_count: None,
             reason: (provider == ProviderId::Tonghuashun)
                 .then(|| NonEmptyText::new("TEST_CODE reason").unwrap()),
+            is_st: None,
             evidence: SourceEvidence::new(
                 provider,
                 "2099-01-02T10:00:00+08:00",

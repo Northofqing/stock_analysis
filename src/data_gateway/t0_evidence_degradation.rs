@@ -14,6 +14,10 @@ use std::sync::{Mutex, OnceLock};
 
 /// 对端事件类型（区分大小写，逐字节比较）。
 pub const EVENT_KIND: &str = "t0_evidence_degraded";
+/// TDX hq 降级/恢复事件 (bundle 2026-10-15.1 新增, generation="server-internal",
+/// 与 t0_evidence_degraded 同通道语义: 只观测 log, 不入 replay)。
+pub const TDX_HQ_DEGRADED_KIND: &str = "tdx_hq_degraded";
+pub const TDX_HQ_RECOVERED_KIND: &str = "tdx_hq_recovered";
 /// 对端声明的 provider。
 pub const EXPECTED_PROVIDER: &str = "LocalAnalysis";
 /// payload schema 名（版本由 `schema_version` 单独承载）。
@@ -427,22 +431,41 @@ fn safe_reason(error: &GrpcError) -> String {
 
 /// 处理一条信封：非本类事件直接跳过；本类事件解析并记录。
 fn consume_envelope(envelope: &MarketEventEnvelope) {
-    if envelope.event_kind != EVENT_KIND {
-        return;
-    }
-    match observe(view_from_envelope(envelope)) {
-        Ok(Observed::Recorded(recorded)) => log::warn!(
-            "[t0_evidence_degraded] batch_id={} instrument={} missing=[{}] unknown_keys=[{}] observed_at={}",
-            recorded.batch_id,
-            recorded.instrument,
-            recorded.missing_fields.join(","),
-            recorded.unknown_keys.join(","),
-            recorded.observed_at
-        ),
-        Ok(Observed::Duplicate { batch_id, .. }) => log::debug!(
-            "[t0_evidence_degraded] 重复投递 batch_id={batch_id}（已计入去重计数）"
-        ),
-        Err(reason) => log::warn!("[t0_evidence_degraded] 事件解析被拒: {reason}"),
+    match envelope.event_kind.as_str() {
+        EVENT_KIND => {
+            match observe(view_from_envelope(envelope)) {
+                Ok(Observed::Recorded(recorded)) => log::warn!(
+                    "[t0_evidence_degraded] batch_id={} instrument={} missing=[{}] unknown_keys=[{}] observed_at={}",
+                    recorded.batch_id,
+                    recorded.instrument,
+                    recorded.missing_fields.join(","),
+                    recorded.unknown_keys.join(","),
+                    recorded.observed_at
+                ),
+                Ok(Observed::Duplicate { batch_id, .. }) => log::debug!(
+                    "[t0_evidence_degraded] 重复投递 batch_id={batch_id}（已计入去重计数）"
+                ),
+                Err(reason) => log::warn!("[t0_evidence_degraded] 事件解析被拒: {reason}"),
+            }
+        }
+        // TDX hq 降级/恢复 (bundle 2026-10-15.1 新增, generation="server-internal"):
+        // 只观测 log, 不入 replay (与 t0_evidence_degraded 同通道语义)。
+        TDX_HQ_DEGRADED_KIND | TDX_HQ_RECOVERED_KIND => {
+            let generation = envelope
+                .cursor
+                .as_ref()
+                .map(|cursor| cursor.generation.as_str())
+                .unwrap_or("absent");
+            log::warn!(
+                "[{}] generation={} provider={} observed_at={} source_at={}",
+                envelope.event_kind,
+                generation,
+                envelope.provider,
+                envelope.observed_at,
+                envelope.source_at
+            );
+        }
+        _ => {}
     }
 }
 
@@ -461,7 +484,11 @@ async fn open_stream(bundle: &Path) -> Result<tonic::Streaming<MarketEventEnvelo
         .subscribe_external(
             EventFilter {
                 instruments: Vec::new(),
-                event_kinds: vec![EVENT_KIND.to_string()],
+                event_kinds: vec![
+                    EVENT_KIND.to_string(),
+                    TDX_HQ_DEGRADED_KIND.to_string(),
+                    TDX_HQ_RECOVERED_KIND.to_string(),
+                ],
             },
             None,
         )

@@ -69,6 +69,7 @@ enum Operation {
   OPERATION_ECONOMIC_RELEASE_SCHEDULE = 63;
   OPERATION_OFFICIAL_PUBLICATIONS = 64;
   OPERATION_OFFICIAL_PUBLICATION = 65;
+  OPERATION_TRADING_CALENDAR = 66;
 }
 
 enum AdmissionState {
@@ -381,6 +382,7 @@ service MarketDataService {
   rpc EconomicReleaseSchedule(QueryRequest) returns (QueryResponse);
   rpc OfficialPublications(QueryRequest) returns (QueryResponse);
   rpc OfficialPublication(QueryRequest) returns (QueryResponse);
+  rpc TradingCalendar(QueryRequest) returns (QueryResponse);
 }
 
 service MarketEventService {

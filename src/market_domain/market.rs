@@ -37,6 +37,10 @@ pub struct LimitPoolEntry {
     pub seal_state: Option<NonEmptyText>,
     pub reseal_count: Option<u32>,
     pub reason: Option<NonEmptyText>,
+    /// v2 (bundle 2026-10-15.1): 源提供的 is_st 真值（可空；绝不从名称推导）。
+    /// v1 记录无此字段 → 反序列化默认 None。
+    #[serde(default)]
+    pub is_st: Option<bool>,
     pub evidence: SourceEvidence,
 }
 

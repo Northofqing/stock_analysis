@@ -112,6 +112,13 @@ macro_rules! impl_dragon_tiger_service {
     ($($stub:ident),* $(,)?) => {
         #[tonic::async_trait]
         impl MarketDataService for DragonTigerService {
+            async fn trading_calendar(
+                &self,
+                _request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                Err(Status::unimplemented("TEST_CODE trading calendar unavailable"))
+            }
+
             async fn dragon_tiger(
                 &self,
                 request: Request<QueryRequest>,

@@ -1562,6 +1562,10 @@ mod tests {
         ($($stub:ident),* $(,)?) => {
             #[tonic::async_trait]
             impl MarketDataService for MockData {
+                async fn trading_calendar(&self, _req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+                    Err(Status::unimplemented("TEST_CODE trading calendar unavailable"))
+                }
+
                 async fn money_flows(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
                     self.money_flow_calls.fetch_add(1, Ordering::SeqCst);
                     flow_failure(req, Operation::MoneyFlows, "Eastmoney", tonic::Code::Internal, false)

@@ -1831,6 +1831,7 @@ mod tests {
             seal_state: None,
             reseal_count: None,
             reason: None,
+            is_st: None,
             evidence: record_evidence,
         };
         P01CompletedDayEvidence {

@@ -726,6 +726,13 @@ macro_rules! external_control_data_service {
                 Err(Status::unimplemented("TEST_CODE official publication unavailable"))
             }
 
+            async fn trading_calendar(
+                &self,
+                _request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                Err(Status::unimplemented("TEST_CODE trading calendar unavailable"))
+            }
+
             async fn global_news(
                 &self,
                 request: Request<QueryRequest>,

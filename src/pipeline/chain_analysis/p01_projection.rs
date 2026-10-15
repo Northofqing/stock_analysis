@@ -693,6 +693,7 @@ mod tests {
             seal_state: None,
             reseal_count: None,
             reason: None,
+            is_st: None,
             evidence: SourceEvidence::new(
                 ProviderId::Eastmoney,
                 "2198-11-17T15:00:00+08:00",
