@@ -1,0 +1,29 @@
+{
+  "bundle_version": "2026-10-15.1",
+  "source_commit": "ff72c06ca0122cb765b3c814646e6859e569b428",
+  "market_data_rpc_count": 66,
+  "global_news_schema_version": 2,
+  "instrument_news_schema_version": 2,
+  "t0_evidence_schema_version": 2,
+  "financial_statements_schema_version": 2,
+  "market_announcements_supported_schema_versions": [1, 2],
+  "realtime_quotes_schema_version": 1,
+  "current_auction_observations_schema_version": 1,
+  "economic_release_observations_schema_version": 1,
+  "economic_release_schedule_schema_version": 1,
+  "futures_delivery_schema_version": 2,
+  "official_publications_schema_version": 1,
+  "official_publication_schema_version": 1,
+  "security_profiles_schema_version": 2,
+  "limit_pools_schema_version": 2,
+  "trading_calendar_schema_version": 1,
+  "deployment_build_identity": {
+    "service_version": "0.2.0",
+    "source_revision": "ff72c06ca0122cb765b3c814646e6859e569b428",
+    "contract_sha256": "dba66a27d82b81e0d0ecee60cfed706cc42eedeb6ab0e404a44a00fdf0ee1d81",
+    "binary_sha256": "19ccc8937c20ad463df16f67cb766da06a51bbee15ababe60284a6601bab2228",
+    "contract_sha256_scope": "SHA-256 of the raw compiled FileDescriptorSet bytes returned by magic_market_grpc_contracts::v1::FILE_DESCRIPTOR_SET",
+    "binary_sha256_scope": "SHA-256 of the exact deployed magic-market-grpc-server executable bytes"
+  },
+  "generated_at_utc": "2026-10-15T10:09:10.8332019+00:00"
+}
