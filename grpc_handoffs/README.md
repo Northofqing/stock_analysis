@@ -18,6 +18,8 @@ D17 / D20 权威事实交接：[证券交易资格与停复牌权威事实](2026
 
 失败归因修正：[gRPC Gateway 默认提供者误记](2026-09-26-gateway-provider-attribution.md)。实时行情和板块成员的断线回归复现旧审计把无提供者证据的失败记为 `Tdx`；本地修正只影响新审计行，不把旧计数解释为物理提供者故障。
 
+2026-10-17 待对端评估：[Windows 侧数据缺口清单与盘中异动监控需求](2026-10-17-windows-data-gaps-and-intraday-alert-request.md)。按 P0/P1 汇总 Mac 侧实测缺口（每条附 `reason_code` 与日志原文片段，便于对端在自身日志定位），并提出新增需求「盘中异动监控」（30 秒级事件上报 + 观察池条件下发），含 wire 字段定义、验收标准与两条候选实现路线（TDX 原生预警 / Windows 侧自算），请对端评估可行性与排期。
+
 ## 范围
 
 - 运行事实只覆盖 2026-09-16 00:47–00:49（Asia/Shanghai）的本机 `127.0.0.1:18082`：两次运行 GetHealth 检查命令都在 dial 阶段超时，没有 HealthResponse、Capabilities，也没有已发送业务 RPC 的证据。
