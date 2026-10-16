@@ -11571,6 +11571,11 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
             let mut auction_vol_notified: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
+            // 2026-10-16: P-02 当日是否已成功推送过（auction_vol_notified 只记票码
+            // 且跨天累积, 不足以判定「今天推过没」）——9:25-9:30 的 live 兜底按 business
+            // date 去重, live 已成功则不补推。
+            let mut auction_vol_pushed_date: Option<chrono::NaiveDate> = None;
+
             // 优选候选虚拟仓位记录：从集合竞价推送的候选+开盘价记录
 
             let mut virtual_observation: Vec<(String, String, f64)> = Vec::new(); // (code, name, open_price)
@@ -11767,6 +11772,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 &auction_hhmm,
                                 limit_pool_date,
                                 &notified_at_tick_start,
+                                stock_analysis::data_gateway::current_auction_observations::AuctionStage::Live,
                             )
                             .await
                             {
@@ -11801,12 +11807,18 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             // v37: 升级到 v12 §14.1 P-02 模板。渲染、入池与通知游标
                             // 都消费本 tick 唯一一次涨停池采集所得的同一选中批次。
                             let banner = current_banner_for("P-02 auction volume");
-                            push_templates::dispatch_auction_volume_daily(
+                            if push_templates::dispatch_auction_volume_daily(
                                 snapshot,
                                 banner.as_ref(),
                                 &mut auction_vol_notified,
                             )
-                            .await;
+                            .await
+                            {
+                                // 2026-10-16: 记当日已成功推送, 供 9:25-9:30 的 live
+                                // 兜底按 business date 去重（已推则不补）。
+                                auction_vol_pushed_date =
+                                    Some(chrono::Local::now().date_naive());
+                            }
                         }
 
                         // P05 shared Unit is recovered by the all-day loop.
@@ -11839,6 +11851,64 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
 
                         continue;
+                    }
+                }
+
+                // ── 2026-10-16: P-02 竞价榜 live 兜底（9:25-9:30 间隙）──
+                // 竞价时段（9:20-9:25）op 61 stage=Live 若失败/无数据（当日实例:
+                // invalid type: map 解析失败），用 stage=Final 的竞价终态补推一次
+                // —— final 批次已实测稳定可得（probe: ADMITTED/records=1）。
+                // 按 business date 去重：live 已成功推送则不补，避免重复。
+                if session == MarketSession::Closed {
+                    let fallback_date = chrono::Local::now().date_naive();
+                    let now_time = chrono::Local::now().time();
+                    if calendar::is_trading_day(fallback_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(9, 25, 0).unwrap()
+                        && now_time < chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap()
+                        && auction_vol_pushed_date != Some(fallback_date)
+                    {
+                        let fallback_hhmm =
+                            chrono::Local::now().format("%H:%M:%S").to_string();
+                        log::info!(
+                            "[竞价][P-02] 9:25-9:30 兜底: live 未成功推送, 改用 op 61 stage=Final 补推 date={fallback_date}"
+                        );
+                        match push_templates::load_auction_volume_tick_from_auction_observations(
+                            &fallback_hhmm,
+                            fallback_date,
+                            &auction_vol_notified,
+                            stock_analysis::data_gateway::current_auction_observations::AuctionStage::Final,
+                        )
+                        .await
+                        {
+                            Ok(tick) => match tick.snapshot.as_ref() {
+                                Ok(snapshot) => {
+                                    let banner =
+                                        current_banner_for("P-02 auction volume fallback");
+                                    if push_templates::dispatch_auction_volume_daily(
+                                        snapshot,
+                                        banner.as_ref(),
+                                        &mut auction_vol_notified,
+                                    )
+                                    .await
+                                    {
+                                        auction_vol_pushed_date = Some(fallback_date);
+                                        log::info!(
+                                            "[竞价][P-02] 9:25 兜底推送成功 (stage=Final)"
+                                        );
+                                    } else {
+                                        log::warn!(
+                                            "[竞价][P-02] 9:25 兜底推送未投递 (stage=Final)"
+                                        );
+                                    }
+                                }
+                                Err(error) => log::info!(
+                                    "[竞价][P-02] 9:25 兜底本批次不发送: {error}"
+                                ),
+                            },
+                            Err(error) => log::error!(
+                                "[竞价][P-02] 9:25 兜底 final 批次拒绝: {error}"
+                            ),
+                        }
                     }
                 }
 

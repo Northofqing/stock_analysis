@@ -37,7 +37,7 @@ pub(crate) async fn prepare_holding_plan_tick(
                 state
                     .coordinator
                     .inspect_holding_plan_occurrence(date, instrument)
-                    .map_err(|_| "holding_plan_owner_read_failed".to_owned())
+                    .map_err(|e| format!("holding_plan_owner_read_failed: {e}"))
             },
             crate::holding_plan::read_legacy_markers,
             crate::market_data::fetch_realtime_quote_batch,
@@ -62,7 +62,7 @@ fn inspect_original(
     match state
         .coordinator
         .inspect_holding_plan_occurrence(date, instrument)
-        .map_err(|_| "holding_plan_owner_read_failed".to_owned())?
+        .map_err(|e| format!("holding_plan_owner_read_failed: {e}"))?
     {
         HoldingPlanOccurrenceObservation::Owned(actual)
             if actual.envelope() == expected.envelope() =>
@@ -99,7 +99,7 @@ fn reconcile_candidate_blocking(
             match state
                 .coordinator
                 .inspect_holding_plan_occurrence(prepared.binding.business_date(), &instrument)
-                .map_err(|_| "holding_plan_owner_read_failed".to_owned())?
+                .map_err(|e| format!("holding_plan_owner_read_failed: {e}"))?
             {
                 HoldingPlanOccurrenceObservation::Missing => {
                     return Ok(HoldingPlanLocalProgress::Candidate(
@@ -201,7 +201,7 @@ fn deliver_candidate_blocking(
                         .map_err(|_| "holding_plan_original_date_invalid".to_owned())?,
                     &instrument,
                 )
-                .map_err(|_| "holding_plan_owner_read_failed".to_owned())?
+                .map_err(|e| format!("holding_plan_owner_read_failed: {e}"))?
             {
                 HoldingPlanOccurrenceObservation::Owned(actual)
                     if actual.envelope() == &envelope =>

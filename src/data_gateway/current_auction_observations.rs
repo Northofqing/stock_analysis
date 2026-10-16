@@ -102,6 +102,53 @@ fn invalid(message: impl Into<String>) -> GatewayError {
     GatewayError::invalid_evidence(CAPABILITY, Some(ProviderId::HithinkFinance), message)
 }
 
+/// 2026-10-16: serde 的 `invalid type: map, expected f64` 不带字段路径——生产
+/// 报错只能看到「auction record fields invalid: invalid type: map, expected f64」,
+/// 无法判断是哪个字段、服务端返回的 map 长什么样（live 路径契约不符时的定位盲点）。
+/// 解析失败时逐字段复检数值域, 报出首个类型不符的字段名 + 实际类型 + 原值片段
+/// （截断 200 字符）。纯观测增强, 不改变接受/拒绝判定。
+fn locate_numeric_field_mismatch(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    const NUMERIC_FIELDS: [&str; 12] = [
+        "auction_price",
+        "pre_close_price",
+        "auction_pct",
+        "auction_volume_shares",
+        "auction_amount",
+        "auction_unmatched",
+        "auction_turnover_pct",
+        "auction_volume_ratio",
+        "auction_yesterday_ratio_pct",
+        "float_market_cap",
+        "last_price",
+        "open_price",
+    ];
+    for field in NUMERIC_FIELDS {
+        let Some(value) = object.get(field) else {
+            continue;
+        };
+        if value.is_null() || value.as_f64().is_some() {
+            continue;
+        }
+        let kind = match value {
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "map",
+            _ => "other",
+        };
+        let raw = value.to_string();
+        let raw = if raw.chars().count() > 200 {
+            format!("{}...", raw.chars().take(200).collect::<String>())
+        } else {
+            raw
+        };
+        return format!("field={field} expected=f64 actual={kind} raw={raw}");
+    }
+    "no numeric field mismatch; failure is in a non-numeric field".to_string()
+}
+
 pub(crate) fn convert_response(
     request: &CurrentAuctionRequest,
     response: &QueryResult,
@@ -173,8 +220,12 @@ pub(crate) fn convert_response(
                 return Err(invalid(format!("auction record missing {field}")));
             }
         }
-        let wire: AuctionWire = serde_json::from_value(value)
-            .map_err(|error| invalid(format!("auction record fields invalid: {error}")))?;
+        let wire: AuctionWire = serde_json::from_value(value.clone()).map_err(|error| {
+            invalid(format!(
+                "auction record fields invalid: {error} ({})",
+                locate_numeric_field_mismatch(object)
+            ))
+        })?;
         if !expected.contains(&wire.instrument) || !seen.insert(wire.instrument.clone()) {
             return Err(invalid(
                 "auction record instrument missing, unexpected, or duplicate",

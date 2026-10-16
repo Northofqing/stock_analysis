@@ -8640,9 +8640,10 @@ pub async fn load_auction_volume_tick_from_auction_observations(
     hhmm: &str,
     trading_date: chrono::NaiveDate,
     notified: &std::collections::HashSet<String>,
+    stage: stock_analysis::data_gateway::current_auction_observations::AuctionStage,
 ) -> Result<AuctionVolumeTickData, String> {
     use stock_analysis::data_gateway::current_auction_observations::{
-        AuctionStage, CurrentAuctionObservationsGateway, CurrentAuctionRequest,
+        CurrentAuctionObservationsGateway, CurrentAuctionRequest,
     };
     use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
 
@@ -8672,7 +8673,9 @@ pub async fn load_auction_volume_tick_from_auction_observations(
     if instruments.is_empty() {
         return Err("op 61 票列表为空(昨日涨停池无沪深A股)".to_string());
     }
-    let request = CurrentAuctionRequest::new(instruments, AuctionStage::Live)
+    // 2026-10-16: stage 由调用方给定——竞价时段 (9:20-9:25) 用 Live；
+    // 9:25-9:30 兜底用 Final（live 失败/无数据时补推竞价终态）。
+    let request = CurrentAuctionRequest::new(instruments, stage)
         .map_err(|error| format!("op 61 请求构造失败: {error}"))?;
 
     let batch = CurrentAuctionObservationsGateway::new()

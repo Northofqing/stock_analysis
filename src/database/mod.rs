@@ -2780,6 +2780,7 @@ pub mod daily_change_confirmation;
 pub mod daily_change_review;
 pub(crate) mod daily_change_review_schema_v1;
 pub mod data_acquisition_audit;
+pub mod advice_outcome_tracking;
 pub mod execution_tracking;
 pub(crate) mod global_schema_catalog_v1;
 pub(crate) mod global_schema_v1;
@@ -4272,6 +4273,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         )
         .execute(&mut *conn)
         .ok();
+
+        // advice_outcome_tracking (2026-10-16): 建议执行跟踪独立表 (推送成功落行,
+        // 执行结果后续回填; 替代 V1 死结的 execution_tracking 写入路径).
+        advice_outcome_tracking::create_schema(&mut *conn)?;
 
         // position_adjustments (PR3-3.3)
         diesel::sql_query(
