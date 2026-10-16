@@ -5071,6 +5071,132 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
     )
 }
 
+/// 2026-10-16 用户指出: 竞价数据的正确入口是 op 61 CurrentAuctionObservations
+/// (窗口内 stage=live、窗口后 stage=final)。每日候选原走 RealtimeQuotes +
+/// MarketStatistics, 竞价期间两者均无可用批次 (source_at=absent →
+/// no_verified_batch), 原 9:16 窗口结构性失败。本函数改用 op 61 stage=Final
+/// 的竞价终态观测同时构造行情批次与量比统计批次, 复用既有装配链。
+///
+/// probe 实测 (2026-10-16): stage=final admission=ADMITTED records=1
+/// evidence_shape=ok; stage=live 在非竞价时段被服务端正确拒绝
+/// (provider_response_invalid), 故候选路径固定 stage=Final。
+async fn load_candidate_batch_via_auction_final() -> Result<RealCandidateBatch, String> {
+    use stock_analysis::data_gateway::current_auction_observations::{
+        AuctionStage, CurrentAuctionObservationsGateway, CurrentAuctionRequest,
+    };
+    use stock_analysis::market_data::TopStock;
+
+    let CandidateSourceContext {
+        entries,
+        themes,
+        held_codes,
+        p5_files,
+        p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
+    } = crate::blocking_market_data::run_blocking_market_data(
+        "BR-099 candidate source context (auction final)",
+        load_candidate_source_context,
+    )
+    .await?;
+    if entries.is_empty() {
+        return Ok(RealCandidateBatch {
+            entries,
+            quotes: std::collections::HashMap::new(),
+            themes,
+            quote_evidence: None,
+            statistics_evidence: None,
+            p5_files,
+            p5_candidate_refs,
+            chain_query,
+            chain_candidate_refs,
+        });
+    }
+
+    let codes: Vec<String> = entries.iter().map(|entry| entry.code.clone()).collect();
+    let instruments: Vec<stock_analysis::market_domain::InstrumentId> = codes
+        .iter()
+        .filter_map(|code| {
+            use stock_analysis::market_domain::{AssetClass, Exchange, InstrumentId};
+            let exchange = match code.as_bytes().first() {
+                Some(b'6') => Exchange::Shanghai,
+                Some(b'0' | b'3') => Exchange::Shenzhen,
+                _ => return None,
+            };
+            InstrumentId::new(exchange, code.clone(), AssetClass::Equity).ok()
+        })
+        .collect();
+    if instruments.len() != codes.len() {
+        return Err(format!(
+            "op 61 候选票列表含非沪深 A 股: requested={} valid={}",
+            codes.len(),
+            instruments.len()
+        ));
+    }
+    let request = CurrentAuctionRequest::new(instruments, AuctionStage::Final)
+        .map_err(|error| format!("op 61 请求构造失败: {error}"))?;
+    let auction_batch = CurrentAuctionObservationsGateway::new()
+        .fetch(&request)
+        .await
+        .map_err(|error| format!("op 61 竞价观测获取失败: {error}"))?;
+    let records = auction_batch.records();
+    if records.is_empty() {
+        return Err("op 61 竞价观测为空批次".to_string());
+    }
+    // 竞价终态逐票记录 → TopStock (口径同 P-02: auction_pct→change_pct,
+    // auction_price→price, auction_volume_ratio→volume_ratio)。
+    let stocks: Vec<TopStock> = records
+        .iter()
+        .map(|obs| TopStock {
+            code: obs.instrument.code().to_string(),
+            name: obs.name.clone().unwrap_or_default(),
+            change_pct: obs.auction_pct.unwrap_or(f64::NAN),
+            price: obs.auction_price.unwrap_or(f64::NAN),
+            volume_ratio: obs.auction_volume_ratio,
+            main_net_yi: None,
+        })
+        .collect();
+    let statistics_rows: Vec<CandidateStatisticsRow> = records
+        .iter()
+        .map(|obs| CandidateStatisticsRow {
+            code: obs.instrument.code().to_string(),
+            volume_ratio: obs.auction_volume_ratio,
+        })
+        .collect();
+    let evidence = auction_batch.evidence().clone();
+    log::info!(
+        "[每日候选][op61-final] codes={} records={} provider={:?} batch_id={} observed_at={}",
+        codes.len(),
+        records.len(),
+        evidence.provider,
+        evidence.batch_id,
+        evidence.observed_at
+    );
+    let quote_batch = crate::market_data::TopStockBatch {
+        stocks,
+        evidence: evidence.clone(),
+        coverage: stock_analysis::data_gateway::QuoteCoverageDisposition::Complete,
+        requested: codes.clone(),
+        rejected: Vec::new(),
+        missing: Vec::new(),
+    };
+    let statistics_batch = CandidateStatisticsBatch {
+        rows: statistics_rows,
+        evidence: evidence.clone(),
+    };
+    assemble_real_candidate_batch(
+        entries,
+        quote_batch,
+        statistics_batch,
+        themes,
+        &held_codes,
+        p5_files,
+        p5_candidate_refs,
+        chain_query,
+        chain_candidate_refs,
+    )
+}
+
 /// 2026-10-15 用户决策 B: 每日选股/候选清单 → 飞书。
 ///
 /// 复用候选台装配 (`load_real_candidate_batch`): chain_daily 涨停主线头股 +
@@ -5079,7 +5205,9 @@ async fn load_real_candidate_batch() -> Result<RealCandidateBatch, String> {
 /// 经 `crate::notify::push_wechat` (SEND_TYPE=feishu → magiclaw CLI) 推送。
 /// 候选台为空时返回 Ok(false) 不推送。
 pub async fn dispatch_daily_candidate_board_to_feishu() -> Result<bool, String> {
-    let batch = load_real_candidate_batch().await?;
+    // 2026-10-16: 竞价期间 RealtimeQuotes/MarketStatistics 无可用批次
+    // (source_at=absent), 改走 op 61 stage=Final 的竞价终态观测入口。
+    let batch = load_candidate_batch_via_auction_final().await?;
     if batch.entries.is_empty() {
         log::info!("[每日候选] 候选台为空 (链来源无合格行且无 P5 源文件), 跳过推送");
         return Ok(false);
@@ -22190,12 +22318,18 @@ mod tests {
         .expect("valid selected snapshot");
         let prepared = prepare_auction_volume_dispatch(&snapshot, &captured_banner_normal());
 
+        // 2026-10-16: 期望同步至现行渲染 (3f84c56dc "prioritize push facts"
+        // 起: banner 后置 + 首位观察/处理段 + 【其他竞价条目】分组)。原断言
+        // 停留在 eeb2ddcdd 的旧格式, 自 3f84c56dc 起 pre-existing 红; 渲染为
+        // production 行为, 断言应钉住现行设计。
         assert_eq!(
             prepared.message(),
             concat!(
-                "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n",
                 "🌅 竞价热点量能 Top2（09:25:00）\n",
-                "  股票FIRST(FIRST) 高开+1.4% 量比4.5 []\n",
+                "首位观察: 股票FIRST(FIRST) 高开+1.4% 量比4.5 []\n",
+                "处理: 等待开盘成交核验｜持仓关系未核验\n",
+                "[🟢 Normal | 仓位5成 | 盈亏事实未绑定 | 数据Full]\n",
+                "【其他竞价条目】\n",
                 "  股票SECOND(SECOND) 高开+2.5% 量比2.3 []\n",
                 "情绪判读: 强承接, 观察池今日9:25 集合竞价结果, 关注开盘承接\n",
                 "辅助建议, 非下单指令",

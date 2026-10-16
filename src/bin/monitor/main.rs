@@ -10570,17 +10570,19 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     ),
                 }
             }
-            // 2026-10-15 用户决策 B: 每日选股/候选清单 → 飞书 (盘前 9:16, 集合竞价)。
-            // 候选台装配依赖实时行情批次 (5 秒新鲜度门): 收盘 15:35 后 provider 停更
-            // (source_at 冻结 → quote_stale → 全 provider 熔断), 盘后无法装配;
-            // 集合竞价 9:15 起行情新鲜可用, 此时 chain_daily 为昨日落库的最新主线。
+            // 2026-10-15 用户决策 B: 每日选股/候选清单 → 飞书。
+            // 2026-10-16 修: 原窗口 9:16-9:30 走 RealtimeQuotes (竞价期间
+            // source_at=absent → no_verified_batch 结构性失败, 放宽 5 秒门无效)。
+            // 改走 op 61 CurrentAuctionObservations stage=Final (用户指出的竞价
+            // 数据入口): 竞价结束 9:25 后终态批次稳定可得 (probe 实测 ADMITTED),
+            // 窗口顺延至 9:25-9:35; chain_daily 仍为昨日落库的最新主线。
             // static 日期去重; 失败保留重试资格 (下一 tick 重试, 窗口内)。
             if calendar::is_trading_day(chain_today)
                 && chain_now.time()
-                    >= chrono::NaiveTime::from_hms_opt(9, 16, 0)
+                    >= chrono::NaiveTime::from_hms_opt(9, 25, 0)
                         .expect("valid daily candidate window")
                 && chain_now.time()
-                    < chrono::NaiveTime::from_hms_opt(9, 30, 0)
+                    < chrono::NaiveTime::from_hms_opt(9, 35, 0)
                         .expect("valid daily candidate window")
             {
                 static DAILY_CANDIDATE_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
@@ -12570,6 +12572,19 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                     continue;
                                                 }
                                             };
+                                        // 2026-10-16: 推送前提取跟踪元数据 (binding 随后 move 进推送).
+                                        let advice_tracking_meta = (
+                                            prepared
+                                                .binding
+                                                .schedule_occurrence_identity()
+                                                .to_owned(),
+                                            prepared
+                                                .binding
+                                                .business_date()
+                                                .format("%Y-%m-%d")
+                                                .to_string(),
+                                            prepared.code.clone(),
+                                        );
                                         let outcome = notify::push_counted_with_binding(
                                             presentation_token,
                                             &prepared.text,
@@ -12577,16 +12592,46 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             prepared.binding,
                                         )
                                         .await;
-                                        if !matches!(
+                                        let pushed = matches!(
                                             outcome,
                                             notify::PushOutcome::Pushed
                                                 | notify::PushOutcome::Deduped
-                                        ) {
+                                        );
+                                        if !pushed {
                                             log::error!(
                                                 "[BR-116][BR-153] 做T投递未确认 code={} outcome={:?}",
                                                 prepared.code,
                                                 outcome
                                             );
+                                        } else {
+                                            // 2026-10-16: 建议执行跟踪落行 (best-effort,
+                                            // 失败不影响推送; 执行结果后续回填).
+                                            let (occurrence, business_date, code) =
+                                                advice_tracking_meta;
+                                            match stock_analysis::database::DatabaseManager::try_get() {
+                                                Some(db) => match db.get_conn() {
+                                                    Ok(mut conn) => {
+                                                        if let Err(error) = stock_analysis::database::advice_outcome_tracking::record_advice_push(
+                                                            &mut *conn,
+                                                            &occurrence,
+                                                            &business_date,
+                                                            "T0Advice",
+                                                            &code,
+                                                            &chrono::Utc::now().to_rfc3339(),
+                                                        ) {
+                                                            log::warn!(
+                                                                "[建议跟踪] 落库失败(不影响推送) code={code} error={error}"
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(error) => log::warn!(
+                                                        "[建议跟踪] 连接不可用(不影响推送) code={code} error={error}"
+                                                    ),
+                                                },
+                                                None => log::warn!(
+                                                    "[建议跟踪] DatabaseManager 未初始化(不影响推送) code={code}"
+                                                ),
+                                            }
                                         }
                                         outcomes.push(outcome);
                                     }
