@@ -11816,8 +11816,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             {
                                 // 2026-10-16: 记当日已成功推送, 供 9:25-9:30 的 live
                                 // 兜底按 business date 去重（已推则不补）。
-                                auction_vol_pushed_date =
-                                    Some(chrono::Local::now().date_naive());
+                                auction_vol_pushed_date = Some(chrono::Local::now().date_naive());
                             }
                         }
 
@@ -11867,8 +11866,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         && now_time < chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap()
                         && auction_vol_pushed_date != Some(fallback_date)
                     {
-                        let fallback_hhmm =
-                            chrono::Local::now().format("%H:%M:%S").to_string();
+                        let fallback_hhmm = chrono::Local::now().format("%H:%M:%S").to_string();
                         log::info!(
                             "[竞价][P-02] 9:25-9:30 兜底: live 未成功推送, 改用 op 61 stage=Final 补推 date={fallback_date}"
                         );
@@ -11908,6 +11906,108 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             Err(error) => log::error!(
                                 "[竞价][P-02] 9:25 兜底 final 批次拒绝: {error}"
                             ),
+                        }
+                    }
+                }
+
+                // ── 2026-10-16: 建议结果滚动回填 (盘后每日一次) ──
+                // 读 advice_outcome_tracking 未回填行 → 以推送日 (business_date) 收盘
+                // 为基准算 T+1/T+3/T+5 涨跌 + 观察窗 MFE/MAE → 写回表. T+N 尚未到期
+                // 的行本轮跳过, 下轮再算 (滚动回填).
+                // 口径: "假设执行"的建议质量, 不是用户真实收益 —— 见模块头注释.
+                if session == MarketSession::AfterHours || session == MarketSession::Closed {
+                    let advice_backfill_date = chrono::Local::now().date_naive();
+                    let now_time = chrono::Local::now().time();
+                    if calendar::is_trading_day(advice_backfill_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 35, 0).unwrap()
+                    {
+                        static ADVICE_BACKFILL_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = ADVICE_BACKFILL_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_backfill_date)
+                            .unwrap_or(false);
+                        if !already {
+                            match stock_analysis::database::DatabaseManager::try_get() {
+                                Some(db) => {
+                                    match stock_analysis::monitor::advice_outcome_backfill::backfill_advice_outcomes(
+                                        &db,
+                                        advice_backfill_date,
+                                    ) {
+                                        Ok(report) => {
+                                            report.log();
+                                            *ADVICE_BACKFILL_LAST
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) =
+                                                Some(advice_backfill_date);
+                                        }
+                                        Err(error) => {
+                                            log::warn!("[建议回填] 失败: {error}");
+                                        }
+                                    }
+                                }
+                                None => log::warn!("[建议回填] 数据库不可用, 本轮跳过"),
+                            }
+                        }
+                    }
+                }
+
+                // ── 2026-10-16: 建议质量报告 (每周五盘后推送一次) ──
+                // 自进化回路第③段: 读已回填结果 → performance_feedback::evaluate
+                // → 渲染 → 推送. 约束: 仅审计输出, 不自动改规则 (§2.10).
+                // 口径: "假设执行"的建议质量, 不是用户真实收益 (文本内已注明).
+                if session == MarketSession::AfterHours || session == MarketSession::Closed {
+                    let advice_report_date = chrono::Local::now().date_naive();
+                    let now_time = chrono::Local::now().time();
+                    let is_friday =
+                        chrono::Datelike::weekday(&advice_report_date) == chrono::Weekday::Fri;
+                    if calendar::is_trading_day(advice_report_date)
+                        && is_friday
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 40, 0).unwrap()
+                    {
+                        static ADVICE_REPORT_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = ADVICE_REPORT_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            match stock_analysis::database::DatabaseManager::try_get() {
+                                Some(db) => {
+                                    // 近 30 个自然日窗口 (覆盖 T+5 观察窗).
+                                    let since = (advice_report_date - chrono::Duration::days(30))
+                                        .format("%Y-%m-%d")
+                                        .to_string();
+                                    match stock_analysis::monitor::advice_feedback_report::build_advice_feedback_report(
+                                        &db,
+                                        &since,
+                                        advice_report_date,
+                                    ) {
+                                        Ok(text) if !text.is_empty() => {
+                                            if crate::notify::push_wechat(&text).await {
+                                                log::info!("[建议质量] 周报告已推送");
+                                                *ADVICE_REPORT_LAST
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    Some(advice_report_date);
+                                            } else {
+                                                log::warn!("[建议质量] 周报告推送失败, 下轮重试");
+                                            }
+                                        }
+                                        Ok(_) => {
+                                            log::info!("[建议质量] 窗口内无已回填样本, 本周不推送");
+                                            *ADVICE_REPORT_LAST
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) =
+                                                Some(advice_report_date);
+                                        }
+                                        Err(error) => log::warn!("[建议质量] 生成失败: {error}"),
+                                    }
+                                }
+                                None => log::warn!("[建议质量] 数据库不可用, 本轮跳过"),
+                            }
                         }
                     }
                 }

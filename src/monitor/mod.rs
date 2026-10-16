@@ -14,6 +14,8 @@
 //! - prediction:     预测追踪闭环
 
 pub mod adaptive;
+pub mod advice_feedback_report; // 2026-10-16: 建议质量报告 (自进化回路第③段, 仅审计)
+pub mod advice_outcome_backfill; // 2026-10-16: 建议结果滚动回填 (T+1/T+3/T+5)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
