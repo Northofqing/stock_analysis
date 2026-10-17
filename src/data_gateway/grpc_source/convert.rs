@@ -1478,10 +1478,26 @@ pub fn market_announcements(
 
 fn parse_market_announcement_records(q: &QueryResult) -> Result<Vec<Value>, GatewayError> {
     const CAPABILITY: &str = "MarketAnnouncements";
-    if !q.complete {
+    // 2026-10-17（P0-2 走 b；对端评估回执 §1.2）：
+    //
+    // 公告的"完整覆盖"在现合同下**不可能保证**——页预算 30 条 × 最多 10 页 =
+    // 300 条/查询，而源侧单日可达 1097 条（对端实测 2026-10-15：声明 1097、
+    // 实际翻 2 页 60 条）。因此服务端按**覆盖 v2 语义**返回 `complete=false`
+    // 并附 coverage 证据（coverage_scope / pit_guarantee /
+    // exchange_event_universe_complete / 逐页 SHA）。这是**设计内行为**，
+    // 不是数据故障。
+    //
+    // 原实现把 `complete=false` 一律硬拒 → 公告类推送长期全灭。
+    // 现改为：**接纳有界前缀**，但仍要求 records 非空——空批次继续拒绝，
+    // 避免把"无数据"伪装成"覆盖不全"。
+    //
+    // 这不等于"当成完整"：evidence 里 `complete=false` 原样保留，消费方据此
+    // 标注"可能不全"。coverage 明细的解析是下一步（当前 QueryResult 只解到
+    // batch 层，coverage 在其外层 result 中）。
+    if !q.complete && q.records.is_empty() {
         return Err(err(
             CAPABILITY,
-            "响应 complete=false, 不得接纳 partial batch",
+            "响应 complete=false 且 records 为空: 无可接纳的有界前缀",
         ));
     }
     let mut records = Vec::new();
