@@ -12010,6 +12010,46 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
                     }
+
+                    // 观察池（2026-10-17 P1.1）：交易日 15:40 后按新闻催化开票。
+                    // operator 口径为「按板块轮动 + 按新闻催化」；这里只落新闻催化一路，
+                    // 板块轮动路未接（board_rotation_daily 零生产写入方，数据停在 2026-07-16）。
+                    // 输入源断供时本块如实报 candidates=0，不制造假的活跃票池。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 40, 0).unwrap()
+                    {
+                        static WATCH_POOL_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = WATCH_POOL_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            match stock_analysis::database::DatabaseManager::try_get() {
+                                Some(db) => {
+                                    match stock_analysis::monitor::ticket_watch_pool::build_watch_pool(
+                                        &db,
+                                        &advice_report_date.format("%Y-%m-%d").to_string(),
+                                        None,
+                                        false,
+                                    ) {
+                                        Ok(report) => {
+                                            report.log();
+                                            *WATCH_POOL_LAST
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) =
+                                                Some(advice_report_date);
+                                        }
+                                        Err(error) => log::warn!(
+                                            "[观察池] 生成失败, 保留重试 date={advice_report_date}: {error}"
+                                        ),
+                                    }
+                                }
+                                None => log::warn!("[观察池] 数据库不可用, 本轮跳过"),
+                            }
+                        }
+                    }
                 }
 
                 if session == MarketSession::Morning || session == MarketSession::Afternoon {
