@@ -42,6 +42,9 @@ pub(crate) mod ordinary_daily_change_window_contract;
 pub mod outcome_daily_bars;
 pub mod position_chain;
 pub mod qualified_trading_facts;
+// 2026-10-17: op 67 的 provider-observed 解析层。与上面的权威 (Authority) 模型
+// 并存且不混用 —— 观察值不能当权威证明（delisted 无来源、裸 f64 价带、无 suspension）。
+pub mod provider_observed_trading_facts;
 pub mod research;
 pub mod review;
 pub mod security_lifecycle;
