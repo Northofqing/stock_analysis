@@ -218,7 +218,7 @@ fn persist(db: &DatabaseManager, fact: &ProviderObservedTradingFact) -> Result<(
             code, trade_date, quality, source, listing_state, listed_on,\
             limit_up, limit_down, price_band_source, evidence_batch, observed_at\
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\
-         ON CONFLICT(code, trade_date) DO UPDATE SET\
+         ON CONFLICT(code, trade_date) DO UPDATE SET \
             quality=excluded.quality,\
             source=excluded.source,\
             listing_state=excluded.listing_state,\
