@@ -18,7 +18,7 @@ D17 / D20 权威事实交接：[证券交易资格与停复牌权威事实](2026
 
 失败归因修正：[gRPC Gateway 默认提供者误记](2026-09-26-gateway-provider-attribution.md)。实时行情和板块成员的断线回归复现旧审计把无提供者证据的失败记为 `Tdx`；本地修正只影响新审计行，不把旧计数解释为物理提供者故障。
 
-2026-10-17 待对端评估：[Windows 侧数据缺口清单与盘中异动监控需求](2026-10-17-windows-data-gaps-and-intraday-alert-request.md)。按 P0/P1 汇总 Mac 侧实测缺口（每条附 `reason_code` 与日志原文片段，便于对端在自身日志定位），并提出新增需求「盘中异动监控」（30 秒级事件上报 + 观察池条件下发），含 wire 字段定义、验收标准与两条候选实现路线（TDX 原生预警 / Windows 侧自算），请对端评估可行性与排期。
+2026-10-17 **已评估**：[Windows 侧数据缺口清单与盘中异动监控需求](2026-10-17-windows-data-gaps-and-intraday-alert-request.md) → [对端评估回执](2026-10-17-windows-data-gaps-and-intraday-alert-evaluation.md)。来单按 P0/P1 汇总 Mac 侧实测缺口并提出「盘中异动监控」需求；回执逐条核对后给出**三处纠正**（Operation 66 实为 `TradingCalendar`；P0-2 `complete=false` 属覆盖 v2 设计内行为；P0-3 系来单方解析器把 4 个比率字段声明为标量、非契约不符）与两份清单（做不了 7 项，含「字面 map→f64 不应做」），并判定**路线 A 不可行 / 路线 B 基础已存在**（`MarketEventService` + 盘中监控循环已运行）。**待 Mac 侧动作 5 项**：①解析器改吃 `{value,unit}`（**已完成**，见 `current_auction_observations.rs::ratio_f64`）②接线 BlockTrades / GlobalIndices / ForeignExchange ③合同重钉核对（pin 四字段与 op 视图）④T0Evidence 盘中复现并附 request_id ⑤确认条件模型与 block_trade 预期。**待 operator 拍板 2 项**：P0-1 权威源路径、P0-2 提额或按 v2 前缀消费。回执附注：push2 族（含 R-09）根因在 Mac 侧网络/代理层（VM 内 DNS 解析为 `198.18.x.x` fake-IP），对端出证据链另件面交。
 
 ## 范围
 

@@ -75,6 +75,47 @@ pub struct CurrentAuctionObservation {
     pub evidence: SourceEvidence,
 }
 
+/// 2026-10-17（响应 Windows 侧评估回执 §1.3）：
+///
+/// op 61 的 **4 个比率字段**实测返回 `{"value": f64, "unit": "Percent"|"Decimal"}`
+/// 映射形态 —— `auction_pct` / `auction_turnover_pct` / `auction_volume_ratio` /
+/// `auction_yesterday_ratio_pct`；其余 8 个数值字段（auction_price / pre_close_price /
+/// auction_volume_shares / auction_amount / auction_unmatched / float_market_cap /
+/// last_price / open_price）为裸 f64 或 null。这是全 API 的既有形状（对端引
+/// `grpc-external-api.md` 同类字段），并非 live 特有 —— `stage=live` 与 `stage=final`
+/// 由同一构造器产出，字段形态一致。
+///
+/// 原始解析器把这 4 个声明成 `Option<f64>`，遇 map 即报
+/// `invalid type: map, expected f64`（2026-10-16 早盘竞价实测）。
+/// 本 deserializer 同时接受 **裸值 / {value,unit} / null**，统一归一为 f64（只取 value，
+/// unit 语义由字段名承载）。这样修不动 wire 合同、也不必改任何消费方。
+mod ratio_f64 {
+    use serde::{Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Ratio {
+        Scalar(f64),
+        WithUnit {
+            value: f64,
+            #[allow(dead_code)]
+            #[serde(default)]
+            unit: Option<String>,
+        },
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<Ratio>::deserialize(deserializer)?;
+        Ok(raw.map(|ratio| match ratio {
+            Ratio::Scalar(value) => value,
+            Ratio::WithUnit { value, .. } => value,
+        }))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AuctionWire {
@@ -85,12 +126,16 @@ struct AuctionWire {
     data_status: String,
     auction_price: Option<f64>,
     pre_close_price: Option<f64>,
+    #[serde(default, deserialize_with = "ratio_f64::deserialize")]
     auction_pct: Option<f64>,
     auction_volume_shares: Option<f64>,
     auction_amount: Option<f64>,
     auction_unmatched: f64,
+    #[serde(default, deserialize_with = "ratio_f64::deserialize")]
     auction_turnover_pct: Option<f64>,
+    #[serde(default, deserialize_with = "ratio_f64::deserialize")]
     auction_volume_ratio: Option<f64>,
+    #[serde(default, deserialize_with = "ratio_f64::deserialize")]
     auction_yesterday_ratio_pct: Option<f64>,
     float_market_cap: Option<f64>,
     last_price: Option<f64>,
@@ -444,5 +489,40 @@ mod tests {
         assert_eq!(observed.methods, ["current_auction_observations"]);
         crate::data_gateway::grpc_source::reset_bridge();
         fixture.finish().await.expect("auction fixture cleanup");
+    }
+
+    /// 2026-10-17: op 61 的 4 个比率字段实测为 `{"value","unit"}` 映射
+    /// （对端评估回执 §1.3），原解析器声明成 `Option<f64>` 即报
+    /// `invalid type: map, expected f64`。本测试锁住宽松解析的四种输入形态，
+    /// 并确认其他类型仍报错（不掩盖真问题）。
+    #[test]
+    fn ratio_f64_accepts_scalar_map_null_and_missing() {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            #[serde(default, deserialize_with = "ratio_f64::deserialize")]
+            value: Option<f64>,
+        }
+
+        // ① 裸标量（其余 8 个数值字段的形态）
+        let scalar: Probe = serde_json::from_str(r#"{"value": 1.25}"#).expect("scalar");
+        assert_eq!(scalar.value, Some(1.25));
+
+        // ② {"value","unit"} 映射（4 个比率字段的形态）
+        let mapped: Probe =
+            serde_json::from_str(r#"{"value": {"value": 1.25, "unit": "Percent"}}"#)
+                .expect("map with unit");
+        assert_eq!(mapped.value, Some(1.25));
+
+        // ③ 显式 null
+        let null: Probe = serde_json::from_str(r#"{"value": null}"#).expect("null");
+        assert_eq!(null.value, None);
+
+        // ④ 字段缺失
+        let missing: Probe = serde_json::from_str("{}").expect("missing");
+        assert_eq!(missing.value, None);
+
+        // ⑤ 其他类型仍必须失败（避免把真错误静默成 None）
+        assert!(serde_json::from_str::<Probe>(r#"{"value": "abc"}"#).is_err());
+        assert!(serde_json::from_str::<Probe>(r#"{"value": {"unit": "Percent"}}"#).is_err());
     }
 }

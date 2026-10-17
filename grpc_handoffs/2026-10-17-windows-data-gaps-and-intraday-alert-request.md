@@ -4,6 +4,21 @@
 - 来源：Mac 侧 monitor（ExternalV1 消费方 / 调用方）
 - 用途：请对端评估并给出排期；P0 项阻塞 Mac 侧业务，P1 项影响能力覆盖，第四部分为新增需求
 
+> **2026-10-17 回执更正**（详见同目录 `2026-10-17-windows-data-gaps-and-intraday-alert-evaluation.md`）
+>
+> 1. **P0-1 的编号错误**：本文原写「`QualifiedTradingFacts`（Operation 66）」有误。现役合同
+>    （`dba66a27…`，随 2026-10-16.1 bundle 交付）中 **Operation 66 = `TradingCalendar`**
+>    （已核本仓 `contracts/external_v1_current/market.proto:385`）。QualifiedTradingFacts 若立项，
+>    号应自 **67** 起。
+> 2. **P0-3 的定性反了**：对 `invalid type: map, expected f64`，本文原判断为「live 契约与 final
+>    不一致，请对端返回裸 f64」。经回执实测，**4 个比率字段（`auction_pct` /
+>    `auction_turnover_pct` / `auction_volume_ratio` / `auction_yesterday_ratio_pct`）在全 API
+>    就是 `{"value","unit"}` 形态**，`stage=live` 与 `stage=final` 同构造器、形态一致；**是 Mac 侧
+>    解析器把这 4 个声明成了标量**（写本文时未核 `current_auction_observations.rs` 的字段类型）。
+>    已按回执建议改为宽容解析（接受裸值 / `{value,unit}` / null，零契约变更），见该文件 `ratio_f64`。
+> 3. **P0-2 的性质**：`complete=false` 属覆盖 v2 的**设计内行为**（实测当日 1097 条 > 300 条/查询
+>    上限），本文「若协议上分批是本意，请告知分页约定」一问**已有答案**（v2 覆盖 envelope 已在线）。
+
 ---
 
 ## 一、背景
