@@ -12090,6 +12090,45 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
                     }
+
+                    // 价格带落库（P1.3）：op 67 的 price_band 只在**观测快照日**有值，
+                    // 当天不查就永久丢失 —— 这是本调度存在的唯一理由。
+                    // 标的 = 当日 active tickets + 当前持仓；非快照日 limit_up/down 存 NULL。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 50, 0).unwrap()
+                    {
+                        static PRICE_BAND_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = PRICE_BAND_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::trading_fact_snapshot::refresh_daily_snapshots(
+                                    &db,
+                                    &date_text,
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        report.log();
+                                        *PRICE_BAND_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[价格带落库] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            } else {
+                                log::warn!("[价格带落库] 数据库不可用, 本轮跳过");
+                            }
+                        }
+                    }
                 }
 
                 if session == MarketSession::Morning || session == MarketSession::Afternoon {

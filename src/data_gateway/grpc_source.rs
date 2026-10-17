@@ -3312,6 +3312,19 @@ impl GrpcSource {
             .map_err(|error| map_external_query_error_named(&format!("{operation:?}"), &error))
     }
 
+    /// op 67 QualifiedTradingFacts（provider-observed 观察值）。
+    ///
+    /// 与 `trading_facts_authority`（Authority 语义）**不是一回事**：
+    /// 这里拿到的是对端观察值（delisted 不产出、裸 f64 价带、无 suspension），
+    /// 解析必须走 `provider_observed_trading_facts::parse_fact`，不得塞进权威模型。
+    pub async fn qualified_trading_facts_async(
+        &self,
+        params: Value,
+    ) -> Result<QueryResult, GatewayError> {
+        self.query_external_native_op(ExternalOperation::QualifiedTradingFacts, params)
+            .await
+    }
+
     pub async fn current_auction_observations_async(
         &self,
         request: &crate::data_gateway::current_auction_observations::CurrentAuctionRequest,
