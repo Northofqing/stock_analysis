@@ -12129,6 +12129,45 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
                     }
+
+                    // 日线+均线（P2 数据基础）：与 trading-authority 门解耦,
+                    // 直接用 HistoricalBars 拉最近 30 个交易日、自算 ma5/ma10/ma20/量比。
+                    // 代价：这是"自算的第二套口径"，authority 通了若数值不一致需要对齐。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 55, 0).unwrap()
+                    {
+                        static DAILY_MA_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = DAILY_MA_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::daily_bars_indicators::refresh_daily_bars_and_ma(
+                                    &db,
+                                    &date_text,
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        report.log();
+                                        *DAILY_MA_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[日线均线] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            } else {
+                                log::warn!("[日线均线] 数据库不可用, 本轮跳过");
+                            }
+                        }
+                    }
                 }
 
                 if session == MarketSession::Morning || session == MarketSession::Afternoon {

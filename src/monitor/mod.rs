@@ -19,6 +19,7 @@ pub mod advice_outcome_backfill; // 2026-10-16: 建议结果滚动回填 (T+1/T+
 pub mod ticket_watch_pool; // 2026-10-17: 观察池生成 (新闻催化; 板块轮动待接写入方)
 pub mod ticket_event_sync; // 2026-10-17: 投递记账 (Delivered → ticket_event; 观察池/持仓才建票)
 pub mod trading_fact_snapshot; // 2026-10-17: op 67 价格带每日落库 (快照日有值, 错过永久丢)
+pub mod daily_bars_indicators; // 2026-10-17: 日线+均线补齐 (与 authority 门解耦, P2 数据基础)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)

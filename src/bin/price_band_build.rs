@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    DatabaseManager::init_retained_monitor(path)?;
+    DatabaseManager::init_retained_monitor(Some(path))?;
     let db = DatabaseManager::get();
 
     println!("[价格带] date={date_text} 开始（标的 = active tickets + 持仓）");
