@@ -16,6 +16,7 @@
 pub mod adaptive;
 pub mod advice_feedback_report; // 2026-10-16: 建议质量报告 (自进化回路第③段, 仅审计)
 pub mod advice_outcome_backfill; // 2026-10-16: 建议结果滚动回填 (T+1/T+3/T+5)
+pub mod ticket_watch_pool; // 2026-10-17: 观察池生成 (新闻催化; 板块轮动待接写入方)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
