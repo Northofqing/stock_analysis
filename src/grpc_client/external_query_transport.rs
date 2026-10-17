@@ -32,11 +32,12 @@ impl ExternalQueryLimit {
     }
 }
 const EXTERNAL_WIRE_MATERIAL: &str = "external-unary-response-evidence-v1";
-// The 2026-10-15.1 public bundle (66 RPC, +TradingCalendar) compiles to this
-// client descriptor. The VM build identity's server contract digest is a
-// distinct release identity.
+// The 2026-10-17.1 public bundle (67 market-data RPC, +QualifiedTradingFacts;
+// 74 rpc declarations total) compiles to this client descriptor. The VM build
+// identity's server contract digest (`dde8897c…`) is a distinct release
+// identity — never use it here.
 pub(crate) const EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256: &str =
-    "718de5d6a6f61194d01b7d89818d48d0fc624fdbeb61226d275922c0f66217f5";
+    "b446a1568f016c49a970cac164d2f9b3558709c1e2a3f9318f15e22b05350af6";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum ExternalQueryMethod {

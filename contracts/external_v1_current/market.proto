@@ -70,6 +70,7 @@ enum Operation {
   OPERATION_OFFICIAL_PUBLICATIONS = 64;
   OPERATION_OFFICIAL_PUBLICATION = 65;
   OPERATION_TRADING_CALENDAR = 66;
+  OPERATION_QUALIFIED_TRADING_FACTS = 67;
 }
 
 enum AdmissionState {
@@ -383,6 +384,7 @@ service MarketDataService {
   rpc OfficialPublications(QueryRequest) returns (QueryResponse);
   rpc OfficialPublication(QueryRequest) returns (QueryResponse);
   rpc TradingCalendar(QueryRequest) returns (QueryResponse);
+  rpc QualifiedTradingFacts(QueryRequest) returns (QueryResponse);
 }
 
 service MarketEventService {

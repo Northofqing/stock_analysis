@@ -372,6 +372,52 @@ pub fn build_external_native_query_request(
                 serde_json::json!({"start":start,"end":end,"limit":limit}),
             )
         }
+        ExternalOperation::QualifiedTradingFacts => {
+            // op 67: 请求 schema magic.market.qualified_trading_facts.request v1。
+            // 边界按对端清单 §1.2：instruments 1..=50 / dates 1..=250 / 乘积 ≤500。
+            // `suspension` 允许透传 —— 服务端会以 UNIMPLEMENTED +
+            // capability_unadmitted 拒绝，本地不替它决定合同语义。
+            ensure_only_keys(&params, &["instruments", "dates", "include"])?;
+            let instruments = required_instruments(&params)?;
+            if !(1..=50).contains(&instruments.len()) {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            let dates = params
+                .get("dates")
+                .and_then(Value::as_array)
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            if !(1..=250).contains(&dates.len()) {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            let mut normalized_dates = Vec::with_capacity(dates.len());
+            for value in dates {
+                normalized_dates.push(Value::from(parse_iso_date(value)?.to_string()));
+            }
+            if instruments.len().saturating_mul(normalized_dates.len()) > 500 {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            let mut request = serde_json::Map::new();
+            request.insert("instruments".to_owned(), Value::Array(instruments));
+            request.insert("dates".to_owned(), Value::Array(normalized_dates));
+            if let Some(include) = params.get("include") {
+                let include = include
+                    .as_array()
+                    .ok_or(ExternalContractError::InvalidParameters)?;
+                for item in include {
+                    match item.as_str() {
+                        Some("lifecycle" | "price_band" | "suspension") => {}
+                        _ => return Err(ExternalContractError::InvalidParameters),
+                    }
+                }
+                request.insert("include".to_owned(), Value::Array(include.clone()));
+            }
+            (
+                "magic.market.qualified_trading_facts.request",
+                1,
+                String::new(),
+                Value::Object(request),
+            )
+        }
         _ => return Err(ExternalContractError::UndeliveredOperation),
     };
     assemble_request(schema, schema_version, preferred_provider, data)

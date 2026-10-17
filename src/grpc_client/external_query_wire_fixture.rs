@@ -987,6 +987,15 @@ macro_rules! external_query_wire_service {
                 Err(Status::unimplemented("TEST_CODE trading calendar unavailable"))
             }
 
+            async fn qualified_trading_facts(
+                &self,
+                _request: Request<QueryRequest>,
+            ) -> Result<Response<QueryResponse>, Status> {
+                Err(Status::unimplemented(
+                    "TEST_CODE qualified trading facts unavailable",
+                ))
+            }
+
             async fn money_flows(
                 &self,
                 request: Request<QueryRequest>,

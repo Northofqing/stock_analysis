@@ -1522,6 +1522,45 @@ fn parse_market_announcement_records(q: &QueryResult) -> Result<Vec<Value>, Gate
     Ok(records)
 }
 
+/// 公告记录里的股票代码。2026-10-17 对端实测帧：顶层没有 `code`，
+/// 代码在 `instrument.code`（`instrument:{exchange,code,asset_class}`）。
+/// 旧 op（`announcements`）用顶层 `code`，两种形状都接受。
+fn announcement_code(v: &Value, capability: &'static str) -> Result<String, GatewayError> {
+    if let Some(code) = v.get("code").and_then(Value::as_str) {
+        if !code.trim().is_empty() {
+            return Ok(code.to_owned());
+        }
+    }
+    if let Some(code) = v
+        .get("instrument")
+        .and_then(|instrument| instrument.get("code"))
+        .and_then(Value::as_str)
+    {
+        if !code.trim().is_empty() {
+            return Ok(code.to_owned());
+        }
+    }
+    Err(err(
+        capability,
+        "record 缺 code（顶层 code 与 instrument.code 均缺失）",
+    ))
+}
+
+/// 公告链接。2026-10-17 对端实测帧用 `canonical_url`；旧 op 用 `url`。
+fn announcement_url(v: &Value, capability: &'static str) -> Result<String, GatewayError> {
+    for key in ["canonical_url", "url"] {
+        if let Some(url) = v.get(key).and_then(Value::as_str) {
+            if !url.trim().is_empty() {
+                return Ok(url.to_owned());
+            }
+        }
+    }
+    Err(err(
+        capability,
+        "record 缺 canonical_url（canonical_url 与 url 均缺失）",
+    ))
+}
+
 fn announcement_records(
     q: &QueryResult,
     capability: &'static str,
@@ -1536,11 +1575,11 @@ fn announcement_records(
         .map(|v| {
             Ok(EventAnnouncement {
                 announcement_id: as_str(v, "announcement_id", capability)?,
-                code: as_str(v, "code", capability)?,
+                code: announcement_code(v, capability)?,
                 category: as_optional_str(v, "category", capability)?,
                 title: as_str(v, "title", capability)?,
                 published_at: as_str(v, "published_at", capability)?,
-                canonical_url: as_str(v, "url", capability)?,
+                canonical_url: announcement_url(v, capability)?,
             })
         })
         .collect::<Result<_, _>>()?;
@@ -4322,6 +4361,79 @@ mod tests {
     use super::*;
     use crate::grpc_client::envelope::{AcquisitionProvenance, CanonicalRecord, QueryAdmission};
     use chrono::TimeZone;
+
+    /// 2026-10-17 对端实测帧：公告记录没有顶层 `code` / `url`，
+    /// 代码在 `instrument.code`，链接在 `canonical_url`。
+    #[test]
+    fn announcement_reads_instrument_code_and_canonical_url() {
+        let record = serde_json::json!({
+            "announcement_id": "A-1",
+            "instrument": {"exchange": "Shenzhen", "code": "000657", "asset_class": "Equity"},
+            "instrument_name": "中钨高新",
+            "category": "重大事项",
+            "title": "关于…的公告",
+            "published_at": "2026-10-17T08:00:00+08:00",
+            "canonical_url": "https://example.test/a-1",
+            "pdf_url": null,
+            "evidence": {}
+        });
+        assert_eq!(
+            announcement_code(&record, "MarketAnnouncements").expect("instrument.code 应被接受"),
+            "000657"
+        );
+        assert_eq!(
+            announcement_url(&record, "MarketAnnouncements").expect("canonical_url 应被接受"),
+            "https://example.test/a-1"
+        );
+    }
+
+    /// 旧 op（`announcements`）用顶层 `code` / `url`，不能因此回归。
+    #[test]
+    fn announcement_keeps_legacy_top_level_code_and_url() {
+        let record = serde_json::json!({
+            "announcement_id": "A-2",
+            "code": "600000",
+            "category": null,
+            "title": "旧格式",
+            "published_at": "2026-10-17T08:00:00+08:00",
+            "url": "https://example.test/a-2"
+        });
+        assert_eq!(
+            announcement_code(&record, "announcements").expect("顶层 code 应被接受"),
+            "600000"
+        );
+        assert_eq!(
+            announcement_url(&record, "announcements").expect("顶层 url 应被接受"),
+            "https://example.test/a-2"
+        );
+    }
+
+    /// 两种形状都没有时必须报错，不能补空字符串（BR-222 精神）。
+    #[test]
+    fn announcement_rejects_missing_code_and_blank_url() {
+        let no_code = serde_json::json!({
+            "announcement_id": "A-3",
+            "instrument": {"exchange": "Shenzhen", "asset_class": "Equity"},
+            "canonical_url": "https://example.test/a-3"
+        });
+        assert!(announcement_code(&no_code, "MarketAnnouncements").is_err());
+
+        let blank_code = serde_json::json!({
+            "announcement_id": "A-4",
+            "code": "   ",
+            "instrument": {"exchange": "Shenzhen", "code": "000001", "asset_class": "Equity"}
+        });
+        assert_eq!(
+            announcement_code(&blank_code, "MarketAnnouncements").expect("空白顶层 code 应回退到 instrument.code"),
+            "000001"
+        );
+
+        let no_url = serde_json::json!({
+            "announcement_id": "A-5",
+            "instrument": {"exchange": "Shenzhen", "code": "000002", "asset_class": "Equity"}
+        });
+        assert!(announcement_url(&no_url, "MarketAnnouncements").is_err());
+    }
 
     fn mk_q(data: &str, provider: &str, source: &str) -> QueryResult {
         QueryResult {
