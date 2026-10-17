@@ -35,6 +35,17 @@ const LOOKBACK_DAYS: i64 = 30;
 const SUPPORT_WINDOW: usize = 20;
 const VOLUME_CONFIRM: f64 = 1.2;
 
+/// 三道超买门：任一命中就不给买点（2026-10-17 由 601811 三连板暴露）。
+///
+/// 601811 当时 close=28.14 / ma5=24.22（偏离 +16.2%）/ 近 5 日 +34.5% / 三连板封死，
+/// 原规则仍给"回踩 ma10 22.1 买" —— 等于要求等一个 22% 的崩盘，或去涨停板上追。
+const MAX_DEVIATION_FROM_MA5: f64 = 0.10;
+const MAX_GAIN_5D: f64 = 0.25;
+const MIN_LIMIT_UP_STREAK_TO_SKIP: usize = 3;
+/// 涨停判定阈值（pct_chg 是百分数）。主板 10% / 创业板科创板 20% / ST 5%；
+/// 取 9.8 既能覆盖主板，也能捕获 20% 板的涨停（其值 >= 19.9）。
+const LIMIT_UP_PCT_THRESHOLD: f64 = 9.8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trend {
     Bullish,
@@ -74,6 +85,8 @@ pub struct BuyZone {
     pub trigger: String,
     /// 是否因为"已在 20 日低附近"而不给买点（区别于"数据不足"）
     pub at_support: bool,
+    /// 是否因为超买/异动（连板 / 近5日涨幅 / 偏离 ma5）而不给买点
+    pub overheated: bool,
 }
 
 fn classify(ma5: Option<f64>, ma10: Option<f64>, ma20: Option<f64>) -> Trend {
@@ -112,10 +125,12 @@ pub fn compute(
         ma20: Option<f64>,
         #[diesel(sql_type = Nullable<Double>)]
         volume_ratio: Option<f64>,
+        #[diesel(sql_type = Nullable<Double>)]
+        pct_chg: Option<f64>,
     }
 
     let bars: Vec<BarRow> = diesel::sql_query(
-        "SELECT date, close, high, low, ma5, ma10, ma20, volume_ratio \
+        "SELECT date, close, high, low, ma5, ma10, ma20, volume_ratio, pct_chg \
          FROM stock_daily WHERE code = ? AND date <= ? \
          ORDER BY date DESC LIMIT ?",
     )
@@ -167,6 +182,48 @@ pub fn compute(
     .ok();
 
     let trend = classify(latest.ma5, latest.ma10, latest.ma20);
+
+    // ---- 三道超买门（2026-10-17 由 601811 三连板暴露）----
+    // 连板：从最新往前数连续 pct_chg >= 阈值的天数
+    let limit_up_streak = bars
+        .iter()
+        .take_while(|row| {
+            row.pct_chg
+                .map(|value| value >= LIMIT_UP_PCT_THRESHOLD)
+                .unwrap_or(false)
+        })
+        .count();
+    // 近 5 个交易日涨幅（bars[0] 为最新，bars[5] 为 5 个交易日前）
+    let gain_5d = if bars.len() > 5 {
+        match (bars[0].close, bars[5].close) {
+            (Some(latest_close), Some(base_close)) if base_close > 0.0 => {
+                Some((latest_close - base_close) / base_close)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // 现价相对 ma5 的偏离度
+    let deviation = latest
+        .ma5
+        .and_then(|ma5| if ma5 > 0.0 { Some((close - ma5) / ma5) } else { None });
+
+    let mut overheat: Option<String> = None;
+    if limit_up_streak >= MIN_LIMIT_UP_STREAK_TO_SKIP {
+        overheat = Some(format!("连续 {limit_up_streak} 个涨停（封板买不进）"));
+    } else if let Some(gain) = gain_5d {
+        if gain > MAX_GAIN_5D {
+            overheat = Some(format!("近 5 日涨幅 {:.1}% 过大", gain * 100.0));
+        }
+    }
+    if overheat.is_none() {
+        if let Some(dev) = deviation {
+            if dev > MAX_DEVIATION_FROM_MA5 {
+                overheat = Some(format!("现价偏离 ma5 {:.1}%", dev * 100.0));
+            }
+        }
+    }
 
     let mut entry_low = None;
     let mut entry_high = None;
@@ -237,6 +294,14 @@ pub fn compute(
         }
     }
 
+    // 三道超买门任一命中：覆盖 trend 分支给出的买点
+    if let Some(reason) = overheat.as_deref() {
+        entry_low = None;
+        entry_high = None;
+        at_support = false;
+        trigger = format!("{reason}，不参与；等回踩或开板后再看");
+    }
+
     // 跌停价是理论底：放弃价不应低于它（否则永远触发不了），只作下限提示
     let limit_down = band.as_ref().and_then(|row| row.limit_down);
     if let (Some(value), Some(floor)) = (abandon, limit_down) {
@@ -267,6 +332,7 @@ pub fn compute(
         abandon,
         trigger,
         at_support,
+        overheated: overheat.is_some(),
     }))
 }
 
@@ -297,6 +363,9 @@ impl BuyZone {
 
         match (self.entry_low, self.entry_high) {
             (Some(low), Some(high)) => lines.push(format!("  买点：{low}-{high}")),
+            _ if self.overheated => {
+                lines.push("  买点：不给（超买/异动，不参与）".to_string())
+            }
             _ if self.at_support => {
                 lines.push("  买点：不给（已在 20 日低点附近，不追）".to_string())
             }
