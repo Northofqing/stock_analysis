@@ -2781,6 +2781,7 @@ pub mod daily_change_review;
 pub(crate) mod daily_change_review_schema_v1;
 pub mod data_acquisition_audit;
 pub mod advice_outcome_tracking;
+pub mod ticket_lifecycle; // 2026-10-17: 票的生命周期 (ticket_lifecycle / ticket_event)
 pub mod execution_tracking;
 pub(crate) mod global_schema_catalog_v1;
 pub(crate) mod global_schema_v1;
@@ -4277,6 +4278,12 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // advice_outcome_tracking (2026-10-16): 建议执行跟踪独立表 (推送成功落行,
         // 执行结果后续回填; 替代 V1 死结的 execution_tracking 写入路径).
         advice_outcome_tracking::create_schema(&mut *conn)?;
+
+        // ticket_lifecycle / ticket_event (2026-10-17): 票的生命周期。把"一只票"
+        // 做成一等公民 —— 60+ 种 push_kind 都是孤立信号，没有"以票为主键"的聚合层，
+        // 导致盘中跟踪/次日决策/盈亏复盘都无法回答"这只票的完整历史".
+        // 纯新增: 不改任何现有推送链路, 现有表一律不动.
+        ticket_lifecycle::create_schema(&mut *conn)?;
 
         // position_adjustments (PR3-3.3)
         diesel::sql_query(
