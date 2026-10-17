@@ -63,6 +63,8 @@ pub(crate) enum ExternalQueryMethod {
     EconomicReleaseObservations,
     #[serde(rename = "OPERATION_ECONOMIC_RELEASE_SCHEDULE")]
     EconomicReleaseSchedule,
+    #[serde(rename = "OPERATION_QUALIFIED_TRADING_FACTS")]
+    QualifiedTradingFacts,
 }
 
 impl ExternalQueryMethod {
@@ -81,6 +83,7 @@ impl ExternalQueryMethod {
             Self::CurrentAuctionObservations => "CurrentAuctionObservations",
             Self::EconomicReleaseObservations => "EconomicReleaseObservations",
             Self::EconomicReleaseSchedule => "EconomicReleaseSchedule",
+            Self::QualifiedTradingFacts => "QualifiedTradingFacts",
         }
     }
 
@@ -102,6 +105,9 @@ impl ExternalQueryMethod {
             }
             Self::EconomicReleaseSchedule => {
                 "/magic.market.v1.MarketDataService/EconomicReleaseSchedule"
+            }
+            Self::QualifiedTradingFacts => {
+                "/magic.market.v1.MarketDataService/QualifiedTradingFacts"
             }
         }
     }
@@ -139,6 +145,7 @@ impl ExternalQueryMethod {
             Operation::CurrentAuctionObservations => Some(Self::CurrentAuctionObservations),
             Operation::EconomicReleaseObservations => Some(Self::EconomicReleaseObservations),
             Operation::EconomicReleaseSchedule => Some(Self::EconomicReleaseSchedule),
+            Operation::QualifiedTradingFacts => Some(Self::QualifiedTradingFacts),
             _ => None,
         }
     }
@@ -428,6 +435,9 @@ impl ExternalQueryTransport {
                 }
                 ExternalQueryMethod::EconomicReleaseSchedule => {
                     client.economic_release_schedule(request).await
+                }
+                ExternalQueryMethod::QualifiedTradingFacts => {
+                    client.qualified_trading_facts(request).await
                 }
             }
         };

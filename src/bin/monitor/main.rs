@@ -12050,6 +12050,46 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
                     }
+
+                    // 投递记账（P1.2）：把当日已投递的逐票推送写进 ticket 时间轴。
+                    // 口径（operator 2026-10-17）：观察池选出的票 + 实际持仓才建档；其余跳过。
+                    // 只读打开 durable_delivery.sqlite3（相对 cwd=运行根），写失败不影响投递。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 45, 0).unwrap()
+                    {
+                        static TICKET_SYNC_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = TICKET_SYNC_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let delivery_db =
+                                    std::path::PathBuf::from("data/durable_delivery.sqlite3");
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::ticket_event_sync::sync_from_delivery(
+                                    &db,
+                                    &delivery_db,
+                                    &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        report.log();
+                                        *TICKET_SYNC_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[ticket记账] 同步失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            } else {
+                                log::warn!("[ticket记账] 数据库不可用, 本轮跳过");
+                            }
+                        }
+                    }
                 }
 
                 if session == MarketSession::Morning || session == MarketSession::Afternoon {

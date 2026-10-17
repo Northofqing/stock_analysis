@@ -7,6 +7,8 @@ pub mod closing_valuation;
 mod store;
 pub mod user_position_snapshot;
 pub use store::{live_rolling_sharpe, strategy_correlation_matrix};
+// 2026-10-17: ticket 记账需要判断"是否实际持仓"（P1.2 口径）。
+pub use store::load_positions;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
