@@ -72,6 +72,15 @@ const DEFAULT_ADDR: &str = "http://127.0.0.1:18082";
 /// (fail-closed, retryable)。
 const GRPC_BRIDGE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 
+/// 建连阶段每一步的超时（2026-10-17 复盘 10-16 15:06 盘后卡死后加）。
+///
+/// 背景：`ensure_connected` 原本三处 await 全无超时，而 `local_initialization` 是
+/// `Semaphore::new(1)` —— 一处卡住，后续所有 gateway 调用在 `acquire_owned()` 永久排队，
+/// 导致盘后 5.5 小时定时任务全停、15:30 产业链报告漏发。
+const LOCAL_INIT_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CLIENT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BenchmarkGrpcOwnership {
     ServerHandled,
@@ -2861,30 +2870,100 @@ impl GrpcSource {
     }
 
     async fn ensure_connected(&self) -> Result<(), GatewayError> {
-        let _qualification = Arc::clone(&self.local_initialization)
-            .acquire_owned()
+        // 2026-10-16 15:06 盘后卡死复盘：这三处 await 原本全无超时，而
+        // local_initialization 是 Semaphore::new(1) —— 一处卡住，后续所有 gateway
+        // 调用在 acquire_owned() 永久排队，盘后 5.5 小时定时任务全停、15:30 产业链漏发。
+        // 每步都加超时 + 耗时日志：超时防住无限挂，日志让下次复现能分清卡在哪一步。
+        let permit_started = std::time::Instant::now();
+        let _qualification = tokio::time::timeout(
+            LOCAL_INIT_PERMIT_TIMEOUT,
+            Arc::clone(&self.local_initialization).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            GatewayError::unavailable(
+                "GrpcBridge",
+                None,
+                true,
+                format!(
+                    "local initialization permit 等待超过 {LOCAL_INIT_PERMIT_TIMEOUT:?}（已有调用卡在建连）"
+                ),
+            )
+        })?
+        .map_err(|_| {
+            GatewayError::unavailable(
+                "GrpcBridge",
+                None,
+                false,
+                "Local initialization qualification closed",
+            )
+        })?;
+        let permit_wait_ms = permit_started.elapsed().as_millis();
+
+        {
+            let guard = tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.client.lock())
+                .await
+                .map_err(|_| {
+                    GatewayError::unavailable(
+                        "GrpcBridge",
+                        None,
+                        true,
+                        format!("client mutex 等待超过 {CLIENT_LOCK_TIMEOUT:?}"),
+                    )
+                })?;
+            if guard.is_some() {
+                if permit_wait_ms > 100 {
+                    log::warn!(
+                        "[data_gateway] 建连排队耗时 {permit_wait_ms}ms（client 已存在，permit 竞争）"
+                    );
+                }
+                return Ok(());
+            }
+        }
+
+        let connect_started = std::time::Instant::now();
+        let client = tokio::time::timeout(CONNECT_TIMEOUT, GrpcMarketClient::connect(&self.addr))
             .await
             .map_err(|_| {
                 GatewayError::unavailable(
                     "GrpcBridge",
                     None,
-                    false,
-                    "Local initialization qualification closed",
+                    true,
+                    format!(
+                        "gRPC 服务端 {} 建连超过 {CONNECT_TIMEOUT:?}",
+                        self.addr
+                    ),
+                )
+            })?
+            .map_err(|e| {
+                GatewayError::unavailable(
+                    "GrpcBridge",
+                    None,
+                    true,
+                    format!("gRPC 服务端 {} 不可达: {e}", self.addr),
                 )
             })?;
-        if self.client.lock().await.is_some() {
-            return Ok(());
+        let connect_ms = connect_started.elapsed().as_millis();
+
+        {
+            let mut guard = tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.client.lock())
+                .await
+                .map_err(|_| {
+                    GatewayError::unavailable(
+                        "GrpcBridge",
+                        None,
+                        true,
+                        format!("client mutex 写入等待超过 {CLIENT_LOCK_TIMEOUT:?}"),
+                    )
+                })?;
+            *guard = Some(client);
         }
-        let client = GrpcMarketClient::connect(&self.addr).await.map_err(|e| {
-            GatewayError::unavailable(
-                "GrpcBridge",
-                None,
-                true,
-                format!("gRPC 服务端 {} 不可达: {e}", self.addr),
-            )
-        })?;
-        log::info!("[data_gateway] gRPC 桥已连接: server={}", self.addr);
-        *self.client.lock().await = Some(client);
+        log::info!(
+            "[data_gateway] gRPC 桥已连接: server={} permit_wait={}ms connect={}ms",
+            self.addr,
+            permit_wait_ms,
+            connect_ms
+        );
         Ok(())
     }
 
@@ -2916,7 +2995,16 @@ impl GrpcSource {
         // query await 会让一个慢 op (如 tdx-smart failover 20s+) 阻塞所有
         // 排队请求, 排队者超过 GRPC_BRIDGE_SYNC_TIMEOUT 后全部超时取消。
         let mut client = {
-            let guard = self.client.lock().await;
+            let guard = tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.client.lock())
+                .await
+                .map_err(|_| {
+                    GatewayError::unavailable(
+                        "GrpcBridge",
+                        None,
+                        true,
+                        format!("query_op client mutex 等待超过 {CLIENT_LOCK_TIMEOUT:?}"),
+                    )
+                })?;
             guard
                 .as_ref()
                 .expect("ensure_connected 后必有 client")
@@ -3170,21 +3258,44 @@ impl GrpcSource {
         &self,
         method: ExternalMethod,
     ) -> Result<(GrpcMarketClient, Vec<ExternalCapability>), GatewayError> {
-        let _qualification = Arc::clone(&self.external_initialization)
-            .acquire_owned()
+        // 与 ensure_connected 同样的防护（2026-10-17）：permit 与建连原本无超时。
+        let _qualification = tokio::time::timeout(
+            LOCAL_INIT_PERMIT_TIMEOUT,
+            Arc::clone(&self.external_initialization).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            GatewayError::unavailable(
+                "GrpcExternalV1",
+                None,
+                true,
+                format!(
+                    "external initialization permit 等待超过 {LOCAL_INIT_PERMIT_TIMEOUT:?}"
+                ),
+            )
+        })?
+        .map_err(|_| {
+            GatewayError::unavailable(
+                "GrpcExternalV1",
+                None,
+                false,
+                "External initialization qualification closed",
+            )
+        })?;
+        // Remove the cached generation before awaiting. Failure or cancellation
+        // spends this cache entry; the next acquisition makes one fresh dial
+        // and repeats every gate. Never retry this acquisition transparently.
+        let cached = tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.external_client.lock())
             .await
             .map_err(|_| {
                 GatewayError::unavailable(
                     "GrpcExternalV1",
                     None,
-                    false,
-                    "External initialization qualification closed",
+                    true,
+                    format!("external_client mutex 等待超过 {CLIENT_LOCK_TIMEOUT:?}"),
                 )
-            })?;
-        // Remove the cached generation before awaiting. Failure or cancellation
-        // spends this cache entry; the next acquisition makes one fresh dial
-        // and repeats every gate. Never retry this acquisition transparently.
-        let cached = self.external_client.lock().await.take();
+            })?
+            .take();
         if let Some(mut state) = cached {
             let health = state
                 .client
@@ -3199,7 +3310,22 @@ impl GrpcSource {
                 .map_err(map_external_connection_error)?;
             require_external_capability(&capabilities, method)?;
             let client = state.client.clone();
-            *self.external_client.lock().await = Some(state);
+            {
+                let mut guard =
+                    tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.external_client.lock())
+                        .await
+                        .map_err(|_| {
+                            GatewayError::unavailable(
+                                "GrpcExternalV1",
+                                None,
+                                true,
+                                format!(
+                                    "external_client mutex 回写等待超过 {CLIENT_LOCK_TIMEOUT:?}"
+                                ),
+                            )
+                        })?;
+                *guard = Some(state);
+            }
             return Ok((client, capabilities));
         }
         let bundle = self.external_bundle.as_ref().ok_or_else(|| {
@@ -3225,9 +3351,16 @@ impl GrpcSource {
 
         let prepared = GrpcMarketClient::prepare_client_bundle(bundle)
             .map_err(map_external_connection_error)?;
-        let mut client = prepared
-            .connect_once()
+        let mut client = tokio::time::timeout(CONNECT_TIMEOUT, prepared.connect_once())
             .await
+            .map_err(|_| {
+                GatewayError::unavailable(
+                    "GrpcExternalV1",
+                    None,
+                    true,
+                    format!("ExternalV1 建连超过 {CONNECT_TIMEOUT:?}"),
+                )
+            })?
             .map_err(map_external_connection_error)?;
         let health = client
             .get_external_health()
@@ -3243,10 +3376,25 @@ impl GrpcSource {
             "[data_gateway] ExternalV1 已通过 health/capability gate: method={}",
             method.as_str_name()
         );
-        *self.external_client.lock().await = Some(ExternalClientState {
-            client: client.clone(),
-            prepared,
-        });
+        {
+            let mut guard =
+                tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.external_client.lock())
+                    .await
+                    .map_err(|_| {
+                        GatewayError::unavailable(
+                            "GrpcExternalV1",
+                            None,
+                            true,
+                            format!(
+                                "external_client mutex 缓存等待超过 {CLIENT_LOCK_TIMEOUT:?}"
+                            ),
+                        )
+                    })?;
+            *guard = Some(ExternalClientState {
+                client: client.clone(),
+                prepared,
+            });
+        }
         Ok((client, capabilities))
     }
 
