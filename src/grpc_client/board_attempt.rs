@@ -102,11 +102,21 @@ impl BoardQuerySession {
     pub(super) fn new_memberships(
         client: GrpcMarketClient,
         code: String,
+        preferred_provider: Option<&str>,
     ) -> Result<Self, GrpcError> {
-        let request = client.build_profile_query_request(
-            Operation::BoardConstituents,
-            serde_json::json!({ "codes": [&code] }),
-        )?;
+        // 2026-10-18: 服务端 BoardMemberships 新增 Eastmoney provider
+        // （Windows release e2319f5）。传 preferred_provider=Eastmoney 时返回
+        // `eastmoney:<category>:<名称>` 身份，board_name 是东财个股页原始名称，
+        // 可与 BoardFlows 的 board_name 精确 join；空值仍走 Tdx，行为不变。
+        //
+        // 走 JSON payload 而不是 proto 字段：QueryRequest 的参数本来就是
+        // payload.data 里的 JSON 对象（market.proto:96 的 preferred_provider
+        // 是这个 JSON 的字段，不是新 proto 消息）。
+        let mut payload = serde_json::json!({ "codes": [&code] });
+        if let Some(provider) = preferred_provider {
+            payload["preferred_provider"] = serde_json::Value::String(provider.to_owned());
+        }
+        let request = client.build_profile_query_request(Operation::BoardConstituents, payload)?;
         let request_id = request
             .context
             .as_ref()

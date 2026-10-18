@@ -263,8 +263,9 @@ impl GrpcMarketClient {
     pub(crate) fn board_memberships_query(
         &self,
         code: String,
+        preferred_provider: Option<&str>,
     ) -> Result<board_attempt::BoardQuerySession, GrpcError> {
-        board_attempt::BoardQuerySession::new_memberships(self.clone(), code)
+        board_attempt::BoardQuerySession::new_memberships(self.clone(), code, preferred_provider)
     }
 
     pub(crate) fn resume_board_memberships_query(
@@ -480,6 +481,14 @@ impl GrpcMarketClient {
                 .require_qualified()?;
         }
         Ok(())
+    }
+
+    /// 只读诊断：当前连接资格是否成立（不改变任何状态）。
+    /// 用于事件订阅路径定位 "GetHealth 成功但 subscribe 仍 unqualified"。
+    pub fn external_qualification_set(&self) -> bool {
+        self.connection_generation
+            .as_ref()
+            .is_some_and(|generation| generation.require_qualified().is_ok())
     }
 
     fn observe_external_health(

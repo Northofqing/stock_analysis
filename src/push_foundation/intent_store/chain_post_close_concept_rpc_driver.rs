@@ -461,7 +461,10 @@ where
             };
             let (ordinal, code, occurrence_version, mut session) = match work {
                 RpcReadyWork::Fresh { ordinal, code } => {
-                    let session = queries.memberships_session(&code).map_err(|error| {
+                    // 这里走默认 provider（Tdx）。东财归属在板块强度维里单独用
+                    // Some("Eastmoney")，两处口径不同是有意的：
+                    // 收盘后产业链概念归属依赖通达信板块的历史稳定性。
+                    let session = queries.memberships_session(&code, None).map_err(|error| {
                         anyhow::Error::new(error).context(PreparationStop::AuthorityRejected {
                             intent_id: intent_id.clone(),
                         })

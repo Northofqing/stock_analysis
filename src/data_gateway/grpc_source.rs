@@ -2709,10 +2709,11 @@ impl ConnectedBoardQueries {
     pub(crate) fn memberships_session(
         &self,
         code: &str,
+        preferred_provider: Option<&str>,
     ) -> Result<BoardQuerySession, GatewayError> {
         let request = MembershipRequest::try_new(code)?;
         self.client
-            .board_memberships_query(request.code().to_owned())
+            .board_memberships_query(request.code().to_owned(), preferred_provider)
             .map_err(|error| map_legacy_durable_query_error(Operation::BoardConstituents, &error))
     }
 
@@ -4032,10 +4033,26 @@ impl GrpcSource {
         kind: BoardKind,
         limit: u32,
     ) -> Result<GatewayBatch<BoardFlowFact>, GatewayError> {
+        // 2026-10-18: 参数名必须同时带两套。
+        //
+        // - Mac LocalBridge 的 fetch_board_flows 读 `kind`（resolve_enum_str(params,"kind",...)）
+        // - Windows 服务端 schema `magic.market.board_flows.request` 读
+        //   `category` + `interval` + `limit`（见
+        //   client-bundle/windows-grpc-production-e2319f5-20261018.1/public/
+        //   WINDOWS_EXTERNALV1_RELEASE_IDENTITY_E2319F5_20261018_V1.md）
+        //
+        // 之前只传 kind，走 bundle 到 Windows 时参数解析失败 → 服务端内部错误，
+        // 被误判成「东财网络被拦」。两套都传，两条通道都能用。
+        let label = format!("{kind:?}");
         let q = self
             .query_op(
                 Operation::BoardFlows,
-                serde_json::json!({ "kind": format!("{kind:?}"), "limit": limit }),
+                serde_json::json!({
+                    "kind": label,
+                    "category": label,
+                    "interval": "Day1",
+                    "limit": limit,
+                }),
             )
             .await?;
         convert::board_flows(&q)
