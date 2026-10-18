@@ -233,7 +233,54 @@ async fn fetch_sina_boards(top_n: usize) -> Result<Vec<BoardRow>, String> {
     Ok(rows)
 }
 
-/// 拉一路板块榜。
+/// 一次调用同时拿涨幅榜和净流入榜。
+///
+/// Windows 侧 2026-10-18 回复指出：D1/D2 不该走 `MarketRankings`
+/// （那个 op 的能力闸门只对 VolumeRatio / MainNetInflow 放行，拿它请求板块榜
+/// 即使到了服务端也会被拒），正确入口是 `BoardFlows`，一次返回
+/// `return_pct`（原 f3）和 `main_net_yuan`（原 f62）。
+///
+/// 实测（2026-10-18 深夜）行业/概念/地域三类都能拿到，例如：
+///   BK1204 国防军工 +4.46% 主力净流入 29.34 亿 领涨 601606 长城军工
+async fn fetch_both(top_n: usize) -> Result<(Vec<BoardRow>, Vec<BoardRow>), String> {
+    let gateway = crate::data_gateway::board::BoardDataGateway::default();
+    let batch = gateway
+        .day1_flows(
+            crate::data_gateway::board::BoardKind::Industry,
+            top_n as u32,
+        )
+        .await
+        .map_err(|error| format!("BoardFlows 行业板块: {error}"))?;
+
+    let rows: Vec<BoardRow> = batch
+        .records()
+        .iter()
+        .map(|fact| BoardRow {
+            code: fact.code.clone(),
+            name: fact.name.clone(),
+            change_pct: fact.return_pct,
+            main_inflow: fact.main_net_yuan,
+            leader_name: fact.leader_name.clone(),
+            // BoardFlows 不带这四个字段，保持 NULL 而不是补 0（BR-222）
+            vol_ratio: None,
+            turnover: None,
+            day1_ratio: None,
+            day5_ratio: None,
+        })
+        .collect();
+
+    // BoardFlows 返回的是按主力净流入降序；涨幅榜要按 return_pct 重排。
+    let mut by_change = rows.clone();
+    by_change.sort_by(|a, b| {
+        b.change_pct
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.change_pct.unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok((by_change, rows))
+}
+
+/// 拉一路板块榜（旧路径，保留作 f3 的新浪兜底入口）。
 ///
 /// 顺序：东财 gRPC 桥（全字段）→ 失败时 f3 回退新浪（只有涨跌幅/领涨股）。
 /// f62 没有备用源：新浪不提供主力净流入，硬算就是编造，所以直接报错留空。
@@ -318,24 +365,25 @@ pub async fn refresh_board_rankings(
 ) -> Result<BoardReport, String> {
     let mut report = BoardReport::default();
 
-    let f3 = match fetch("f3").await {
-        Ok(rows) => {
-            report.f3_count = rows.len();
-            rows
+    // 一次 BoardFlows 调用同时得到两榜（涨幅按 return_pct 重排、净流入用原序）。
+    let (f3, f62) = match fetch_both(TOP_N).await {
+        Ok((by_change, by_inflow)) => {
+            report.f3_count = by_change.len();
+            report.f62_count = by_inflow.len();
+            (by_change, by_inflow)
         }
         Err(error) => {
-            report.errors.push(format!("涨幅榜 {error}"));
-            Vec::new()
-        }
-    };
-    let f62 = match fetch("f62").await {
-        Ok(rows) => {
-            report.f62_count = rows.len();
-            rows
-        }
-        Err(error) => {
-            report.errors.push(format!("净流入榜 {error}"));
-            Vec::new()
+            // BoardFlows 整体失败时才回退新浪（只有涨幅/领涨股，没有净流入）。
+            log::warn!("[板块榜] BoardFlows 失败（{error}），f3 回退新浪概念板块");
+            report.errors.push(format!("BoardFlows: {error}"));
+            let sina = fetch_sina_boards(TOP_N).await.unwrap_or_else(|sina_error| {
+                report
+                    .errors
+                    .push(format!("新浪兜底也失败: {sina_error}"));
+                Vec::new()
+            });
+            report.f3_count = sina.len();
+            (sina, Vec::new())
         }
     };
 
