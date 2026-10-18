@@ -30,6 +30,7 @@ pub mod code_review; // 2026-10-18: 票级复盘 (paper_trades 聚合, 不推测
 pub mod concept_peers; // 2026-10-18: 概念共现 (从 stock_concepts 现算)
 pub mod watch_pool_monitor; // 2026-10-18: 观察池定向监控 (30s 异动扫描)
 pub mod auction_watch; // 2026-10-18: 观察池竞价观测 (09:25 stage=Final)
+pub mod ticket_priority; // 2026-10-18: 观察池票优先级 (5 维加权排序)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)

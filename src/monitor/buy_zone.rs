@@ -108,7 +108,7 @@ fn round2(value: f64) -> f64 {
 ///
 /// 为什么不是一个统一的股票主表：库里没有这张表。名称只散落在
 /// 持仓、持仓快照、推送记录、催化剂观察里，所以按"离当前状态最近"的顺序查。
-fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<String> {
+pub(crate) fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<String> {
     #[derive(QueryableByName)]
     struct NameRow {
         #[diesel(sql_type = Text)]

@@ -12162,6 +12162,47 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 观察池票优先级（2026-10-18）：15:44，观察池生成之后、记账之前。
+                    // 五维加权：新闻催化 30% / 板块强度 20% / 可买价 25% / 仓位 15% / 概念共振 10%。
+                    // 缺失维度从分母剔除，不当作 0 分。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 44, 0).unwrap()
+                    {
+                        static PRIORITY_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = PRIORITY_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::ticket_priority::rank_watch_pool(
+                                    &db,
+                                    &date_text,
+                                ) {
+                                    Ok(rows) => {
+                                        log::info!(
+                                            "[优先级] as_of={date_text} 标的={}",
+                                            rows.len()
+                                        );
+                                        for (position, row) in rows.iter().enumerate() {
+                                            log::info!("[优先级] {}", row.render(position + 1));
+                                        }
+                                        *PRIORITY_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[优先级] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 投递记账（P1.2）：把当日已投递的逐票推送写进 ticket 时间轴。
                     // 口径（operator 2026-10-17）：观察池选出的票 + 实际持仓才建档；其余跳过。
                     // 只读打开 durable_delivery.sqlite3（相对 cwd=运行根），写失败不影响投递。
