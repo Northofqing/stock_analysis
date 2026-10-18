@@ -12162,6 +12162,44 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 板块榜落库（2026-10-18）：15:30，早于 15:44 的票优先级。
+                    // 这个时序是必须的 —— 优先级要读当日 board_ranking_daily 算"板块强度"，
+                    // 板块榜晚于优先级写就等于当天永远读不到。
+                    // 两路排行各 30 条：f3 涨幅榜 / f62 主力净流入榜。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 30, 0).unwrap()
+                    {
+                        static BOARD_RANK_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = BOARD_RANK_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::board_ranking_snapshot::refresh_board_rankings(
+                                    &db,
+                                    &date_text,
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        report.log();
+                                        *BOARD_RANK_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[板块榜] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 观察池票优先级（2026-10-18）：15:44，观察池生成之后、记账之前。
                     // 五维加权：新闻催化 30% / 板块强度 20% / 可买价 25% / 仓位 15% / 概念共振 10%。
                     // 缺失维度从分母剔除，不当作 0 分。
@@ -12278,6 +12316,48 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 }
                             } else {
                                 log::warn!("[价格带落库] 数据库不可用, 本轮跳过");
+                            }
+                        }
+                    }
+
+                    // 盘后可买价推送（2026-10-18）：16:00，等 15:50 价格带 + 15:55 均线都落库后再算。
+                    // 输出"明日计划"：每只票 买点区间 / 放弃价 / 建议仓位 / 条件，推飞书。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap()
+                    {
+                        static BUY_ZONE_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = BUY_ZONE_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::buy_zone_dispatch::render_plan(
+                                    &db,
+                                    &date_text,
+                                ) {
+                                    Ok(text) => {
+                                        log::info!(
+                                            "[可买价] 明日计划生成 {} 字",
+                                            text.chars().count()
+                                        );
+                                        if crate::notify::push_wechat(&text).await {
+                                            log::info!("[可买价] 明日计划已推送");
+                                            *BUY_ZONE_LAST
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) =
+                                                Some(advice_report_date);
+                                        } else {
+                                            log::warn!("[可买价] 推送失败, 保留重试");
+                                        }
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[可买价] 生成失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
                             }
                         }
                     }

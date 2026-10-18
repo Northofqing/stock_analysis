@@ -55,7 +55,7 @@ pub enum Trend {
 }
 
 impl Trend {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Trend::Bullish => "多头排列",
             Trend::Bearish => "空头排列",
