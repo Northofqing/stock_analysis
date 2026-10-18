@@ -25,7 +25,13 @@ use encoding_rs::GBK;
 use crate::data_gateway::board_ranking::BoardRankingFact;
 use crate::database::DatabaseManager;
 
-const TOP_N: usize = 30;
+/// 落库条数。
+///
+/// 2026-10-18 从 30 改成 200（全量）：新浪一次给 175 个概念板块，成本一样，
+/// 但只留 top30 会让「票的概念不在当日热点里」的票永远拿不到板块分
+/// （实测 9 只票里 8 只缺这一维）。全量落库后，`board_score` 才能对任意票
+/// 取到它所属概念的当日涨幅。
+const TOP_N: usize = 200;
 
 /// 新浪板块 —— 东财 clist 不可用时的 f3 备用源（2026-10-18 实测 200）。
 ///

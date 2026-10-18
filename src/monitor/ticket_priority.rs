@@ -39,6 +39,13 @@ const W_RESONANCE: f64 = 0.10;
 
 /// 新闻催化满分对应的命中数（5 日内）
 const NEWS_HITS_FULL: f64 = 5.0;
+
+/// 新闻回看窗口：10 个交易日。
+///
+/// 原来用 5 个自然日。实测 2026-10-18：9 只带新闻催化的观察票里，
+/// 只有 1 只落在 5 日窗口内 —— 周末选出的票，到周三新闻就滑出窗口，
+/// 催化维直接归零。改成 10 个交易日才覆盖「这周选出来的票这周还有效」。
+const NEWS_LOOKBACK_TRADING_DAYS: usize = 10;
 /// 板块强度满分对应的涨幅（%）
 const BOARD_PCT_FULL: f64 = 8.0;
 /// 概念共振满分对应的共享概念数
@@ -114,11 +121,15 @@ struct HitRow {
 }
 
 fn news_score(conn: &mut SqliteConnection, code: &str, as_of: &str) -> Option<f64> {
-    let since = chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
-        .ok()?
-        .checked_sub_days(chrono::Days::new(5))?
-        .format("%Y-%m-%d")
-        .to_string();
+    // 回看 10 个交易日（不是 5 个自然日）。
+    // 实测 2026-10-18：9 只观察票里有 8 只有新闻催化，但用 5 自然日窗口时
+    // 只有 1 只落在窗口内 —— 周末选出的票，到周三新闻就滑出去了。
+    let as_of_date = chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d").ok()?;
+    let mut since_date = as_of_date;
+    for _ in 0..NEWS_LOOKBACK_TRADING_DAYS {
+        since_date = crate::calendar::prev_trading_day(since_date);
+    }
+    let since = since_date.format("%Y-%m-%d").to_string();
     let row: HitRow = diesel::sql_query(
         "SELECT COUNT(*) AS hits, MAX(created_at) AS latest \
          FROM news_ai_assessment \
@@ -208,12 +219,25 @@ pub fn rank_watch_pool(db: &DatabaseManager, as_of: &str) -> Result<Vec<Priority
         {
             Ok(Some(zone)) => {
                 let advice = crate::monitor::position_sizing::advise(code, &zone);
+                // 可买分要区分趋势：空头排列里的"买点"是下跌中继的反弹，
+                // 不是趋势票的回踩。实测 2026-10-18：不加这个门槛时，
+                // 空头排列的票拿 100 分直接排在前四，反而把真正的趋势票压下去。
                 let buy_value = if zone.overheated {
                     Some(0.0)
                 } else if zone.at_support {
-                    Some(40.0)
+                    Some(match zone.trend {
+                        crate::monitor::buy_zone::Trend::Bullish => 40.0,
+                        crate::monitor::buy_zone::Trend::Tangled => 30.0,
+                        crate::monitor::buy_zone::Trend::Bearish => 20.0,
+                        crate::monitor::buy_zone::Trend::Unknown => 30.0,
+                    })
                 } else if zone.entry_low.is_some() {
-                    Some(100.0)
+                    Some(match zone.trend {
+                        crate::monitor::buy_zone::Trend::Bullish => 100.0,
+                        crate::monitor::buy_zone::Trend::Tangled => 80.0,
+                        crate::monitor::buy_zone::Trend::Bearish => 60.0,
+                        crate::monitor::buy_zone::Trend::Unknown => 70.0,
+                    })
                 } else {
                     None
                 };
