@@ -141,32 +141,62 @@ fid=f62: ...；该榜无备用源（新浪不提供主力净流入，强行推�
 ```
 news_ai_assessment  MAX(created_at)=2026-10-14T06:50:34Z   ← 之后零新增
 [NewsFlashGate][BR-137] intake input=67 buffered=0 duplicate=61 stale=6
-[NewsAI][BR-172] assessment retained ... existing=true      ← 评估的都是老新闻
-[NewsAI][BR-172] completed pushed=0 ... failed=0            ← 没有失败
+[NewsAI][BR-172] completed pushed=0 ... failed=5            ← 每轮 5 条全失败
+[NewsAI][BR-172] candidate failed ... model unavailable
 ```
 
-### 排除的假设
+### 真实根因：不是源枯竭，是 LLM 连不上
 
-| 假设 | 证据 | 结论 |
+**这一条最初判断错了。** 最初看到东财新闻接口 `totle_hits=0` 就归因为"上游内容枯竭"，
+但审计表显示东财一直在成功返回：
+
+```
+Eastmoney|eastmoney-web|available|accepted  90689 次   ← 一直成功
+Cailianpress|...|available|accepted         103133 次  ← 也一直成功
+```
+
+真正的断点在 NewsAI 评估环节：
+
+```
+[16:00:37 WARN] [NewsAI][BR-172] candidate failed
+error=model unavailable: [LLM] HTTP 错误:
+https://api.deepseek.com/v1/chat/completions:
+tcp connect error: Connection refused
+```
+
+每 tick 处理 5 条（`MAX_ASSESSMENTS_PER_TICK = 5`），全部因为 LLM 连不上而失败。
+所以 `news_ai_assessment` 停在 10-14 —— **不是没新闻，是新闻评估不出来**。
+
+### 关键区分
+
+| 层 | 状态 | 证据 |
 |---|---|---|
-| 抓取器挂了 | `input=67`，一直在拉 | ✗ |
-| AI 评估失败 | `failed=0` | ✗ |
-| 落库失败 | `existing=true` 说明查到了 | ✗ |
-| 参数缺失 | 补 `req_trace` 后 http=200 | ✗ |
-| 代理拦截 | Surge 规则 `eastmoney.com,DIRECT` | ✗ |
+| 新闻数据源（对端 4 provider） | ✅ 正常 | 东财 90689 次 accepted、CLS 103133 次 accepted |
+| NewsFlashGate 去重/时效 | ✅ 正常工作 | `duplicate=61 stale=6` 是设计内行为 |
+| **NewsAI 的 LLM 调用** | ❌ **Connection refused** | 每轮 `failed=5` |
+| `news_ai_assessment` 落库 | ⛔ 被上游阻断 | MAX=2026-10-14 |
 
-### 实测根因
-
-东财新闻接口所有栏目都没有内容：
+### 已验证：API 本身没问题
 
 ```
-https://np-listapi.eastmoney.com/comm/web/getNewsByColumns?column=1..8
-→ 全部 {"code":"1","message":"success","data":{"list":[],"totle_hits":0}}
+DEEPSEEK_BASE_URL = https://api.deepseek.com
+带 key 实测:  http=200  time=0.85s        ← 网络和凭据都正常
+DNS:          api.deepseek.com → 115.231.230.218（真实 IP，非 fake-ip）
 ```
 
-`code:"1"` 是成功，`totle_hits:0` 是**这个栏目真的没有内容**。
+所以是 **monitor 进程内部的坏状态**（DNS 缓存或连接池），不是网络、不是凭据、不是 API 故障。
 
-### 已确认还活着的三个新闻源
+### 修复
+
+重启 monitor 进程（`launchctl kickstart -k gui/501/com.stockanalysis.monitor`）。
+进程重建后 DNS 缓存和连接池都清空，下一次 tick 就能重新解析。
+
+**但这只是止血**：如果进程内 DNS 缓存再次被污染，还会复发。
+根因（为什么进程会缓存到一个 refused 的地址）尚未确定。
+
+### 数据源层仍然要关注
+
+以下是独立于 LLM 故障的事实，将来接新源时需要：
 
 | 源 | 接口 | 实测 |
 |---|---|---|
@@ -174,18 +204,22 @@ https://np-listapi.eastmoney.com/comm/web/getNewsByColumns?column=1..8
 | 新浪滚动 | `feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516` | 200，`total=100029` |
 | 同花顺快讯 | `news.10jqka.com.cn/tapp/news/push/stock/` | 200，有内容 |
 
-### 未解决
+以及：`np-listapi.eastmoney.com/comm/web/getNewsByColumns` 所有 column（1..8）都返回
+`{"code":"1","data":{"list":[],"totle_hits":0}}` —— 这个**特定接口**确实空了，
+但系统走的不是它（系统走对端 `GlobalNews` 的 4 个 provider）。
 
-对端 `GlobalNews` 支持 4 个 provider（Eastmoney / Cailianpress / Jin10 / ThePaper），
-但探测程序 `global_news_probe` 走的是 ExternalV1 bundle 通道，
-返回 `external_bundle_invalid: 连接或 readiness 检查失败` —— 那是**探测路径的问题**，
-不是 provider 内容结论。monitor 实际走 18082 本地桥，路径不同。
+### 探测工具的正确用法
 
-**下一步**：让 probe 走 `GRPC_MARKET_ADDR=http://127.0.0.1:18082` 重试，
-确认 Cailianpress / Jin10 是否有新鲜内容。若有一个活着，切 provider 即可修复新闻催化。
+`global_news_probe` **不要**设 `GRPC_MARKET_CLIENT_BUNDLE`（那会走 ExternalV1，
+未做 readiness 会得到 `external_bundle_invalid`）。走本地桥：
 
-**若全部枯竭**：需要写新 adapter 接上表里那三个活源之一，
-且必须满足 `NewsFlashGate` 的准入契约（batch evidence + source_at + 去重）。
+```bash
+GRPC_MARKET_ADDR=http://127.0.0.1:18082 STOCK_DB=<运行根>/data/stock_analysis.db \
+  ./target/release/global_news_probe
+```
+
+2026-10-18 实测结果：Cailianpress 返回 5 条今天 07:46-07:59 的新闻；
+Eastmoney / Jin10 / ThePaper 各返回 `invalid_evidence`（服务端内部错误）。
 
 ---
 
