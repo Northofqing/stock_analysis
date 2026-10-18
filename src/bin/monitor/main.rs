@@ -6741,6 +6741,8 @@ async fn main() {
         let post_close_news = tokio::spawn(post_close_news_scheduler());
         // 观察池定向监控（2026-10-18）：盘中每 30 秒扫异动，只落日志不推送。
         let watch_pool_monitor = tokio::spawn(watch_pool_monitor_loop());
+        // 观察池竞价观测（2026-10-18）：09:25 拉竞价终态，比实时扫描早 5 分钟。
+        let auction_watch = tokio::spawn(auction_watch_loop());
         let post_session_review = spawn_post_session_review_scheduler(selection_v2_enabled);
         // 2026-08-31: 复盘欠账补推 (启动一次性)。等待 durable startup
         // reconciliation (producer_ready 屏障) 完成, 30s × 20 ≈ 10 分钟上限;
@@ -13789,6 +13791,44 @@ async fn post_close_news_review() {
 ///
 /// 只在交易时段拉行情 —— 非交易时段拿到的是上一交易日的陈旧值，
 /// 用陈旧值算"日内涨跌幅"会误报。
+/// 观察池竞价观测（2026-10-18）：每个交易日 09:25-09:32 拉一次竞价终态。
+///
+/// 为什么不常驻拉：竞价只有一个终态（09:25 撮合完成），
+/// 拉一次就够。`done_for` 保证当天只拉一次，失败才重试。
+async fn auction_watch_loop() {
+    let mut done_for: Option<chrono::NaiveDate> = None;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+
+        let now = chrono::Local::now();
+        let today = now.date_naive();
+        if !calendar::is_trading_day(today) || done_for == Some(today) {
+            continue;
+        }
+        let time = now.time();
+        if time < chrono::NaiveTime::from_hms_opt(9, 25, 0).unwrap()
+            || time > chrono::NaiveTime::from_hms_opt(9, 32, 0).unwrap()
+        {
+            continue;
+        }
+
+        let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+            continue;
+        };
+
+        match stock_analysis::monitor::auction_watch::observe(&db).await {
+            Ok(rows) => {
+                log::info!("[竞价观察] 标的={} 竞价终态", rows.len());
+                for row in &rows {
+                    log::info!("[竞价观察] {}", row.render());
+                }
+                done_for = Some(today);
+            }
+            Err(error) => log::warn!("[竞价观察] 拉取失败, 下一轮重试: {error}"),
+        }
+    }
+}
+
 async fn watch_pool_monitor_loop() {
     use std::collections::HashMap;
 
