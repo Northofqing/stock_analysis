@@ -194,6 +194,46 @@ DNS:          api.deepseek.com → 115.231.230.218（真实 IP，非 fake-ip）
 **但这只是止血**：如果进程内 DNS 缓存再次被污染，还会复发。
 根因（为什么进程会缓存到一个 refused 的地址）尚未确定。
 
+### 修好 LLM 之后暴露的第二个断点
+
+重启后 `failed=5 → failed=0`、`Connection refused` 归零，但两表仍然停在 10-14：
+
+```
+news_ai_assessment      1467 行  MAX=2026-10-14T06:50:34Z
+news_ai_delivery_event  4253 行  MAX=2026-10-14T06:44:13Z
+```
+
+同时出现新的 ERROR（每次 5 条，与 `MAX_ASSESSMENTS_PER_TICK` 一致）：
+
+```
+[16:09:39 ERROR] [NewsAI][BR-172] manual-review notice unconfirmed; retry retained:
+Ok(Err("delivery audit envelope: unsupported delivery outcome: manual_review
+```
+
+链条：
+
+1. 评估结论是 `NewsAiPendingRecovery::ManualReview`（需要人工复核）
+2. 写投递审计时，`src/event/envelope.rs:93` 的枚举**不认识 `manual_review`**
+3. 于是审计写不进去 → 结果留在恢复队列里重试
+4. `news_ai_assessment` 因此没有新增行
+
+**所以新闻催化维度仍然读不到数据**，不是 LLM 的问题了，是
+「评估结论落在 ManualReview，而投递审计不支持这个 outcome」。
+
+要修这条需要：
+- 在投递审计枚举里支持 `manual_review`，或
+- 把 ManualReview 的结果单独落一张可查询的表（而不是当成投递失败重试）
+
+两者都要改 `src/event/envelope.rs` 和 `src/database/news_ai.rs`，属于代码改动，尚未进行。
+
+### 第三个断点：候选全是旧内容
+
+`[NewsFlashGate] input=67 duplicate=61` —— 每轮 67 条里 61 条是已见过的。
+东财返回的 20 条长期是同一批。CLS 虽然能返回今天的新闻（probe 实测 5 条 07:46-07:59），
+但没有进入候选集（feed 选择或 limit 分配问题）。
+
+即使 ManualReview 那条修好，只要候选全是旧内容，评估也不会有新结论。
+
 ### 数据源层仍然要关注
 
 以下是独立于 LLM 故障的事实，将来接新源时需要：
