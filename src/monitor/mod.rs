@@ -21,6 +21,9 @@ pub mod ticket_event_sync; // 2026-10-17: 投递记账 (Delivered → ticket_eve
 pub mod trading_fact_snapshot; // 2026-10-17: op 67 价格带每日落库 (快照日有值, 错过永久丢)
 pub mod daily_bars_indicators; // 2026-10-17: 日线+均线补齐 (与 authority 门解耦, P2 数据基础)
 pub mod buy_zone; // 2026-10-17: P2 可买价 (按票: 位置/买点区间/放弃价)
+pub mod ticket_stage_sync; // 2026-10-18: 持仓快照驱动 stage 自动流转 (观察→持有→退出)
+pub mod ticket_eviction; // 2026-10-18: 观察池淘汰 (超期/跌幅, 只管 observing)
+pub mod board_ranking_snapshot; // 2026-10-18: 板块榜每日落库 (f3 涨幅 / f62 净流入)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)

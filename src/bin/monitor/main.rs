@@ -12011,6 +12011,79 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 票状态自动流转（2026-10-18）：持仓快照驱动，不猜不断言。
+                    //   持仓里有 + ticket 无        → 开票 stage=holding
+                    //   持仓里有 + stage=observing  → 推进到 holding（观察池的票被买了）
+                    //   持仓里无 + stage=holding    → 关闭，stage=exited
+                    // 放在 15:40 观察池之前：先让 stage 反映真实持仓，再生成新观察。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 35, 0).unwrap()
+                    {
+                        static STAGE_SYNC_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = STAGE_SYNC_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::ticket_stage_sync::sync_stages_from_positions(
+                                    &db,
+                                    &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        report.log();
+                                        *STAGE_SYNC_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[票状态] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            } else {
+                                log::warn!("[票状态] 数据库不可用, 本轮跳过");
+                            }
+                        }
+                    }
+
+                    // 观察池淘汰（2026-10-18）：超期/跌幅出池，只管 observing。
+                    // 放在 15:40 观察池生成之前：先清掉已不成立的观察，再生成新的。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 38, 0).unwrap()
+                    {
+                        static EVICT_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = EVICT_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::ticket_eviction::evict_stale_observations(
+                                    &db,
+                                    &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        report.log();
+                                        *EVICT_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[观察淘汰] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 观察池（2026-10-17 P1.1）：交易日 15:40 后按新闻催化开票。
                     // operator 口径为「按板块轮动 + 按新闻催化」；这里只落新闻催化一路，
                     // 板块轮动路未接（board_rotation_daily 零生产写入方，数据停在 2026-07-16）。
