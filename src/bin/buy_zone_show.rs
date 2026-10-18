@@ -76,6 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(Some(zone)) => {
                 produced += 1;
                 println!("\n{}", zone.render());
+                let advice = stock_analysis::monitor::position_sizing::advise(code, &zone);
+                println!("     {}", advice.render());
             }
             Ok(None) => println!("\n{code}  无日线数据，跳过"),
             Err(error) => println!("\n{code}  失败: {error}"),

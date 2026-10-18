@@ -24,6 +24,7 @@ pub mod buy_zone; // 2026-10-17: P2 可买价 (按票: 位置/买点区间/放�
 pub mod ticket_stage_sync; // 2026-10-18: 持仓快照驱动 stage 自动流转 (观察→持有→退出)
 pub mod ticket_eviction; // 2026-10-18: 观察池淘汰 (超期/跌幅, 只管 observing)
 pub mod board_ranking_snapshot; // 2026-10-18: 板块榜每日落库 (f3 涨幅 / f62 净流入)
+pub mod position_sizing; // 2026-10-18: 仓位建议 (风险预算, 只建议不阻断)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
