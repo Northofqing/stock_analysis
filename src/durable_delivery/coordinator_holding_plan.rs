@@ -283,6 +283,15 @@ fn frame(h: &mut Sha256, b: &[u8]) {
     h.update((b.len() as u64).to_be_bytes());
     h.update(b);
 }
+fn table_exists(c: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = c.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn authority_sha(c: &Connection, context: &OccurrenceContext) -> Result<String> {
     let mut h = Sha256::new();
     frame(&mut h, b"holding-plan-exact-owner-sql-witness-v1");
@@ -291,6 +300,18 @@ fn authority_sha(c: &Connection, context: &OccurrenceContext) -> Result<String> 
     let owners = members(c, context)?;
     for table in AUTHORITY_TABLES {
         frame(&mut h, table.as_bytes());
+        // v9 库没有 v10 才加的 correlation 表。schema.rs 明写它只是「审计边、
+        // 不是投递权威」（Correlation is an audit edge, not a delivery authority），
+        // 所以缺失一律按「无观测」处理，不能当成错误。
+        //
+        // 这是 P4 停供三周的根因：monitor 用 open_existing_monitor_schema9 打开
+        // 生产库（user_version=9），而这里无条件 SELECT 全部 17 张表，
+        // 走到 delivery_correlation_observations 就 no such table，
+        // 被上层包装成 holding_plan_owner_read_failed。
+        if !table_exists(c, table)? {
+            frame(&mut h, b"absent");
+            continue;
+        }
         let sql = format!("SELECT rowid,* FROM {table} WHERE decision_identity IN (SELECT decision_identity FROM delivery_decisions WHERE business_date=?1 AND push_kind='HoldingPlan' AND scope_key=?2) ORDER BY rowid");
         let mut query = c.prepare(&sql)?;
         for name in query.column_names() {

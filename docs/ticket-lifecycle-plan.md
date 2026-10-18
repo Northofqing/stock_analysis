@@ -156,3 +156,86 @@ state 分布：RejectedDurable 2859 / Delivered 161 / ManualResolvedRejected 6
 - 不补 0、不推导涨跌停价（BR-222 / BR-205）。
 - 不给"保证盈利"的单一买价；只给区间 + 触发条件。
 - 不做股权穿透式的关联公司分析（无数据源）。
+
+## 六、P4 停供真因（2026-10-18 定位并修复）
+
+### 现象
+
+`HoldingPlan` 自 2026-09-23 09:47 之后 0 决策，累计 103 次：
+
+```
+[I-04][T-03] code=xxx 原 owner 读取拒绝: holding_plan_owner_read_failed
+```
+
+`{e}` 渲染为空，看不到真实原因。
+
+### 真因
+
+`src/durable_delivery/coordinator_holding_plan.rs` 的 `authority_sha()` 遍历
+`AUTHORITY_TABLES`（17 张表）时**无条件** `SELECT rowid,* FROM {table}`：
+
+```rust
+for table in AUTHORITY_TABLES {
+    let sql = format!("SELECT rowid,* FROM {table} WHERE ...");
+    let mut query = c.prepare(&sql)?;   // ← 表不存在就到这里炸
+```
+
+而第 8 张 `delivery_correlation_observations` 是 **schema v10 才加的**表
+（`schema.rs:357`，注释写着「Correlation is an audit edge, not a delivery authority」）。
+
+monitor 用 `open_existing_monitor_schema9` 打开生产库，生产库 `user_version=9`，
+**没有这张表** → `prepare` 报 `no such table` → 被上层包装成
+`holding_plan_owner_read_failed`。
+
+### 为什么之前排查没找到
+
+`open_existing_monitor_schema9` 的 `monitor_schema9::verify()` **不检查这张表**
+（它只校验 v9 的表），所以 coordinator 能正常打开、日志显示一切正常，
+只有在真正读 occurrence 时才炸。而且错误被 `{e}` 空渲染吞掉了。
+
+### 怎么提前定位的（不用等交易时段）
+
+写了一个探针 `src/bin/holding_plan_probe.rs`：
+
+- `inspect_holding_plan_occurrence` 是 lib pub；
+- `CoordinatorConfig::production()` 接受任意 owner identity
+  （不匹配的 owner 走 `Ok(None)` → `Missing`，不是错误）；
+- 所以任意时刻都能复现同一条读取路径，不必等 10:30 的 I-04。
+
+第一次跑就拿到：
+
+```
+sqlite durable-delivery failure: no such table: delivery_correlation_observations
+```
+
+### 修复
+
+`authority_sha()` 里对缺失表跳过，并 frame 一个 `"absent"` 标记：
+
+```rust
+if !table_exists(c, table)? {
+    frame(&mut h, b"absent");
+    continue;
+}
+```
+
+理由：schema.rs 自己写明这张表只是审计边、不是投递权威，缺失合法；
+frame `"absent"` 保证哈希仍随 schema 状态变化（表被创建后哈希会变，
+`binding.validate` 会正确报 `exact_owner_sql_witness_changed`）。
+
+其他 16 张表缺失仍然报错（fail-closed 不变）。
+
+### 验证
+
+```
+$ holding_plan_probe 601811 2026-10-16
+[probe] coordinator 已打开
+[probe] OK: Missing        ← 修复前是 no such table
+```
+
+### 未验证的部分
+
+- 生产库（v9）上的真实读取：要等运行根部署后跑 probe 确认。
+- `Owned` 分支从未被测到过（生产库里 9-23 之前的 HoldingPlan 记录也不会有
+  correlation 观测，所以历史决策读出来都是 `Missing`）。
+- 修复后能不能真的产生新决策：要等下一个交易日的 I-04 触发。
