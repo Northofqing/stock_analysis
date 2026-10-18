@@ -68,6 +68,8 @@ impl Trend {
 #[derive(Debug, Clone)]
 pub struct BuyZone {
     pub code: String,
+    /// 股票名称。查不到就是 None —— 不编造（BR-222），显示时只出代码。
+    pub name: Option<String>,
     pub as_of: String,
     pub close: f64,
     pub ma5: Option<f64>,
@@ -100,6 +102,38 @@ fn classify(ma5: Option<f64>, ma10: Option<f64>, ma20: Option<f64>) -> Trend {
 
 fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
+}
+
+/// 查股票名称：按可信度依次查四张表，都没有就返回 None（不编造，BR-222）。
+///
+/// 为什么不是一个统一的股票主表：库里没有这张表。名称只散落在
+/// 持仓、持仓快照、推送记录、催化剂观察里，所以按"离当前状态最近"的顺序查。
+fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<String> {
+    #[derive(QueryableByName)]
+    struct NameRow {
+        #[diesel(sql_type = Text)]
+        name: String,
+    }
+    const SOURCES: [&str; 4] = [
+        "stock_position",
+        "user_position_snapshot_item",
+        "pushed_stocks",
+        "catalyst_watchlist_daily",
+    ];
+    for table in SOURCES {
+        let sql = format!(
+            "SELECT name FROM {table} \
+             WHERE code = ? AND name IS NOT NULL AND name <> '' \
+             ORDER BY rowid DESC LIMIT 1"
+        );
+        if let Ok(row) = diesel::sql_query(sql)
+            .bind::<Text, _>(code)
+            .get_result::<NameRow>(conn)
+        {
+            return Some(row.name);
+        }
+    }
+    None
 }
 
 pub fn compute(
@@ -316,6 +350,7 @@ pub fn compute(
 
     Ok(Some(BuyZone {
         code: code.to_string(),
+        name: resolve_name(conn, code),
         as_of: latest.date.clone(),
         close: round2(close),
         ma5: latest.ma5.map(round2),
@@ -338,11 +373,21 @@ pub fn compute(
 
 impl BuyZone {
     /// 单票一段（用户要求"按票"，信息完整不聚合）。
+    /// 展示用标签：代码 + 名称。查不到名称时只出代码（不编造）。
+    pub fn display_name(&self) -> String {
+        match self.name.as_deref() {
+            Some(name) if !name.is_empty() => format!("{} {}", self.code, name),
+            _ => self.code.clone(),
+        }
+    }
+
     pub fn render(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!(
             "{}  收盘 {}（{}）",
-            self.code, self.close, self.as_of
+            self.display_name(),
+            self.close,
+            self.as_of
         ));
 
         let ma_text = match (self.ma5, self.ma10, self.ma20) {

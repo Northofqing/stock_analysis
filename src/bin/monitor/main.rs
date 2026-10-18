@@ -6739,6 +6739,8 @@ async fn main() {
         // 抓取持仓股近 30 天事实。
 
         let post_close_news = tokio::spawn(post_close_news_scheduler());
+        // 观察池定向监控（2026-10-18）：盘中每 30 秒扫异动，只落日志不推送。
+        let watch_pool_monitor = tokio::spawn(watch_pool_monitor_loop());
         let post_session_review = spawn_post_session_review_scheduler(selection_v2_enabled);
         // 2026-08-31: 复盘欠账补推 (启动一次性)。等待 durable startup
         // reconciliation (producer_ready 屏障) 完成, 30s × 20 ≈ 10 分钟上限;
@@ -12050,6 +12052,40 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 加仓/减仓识别（2026-10-18）：紧接状态同步之后。
+                    // 相邻两份持仓快照比 quantity，写 ticket_event（不改 stage）。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 36, 0).unwrap()
+                    {
+                        static POS_CHANGE_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = POS_CHANGE_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::position_change_detect::detect_position_changes(
+                                    &db,
+                                    &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        report.log();
+                                        *POS_CHANGE_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[持仓变化] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 观察池淘汰（2026-10-18）：超期/跌幅出池，只管 observing。
                     // 放在 15:40 观察池生成之前：先清掉已不成立的观察，再生成新的。
                     if calendar::is_trading_day(advice_report_date)
@@ -13748,6 +13784,64 @@ async fn post_close_news_review() {
 /// v13.12 (Task 12): 盘后回溯调度 — 每 30 分钟 tick 一次, 若本地时间已过 15:30 则触发一次.
 
 /// 简化策略: 进入盘后时段后每 30 分钟最多触发一次 (避免重启后多触).
+
+/// 观察池定向监控（2026-10-18）：盘中每 30 秒扫描异动。
+///
+/// 只在交易时段拉行情 —— 非交易时段拿到的是上一交易日的陈旧值，
+/// 用陈旧值算"日内涨跌幅"会误报。
+async fn watch_pool_monitor_loop() {
+    use std::collections::HashMap;
+
+    let mut last_prices: HashMap<String, f64> = HashMap::new();
+    let mut alerted_at: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+        let now = chrono::Local::now();
+        if !calendar::is_trading_day(now.date_naive()) {
+            continue;
+        }
+        let time = now.time();
+        let in_session = (time >= chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap()
+            && time <= chrono::NaiveTime::from_hms_opt(11, 30, 0).unwrap())
+            || (time >= chrono::NaiveTime::from_hms_opt(13, 0, 0).unwrap()
+                && time <= chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap());
+        if !in_session {
+            continue;
+        }
+
+        let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+            continue;
+        };
+
+        let alerts =
+            match stock_analysis::monitor::watch_pool_monitor::scan(&db, &last_prices).await {
+                Ok(alerts) => alerts,
+                Err(error) => {
+                    log::warn!("[定向监控] 扫描失败: {error}");
+                    continue;
+                }
+            };
+
+        let now_utc = chrono::Utc::now();
+        for alert in &alerts {
+            let key = format!("{}|{}", alert.code, alert.reason);
+            if let Some(previous) = alerted_at.get(&key) {
+                if (now_utc - *previous).num_minutes() < 30 {
+                    continue;
+                }
+            }
+            alerted_at.insert(key, now_utc);
+            log::info!("[定向监控] {}", alert.render());
+        }
+
+        // 只更新触发过的票的价格。未触发的票变动 <1%，继续用旧价无影响。
+        for alert in &alerts {
+            last_prices.insert(alert.code.clone(), alert.price);
+        }
+    }
+}
 
 async fn post_close_news_scheduler() {
     use std::time::Duration;

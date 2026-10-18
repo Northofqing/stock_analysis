@@ -25,6 +25,10 @@ pub mod ticket_stage_sync; // 2026-10-18: 持仓快照驱动 stage 自动流转 
 pub mod ticket_eviction; // 2026-10-18: 观察池淘汰 (超期/跌幅, 只管 observing)
 pub mod board_ranking_snapshot; // 2026-10-18: 板块榜每日落库 (f3 涨幅 / f62 净流入)
 pub mod position_sizing; // 2026-10-18: 仓位建议 (风险预算, 只建议不阻断)
+pub mod position_change_detect; // 2026-10-18: 加仓/减仓识别 (相邻快照比 quantity)
+pub mod code_review; // 2026-10-18: 票级复盘 (paper_trades 聚合, 不推测原因)
+pub mod concept_peers; // 2026-10-18: 概念共现 (从 stock_concepts 现算)
+pub mod watch_pool_monitor; // 2026-10-18: 观察池定向监控 (30s 异动扫描)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)

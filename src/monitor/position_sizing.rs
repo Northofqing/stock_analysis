@@ -195,6 +195,7 @@ mod tests {
     fn zone_with(entry_low: f64, entry_high: f64, abandon: f64) -> BuyZone {
         BuyZone {
             code: "TEST".to_string(),
+            name: Some("测试股".to_string()),
             as_of: "2026-10-16".to_string(),
             close: 10.0,
             ma5: Some(10.0),
