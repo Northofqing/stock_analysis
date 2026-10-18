@@ -2523,6 +2523,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "magic-market-core"
+version = "0.2.0"
+source = "git+https://github.com/Northofqing/magic-market-data-rs.git?rev=75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e#75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "magic-tdx-rs"
+version = "0.2.0"
+dependencies = [
+ "crc32fast",
+ "encoding_rs",
+ "flate2",
+ "magic-market-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4811,6 +4835,7 @@ dependencies = [
  "dashmap 6.2.1",
  "diesel",
  "dotenvy",
+ "encoding_rs",
  "env_logger",
  "fs2",
  "futures",
@@ -4821,6 +4846,7 @@ dependencies = [
  "lettre",
  "libc",
  "log",
+ "magic-tdx-rs",
  "once_cell",
  "pam",
  "plotters",

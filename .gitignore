@@ -19,6 +19,8 @@
 /docs/*
 !/docs/Project_Architecture_Blueprint.md
 !/docs/Project_Architecture_Blueprint.html
+!/docs/ticket-priority.md
+!/docs/data-source-fallbacks.md
 !/docs/push-system/
 /docs/push-system/*
 !/docs/push-system/README.md

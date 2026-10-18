@@ -32,6 +32,8 @@ pub mod watch_pool_monitor; // 2026-10-18: 观察池定向监控 (30s 异动扫�
 pub mod auction_watch; // 2026-10-18: 观察池竞价观测 (09:25 stage=Final)
 pub mod ticket_priority; // 2026-10-18: 观察池票优先级 (5 维加权排序)
 pub mod buy_zone_dispatch; // 2026-10-18: 盘后可买价推送 (16:00 明日计划)
+pub mod f10_profile; // 2026-10-18: TDX F10 公司资料落库 (经营/行业/提示/股本)
+pub mod chain_ai; // 2026-10-18: AI 产业链候选 (推断, 不参与决策)
 pub mod alert;
 pub mod alert_log;
 pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)

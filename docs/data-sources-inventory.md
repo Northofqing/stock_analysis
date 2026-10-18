@@ -10,6 +10,11 @@
 - 不完整、过期、重复、冲突或身份不匹配的数据显式拒绝。
 - 测试 fixture 使用 `TEST_CODE` identity，且只在 integration-test target 中编译。
 
+> **当前实际状态见 [`data-source-fallbacks.md`](data-source-fallbacks.md)。**
+> 那份文档逐条记录「原方案 → 为什么不行（实测证据）→ 补偿方案 → 代价」，
+> 包括：板块 f3 走新浪概念板块、f62 无源留空、新闻源枯竭、
+> F10 绕开 Windows 直连、产业链用 AI 推断。本文只讲原则，不讲当前通不通。
+
 ## 市场与证券数据
 
 | 能力 | gRPC operation / 本地边界 | 本仓准入重点 | 主要消费者 |
