@@ -172,8 +172,7 @@ pub(super) fn prepare_tick_with(
                 // 但必须出声——否则会静默退化成「可以卖」。
                 let t1_locked = match stock_analysis::database::DatabaseManager::try_get() {
                     Some(db) => {
-                        match stock_analysis::monitor::position_change_detect::t1_locked_quantities(db)
-                        {
+                        match stock_analysis::monitor::trade_ledger::today_bought_quantities(db) {
                             Ok(locked) => locked,
                             Err(error) => {
                                 log::warn!("[T-03] T+1 锁定股数读取失败, 本轮按未锁定处理: {error}");

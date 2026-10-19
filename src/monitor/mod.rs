@@ -48,6 +48,7 @@ pub mod news_ai;
 pub mod news_monitor;
 pub mod news_outcomes;
 pub mod outcome_data;
+pub mod trade_ledger; // 交易流水: 手工录入 + 快照差分推断 (2026-10-19)
 pub mod position_change_detect; // 2026-10-18: 加仓/减仓识别 (相邻快照比 quantity)
 pub mod position_sizing; // 2026-10-18: 仓位建议 (风险预算, 只建议不阻断)
 pub mod prediction;

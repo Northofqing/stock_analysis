@@ -73,5 +73,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconciliation.unchanged,
         reconciliation.unconfirmed_open
     );
+
+    // 交易流水：把这份快照相对上一份的买入增量落 `trades`（幂等）。
+    //
+    // 只推断买入——快照里没有卖出价，用成本价冒充会让盈亏归因全错（BR-222）。
+    // 卖出的票列出来，由操作者用 `trade_record` 补录真实成交价。
+    let effective = input.effective_at.format("%Y-%m-%d %H:%M:%S").to_string();
+    match stock_analysis::monitor::trade_ledger::record_snapshot_buys(
+        DatabaseManager::get(),
+        &effective,
+    ) {
+        Ok(report) => {
+            report.log();
+            println!(
+                "trade_ledger inferred_buys={} sells_needing_manual_price={} already_recorded={}",
+                report.inferred_buys,
+                report.sells_needing_manual_price.len(),
+                report.already_recorded
+            );
+        }
+        Err(error) => {
+            // 流水推断失败不该让「快照已落库」这件事看起来失败，但必须出声。
+            eprintln!("trade_ledger 推断失败（快照与持仓投影已成功写入）: {error}");
+        }
+    }
     Ok(())
 }
