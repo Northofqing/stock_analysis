@@ -13826,6 +13826,47 @@ async fn post_close_news_review() {
         }
     };
 
+    // P3.1: 新闻覆盖从「只持仓」扩到「持仓 + 活跃票」。
+    // 观察池里的票才是候选买入对象，只回溯持仓会让新闻催化维永远空转。
+    let watch_codes: Vec<String> = match stock_analysis::database::DatabaseManager::try_get() {
+        Some(db) => match db.get_conn() {
+            Ok(mut conn) => {
+                use diesel::sql_query;
+                use diesel::sql_types::Text;
+                use diesel::RunQueryDsl;
+
+                #[derive(diesel::QueryableByName)]
+                struct CodeRow {
+                    #[diesel(sql_type = Text)]
+                    code: String,
+                }
+
+                sql_query("SELECT code FROM ticket_lifecycle WHERE close_date IS NULL")
+                    .load::<CodeRow>(&mut conn)
+                    .map(|rows| rows.into_iter().map(|row| row.code).collect())
+                    .unwrap_or_else(|error| {
+                        log::warn!("[盘后] 活跃票查询失败, 仅回溯持仓: {}", error);
+                        Vec::new()
+                    })
+            }
+            Err(error) => {
+                log::warn!("[盘后] 连接不可用, 仅回溯持仓: {}", error);
+                Vec::new()
+            }
+        },
+        None => {
+            log::warn!("[盘后] 数据库未初始化, 仅回溯持仓");
+            Vec::new()
+        }
+    };
+
+    let mut holdings = holdings;
+    for code in watch_codes {
+        if !holdings.contains(&code) {
+            holdings.push(code);
+        }
+    }
+
     log::info!(
         "[盘后] 拉 {} 只持仓近 30 天个股新闻 (from={}, to={})",
         holdings.len(),

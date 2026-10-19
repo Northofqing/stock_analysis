@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 
 use diesel::prelude::*;
-use diesel::sql_types::Text;
+use diesel::sql_types::{BigInt, Integer, Text};
 
 use crate::data_gateway::GatewayBatch;
 use crate::database::DatabaseManager;
@@ -31,6 +31,9 @@ use crate::database::DatabaseManager;
 pub const DAY_CHANGE_THRESHOLD: f64 = 3.0;
 /// 相对上次观测价的变动阈值（小数，0.01 = 1%）
 pub const TICK_CHANGE_THRESHOLD: f64 = 0.01;
+/// 新闻催化回看窗口（秒）。10 分钟足够覆盖盘中快讯，
+/// 又不会把早上的新闻反复报出来。
+pub const NEWS_LOOKBACK_SECS: i64 = 600;
 
 #[derive(Debug, Clone)]
 pub struct WatchAlert {
@@ -90,6 +93,17 @@ pub async fn scan(
         return Ok(Vec::new());
     }
 
+    // P3.1: 新闻催化。观察池的票如果 10 分钟内出现了新新闻/公告，
+    // 即使价格没动也要报——这正是「新闻驱动」和「纯价格异动」的区别。
+    // 已通知过的新闻用 news_dedup 记住，避免 30 秒一轮反复刷屏。
+    let news_hits = match load_fresh_news(db, &codes) {
+        Ok(hits) => hits,
+        Err(error) => {
+            log::warn!("[观察池] 新闻查询失败, 本轮只跑价格规则: {}", error);
+            Vec::new()
+        }
+    };
+
     let bridge = crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes")
         .map_err(|error| error.to_string())?;
     let quotes = match bridge.realtime_quotes_async(&codes).await {
@@ -98,7 +112,16 @@ pub async fn scan(
         Err(error) => return Err(format!("行情拉取失败: {error}")),
     };
 
+    let mut news_by_code: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for hit in news_hits {
+        news_by_code
+            .entry(hit.code.clone())
+            .or_default()
+            .push((hit.id, hit.title));
+    }
+
     let mut alerts: Vec<WatchAlert> = Vec::new();
+    let mut notified_news: Vec<i64> = Vec::new();
     for quote in quotes {
         let mut reasons: Vec<String> = Vec::new();
 
@@ -115,6 +138,20 @@ pub async fn scan(
             }
         }
 
+        if let Some(items) = news_by_code.get(&quote.code) {
+            if let Some((_, title)) = items.first() {
+                let trimmed: String = title.chars().take(40).collect();
+                if items.len() == 1 {
+                    reasons.push(format!("新闻：{trimmed}"));
+                } else {
+                    reasons.push(format!("新闻 {} 条：{trimmed}", items.len()));
+                }
+                for (id, _) in items {
+                    notified_news.push(*id);
+                }
+            }
+        }
+
         if reasons.is_empty() {
             continue;
         }
@@ -127,6 +164,12 @@ pub async fn scan(
         });
     }
 
+    if !notified_news.is_empty() {
+        if let Ok(mut conn) = db.get_conn() {
+            mark_news_notified(&mut conn, &notified_news);
+        }
+    }
+
     alerts.sort_by(|a, b| {
         b.change_percent
             .abs()
@@ -134,6 +177,77 @@ pub async fn scan(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(alerts)
+}
+
+/// 一条待报的新闻。
+struct FreshNews {
+    id: i64,
+    code: String,
+    title: String,
+}
+
+/// 最近 10 分钟、还没通知过的、属于观察池的新闻。
+///
+/// 先按时间窗口取一批（单次 bind，避免动态 IN 的类型问题），
+/// 再在 Rust 里按观察池过滤——观察池通常只有几只到几十只票，
+/// 这批上限 200 条足够，不会漏。
+fn load_fresh_news(db: &DatabaseManager, codes: &[String]) -> Result<Vec<FreshNews>, String> {
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cutoff = chrono::Utc::now().timestamp() - NEWS_LOOKBACK_SECS;
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        code: Option<String>,
+        #[diesel(sql_type = Text)]
+        title: String,
+    }
+
+    // code 为空的宏观新闻交给 NewsFlash 链路，不在这里报。
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT n.id AS id, n.code AS code, n.title AS title
+           FROM news_items n
+          WHERE n.code IS NOT NULL
+            AND n.fetched_at > ?
+            AND NOT EXISTS (
+                  SELECT 1 FROM news_dedup d WHERE d.key = 'watch_news:' || n.id
+                )
+          ORDER BY n.published_at DESC
+          LIMIT 200",
+    )
+    .bind::<BigInt, _>(cutoff)
+    .load::<Row>(&mut conn)
+    .map_err(|error| format!("新闻查询失败: {error}"))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let code = row.code?;
+            if !codes.iter().any(|known| known == &code) {
+                return None;
+            }
+            Some(FreshNews {
+                id: row.id,
+                code,
+                title: row.title,
+            })
+        })
+        .collect())
+}
+
+/// 记下已通知的新闻，避免下一轮重复。
+fn mark_news_notified(conn: &mut SqliteConnection, ids: &[i64]) {
+    for id in ids {
+        let key = format!("watch_news:{id}");
+        let _ = diesel::sql_query("INSERT OR IGNORE INTO news_dedup (key) VALUES (?)")
+            .bind::<Text, _>(key)
+            .execute(conn);
+    }
 }
 
 #[cfg(test)]
