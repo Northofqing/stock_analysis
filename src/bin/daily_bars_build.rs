@@ -65,8 +65,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     DatabaseManager::init_retained_monitor(Some(path))?;
     let db = DatabaseManager::get();
 
-    println!("[日线均线] as_of={date_text} 开始（标的 = active tickets + 持仓）");
-    let report = match refresh_daily_bars_and_ma(db, &date_text).await {
+    // --codes 600519,300750,... 显式指定标的；不传则沿用
+    // active tickets + 持仓。补新闻票、板块成分的历史日线时用这个。
+    let codes_override: Option<Vec<String>> = arg_value(&args, "--codes").map(|raw| {
+        raw.split(',')
+            .map(|item| item.trim().to_owned())
+            .filter(|item| !item.is_empty())
+            .collect()
+    });
+
+    match &codes_override {
+        Some(list) => println!(
+            "[日线均线] as_of={date_text} 开始（标的 = 显式指定 {} 只）",
+            list.len()
+        ),
+        None => println!("[日线均线] as_of={date_text} 开始（标的 = active tickets + 持仓）"),
+    }
+
+    let report = match refresh_daily_bars_and_ma(db, &date_text, codes_override.as_deref()).await {
         Ok(report) => report,
         Err(error) => {
             eprintln!("[日线均线] 失败: {error}");
@@ -79,9 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.targets, report.fetched, report.persisted_bars, report.with_ma20
     );
     if report.fetched > 0 && report.with_ma20 == 0 {
-        println!(
-            "  （with_ma20=0 = 拉到的历史不足 20 个交易日，ma20 全 NULL，P2 仍不可做）"
-        );
+        println!("  （with_ma20=0 = 拉到的历史不足 20 个交易日，ma20 全 NULL，P2 仍不可做）");
     }
     for error in &report.errors {
         println!("  ! {error}");

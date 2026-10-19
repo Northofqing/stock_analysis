@@ -75,11 +75,19 @@ P1.3 op 67 价格带每日落库
 
 ### P3 定向监控（观察池的票）
 
-- P3.1 新闻/公告按 ticket 的 code 过滤（现有全局采集 → 过滤 → 追加事件）。
+- **P3.1 新闻/公告按 ticket 的 code 过滤 — 已完成（2026-10-19）**
+  - 盘后回溯（`main.rs::post_close_news_review`）：标的从「只持仓」扩到
+    「持仓 ∪ `ticket_lifecycle` 活跃票」。以前观察池的票根本没有新闻数据，
+    优先级打分里的「新闻催化」维永远 0 分。
+  - 盘中扫描（`watch_pool_monitor::scan`）：新增第三条规则——查 `news_items`
+    最近 10 分钟、未被 `news_dedup` 标记的新闻，命中就报「新闻：{标题}」。
+  - 去重：通知后写 `news_dedup` key=`watch_news:{id}`，30 秒一轮不会重复。
+  - 边界：新闻票必须在行情批次里才报（拿不到价格就没有意义）。
 - P3.2 关联公司（弱关联版）：`board_memberships` 同板块 + 新闻共同提及；
   明确标注"弱关联"，不做股权穿透（无数据源）。
+  - **现状**：只有 `concept_peers`（共享概念），不是"关联公司"。
+    F10 16 类里没有产业链上下游，股权关联不可靠 → 卡在数据源。
 - 验证：某票当天新闻命中时，事件时间轴出现 `news_catalyst` / `announcement` 行。
-- 做不到：间接关联只能做到"同板块 + 同新闻"，无法做供应链/股权穿透。
 
 ### P4 次日动作 + 价格
 
@@ -137,9 +145,21 @@ state 分布：RejectedDurable 2859 / Delivered 161 / ManualResolvedRejected 6
 
 ### P6 逐票复盘归因
 
-- `advice_outcome_tracking` 的逐票结果 append 到 `ticket_event`。
-- 归因维度：个股自身（事件/新闻）vs 板块（同板块涨跌）vs 大盘（指数）。
-- 验证：一只票平仓后，时间轴尾部出现 `outcome` 行，带 T+1/T+3/T+5 与归因标签。
+- **P6 二层归因 — 已完成（2026-10-19）**：`src/monitor/attribution_benchmark.rs`
+  + CLI `attribution_benchmark_build`，落表 `attribution_benchmark_daily`。
+  - `stock_pct`    `stock_daily.pct_chg`
+  - `market_pct`   当日全市场等权平均，**样本 >= 50 才采纳**，否则 NULL（BR-222）
+  - `excess_pct`   `stock_pct - market_pct`，即选股超额
+  - `board_pct`    **留 NULL**：板块日线只有 2026-10-16 一天（新浪概念快照），
+    D3 板块成分映射未落地，填一个估出来的值比 NULL 更糟。
+  - 实测 2026-10-09：817 只全部带基准，市场 +0.69%，
+    300413 超额 +19.29 / 300340 +15.20 / 688561 +10.52。
+  - 实测 2026-10-16：18 只，样本不足 → `market_pct` / `excess_pct` 全 NULL。
+  - 补样本：`daily_bars_build --codes` 可显式指定标的，
+    `stock_concepts` 里有 1265 个代码，补完全市场后基准即可采纳。
+- 已有的 `paper_attribution_daily` 是**按 signal_family 统计 PnL/胜率**，
+  停在 2026-08-28、`attribution_run_audit` 0 行，与本轮的二层拆分不冲突。
+- 验证：`attribution_benchmark_build --date <日> --show` 能看到个股/市场/超额三列。
 - 做不到：归因是统计相关，不是因果；报告必须写明"假设执行、非真实收益"。
 
 ## 四、顺序原则

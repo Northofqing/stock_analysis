@@ -12217,8 +12217,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
                                 let date_text = advice_report_date.format("%Y-%m-%d").to_string();
                                 match stock_analysis::monitor::ticket_priority::rank_watch_pool(
-                                    &db,
-                                    &date_text,
+                                    &db, &date_text,
                                 ) {
                                     Ok(rows) => {
                                         log::info!(
@@ -12228,9 +12227,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         for (position, row) in rows.iter().enumerate() {
                                             log::info!("[优先级] {}", row.render(position + 1));
                                         }
-                                        *PRIORITY_LAST
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner()) =
+                                        *PRIORITY_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
                                             Some(advice_report_date);
                                     }
                                     Err(error) => log::warn!(
@@ -12336,8 +12333,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
                                 let date_text = advice_report_date.format("%Y-%m-%d").to_string();
                                 match stock_analysis::monitor::buy_zone_dispatch::render_plan(
-                                    &db,
-                                    &date_text,
+                                    &db, &date_text,
                                 ) {
                                     Ok(text) => {
                                         log::info!(
@@ -12381,6 +12377,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 match stock_analysis::monitor::daily_bars_indicators::refresh_daily_bars_and_ma(
                                     &db,
                                     &date_text,
+                                    None,
                                 )
                                 .await
                                 {

@@ -91,20 +91,25 @@ fn window_mean(values: &[f64], end_inclusive: usize, window: usize) -> Option<f6
 pub async fn refresh_daily_bars_and_ma(
     db: &DatabaseManager,
     as_of: &str,
+    codes_override: Option<&[String]>,
 ) -> Result<DailyBarsReport, String> {
     let mut report = DailyBarsReport::default();
 
-    let codes = {
-        let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-        collect_target_codes(&mut conn)?
+    let codes = match codes_override {
+        // 显式指定标的：补齐新闻票、板块成分等非 ticket 标的的历史日线。
+        Some(list) => list.to_vec(),
+        None => {
+            let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+            collect_target_codes(&mut conn)?
+        }
     };
     report.targets = codes.len();
     if codes.is_empty() {
         return Ok(report);
     }
 
-    let bridge =
-        crate::data_gateway::grpc_source::bridge_for("HistoricalBars").map_err(|e| e.to_string())?;
+    let bridge = crate::data_gateway::grpc_source::bridge_for("HistoricalBars")
+        .map_err(|e| e.to_string())?;
 
     // 先全部拉取（async），再统一写库，避免长时间持有数据库连接
     let mut fetched: Vec<(String, Vec<crate::data_provider::KlineData>, String)> = Vec::new();
