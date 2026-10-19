@@ -11431,6 +11431,13 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
 
                 if session.contains("休市") || session.contains("盘后") {
 
+                    // 盘后必须立刻跳出等待循环：15:30-16:00 的十个盘后调度
+                    // （板块榜/观察池/优先级/价格带/明日计划）全在 while 之后，
+                    // 不 break 就永远执行不到。2026-10-19 定位。
+                    if session.contains("盘后") {
+                        break;
+                    }
+
                     // 还在盘前等待窗口
                 }
 
