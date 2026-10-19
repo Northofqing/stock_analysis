@@ -12129,10 +12129,14 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
-                    // 观察池（2026-10-17 P1.1）：交易日 15:40 后按新闻催化开票。
-                    // operator 口径为「按板块轮动 + 按新闻催化」；这里只落新闻催化一路，
-                    // 板块轮动路未接（board_rotation_daily 零生产写入方，数据停在 2026-07-16）。
-                    // 输入源断供时本块如实报 candidates=0，不制造假的活跃票池。
+                    // 观察池（2026-10-17 P1.1；2026-10-19 接上板块轮动路）。
+                    // operator 口径为「按板块轮动 + 按新闻催化」，两路都在这里落票：
+                    // - 新闻：news_ai_assessment 的 positive/major_positive + target_code
+                    // - 板块：15:30 落库的板块榜 top10 → board_member 成分股 → 按涨幅取每板块前 3
+                    //
+                    // 板块路依赖 board_member 当日数据，所以先跑 build_from_ranking。
+                    // 桥接 BoardConstituents 到 2026-10-19 才支持 board_code 口径，
+                    // 此前只会 code→board 反查，按板块选票这条根本走不通。
                     if calendar::is_trading_day(advice_report_date)
                         && now_time >= chrono::NaiveTime::from_hms_opt(15, 40, 0).unwrap()
                     {
@@ -12146,9 +12150,24 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         if !already {
                             match stock_analysis::database::DatabaseManager::try_get() {
                                 Some(db) => {
+                                    let date_text =
+                                        advice_report_date.format("%Y-%m-%d").to_string();
+                                    match stock_analysis::monitor::board_member::build_from_ranking(
+                                        &db,
+                                        &date_text,
+                                        10,
+                                        10_000,
+                                    )
+                                    .await
+                                    {
+                                        Ok(report) => report.log(),
+                                        Err(error) => log::warn!(
+                                            "[板块成分] 榜单建表失败 date={date_text}: {error}"
+                                        ),
+                                    }
                                     match stock_analysis::monitor::ticket_watch_pool::build_watch_pool(
                                         &db,
-                                        &advice_report_date.format("%Y-%m-%d").to_string(),
+                                        &date_text,
                                         None,
                                         false,
                                     ) {

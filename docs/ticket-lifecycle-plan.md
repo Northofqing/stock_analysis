@@ -148,8 +148,36 @@ state 分布：RejectedDurable 2859 / Delivered 161 / ManualResolvedRejected 6
   - **2026-10-16 实测**：报「之前没有第二个交易日的板块榜，无法判断轮动」✓
   - **数据缺口**：`board_ranking_daily` 目前只有 10-16 一天真实数据。
     2026-10-18 那 175 行是周日手工跑 CLI 写入的 10-16 副本（逐行相同），已删除。
-- 每日产出"下一个板块"的候选，进观察池（source=board_rotation）—— 待数据齐后接。
-- 验证：`board_rotation_build --date <日>` 输出「主线/接力/退潮」各几个板块。
+- **P5 选票入口 — 已接通（2026-10-19）**
+  - 桥接 `BoardConstituents` 新增 `board_code` 口径。此前 `fetch_board_constituents`
+    只能调 `gateway.memberships(code)`，方向是「个股→板块」；provider 的
+    `BoardConstituentRequest { board_code, limit }` 本来就支持按板块查成分，但
+    `BoardDataGateway` 没有公开入口（`board_constituents_raw` 是 `pub(super)`，
+    `board.rs::board_constituents` 要 `VerifiedBoardBinding`，而 binding 是空列表）。
+    改法：`board_runtime::constituents_by_board()` 复用 `board_constituents_raw`
+    + 与 `fetch_memberships` 同一套 evidence 校验（改校验返回的 `board_code` 一致），
+    `delegate::fetch_board_constituents` 优先读 `board_code`，保留 `codes` 兼容路径。
+    提交在 `.worktrees/tdx-local-provider-20260923` 的 `479e761d2`。
+  - 新表 `board_member(board_code, board_name, kind, instrument_code)`，
+    CLI `board_member_build --from-ranking --date <日> --top 10`。板块名先试
+    `tdx:concept:<名>`，失败再试 `tdx:industry:<名>`（新浪概念榜与 TDX 分类不同）。
+  - 观察池 `ticket_watch_pool::collect_board_rotation` 接第二路：当日板块榜 top10 →
+    `board_member` 成分股 → 按**上一完整交易日**涨幅取每板块前 3（`BOARD_PER_BOARD=3`）。
+    用上一交易日而非当日：`stock_daily` 当日只有活跃票样本（10-19 仅 9 只），
+    拿它排序会把 1241 只里的强票挡在外面。
+  - monitor 15:40 调度：先 `build_from_ranking(10, 10_000)` 再 `build_watch_pool`。
+  - **2026-10-19 实测**：top10 板块里 5 个成功、5 个报「服务端内部错误」
+    （海上丝路/海工装备/氢燃料/军工航天/抗癌）；成功的是国产软件 261、风电 400、
+    仿制药 73、民营医院 78、草甘膦 17 只，共 829 行。观察池 16 候选
+    （2 新闻 + 14 板块），开票 14 只 `source=board_rotation`。
+  - **已知限制**：约一半新浪概念名在 TDX 板块里对不上（返回内部错误而非空），
+    目前只能记 `failures` 跳过。板块覆盖不全 = 选票面偏窄。
+  - 桥接重启后**首次监听要等约 140–260 秒**（`DatabaseManager::init` 跑 migrations），
+    这段时间内所有数据调用报 `unavailable`。重启桥接要留足观察窗口，
+    不要在这个窗口里判定启动失败。
+- 每日产出"下一个板块"的候选，进观察池（source=board_rotation）—— 已接。
+- 验证：`board_rotation_build --date <日>` 输出「主线/接力/退潮」各几个板块；
+  `watch_pool_build --date <日> --dry-run` 能看到 `[board_rotation]` 行。
 - 做不到：板块轮动的"早期信号"本质滞后；只能做提示，不能当买入依据。
 
 ### P6 逐票复盘归因

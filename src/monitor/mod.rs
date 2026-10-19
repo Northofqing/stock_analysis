@@ -23,6 +23,7 @@ pub mod attribution_benchmark; // P6 二层归因: 个股 vs 市场 (2026-10-19)
 pub mod attribution_deep; // G5b 深链归因 (盘后 LLM 深链, 2026-08-22 落地)
 pub mod auction;
 pub mod auction_watch; // 2026-10-18: 观察池竞价观测 (09:25 stage=Final)
+pub mod board_member; // 板块 ← 成分股 反查表 (2026-10-19)
 pub mod board_ranking_snapshot; // 2026-10-18: 板块榜每日落库 (f3 涨幅 / f62 净流入)
 pub mod board_rotation_signal; // P5 板块轮动: 主线/接力/退潮 (2026-10-19)
 pub mod buy_zone; // 2026-10-17: P2 可买价 (按票: 位置/买点区间/放弃价)

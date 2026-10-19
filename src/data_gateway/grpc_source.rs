@@ -2930,10 +2930,7 @@ impl GrpcSource {
                     "GrpcBridge",
                     None,
                     true,
-                    format!(
-                        "gRPC 服务端 {} 建连超过 {CONNECT_TIMEOUT:?}",
-                        self.addr
-                    ),
+                    format!("gRPC 服务端 {} 建连超过 {CONNECT_TIMEOUT:?}", self.addr),
                 )
             })?
             .map_err(|e| {
@@ -3270,9 +3267,7 @@ impl GrpcSource {
                 "GrpcExternalV1",
                 None,
                 true,
-                format!(
-                    "external initialization permit 等待超过 {LOCAL_INIT_PERMIT_TIMEOUT:?}"
-                ),
+                format!("external initialization permit 等待超过 {LOCAL_INIT_PERMIT_TIMEOUT:?}"),
             )
         })?
         .map_err(|_| {
@@ -3378,19 +3373,16 @@ impl GrpcSource {
             method.as_str_name()
         );
         {
-            let mut guard =
-                tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.external_client.lock())
-                    .await
-                    .map_err(|_| {
-                        GatewayError::unavailable(
-                            "GrpcExternalV1",
-                            None,
-                            true,
-                            format!(
-                                "external_client mutex 缓存等待超过 {CLIENT_LOCK_TIMEOUT:?}"
-                            ),
-                        )
-                    })?;
+            let mut guard = tokio::time::timeout(CLIENT_LOCK_TIMEOUT, self.external_client.lock())
+                .await
+                .map_err(|_| {
+                    GatewayError::unavailable(
+                        "GrpcExternalV1",
+                        None,
+                        true,
+                        format!("external_client mutex 缓存等待超过 {CLIENT_LOCK_TIMEOUT:?}"),
+                    )
+                })?;
             *guard = Some(ExternalClientState {
                 client: client.clone(),
                 prepared,
@@ -4014,6 +4006,44 @@ impl GrpcSource {
             .query_op(
                 Operation::BoardConstituents,
                 serde_json::json!({ "codes": [code] }),
+            )
+            .await?;
+        convert::board_constituents(&q)
+    }
+
+    /// 板块成分归属: 批量。
+    ///
+    /// 底层 op 收 `codes` 数组，单只包装只是为了对齐调用方语义。
+    /// 反向建 `board_member` 时要跑全市场，逐只调用每只约 16 秒（TDX block 文件），
+    /// 1265 只要 5 小时；批量一次 50 只可压到分钟级。
+    pub async fn board_constituents_many_async(
+        &self,
+        codes: &[String],
+    ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::BoardConstituents,
+                serde_json::json!({ "codes": codes }),
+            )
+            .await?;
+        convert::board_constituents(&q)
+    }
+
+    /// 板块成分归属: 按板块代码查成分股（真方向）。
+    ///
+    /// Windows 侧 `TdxBoardProvider::board_constituents` 收的是
+    /// `BoardConstituentRequest { board_code, limit }`，按板块名过滤后返回成分股。
+    /// 之前 `board_constituents_async` 传的是 `codes`（instrument 口径），
+    /// 于是拿到的是 code→board 的反向归属，方向用反了。
+    pub async fn board_constituents_by_board_async(
+        &self,
+        board_code: &str,
+        limit: u32,
+    ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+        let q = self
+            .query_op(
+                Operation::BoardConstituents,
+                serde_json::json!({ "board_code": board_code, "limit": limit }),
             )
             .await?;
         convert::board_constituents(&q)
