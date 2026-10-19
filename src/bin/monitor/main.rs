@@ -12226,6 +12226,66 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 板块轮动信号（2026-10-19）：15:34，板块榜落库之后、观察池之前。
+                    // 只有存在**第二个可比交易日**时才计算——单日只能看排名，
+                    // 算不出「接力/退潮」，强行给结论等于编造（BR-222）。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 34, 0).unwrap()
+                    {
+                        static ROTATION_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = ROTATION_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::board_rotation_signal::has_comparable_days(
+                                    &db,
+                                    &date_text,
+                                ) {
+                                    Ok(true) => {
+                                        match stock_analysis::monitor::board_rotation_signal::build(
+                                            &db, &date_text,
+                                        ) {
+                                            Ok(result) => {
+                                                log::info!(
+                                                    "[轮动] date={} prev={:?} 主线={} 新进={} 退潮={}",
+                                                    result.trade_date,
+                                                    result.prev_date,
+                                                    result.mainline,
+                                                    result.new,
+                                                    result.fading
+                                                );
+                                                *ROTATION_LAST
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    Some(advice_report_date);
+                                            }
+                                            Err(error) => log::warn!(
+                                                "[轮动] 计算失败, 保留重试 date={date_text}: {error}"
+                                            ),
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        log::info!(
+                                            "[轮动] {date_text} 之前没有第二个交易日的板块榜，算不出接力（不是失败）"
+                                        );
+                                        *ROTATION_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[轮动] 可比日检查失败 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 观察池票优先级（2026-10-18）：15:44，观察池生成之后、记账之前。
                     // 五维加权：新闻催化 30% / 板块强度 20% / 可买价 25% / 仓位 15% / 概念共振 10%。
                     // 缺失维度从分母剔除，不当作 0 分。
