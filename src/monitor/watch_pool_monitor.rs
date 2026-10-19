@@ -34,6 +34,13 @@ pub const TICK_CHANGE_THRESHOLD: f64 = 0.01;
 /// 新闻催化回看窗口（秒）。10 分钟足够覆盖盘中快讯，
 /// 又不会把早上的新闻反复报出来。
 pub const NEWS_LOOKBACK_SECS: i64 = 600;
+/// 同板块关联票的涨幅阈值（%）。
+///
+/// 设 5% 而不是 3%：板块内每天都有一堆 3% 的票，报出来等于噪音；
+/// 5% 以上才算「板块里有票在独立走强」，对判断板块是否还在有参考价值。
+pub const PEER_CHANGE_THRESHOLD: f64 = 5.0;
+/// 每轮最多查多少只关联票行情（保护行情接口，也避免日志爆炸）。
+const PEER_QUERY_LIMIT: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct WatchAlert {
@@ -104,6 +111,16 @@ pub async fn scan(
         }
     };
 
+    // P3.3: 同板块关联票异动。观察池的票今天可能不动，但它所在板块里
+    // 已经有票在走强 —— 这是「板块还在不在」的直接证据，值得报。
+    let peer_alerts = match load_peer_alerts(db, &codes).await {
+        Ok(alerts) => alerts,
+        Err(error) => {
+            log::warn!("[观察池] 关联票查询失败, 本轮跳过该规则: {error}");
+            HashMap::new()
+        }
+    };
+
     let bridge = crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes")
         .map_err(|error| error.to_string())?;
     let quotes = match bridge.realtime_quotes_async(&codes).await {
@@ -152,6 +169,15 @@ pub async fn scan(
             }
         }
 
+        if let Some(peers) = peer_alerts.get(&quote.code) {
+            for peer in peers {
+                reasons.push(format!(
+                    "同板块「{}」{} {} {:+.2}%",
+                    peer.board_name, peer.code, peer.name, peer.change_pct
+                ));
+            }
+        }
+
         if reasons.is_empty() {
             continue;
         }
@@ -177,6 +203,144 @@ pub async fn scan(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(alerts)
+}
+
+/// 同板块里异动的一只票。
+struct PeerHit {
+    code: String,
+    name: String,
+    price: f64,
+    change_pct: f64,
+    board_name: String,
+}
+
+/// 同板块关联票异动：观察池的票属于哪些板块，这些板块里今天还有谁在走强。
+///
+/// 为什么是「同板块」而不是「关联公司」：`chain_relation_candidate` 存的
+/// 是产业环节（钢材/原料药），`object_code` 全部是 NULL，盯不了股价。
+/// 目前唯一带可交易代码的关联关系是「同板块」——`board_member` 有八百多条成分。
+///
+/// 每个板块只保留涨幅最高的一只，避免同一板块刷出十几条。
+async fn load_peer_alerts(
+    db: &DatabaseManager,
+    codes: &[String],
+) -> Result<HashMap<String, Vec<PeerHit>>, String> {
+    #[derive(QueryableByName)]
+    struct MemberRow {
+        #[diesel(sql_type = Text)]
+        board_code: String,
+        #[diesel(sql_type = Text)]
+        board_name: String,
+        #[diesel(sql_type = Text)]
+        instrument_code: String,
+    }
+
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    // board_member 只有千级行，全量取回在 Rust 侧过滤，避免动态 IN 绑定。
+    let members: Vec<MemberRow> = diesel::sql_query(
+        "SELECT board_code, board_name, instrument_code FROM board_member",
+    )
+    .load(&mut conn)
+    .map_err(|error| format!("板块成分查询失败: {error}"))?;
+    drop(conn);
+
+    let watched: HashSet<&str> = codes.iter().map(String::as_str).collect();
+    let mut boards_of: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    let mut board_members: HashMap<&str, Vec<&str>> = HashMap::new();
+    for row in &members {
+        board_members
+            .entry(row.board_code.as_str())
+            .or_default()
+            .push(row.instrument_code.as_str());
+        if watched.contains(row.instrument_code.as_str()) {
+            boards_of
+                .entry(row.instrument_code.as_str())
+                .or_default()
+                .push((row.board_code.as_str(), row.board_name.as_str()));
+        }
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for boards in boards_of.values() {
+        for (board_code, _) in boards {
+            if let Some(list) = board_members.get(board_code) {
+                for code in list {
+                    if watched.contains(code) || !seen.insert(code) {
+                        continue;
+                    }
+                    candidates.push((*code).to_owned());
+                    if candidates.len() >= PEER_QUERY_LIMIT {
+                        break;
+                    }
+                }
+            }
+            if candidates.len() >= PEER_QUERY_LIMIT {
+                break;
+            }
+        }
+        if candidates.len() >= PEER_QUERY_LIMIT {
+            break;
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let bridge = crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes")
+        .map_err(|error| error.to_string())?;
+    let quotes = match bridge.realtime_quotes_async(&candidates).await {
+        Ok(GatewayBatch::Available { records, .. }) => records,
+        Ok(GatewayBatch::VerifiedEmpty(_)) => return Ok(HashMap::new()),
+        Err(error) => return Err(format!("关联票行情拉取失败: {error}")),
+    };
+    let by_code: HashMap<&str, &crate::data_gateway::RealtimeMarketQuote> = quotes
+        .iter()
+        .map(|quote| (quote.code.as_str(), quote))
+        .collect();
+
+    // subject -> board_code -> 最强的一只 peer
+    let mut best: HashMap<String, HashMap<String, PeerHit>> = HashMap::new();
+    for (subject, boards) in &boards_of {
+        for (board_code, board_name) in boards {
+            let Some(list) = board_members.get(board_code) else {
+                continue;
+            };
+            for peer in list {
+                if watched.contains(peer) {
+                    continue;
+                }
+                let Some(quote) = by_code.get(peer) else {
+                    continue;
+                };
+                if quote.change_percent < PEER_CHANGE_THRESHOLD {
+                    continue;
+                }
+                let slot = best
+                    .entry((*subject).to_owned())
+                    .or_default()
+                    .entry((*board_code).to_owned())
+                    .or_insert_with(|| PeerHit {
+                        code: quote.code.clone(),
+                        name: quote.name.clone(),
+                        price: quote.price,
+                        change_pct: quote.change_percent,
+                        board_name: (*board_name).to_owned(),
+                    });
+                if quote.change_percent > slot.change_pct {
+                    slot.code = quote.code.clone();
+                    slot.name = quote.name.clone();
+                    slot.price = quote.price;
+                    slot.change_pct = quote.change_percent;
+                }
+            }
+        }
+    }
+
+    Ok(best
+        .into_iter()
+        .map(|(subject, boards)| (subject, boards.into_values().collect()))
+        .collect())
 }
 
 /// 一条待报的新闻。

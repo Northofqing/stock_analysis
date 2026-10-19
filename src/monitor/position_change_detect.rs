@@ -24,7 +24,7 @@
 //! - `quantity` 相同视为无变化，不记事件。
 
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Nullable, Double, Text};
+use diesel::sql_types::{BigInt, Double, Nullable, Text};
 
 use crate::database::{ticket_lifecycle, DatabaseManager};
 
@@ -103,13 +103,59 @@ fn load_items(
     .bind::<Text, _>(snapshot_id)
     .load(conn)
     .map_err(|error| format!("读取快照 {snapshot_id} 明细失败: {error}"))?;
-    Ok(rows.into_iter().map(|row| (row.code, row.quantity)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.code, row.quantity))
+        .collect())
 }
 
-pub fn detect_position_changes(
+/// 当日买入（T+1 锁定）股数：当前快照 vs 上一份快照的 `quantity` 增量。
+///
+/// A 股 T+1：当天买入的股数当天不能卖。系统拿不到券商的「可用数量」字段
+/// （`UserPositionItemInput` 只有 `quantity` / `cost_price`），只能用快照增量推断。
+///
+/// 边界：两次快照之间买入的都算锁定。用户每天导入一次时这就是当日买入；
+/// 若隔了多日才导入一次，会把多日买入全锁一天——偏保守，但不会放行不该卖的。
+pub fn t1_locked_quantities(
     db: &DatabaseManager,
-    as_of: &str,
-) -> Result<ChangeReport, String> {
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    use diesel::QueryableByName;
+
+    #[derive(QueryableByName)]
+    struct SnapshotIdRow {
+        #[diesel(sql_type = Text)]
+        snapshot_id: String,
+    }
+
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    let snaps: Vec<SnapshotIdRow> = diesel::sql_query(
+        "SELECT snapshot_id FROM user_position_snapshot \
+         ORDER BY effective_at DESC, rowid DESC LIMIT 2",
+    )
+    .load(&mut conn)
+    .map_err(|e| e.to_string())?;
+    if snaps.len() < 2 {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let current = load_items(&mut conn, &snaps[0].snapshot_id)?;
+    let previous = load_items(&mut conn, &snaps[1].snapshot_id)?;
+    let previous_map: std::collections::HashMap<&str, i64> = previous
+        .iter()
+        .map(|(code, qty)| (code.as_str(), *qty))
+        .collect();
+
+    let mut locked = std::collections::HashMap::new();
+    for (code, qty) in &current {
+        let old = previous_map.get(code.as_str()).copied().unwrap_or(0);
+        if *qty > old {
+            locked.insert(code.clone(), (*qty - old) as u64);
+        }
+    }
+    Ok(locked)
+}
+
+pub fn detect_position_changes(db: &DatabaseManager, as_of: &str) -> Result<ChangeReport, String> {
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
 
     let snaps: Vec<SnapshotRow> = diesel::sql_query(
@@ -135,25 +181,50 @@ pub fn detect_position_changes(
         ..Default::default()
     };
 
-    let previous_map: std::collections::HashMap<&str, i64> =
-        previous.iter().map(|(code, qty)| (code.as_str(), *qty)).collect();
-    let current_map: std::collections::HashMap<&str, i64> =
-        current.iter().map(|(code, qty)| (code.as_str(), *qty)).collect();
+    let previous_map: std::collections::HashMap<&str, i64> = previous
+        .iter()
+        .map(|(code, qty)| (code.as_str(), *qty))
+        .collect();
+    let current_map: std::collections::HashMap<&str, i64> = current
+        .iter()
+        .map(|(code, qty)| (code.as_str(), *qty))
+        .collect();
 
     // 新建 / 加仓 / 减仓
     for (code, qty) in &current {
         match previous_map.get(code.as_str()) {
             None => {
                 report.opened.push(code.clone());
-                record(&mut conn, code, as_of, "position_opened", &format!("新建仓 {qty} 股"), &mut report);
+                record(
+                    &mut conn,
+                    code,
+                    as_of,
+                    "position_opened",
+                    &format!("新建仓 {qty} 股"),
+                    &mut report,
+                );
             }
             Some(&old) if *qty > old => {
                 report.added.push((code.clone(), old, *qty));
-                record(&mut conn, code, as_of, "position_added", &format!("加仓 {old} → {qty} 股"), &mut report);
+                record(
+                    &mut conn,
+                    code,
+                    as_of,
+                    "position_added",
+                    &format!("加仓 {old} → {qty} 股"),
+                    &mut report,
+                );
             }
             Some(&old) if *qty < old => {
                 report.reduced.push((code.clone(), old, *qty));
-                record(&mut conn, code, as_of, "position_reduced", &format!("减仓 {old} → {qty} 股"), &mut report);
+                record(
+                    &mut conn,
+                    code,
+                    as_of,
+                    "position_reduced",
+                    &format!("减仓 {old} → {qty} 股"),
+                    &mut report,
+                );
             }
             Some(_) => {}
         }
@@ -163,7 +234,14 @@ pub fn detect_position_changes(
     for (code, qty) in &previous {
         if !current_map.contains_key(code.as_str()) {
             report.exited.push(code.clone());
-            record(&mut conn, code, as_of, "position_closed", &format!("清仓（原 {qty} 股）"), &mut report);
+            record(
+                &mut conn,
+                code,
+                as_of,
+                "position_closed",
+                &format!("清仓（原 {qty} 股）"),
+                &mut report,
+            );
         }
     }
 
@@ -182,19 +260,15 @@ fn record(
         Ok(Some(ticket)) => ticket,
         Ok(None) => return, // 没有 active ticket，stage_sync 会负责开票
         Err(error) => {
-            report.errors.push(format!("{code} 查询 ticket 失败: {error}"));
+            report
+                .errors
+                .push(format!("{code} 查询 ticket 失败: {error}"));
             return;
         }
     };
-    if let Err(error) = ticket_lifecycle::append_event(
-        conn,
-        ticket.id,
-        as_of,
-        kind,
-        None,
-        None,
-        Some(summary),
-    ) {
+    if let Err(error) =
+        ticket_lifecycle::append_event(conn, ticket.id, as_of, kind, None, None, Some(summary))
+    {
         report.errors.push(format!("{code} 记事件失败: {error}"));
     }
 }

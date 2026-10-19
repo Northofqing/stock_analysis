@@ -168,7 +168,29 @@ pub(super) fn prepare_tick_with(
                 .failures
                 .push("holding_plan_fresh_banner_unavailable".into()),
             Some(banner) => {
-                match prepare_fresh_subset(banner, &snapshot, fresh, fetch_quotes, observed_at) {
+                // T+1 锁定股数只影响「能不能卖」，读失败不阻断本轮建议，
+                // 但必须出声——否则会静默退化成「可以卖」。
+                let t1_locked = match stock_analysis::database::DatabaseManager::try_get() {
+                    Some(db) => {
+                        match stock_analysis::monitor::position_change_detect::t1_locked_quantities(db)
+                        {
+                            Ok(locked) => locked,
+                            Err(error) => {
+                                log::warn!("[T-03] T+1 锁定股数读取失败, 本轮按未锁定处理: {error}");
+                                Default::default()
+                            }
+                        }
+                    }
+                    None => Default::default(),
+                };
+                match prepare_fresh_subset(
+                    banner,
+                    &snapshot,
+                    fresh,
+                    fetch_quotes,
+                    observed_at,
+                    &t1_locked,
+                ) {
                     Ok(prepared) => result
                         .candidates
                         .extend(prepared.into_iter().map(HoldingPlanCandidate::Fresh)),
@@ -399,7 +421,14 @@ pub(super) fn prepare_holding_plan_messages_with(
         .iter()
         .map(|item| item.code.clone())
         .collect::<Vec<_>>();
-    prepare_fresh_subset(banner, &snapshot, requested, fetch_quote_batch, observed_at)
+    prepare_fresh_subset(
+        banner,
+        &snapshot,
+        requested,
+        fetch_quote_batch,
+        observed_at,
+        &std::collections::HashMap::new(),
+    )
 }
 
 fn prepare_fresh_subset(
@@ -408,6 +437,7 @@ fn prepare_fresh_subset(
     requested_codes: Vec<String>,
     fetch_quote_batch: impl FnOnce(&[String]) -> Result<market_data::TopStockBatch, String>,
     observed_at: chrono::DateTime<chrono::FixedOffset>,
+    t1_locked: &std::collections::HashMap<String, u64>,
 ) -> Result<Vec<PreparedHoldingPlan>, String> {
     if snapshot.confirm_empty || requested_codes.is_empty() {
         return Ok(Vec::new());
@@ -456,10 +486,20 @@ fn prepare_fresh_subset(
         }
         let pnl_pct = (quote.price / item.cost_price - 1.0) * 100.0;
         let stop = item.cost_price * 0.92;
+        let held_qty = u32::try_from(item.quantity).unwrap_or(u32::MAX);
+        // T+1：当日买入的股数当天不能卖（A 股交割制度）。
+        // locked >= held_qty 表示整仓都是今天买的，任何卖出类建议都不可执行，
+        // 降级为「持有」并说明原因，而不是照常给减仓价让人下单。
+        let locked = t1_locked.get(&item.code).copied().unwrap_or(0);
+        let fully_locked = locked > 0 && locked >= item.quantity;
         let intent = if quote.price <= stop {
             push_templates::Intent::StopLossReview
         } else if pnl_pct > 5.0 {
-            push_templates::Intent::Reduce
+            if fully_locked {
+                push_templates::Intent::Hold
+            } else {
+                push_templates::Intent::Reduce
+            }
         } else if pnl_pct < -3.0 {
             push_templates::Intent::Add
         } else {
@@ -473,6 +513,9 @@ fn prepare_fresh_subset(
                 format!("浮盈 {pnl_pct:.1}% 触发减仓观察 (>+5%)")
             }
             push_templates::Intent::Add => format!("浮亏 {pnl_pct:.1}% 触发加仓观察 (<-3%)"),
+            push_templates::Intent::Hold if fully_locked && pnl_pct > 5.0 => format!(
+                "浮盈 {pnl_pct:.1}% 但当日买入 {locked} 股 T+1 锁定，今日不可卖"
+            ),
             push_templates::Intent::Hold => format!("浮盈 {pnl_pct:.1}%, 持有观望区间"),
             _ => unreachable!("T-03 只产出 StopLossReview/Reduce/Add/Hold"),
         };
@@ -486,7 +529,7 @@ fn prepare_fresh_subset(
                 intent,
                 price: quote.price,
                 cost: item.cost_price,
-                avail: u32::try_from(item.quantity).unwrap_or(u32::MAX),
+                avail: held_qty,
                 reduce_zone: (intent != push_templates::Intent::StopLossReview)
                     .then_some((item.cost_price * 1.02, item.cost_price * 1.05)),
                 support: item.cost_price * 0.95,
