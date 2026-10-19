@@ -24,6 +24,7 @@ pub mod attribution_deep; // G5b 深链归因 (盘后 LLM 深链, 2026-08-22 落
 pub mod auction;
 pub mod auction_watch; // 2026-10-18: 观察池竞价观测 (09:25 stage=Final)
 pub mod board_ranking_snapshot; // 2026-10-18: 板块榜每日落库 (f3 涨幅 / f62 净流入)
+pub mod board_rotation_signal; // P5 板块轮动: 主线/接力/退潮 (2026-10-19)
 pub mod buy_zone; // 2026-10-17: P2 可买价 (按票: 位置/买点区间/放弃价)
 pub mod buy_zone_dispatch; // 2026-10-18: 盘后可买价推送 (16:00 明日计划)
 pub mod chain_ai; // 2026-10-18: AI 产业链候选 (推断, 不参与决策)

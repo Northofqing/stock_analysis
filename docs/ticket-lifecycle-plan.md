@@ -138,9 +138,18 @@ state 分布：RejectedDurable 2859 / Delivered 161 / ManualResolvedRejected 6
 
 ### P5 板块轮动接力
 
-- 接 `save_board_rotations` 写入方：板块排名（已有 gateway）+ 板块成分 + 新闻标题，三源组装。
-- 每日产出"下一个板块"的候选，进观察池（source=board_rotation）。
-- 验证：`board_rotation_daily` 开始每日新增；观察池出现 source=board_rotation 的票。
+- **P5 轮动信号 — 代码完成（2026-10-19），等数据**
+  - `src/monitor/board_rotation_signal.rs` + CLI `board_rotation_build`
+  - 表 `board_rotation_signal`（不动旧 `board_rotation_daily`，
+    后者要求 `news_title` 非空，硬塞空串等于造假）
+  - 三态：`mainline`（连续在 top10）/ `new`（今天新进 top10）/ `fading`（昨天在、今天掉出）
+  - 判定用**名次**不用涨跌幅：涨幅可能因复权/口径差异不可比
+  - 单日保护：`has_comparable_days` 检查，只有一个交易日时直接报错退出
+  - **2026-10-16 实测**：报「之前没有第二个交易日的板块榜，无法判断轮动」✓
+  - **数据缺口**：`board_ranking_daily` 目前只有 10-16 一天真实数据。
+    2026-10-18 那 175 行是周日手工跑 CLI 写入的 10-16 副本（逐行相同），已删除。
+- 每日产出"下一个板块"的候选，进观察池（source=board_rotation）—— 待数据齐后接。
+- 验证：`board_rotation_build --date <日>` 输出「主线/接力/退潮」各几个板块。
 - 做不到：板块轮动的"早期信号"本质滞后；只能做提示，不能当买入依据。
 
 ### P6 逐票复盘归因
