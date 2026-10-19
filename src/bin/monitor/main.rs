@@ -12317,6 +12317,107 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // P3.2 关联公司（15:52）：F10 取数 + AI 推断产业链上下游。
+                    // F10 走 TDX 免费；AI 调 DeepSeek 要钱，所以只对观察池的票、
+                    // 且只在该票还没有候选时调一次（load_candidates 非空就跳过）。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 52, 0).unwrap()
+                    {
+                        static CHAIN_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = CHAIN_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let watch_codes: Vec<String> = match db.get_conn() {
+                                    Ok(mut conn) => {
+                                        use diesel::sql_query;
+                                        use diesel::sql_types::Text;
+                                        use diesel::RunQueryDsl;
+
+                                        #[derive(diesel::QueryableByName)]
+                                        struct CodeRow {
+                                            #[diesel(sql_type = Text)]
+                                            code: String,
+                                        }
+
+                                        sql_query(
+                                            "SELECT code FROM ticket_lifecycle WHERE close_date IS NULL",
+                                        )
+                                        .load::<CodeRow>(&mut conn)
+                                        .map(|rows| rows.into_iter().map(|r| r.code).collect())
+                                        .unwrap_or_default()
+                                    }
+                                    Err(_) => Vec::new(),
+                                };
+
+                                if watch_codes.is_empty() {
+                                    log::info!("[关联公司] 观察池为空, 跳过");
+                                } else {
+                                    match stock_analysis::monitor::f10_profile::refresh_f10(
+                                        &db,
+                                        &watch_codes,
+                                    ) {
+                                        Ok(report) => report.log(),
+                                        Err(error) => {
+                                            log::warn!("[关联公司] F10 取数失败: {error}")
+                                        }
+                                    }
+
+                                    let registry =
+                                        stock_analysis::llm::LlmRegistry::from_env();
+                                    match registry.select("chain_analysis") {
+                                        Some(provider) => {
+                                            let mut analyzed = 0usize;
+                                            for code in &watch_codes {
+                                                let has_candidates = match db.get_conn() {
+                                                    Ok(mut conn) => {
+                                                        stock_analysis::monitor::chain_ai::load_candidates(
+                                                            &mut conn, code,
+                                                        )
+                                                        .map(|rows| !rows.is_empty())
+                                                        .unwrap_or(false)
+                                                    }
+                                                    Err(_) => true,
+                                                };
+                                                if has_candidates {
+                                                    continue;
+                                                }
+                                                match stock_analysis::monitor::chain_ai::analyze(
+                                                    provider.clone(),
+                                                    &db,
+                                                    code,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(report) => {
+                                                        report.log();
+                                                        analyzed += 1;
+                                                    }
+                                                    Err(error) => log::warn!(
+                                                        "[关联公司] AI 推断失败 code={code}: {error}"
+                                                    ),
+                                                }
+                                            }
+                                            log::info!(
+                                                "[关联公司] 完成 观察池={} 新推断={analyzed}",
+                                                watch_codes.len()
+                                            );
+                                        }
+                                        None => log::warn!(
+                                            "[关联公司] 无可用 LLM provider（检查 DEEPSEEK_API_KEY）"
+                                        ),
+                                    }
+                                }
+                                *CHAIN_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(advice_report_date);
+                            }
+                        }
+                    }
+
                     // 盘后可买价推送（2026-10-18）：16:00，等 15:50 价格带 + 15:55 均线都落库后再算。
                     // 输出"明日计划"：每只票 买点区间 / 放弃价 / 建议仓位 / 条件，推飞书。
                     if calendar::is_trading_day(advice_report_date)
