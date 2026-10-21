@@ -71,6 +71,12 @@ pub(crate) enum ExternalQueryMethod {
     /// Unimplemented，请求根本没发出去。
     #[serde(rename = "OPERATION_BOARD_MEMBERSHIPS")]
     BoardMemberships,
+    /// 2026-10-21: Windows d75f09d 给 BoardConstituents 加了 Eastmoney 臂
+    /// （`BK####` → 成分股，`preferred_provider=Eastmoney`）。之前不在 ExternalV1
+    /// 路由表里，客户端在本地就返回 `Unimplemented { details: 全空 }`，
+    /// 请求根本没发出去（日志表现为 reason_code=external_query_rejected、provider=None）。
+    #[serde(rename = "OPERATION_BOARD_CONSTITUENTS")]
+    BoardConstituents,
 }
 
 impl ExternalQueryMethod {
@@ -91,6 +97,7 @@ impl ExternalQueryMethod {
             Self::EconomicReleaseSchedule => "EconomicReleaseSchedule",
             Self::QualifiedTradingFacts => "QualifiedTradingFacts",
             Self::BoardMemberships => "BoardMemberships",
+            Self::BoardConstituents => "BoardConstituents",
         }
     }
 
@@ -117,6 +124,7 @@ impl ExternalQueryMethod {
                 "/magic.market.v1.MarketDataService/QualifiedTradingFacts"
             }
             Self::BoardMemberships => "/magic.market.v1.MarketDataService/BoardMemberships",
+            Self::BoardConstituents => "/magic.market.v1.MarketDataService/BoardConstituents",
         }
     }
 
@@ -137,6 +145,7 @@ impl ExternalQueryMethod {
             Operation::MarketAnnouncements => Some(Self::MarketAnnouncements),
             Operation::GlobalNews => Some(Self::GlobalNews),
             Operation::InstrumentNews => Some(Self::InstrumentNews),
+            Operation::BoardConstituents => Some(Self::BoardConstituents),
             _ => None,
         }
     }
@@ -449,6 +458,7 @@ impl ExternalQueryTransport {
                     client.qualified_trading_facts(request).await
                 }
                 ExternalQueryMethod::BoardMemberships => client.board_memberships(request).await,
+                ExternalQueryMethod::BoardConstituents => client.board_constituents(request).await,
             }
         };
         let bind = |mut evidence: ExternalWireEvidenceV1| {
@@ -969,7 +979,7 @@ mod window_limit_tests {
         );
         assert_eq!(
             serde_json::to_string(&old).unwrap(),
-            r#"{"material":"external-unary-response-evidence-v1","profile":"ExternalV1","method":"OPERATION_HISTORICAL_BARS","client_descriptor_sha256":"41db4b931010d7dfed7240dd1713ad85dac91ddee6338265737fcc6970ace90b","evidence":{"Missing":{"framed_body_limit_bytes":4194309}}}"#
+            r#"{"material":"external-unary-response-evidence-v1","profile":"ExternalV1","method":"OPERATION_HISTORICAL_BARS","client_descriptor_sha256":"b446a1568f016c49a970cac164d2f9b3558709c1e2a3f9318f15e22b05350af6","evidence":{"Missing":{"framed_body_limit_bytes":4194309}}}"#
         );
         assert!(old.validate(ExternalQueryMethod::HistoricalBars).is_ok());
         assert!(old
@@ -1154,5 +1164,21 @@ mod stored_window_limit_tests {
                 length == 16384
             );
         }
+    }
+
+    #[test]
+    fn board_constituents_routes_over_external_v1() {
+        // Regression guard for the 2026-10-21 failure: an op missing from this
+        // table is rejected locally as Unimplemented { details: 全空 }, which the
+        // gateway surfaces as reason_code=external_query_rejected, provider=None
+        // — indistinguishable from a server rejection unless the table is tested.
+        use crate::grpc_client::pb::magic::market::v1::Operation as LocalOperation;
+        let method = ExternalQueryMethod::from_local_operation(LocalOperation::BoardConstituents)
+            .expect("BoardConstituents must route over ExternalV1");
+        assert_eq!(
+            method.path(),
+            "/magic.market.v1.MarketDataService/BoardConstituents"
+        );
+        assert_eq!(method.generated_method(), "BoardConstituents");
     }
 }
