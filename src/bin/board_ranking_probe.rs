@@ -53,7 +53,10 @@ fn main() {
                 let text = error.to_string();
                 if text.contains("unimplemented") || text.contains("UNIMPLEMENTED") {
                     println!("  → 判定：对端未实现，需要 Windows 侧开发");
-                } else if text.contains("parse") || text.contains("decode") || text.contains("反序列化") {
+                } else if text.contains("parse")
+                    || text.contains("decode")
+                    || text.contains("反序列化")
+                {
                     println!("  → 判定：对端有数据但格式不符，我这边改解析");
                 } else if text.contains("unavailable") || text.contains("transport") {
                     println!("  → 判定：传输层问题（桥未连 / 超时），不是 op 缺失");

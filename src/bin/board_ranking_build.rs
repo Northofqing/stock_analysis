@@ -24,11 +24,7 @@ async fn main() {
         .iter()
         .position(|arg| arg == "--date")
         .and_then(|index| args.get(index + 1).cloned())
-        .unwrap_or_else(|| {
-            chrono::Local::now()
-                .format("%Y-%m-%d")
-                .to_string()
-        });
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
 
     DatabaseManager::init_retained_monitor(Some(std::path::PathBuf::from(&db_path)))
         .unwrap_or_else(|error| {

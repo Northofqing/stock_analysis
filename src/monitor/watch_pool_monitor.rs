@@ -40,7 +40,13 @@ pub const NEWS_LOOKBACK_SECS: i64 = 600;
 /// 5% 以上才算「板块里有票在独立走强」，对判断板块是否还在有参考价值。
 pub const PEER_CHANGE_THRESHOLD: f64 = 5.0;
 /// 每轮最多查多少只关联票行情（保护行情接口，也避免日志爆炸）。
-const PEER_QUERY_LIMIT: usize = 200;
+/// 同板块关联票单次最多拉取的候选数。
+///
+/// 200 会直接触发 provider 拒绝：Tencent 行情接口对单次批量有上限，
+/// 超限返回 internal，导致每 30 秒刷一条 warn 且规则整轮跳过。
+/// 50 是实测可用的批量；超出部分下一轮继续（`load_peer_alerts` 按板块分组，
+/// 每个板块只报最强一只，50 只足以覆盖观察池 16 只票的同板块邻居）。
+const PEER_QUERY_LIMIT: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct WatchAlert {

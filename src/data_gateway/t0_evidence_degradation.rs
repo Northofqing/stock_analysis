@@ -480,6 +480,17 @@ async fn open_stream(bundle: &Path) -> Result<tonic::Streaming<MarketEventEnvelo
         .get_external_health()
         .await
         .map_err(|error| format!("qualify {}", safe_reason(&error)))?;
+    // 诊断（2026-10-17）：GetHealth 成功后资格是否真的成立。
+    // 此前的日志只有 "subscribe reason_code=external_connection_unqualified"，
+    // 分不清是 GetHealth 没置上资格，还是 subscribe 之前被 revoke。
+    let qualified = client.external_qualification_set();
+    if qualified {
+        log::info!("[t0_evidence_degraded] qualify done health_set=true");
+    } else {
+        log::warn!(
+            "[t0_evidence_degraded] qualify done health_set=false (GetHealth 成功但资格未置上)"
+        );
+    }
     client
         .subscribe_external(
             EventFilter {
@@ -493,7 +504,7 @@ async fn open_stream(bundle: &Path) -> Result<tonic::Streaming<MarketEventEnvelo
             None,
         )
         .await
-        .map_err(|error| format!("subscribe {}", safe_reason(&error)))
+        .map_err(|error| format!("subscribe health_set={qualified} {}", safe_reason(&error)))
 }
 
 /// 常驻订阅对端降级事件的循环。失败按指数退避重连，永不向上传播错误，

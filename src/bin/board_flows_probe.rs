@@ -21,7 +21,9 @@ fn main() {
     // BR-159 要求每次采集都写审计，审计要数据库；不初始化的话
     // provider 明明 accepted 了也会被报成 acquisition_audit_unavailable。
     let db_path = env::var("STOCK_DB").unwrap_or_else(|_| {
-        eprintln!("[BoardFlows] 必须设置 STOCK_DB（例如 STOCK_DB=<运行根>/data/stock_analysis.db）");
+        eprintln!(
+            "[BoardFlows] 必须设置 STOCK_DB（例如 STOCK_DB=<运行根>/data/stock_analysis.db）"
+        );
         std::process::exit(2);
     });
     DatabaseManager::init_retained_monitor(Some(PathBuf::from(&db_path))).unwrap_or_else(|error| {

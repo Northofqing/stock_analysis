@@ -152,9 +152,7 @@ fn invalid(message: impl Into<String>) -> GatewayError {
 /// 无法判断是哪个字段、服务端返回的 map 长什么样（live 路径契约不符时的定位盲点）。
 /// 解析失败时逐字段复检数值域, 报出首个类型不符的字段名 + 实际类型 + 原值片段
 /// （截断 200 字符）。纯观测增强, 不改变接受/拒绝判定。
-fn locate_numeric_field_mismatch(
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> String {
+fn locate_numeric_field_mismatch(object: &serde_json::Map<String, serde_json::Value>) -> String {
     const NUMERIC_FIELDS: [&str; 12] = [
         "auction_price",
         "pre_close_price",

@@ -22,8 +22,8 @@ use diesel::prelude::*;
 use diesel::sql_types::Text;
 use serde_json::{json, Value};
 
-use crate::data_gateway::provider_observed_trading_facts::{self, ProviderObservedTradingFact};
 use crate::data_gateway::grpc_source;
+use crate::data_gateway::provider_observed_trading_facts::{self, ProviderObservedTradingFact};
 use crate::database::DatabaseManager;
 
 /// op 67 的 instruments 上限（对端清单 §1.2）。
@@ -86,11 +86,10 @@ fn collect_target_codes(conn: &mut SqliteConnection) -> Result<Vec<String>, Stri
 
     let mut codes: BTreeSet<String> = BTreeSet::new();
 
-    let ticket_rows: Vec<CodeRow> = diesel::sql_query(
-        "SELECT code FROM ticket_lifecycle WHERE close_date IS NULL",
-    )
-    .load(conn)
-    .unwrap_or_default();
+    let ticket_rows: Vec<CodeRow> =
+        diesel::sql_query("SELECT code FROM ticket_lifecycle WHERE close_date IS NULL")
+            .load(conn)
+            .unwrap_or_default();
     for row in ticket_rows {
         codes.insert(row.code);
     }
@@ -188,7 +187,9 @@ pub async fn refresh_daily_snapshots(
                         report.without_price_band += 1;
                     }
                 }
-                Err(error) => report.errors.push(format!("{} 落库失败: {error}", fact.code)),
+                Err(error) => report
+                    .errors
+                    .push(format!("{} 落库失败: {error}", fact.code)),
             }
         }
     }

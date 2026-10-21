@@ -248,7 +248,10 @@ fn to_fact_evidence(wire: WireEvidence) -> FactEvidence {
     }
 }
 
-fn validate_price(value: Option<f64>, field: &'static str) -> Result<(), ProviderObservedFactError> {
+fn validate_price(
+    value: Option<f64>,
+    field: &'static str,
+) -> Result<(), ProviderObservedFactError> {
     match value {
         Some(v) if !v.is_finite() || v <= 0.0 => Err(ProviderObservedFactError::NonFinite(field)),
         _ => Ok(()),
@@ -279,8 +282,7 @@ pub fn parse_fact(value: &Value) -> Result<ProviderObservedTradingFact, Provider
             value: wire.instrument.asset_class,
         });
     }
-    if wire.instrument.code.len() != 6
-        || !wire.instrument.code.chars().all(|c| c.is_ascii_digit())
+    if wire.instrument.code.len() != 6 || !wire.instrument.code.chars().all(|c| c.is_ascii_digit())
     {
         return Err(ProviderObservedFactError::Inconsistent {
             field: "instrument.code",
@@ -302,11 +304,12 @@ pub fn parse_fact(value: &Value) -> Result<ProviderObservedTradingFact, Provider
             value: wire.quality.clone(),
         }
     })?;
-    let source =
-        TradingFactSource::parse(&wire.source).ok_or_else(|| ProviderObservedFactError::InvalidEnum {
+    let source = TradingFactSource::parse(&wire.source).ok_or_else(|| {
+        ProviderObservedFactError::InvalidEnum {
             field: "source",
             value: wire.source.clone(),
-        })?;
+        }
+    })?;
 
     let listing_state = match wire.listing_state.as_deref() {
         Some(raw) => Some(ListingState::parse(raw)?),
@@ -321,7 +324,9 @@ pub fn parse_fact(value: &Value) -> Result<ProviderObservedTradingFact, Provider
                 detail: "listing_state 为 listed/not_yet_listed 时必须给出 listed_on".to_owned(),
             });
         }
-        (_, Some(listed_on)) if chrono::NaiveDate::parse_from_str(listed_on, "%Y-%m-%d").is_err() => {
+        (_, Some(listed_on))
+            if chrono::NaiveDate::parse_from_str(listed_on, "%Y-%m-%d").is_err() =>
+        {
             return Err(ProviderObservedFactError::Inconsistent {
                 field: "listed_on",
                 detail: format!("非法日期 {listed_on}"),
@@ -540,7 +545,10 @@ mod tests {
         assert!(!fact.price_band_available(), "非快照日不应有价格带");
         assert_eq!(fact.limit_up, None);
         assert_eq!(fact.limit_down, None);
-        assert!(!ListingState::Listed.implies_tradable(), "listed 不等于可交易");
+        assert!(
+            !ListingState::Listed.implies_tradable(),
+            "listed 不等于可交易"
+        );
     }
 
     #[test]
@@ -555,7 +563,10 @@ mod tests {
         );
         let band_evidence = fact.price_band_evidence.expect("应有价格带证据");
         assert_eq!(band_evidence.provider, "Tencent");
-        assert_eq!(band_evidence.batch_id, "tencent-web:1792203713.191533300:market-statistics");
+        assert_eq!(
+            band_evidence.batch_id,
+            "tencent-web:1792203713.191533300:market-statistics"
+        );
     }
 
     #[test]
@@ -574,14 +585,20 @@ mod tests {
         authoritative["quality"] = json!("authoritative");
         assert!(matches!(
             parse_fact(&authoritative),
-            Err(ProviderObservedFactError::InvalidEnum { field: "quality", .. })
+            Err(ProviderObservedFactError::InvalidEnum {
+                field: "quality",
+                ..
+            })
         ));
 
         let mut wrong_band_source = synthetic_snapshot();
         wrong_band_source["price_band_source"] = json!("tencent-quote-batch");
         assert!(matches!(
             parse_fact(&wrong_band_source),
-            Err(ProviderObservedFactError::InvalidEnum { field: "price_band_source", .. })
+            Err(ProviderObservedFactError::InvalidEnum {
+                field: "price_band_source",
+                ..
+            })
         ));
     }
 
@@ -592,7 +609,10 @@ mod tests {
         missing_source["price_band_source"] = json!(null);
         assert!(matches!(
             parse_fact(&missing_source),
-            Err(ProviderObservedFactError::Inconsistent { field: "price_band_source", .. })
+            Err(ProviderObservedFactError::Inconsistent {
+                field: "price_band_source",
+                ..
+            })
         ));
 
         // 只有涨停没有跌停
@@ -600,7 +620,10 @@ mod tests {
         missing_lower["limit_down"] = json!(null);
         assert!(matches!(
             parse_fact(&missing_lower),
-            Err(ProviderObservedFactError::Inconsistent { field: "limit_up/limit_down", .. })
+            Err(ProviderObservedFactError::Inconsistent {
+                field: "limit_up/limit_down",
+                ..
+            })
         ));
 
         // 跌停高于涨停
@@ -609,7 +632,10 @@ mod tests {
         reversed["limit_down"] = json!(9.0);
         assert!(matches!(
             parse_fact(&reversed),
-            Err(ProviderObservedFactError::Inconsistent { field: "limit_up/limit_down", .. })
+            Err(ProviderObservedFactError::Inconsistent {
+                field: "limit_up/limit_down",
+                ..
+            })
         ));
 
         // 无价格带却声明来源
@@ -617,7 +643,10 @@ mod tests {
         stray_source["price_band_source"] = json!("tencent-market-statistics");
         assert!(matches!(
             parse_fact(&stray_source),
-            Err(ProviderObservedFactError::Inconsistent { field: "price_band_source", .. })
+            Err(ProviderObservedFactError::Inconsistent {
+                field: "price_band_source",
+                ..
+            })
         ));
     }
 
@@ -655,7 +684,9 @@ mod tests {
         value["suspended"] = json!(false);
         assert_eq!(
             parse_fact(&value),
-            Err(ProviderObservedFactError::UnknownField("suspended".to_owned())),
+            Err(ProviderObservedFactError::UnknownField(
+                "suspended".to_owned()
+            )),
             "suspension 不在本 op 合同内，出现即应拒绝"
         );
     }
@@ -675,7 +706,9 @@ mod tests {
         );
         // 行数超限 → invalid_argument
         assert_eq!(
-            validate_request_shape(50, 250, &[]).unwrap_err().reason_code(),
+            validate_request_shape(50, 250, &[])
+                .unwrap_err()
+                .reason_code(),
             "invalid_argument"
         );
         // 正常组合

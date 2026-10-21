@@ -349,7 +349,11 @@ impl ScannerPositionQuotes {
         scope_note: String,
     ) -> Result<Self, String> {
         validate_scanner_quote_membership(&requested, admitted.quotes())?;
-        Ok(Self::Available(ScannerPositionQuoteBatch { requested, admitted, scope_note }))
+        Ok(Self::Available(ScannerPositionQuoteBatch {
+            requested,
+            admitted,
+            scope_note,
+        }))
     }
 
     pub(super) fn scope_note(&self) -> &str {

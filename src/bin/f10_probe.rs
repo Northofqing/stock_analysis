@@ -40,7 +40,11 @@ fn main() {
                     .chars()
                     .take_while(|ch| !ch.is_control())
                     .collect();
-                let mark = if category.name.len() > 12 { " [填充]" } else { "" };
+                let mark = if category.name.len() > 12 {
+                    " [填充]"
+                } else {
+                    ""
+                };
                 println!("  - {cleaned}  ({}B){mark}", category.name.len());
             }
             println!("[F10] 带填充的分类数={padded}");

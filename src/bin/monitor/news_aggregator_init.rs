@@ -2509,13 +2509,18 @@ mod tests {
         let kind = crate::notify::PushKind::NewsFlashAggregated;
         let mut event = stock_analysis::push_l1::SignalEvent::new(
             stock_analysis::push_l1::SignalSource::NewsCatalyst,
-            "news_flash_aggregated", None, chrono::Local::now(),
+            "news_flash_aggregated",
+            None,
+            chrono::Local::now(),
             stock_analysis::push_l1::SignalPayload::NewsCatalyst(
                 stock_analysis::push_l1::NewsCatalystPayload {
-                    code: None, headline: Some("TEST_CODE_NEWS".into()),
-                    source: Some("TEST_CODE_SOURCE".into()), published_on: None,
-                }
-            ), stock_analysis::push_l1::Severity::Normal,
+                    code: None,
+                    headline: Some("TEST_CODE_NEWS".into()),
+                    source: Some("TEST_CODE_SOURCE".into()),
+                    published_on: None,
+                },
+            ),
+            stock_analysis::push_l1::Severity::Normal,
         );
         event.event_id = reservation.reservation_identity_sha256().to_owned();
         assert!(crate::v14_adapter::commit_dedup_for_event(&event, kind, None, None).is_err());

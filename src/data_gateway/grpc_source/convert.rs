@@ -3570,7 +3570,10 @@ pub fn limit_pools(
         {
             return Err(err(
                 capability,
-                format!("LimitPoolEntry fields 与 schema@{} 冲突", payload.schema_version),
+                format!(
+                    "LimitPoolEntry fields 与 schema@{} 冲突",
+                    payload.schema_version
+                ),
             ));
         }
         let record: LimitPoolEntry = serde_json::from_value(value)
@@ -4424,7 +4427,8 @@ mod tests {
             "instrument": {"exchange": "Shenzhen", "code": "000001", "asset_class": "Equity"}
         });
         assert_eq!(
-            announcement_code(&blank_code, "MarketAnnouncements").expect("空白顶层 code 应回退到 instrument.code"),
+            announcement_code(&blank_code, "MarketAnnouncements")
+                .expect("空白顶层 code 应回退到 instrument.code"),
             "000001"
         );
 

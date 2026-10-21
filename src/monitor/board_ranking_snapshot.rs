@@ -319,7 +319,12 @@ async fn fetch(fid: &str) -> Result<Vec<BoardRow>, String> {
     }
 }
 
-fn persist(conn: &mut SqliteConnection, date: &str, fid: &str, rows: &[BoardRow]) -> Result<usize, String> {
+fn persist(
+    conn: &mut SqliteConnection,
+    date: &str,
+    fid: &str,
+    rows: &[BoardRow],
+) -> Result<usize, String> {
     let mut written = 0usize;
     for (index, row) in rows.iter().enumerate() {
         written += diesel::sql_query(
@@ -377,9 +382,7 @@ pub async fn refresh_board_rankings(
             log::warn!("[板块榜] BoardFlows 失败（{error}），f3 回退新浪概念板块");
             report.errors.push(format!("BoardFlows: {error}"));
             let sina = fetch_sina_boards(TOP_N).await.unwrap_or_else(|sina_error| {
-                report
-                    .errors
-                    .push(format!("新浪兜底也失败: {sina_error}"));
+                report.errors.push(format!("新浪兜底也失败: {sina_error}"));
                 Vec::new()
             });
             report.f3_count = sina.len();
@@ -427,7 +430,13 @@ pub fn top_gaining_boards(
     .map_err(|e| e.to_string())?;
     Ok(rows
         .into_iter()
-        .map(|row| (row.board_code, row.board_name, row.change_pct.unwrap_or_default()))
+        .map(|row| {
+            (
+                row.board_code,
+                row.board_name,
+                row.change_pct.unwrap_or_default(),
+            )
+        })
         .collect())
 }
 

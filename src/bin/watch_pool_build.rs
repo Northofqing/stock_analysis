@@ -49,7 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.opened,
         report.appended,
         report.skipped_invalid_code,
-        if report.dry_run { "  (dry-run, 未写库)" } else { "" }
+        if report.dry_run {
+            "  (dry-run, 未写库)"
+        } else {
+            ""
+        }
     );
     for error in &report.errors {
         println!("  ! {error}");
