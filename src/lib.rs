@@ -8,9 +8,9 @@ extern crate self as stock_analysis;
 // bin/monitor 时间线需要调用 modes::run_chain_analysis_mode (新闻+AI 链分析推送)。
 // CLI binary (src/main.rs) 保留本地 mod app; mod cli;, 与库路径互不冲突。
 pub mod analyzer;
-pub mod assistant_review;
 pub mod announcement;
 pub mod app;
+pub mod assistant_review;
 pub mod auth;
 pub mod breakout;
 pub mod broker;

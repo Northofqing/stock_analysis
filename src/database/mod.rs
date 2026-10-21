@@ -2769,6 +2769,7 @@ fn build_sqlite_pool_from_manager_with_checkout_validation(
 pub mod factor_snapshot;
 pub mod repository;
 // v12 MVP-5 §8.1
+pub mod advice_outcome_tracking;
 pub(crate) mod agent_logs;
 pub mod attribution_epochs;
 pub mod attribution_reports;
@@ -2780,8 +2781,6 @@ pub mod daily_change_confirmation;
 pub mod daily_change_review;
 pub(crate) mod daily_change_review_schema_v1;
 pub mod data_acquisition_audit;
-pub mod advice_outcome_tracking;
-pub mod ticket_lifecycle; // 2026-10-17: 票的生命周期 (ticket_lifecycle / ticket_event)
 pub mod execution_tracking;
 pub(crate) mod global_schema_catalog_v1;
 pub(crate) mod global_schema_v1;
@@ -2800,7 +2799,8 @@ pub(crate) mod paper_ledger_schema_v1;
 pub(crate) mod paper_snapshot_activation_schema_v1;
 pub mod position_chain;
 mod positions;
-// BR-215: projection reconciliation is a tool-facing entry point.
+pub mod ticket_lifecycle; // 2026-10-17: 票的生命周期 (ticket_lifecycle / ticket_event)
+                          // BR-215: projection reconciliation is a tool-facing entry point.
 pub(crate) use positions::{
     read_open_position_rows, valid_sqlite_timestamp, OwnedPositionSourceRow,
 };
@@ -2851,11 +2851,16 @@ impl DatabaseManager {
 
     /// Existing production monitor keeps the original business store while
     /// prospective platform Unit storage remains outside the released scope.
-    pub fn init_retained_monitor(db_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn init_retained_monitor(
+        db_path: Option<PathBuf>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         Self::init_with_scope(db_path, true)
     }
 
-    fn init_with_scope(db_path: Option<PathBuf>, retained_monitor: bool) -> Result<(), Box<dyn std::error::Error>> {
+    fn init_with_scope(
+        db_path: Option<PathBuf>,
+        retained_monitor: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(test)]
         let _init_guard = unit_test_init_lock()
             .lock()
@@ -3000,7 +3005,10 @@ impl DatabaseManager {
         Self::open_at_path_with_scope(path, false)
     }
 
-    fn open_at_path_with_scope(path: PathBuf, retained_monitor: bool) -> Result<Self, Box<dyn std::error::Error>> {
+    fn open_at_path_with_scope(
+        path: PathBuf,
+        retained_monitor: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let database_url = path.to_string_lossy().to_string();
         info!("初始化数据库: {}", database_url);
         let phase_started = std::time::Instant::now();
@@ -3580,7 +3588,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         Self::run_migrations_with_scope(conn, false)
     }
 
-    fn run_migrations_with_scope(conn: &mut SqliteConnection, retained_monitor: bool) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_migrations_with_scope(
+        conn: &mut SqliteConnection,
+        retained_monitor: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         user_position_snapshot::create_schema(conn).map_err(std::io::Error::other)?;
         user_account_summary::create_schema(conn).map_err(std::io::Error::other)?;
         closing_valuation::create_schema(conn).map_err(std::io::Error::other)?;
@@ -5299,13 +5310,24 @@ mod tests {
             for table in ["paper_trades", "prediction_tracker"] {
                 let count = diesel::sql_query(
                     "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?",
-                ).bind::<diesel::sql_types::Text, _>(table).get_result::<Count>(&mut connection).unwrap().count;
+                )
+                .bind::<diesel::sql_types::Text, _>(table)
+                .get_result::<Count>(&mut connection)
+                .unwrap()
+                .count;
                 assert_eq!(count, 1, "{table}");
             }
-            for table in ["candidate_board_prediction_freeze_v2", "candidate_board_prediction_member_v2"] {
+            for table in [
+                "candidate_board_prediction_freeze_v2",
+                "candidate_board_prediction_member_v2",
+            ] {
                 let count = diesel::sql_query(
                     "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name=?",
-                ).bind::<diesel::sql_types::Text, _>(table).get_result::<Count>(&mut connection).unwrap().count;
+                )
+                .bind::<diesel::sql_types::Text, _>(table)
+                .get_result::<Count>(&mut connection)
+                .unwrap()
+                .count;
                 assert_eq!(count, i64::from(!retained), "{table}");
             }
         }

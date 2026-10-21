@@ -64,4 +64,6 @@ pub mod ticket_priority; // 2026-10-18: 观察池票优先级 (5 维加权排序
 pub mod ticket_stage_sync; // 2026-10-18: 持仓快照驱动 stage 自动流转 (观察→持有→退出)
 pub mod ticket_watch_pool; // 2026-10-17: 观察池生成 (新闻催化; 板块轮动待接写入方)
 pub mod trading_fact_snapshot; // 2026-10-17: op 67 价格带每日落库 (快照日有值, 错过永久丢)
+pub mod holdings_bridge; // 2026-10-20: Windows 持仓桥（TDX 导出快照，只读 HTTP）
 pub mod watch_pool_monitor; // 2026-10-18: 观察池定向监控 (30s 异动扫描)
+pub mod watch_pool_perf; // 2026-10-20: 观察池选股表现 (N 日收益/胜率)
