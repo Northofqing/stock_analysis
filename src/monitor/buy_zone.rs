@@ -108,7 +108,7 @@ fn round2(value: f64) -> f64 {
 ///
 /// 为什么不是一个统一的股票主表：库里没有这张表。名称只散落在
 /// 持仓、持仓快照、推送记录、催化剂观察里，所以按"离当前状态最近"的顺序查。
-pub(crate) fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<String> {
+pub fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<String> {
     #[derive(QueryableByName)]
     struct NameRow {
         #[diesel(sql_type = Text)]
@@ -133,7 +133,40 @@ pub(crate) fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<St
             return Some(row.name);
         }
     }
-    None
+    // 观察池的新票不在上述四张表里（没持仓过、没推送过），但 F10 建档
+    // 正文头部固定带名称：`☆经营分析☆ ◇000701 厦门信达 更新日期：…◇`。
+    // 这是权威数据源自带的字段，不是推导值（BR-222 允许）。
+    name_from_f10(conn, code)
+}
+
+/// 从 `stock_f10_profile.content` 头部解析股票名称。
+///
+/// 格式固定为 `◇{code} {name} 更新日期：…◇`；解析不出来就返回 None，
+/// 由调用方退回「只显代码」。
+fn name_from_f10(conn: &mut SqliteConnection, code: &str) -> Option<String> {
+    #[derive(QueryableByName)]
+    struct ContentRow {
+        #[diesel(sql_type = Text)]
+        content: String,
+    }
+    let row: ContentRow = diesel::sql_query(
+        "SELECT content FROM stock_f10_profile WHERE code = ? \
+         ORDER BY fetched_at DESC LIMIT 1",
+    )
+    .bind::<Text, _>(code)
+    .get_result(conn)
+    .ok()?;
+
+    let marker = format!("◇{code} ");
+    let start = row.content.find(&marker)? + marker.len();
+    let rest = &row.content[start..];
+    let end = rest.find(" 更新日期").or_else(|| rest.find('◇'))?;
+    let name = rest[..end].trim();
+    if name.is_empty() || name.len() > 12 {
+        // 超过 12 字基本是解析错行（F10 正文里还有别的 ◇ 标记），宁可不填
+        return None;
+    }
+    Some(name.to_string())
 }
 
 pub fn compute(
@@ -184,20 +217,22 @@ pub fn compute(
     };
 
     let window = &bars[..bars.len().min(SUPPORT_WINDOW)];
-    let low_20d = window
-        .iter()
-        .filter_map(|row| row.low)
-        .fold(None::<f64>, |acc, value| match acc {
-            Some(current) => Some(current.min(value)),
-            None => Some(value),
-        });
-    let high_20d = window
-        .iter()
-        .filter_map(|row| row.high)
-        .fold(None::<f64>, |acc, value| match acc {
-            Some(current) => Some(current.max(value)),
-            None => Some(value),
-        });
+    let low_20d =
+        window
+            .iter()
+            .filter_map(|row| row.low)
+            .fold(None::<f64>, |acc, value| match acc {
+                Some(current) => Some(current.min(value)),
+                None => Some(value),
+            });
+    let high_20d =
+        window
+            .iter()
+            .filter_map(|row| row.high)
+            .fold(None::<f64>, |acc, value| match acc {
+                Some(current) => Some(current.max(value)),
+                None => Some(value),
+            });
 
     #[derive(QueryableByName)]
     struct BandRow {
@@ -239,9 +274,13 @@ pub fn compute(
         None
     };
     // 现价相对 ma5 的偏离度
-    let deviation = latest
-        .ma5
-        .and_then(|ma5| if ma5 > 0.0 { Some((close - ma5) / ma5) } else { None });
+    let deviation = latest.ma5.and_then(|ma5| {
+        if ma5 > 0.0 {
+            Some((close - ma5) / ma5)
+        } else {
+            None
+        }
+    });
 
     let mut overheat: Option<String> = None;
     if limit_up_streak >= MIN_LIMIT_UP_STREAK_TO_SKIP {
@@ -356,7 +395,9 @@ pub fn compute(
         ma5: latest.ma5.map(round2),
         ma10: latest.ma10.map(round2),
         ma20: latest.ma20.map(round2),
-        volume_ratio: latest.volume_ratio.map(|value| (value * 100.0).round() / 100.0),
+        volume_ratio: latest
+            .volume_ratio
+            .map(|value| (value * 100.0).round() / 100.0),
         low_20d: low_20d.map(round2),
         high_20d: high_20d.map(round2),
         limit_up: band.as_ref().and_then(|row| row.limit_up),
@@ -408,9 +449,7 @@ impl BuyZone {
 
         match (self.entry_low, self.entry_high) {
             (Some(low), Some(high)) => lines.push(format!("  买点：{low}-{high}")),
-            _ if self.overheated => {
-                lines.push("  买点：不给（超买/异动，不参与）".to_string())
-            }
+            _ if self.overheated => lines.push("  买点：不给（超买/异动，不参与）".to_string()),
             _ if self.at_support => {
                 lines.push("  买点：不给（已在 20 日低点附近，不追）".to_string())
             }

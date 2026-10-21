@@ -99,7 +99,10 @@ pub fn advise(code: &str, zone: &BuyZone) -> SizingAdvice {
         code: code.to_string(),
         suggested_pct: 0.0,
         max_pct: MAX_SINGLE_POSITION,
-        entry: zone.entry_low.zip(zone.entry_high).map(|(low, high)| (low + high) / 2.0),
+        entry: zone
+            .entry_low
+            .zip(zone.entry_high)
+            .map(|(low, high)| (low + high) / 2.0),
         abandon: zone.abandon,
         stop_distance_pct: None,
         raw_stop_distance_pct: None,

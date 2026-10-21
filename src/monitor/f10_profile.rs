@@ -153,12 +153,14 @@ pub fn refresh_f10(db: &DatabaseManager, codes: &[String]) -> Result<F10Report, 
                             report.fetched += 1;
                             report.total_bytes += content.byte_length;
                         }
-                        Err(error) => {
-                            report.failed.push(format!("{code} {name} 落库失败: {error}"))
-                        }
+                        Err(error) => report
+                            .failed
+                            .push(format!("{code} {name} 落库失败: {error}")),
                     }
                 }
-                Err(error) => report.failed.push(format!("{code} {name} 取数失败: {error}")),
+                Err(error) => report
+                    .failed
+                    .push(format!("{code} {name} 取数失败: {error}")),
             }
         }
     }

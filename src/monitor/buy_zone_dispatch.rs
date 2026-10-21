@@ -103,6 +103,8 @@ struct WatchRow {
     code: String,
     #[diesel(sql_type = Text)]
     source: String,
+    #[diesel(sql_type = Text)]
+    open_date: String,
 }
 
 #[derive(QueryableByName)]
@@ -214,21 +216,76 @@ fn render_board_header(conn: &mut SqliteConnection, as_of: &str) -> String {
     lines.join("\n")
 }
 
-/// 每只票所属板块（用于新买入组标注来源）。
-fn load_sectors(conn: &mut SqliteConnection) -> std::collections::HashMap<String, String> {
+/// 每只票所属的板块集合（用于 C 规则：板块退潮即退出候选）。
+///
+/// 不再按 `kind='concept'` 过滤——`board_ranking_daily` 的榜单里概念与行业
+/// 混排，只查 concept 会让行业票永远匹配不到 top10。
+fn load_sectors(
+    conn: &mut SqliteConnection,
+) -> std::collections::HashMap<String, Vec<String>> {
     let rows: Vec<SectorRow> = diesel::sql_query(
-        "SELECT instrument_code, board_name FROM board_member WHERE kind = 'concept'",
+        "SELECT instrument_code, board_name FROM board_member",
     )
     .load(conn)
     .unwrap_or_default();
 
-    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for row in rows {
         map.entry(row.instrument_code)
-            .or_insert(row.board_name);
+            .or_default()
+            .push(row.board_name);
     }
     map
 }
+
+/// 当日榜单 top N 的板块名（C 规则的「仍在榜」集合）。
+fn active_boards(conn: &mut SqliteConnection, as_of: &str, top_n: i64) -> Vec<String> {
+    #[derive(QueryableByName)]
+    struct NameRow {
+        #[diesel(sql_type = Text)]
+        board_name: String,
+    }
+    let rows: Vec<NameRow> = diesel::sql_query(
+        "SELECT board_name FROM board_ranking_daily \
+          WHERE trade_date = ? ORDER BY rank_position LIMIT ?",
+    )
+    .bind::<Text, _>(as_of.to_owned())
+    .bind::<BigInt, _>(top_n)
+    .load(conn)
+    .unwrap_or_default();
+    rows.into_iter().map(|row| row.board_name).collect()
+}
+
+/// `open_date` 到 `as_of` 之间经过的交易日数（B 规则 TTL 用）。
+///
+/// 用 `board_ranking_daily` 的 distinct trade_date 当日历——榜单每天盘后
+/// 必写，比再建一张交易日表可靠；查不到时返回 0（不误杀）。
+fn trading_days_since(conn: &mut SqliteConnection, open_date: &str, as_of: &str) -> i64 {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let rows: Vec<CountRow> = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM (SELECT DISTINCT trade_date \
+           FROM board_ranking_daily WHERE trade_date > ? AND trade_date <= ?)",
+    )
+    .bind::<Text, _>(open_date.to_owned())
+    .bind::<Text, _>(as_of.to_owned())
+    .load(conn)
+    .unwrap_or_default();
+    rows.first().map(|row| row.n).unwrap_or(0)
+}
+
+/// 观察池候选的最长存活交易日数（B 规则）。
+///
+/// 板块轮动快时票可能在买点出现前就被 C 规则移出；给 3 个交易日让票发酵，
+/// 超过仍未触发买点就退出候选，避免池子无限膨胀。
+const WATCH_TTL_TRADING_DAYS: i64 = 3;
+
+/// 板块榜取前多少名算「仍在榜」（C 规则）。
+const ACTIVE_BOARD_TOP_N: i64 = 10;
 
 /// 生成明日计划文本。空池返回提示文本（不是错误）。
 pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> {
@@ -243,25 +300,32 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
 
     // 观察池：active ticket 里排除已持仓的（持仓走另一段）。
     let watch_rows: Vec<WatchRow> = diesel::sql_query(
-        "SELECT code, source FROM ticket_lifecycle \
+        "SELECT code, source, open_date FROM ticket_lifecycle \
           WHERE close_date IS NULL AND stage = 'observing'",
     )
     .load(&mut conn)
     .map_err(|error| error.to_string())?;
-    let watching: Vec<(String, String)> = watch_rows
+    let watching: Vec<(String, String, String)> = watch_rows
         .into_iter()
         .filter(|row| !holding_codes.contains(&row.code))
-        .map(|row| (row.code, row.source))
+        .map(|row| (row.code, row.source, row.open_date))
         .collect();
 
     // T+1 锁定：今日买入股数。
     let t1_locked = crate::monitor::trade_ledger::today_bought_quantities(db).unwrap_or_default();
 
     let sectors = load_sectors(&mut conn);
+    // C 规则：今日榜单 top10 的板块名，票所属板块全不在其中 → 退出候选。
+    let active_set: std::collections::HashSet<String> =
+        active_boards(&mut conn, as_of, ACTIVE_BOARD_TOP_N)
+            .into_iter()
+            .collect();
     let mut parts: Vec<String> = Vec::new();
 
+    // 新买入的最终数量要等 C/B 过滤后才确定——标题只报持仓与观察池规模，
+    // 真实候选数在下面的「🎯 新买入候选」行。
     parts.push(format!(
-        "【明日计划 {as_of}】持仓 {} 只 · 新买入候选 {} 只",
+        "【明日计划 {as_of}】持仓 {} 只 · 观察池 {} 只",
         holdings.len(),
         watching.len()
     ));
@@ -326,8 +390,33 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
         let mut rejected: Vec<String> = Vec::new();
         let mut no_entry: Vec<String> = Vec::new();
         let mut no_sector: Vec<String> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        let mut expired: Vec<String> = Vec::new();
 
-        for (code, source) in &watching {
+        for (code, source, open_date) in &watching {
+            // B 规则 TTL：开票后超过 N 个交易日仍未触发买点 → 退出候选。
+            let used_days = trading_days_since(&mut conn, open_date, as_of);
+            if used_days > WATCH_TTL_TRADING_DAYS {
+                expired.push(format!(
+                    "{code}（观察 {used_days} 个交易日未触发买点，超过 {WATCH_TTL_TRADING_DAYS} 日上限）"
+                ));
+                continue;
+            }
+            // C 规则：所属板块全部退出当日 top N → 退出候选。
+            // 新闻催化票不受板块约束（它的理由是新闻，不是板块轮动）。
+            if source.as_str() != "news_catalyst" {
+                // 查不到板块记录时**保留**：`board_member` 只覆盖成分拉取成功的
+                // 板块（今天 top10 里水域改革/鸿蒙概念/基因测序/科创50 四个拉取
+                // 失败），把「查不到」当成「已退潮」会误杀这些板块的票。
+                let still_active = sectors
+                    .get(code)
+                    .map(|boards| boards.iter().any(|board| active_set.contains(board)))
+                    .unwrap_or(true);
+                if !still_active {
+                    dropped.push(code.clone());
+                    continue;
+                }
+            }
             match buy_zone::compute(&mut conn, code, as_of) {
                 Ok(Some(zone)) => {
                     // 正常关系：**放弃价 < 买点下限**——跌到放弃价以下就不买了，
@@ -343,8 +432,10 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
                             continue;
                         }
                     }
-                    if let Some(board) = sectors.get(code) {
-                        no_sector.push(format!("{code}〔{board}〕"));
+                    if let Some(boards) = sectors.get(code) {
+                        if let Some(board) = boards.first() {
+                            no_sector.push(format!("{code}〔{board}〕"));
+                        }
                     }
                     // 没有买点的票不进正文：它们不可能被买入，逐只展开是噪音。
                     // 归进"不建议买入"汇总，写清原因。
@@ -388,6 +479,7 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
             parts.push(String::new());
             let board = sectors
                 .get(&row.code)
+                .and_then(|boards| boards.first())
                 .map(|b| format!("  〔{b}〕"))
                 .unwrap_or_default();
             parts.push(format!("{}. {}{}", index + 1, row.label, board));
@@ -406,6 +498,31 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
                 "不建议买入 {} 只：{}",
                 no_entry.len(),
                 no_entry.join("、")
+            ));
+        }
+
+        if !dropped.is_empty() {
+            parts.push(String::new());
+            let preview = if dropped.len() > 6 {
+                format!(
+                    "{} 等",
+                    dropped.iter().take(6).cloned().collect::<Vec<_>>().join("、")
+                )
+            } else {
+                dropped.join("、")
+            };
+            parts.push(format!(
+                "板块退出 top{ACTIVE_BOARD_TOP_N} 移出 {} 只：{preview}",
+                dropped.len()
+            ));
+        }
+
+        if !expired.is_empty() {
+            parts.push(String::new());
+            parts.push(format!(
+                "观察超期 {} 只：{}",
+                expired.len(),
+                expired.join("、")
             ));
         }
 

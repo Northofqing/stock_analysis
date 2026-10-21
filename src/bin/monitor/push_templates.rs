@@ -1205,14 +1205,32 @@ impl BannerCtx {
                 },
             )
         };
-        let line1 = format!(
-            "[{} {} | {} | {} | 数据{}]",
-            self.account_mode.icon(),
-            self.account_mode.label(),
-            position,
-            pnl,
-            self.data_mode.label(),
-        );
+        // 账户 Frozen 是粘滞状态（BR-021/108 只能盘前窗口重置），
+        // 它不改变任何建议内容。把它连红点摆在首行，会让人以为整条推送
+        // 停摆——所以 Frozen 不进 banner，可见性交给下面的 account_note。
+        let account_tag = match self.account_mode {
+            AccountMode::Normal | AccountMode::ReduceOnly => Some(format!(
+                "{} {}",
+                self.account_mode.icon(),
+                self.account_mode.label()
+            )),
+            AccountMode::Frozen => None,
+        };
+        let line1 = match account_tag {
+            Some(tag) => format!(
+                "[{} | {} | {} | 数据{}]",
+                tag,
+                position,
+                pnl,
+                self.data_mode.label(),
+            ),
+            None => format!(
+                "[{} | {} | 数据{}]",
+                position,
+                pnl,
+                self.data_mode.label(),
+            ),
+        };
         let account_note = if let Some(fact) = self.account_fact.as_ref() {
             if let Some(paper) = &fact.paper_account {
                 use stock_analysis::trading::paper_ledger_runtime::PaperPnlPeriod;
@@ -20986,7 +21004,7 @@ mod tests {
             data_missing_note: None,
         };
         let captured = banner.capture_with_external_notes(&source);
-        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Full]\n\
+        let expected = "[仓位批次不完整 | 日盈亏批次不完整 | 数据Full]\n\
                         [ℹ️ 实时账户未接入；FIRST_ACCOUNT_NOTE；收盘估值不可用]";
 
         assert_eq!(captured.render(), expected);
@@ -21191,7 +21209,7 @@ mod tests {
         // Full 模式下 data_missing_note 被忽略
         assert_eq!(
             b.render(),
-            "[🔴 Frozen | 仓位0成 | 盈亏事实未绑定 | 数据Full]"
+            "[仓位0成 | 盈亏事实未绑定 | 数据Full]"
         );
     }
 
@@ -21365,7 +21383,7 @@ mod tests {
             },
             &source,
         );
-        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
+        let expected = "[仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
                         [⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]\n\
                         [ℹ️ 实时账户未接入；用户确认账户快照（截至 2026-09-14T18:50:00+08:00，source=TEST_CODE_USER_CONFIRMED）：快照仓位60.0%，2026-09-14 当日盈亏 -12.50（截至快照，非实时账户）；收盘估值不可用]\n\
                         📡 数据状态变更（10:59）\n\
@@ -21566,7 +21584,7 @@ mod tests {
             },
             &source,
         );
-        let expected = "[🔴 Frozen | 仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
+        let expected = "[仓位批次不完整 | 日盈亏批次不完整 | 数据Unsafe]\n\
                         [⚠️ TEST_CODE_QUOTE_MISSING: 本条不含承接判断]\n\
                         [ℹ️ 实时账户未接入；TEST_CODE_FIRST_CLOSING：收盘估值价格日 2026-09-15]\n\
                         📡 数据状态变更（11:02）\n\

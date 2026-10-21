@@ -119,11 +119,7 @@ fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<String> {
 }
 
 /// 给定一只票，返回共享概念数 >= `min_shared` 的其他票，按共享数降序。
-pub fn peers_of(
-    db: &DatabaseManager,
-    code: &str,
-    min_shared: usize,
-) -> Result<Vec<Peer>, String> {
+pub fn peers_of(db: &DatabaseManager, code: &str, min_shared: usize) -> Result<Vec<Peer>, String> {
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     let rows: Vec<ConceptRow> = diesel::sql_query("SELECT code, concepts FROM stock_concepts")
         .load(&mut conn)
