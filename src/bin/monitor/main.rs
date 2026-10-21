@@ -12238,6 +12238,80 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         "[观察池] 板块龙头 {} 只（龙头优先）",
                                         leader_codes.len()
                                     );
+                                    // 东财板块成分股：用当日榜单 top 板块的 BK 码拉成分
+                                    // （ExternalV1 Eastmoney 臂）。board_member 是 TDX 体系
+                                    // （tdx:industry:融资融券），与东财行业榜（BK1512 生猪养殖）
+                                    // 的名字和代码交集都是 0，实测候选一直是 0。
+                                    let eastmoney_members: std::collections::HashMap<String, Vec<String>> = {
+                                        let mut map = std::collections::HashMap::new();
+                                        #[derive(diesel::QueryableByName)]
+                                        struct BRow {
+                                            #[diesel(sql_type = diesel::sql_types::Text)]
+                                            board_name: String,
+                                            #[diesel(sql_type = diesel::sql_types::Text)]
+                                            board_code: String,
+                                        }
+                                        let tops: Vec<BRow> = match db.get_conn() {
+                                            Ok(mut conn) => {
+                                              use diesel::RunQueryDsl as _;
+                                              diesel::sql_query(
+                                                "SELECT board_name, board_code \
+                                                 FROM board_ranking_daily \
+                                                 WHERE trade_date = ? AND rank_fid = 'f3' \
+                                                   AND rank_position < 10 \
+                                                 GROUP BY board_name, board_code",
+                                            )
+                                            .bind::<diesel::sql_types::Text, _>(date_text.clone())
+                                              .load(&mut conn)
+                                              .unwrap_or_default()
+                                            }
+                                            Err(error) => {
+                                                log::warn!("[观察池] 板块榜查询失败: {error}");
+                                                Vec::new()
+                                            }
+                                        };
+                                        match stock_analysis::data_gateway::grpc_source::bridge_for(
+                                            "BoardConstituents",
+                                        ) {
+                                            Ok(bridge) => {
+                                                for row in tops {
+                                                    match bridge
+                                                        .board_constituents_by_board_async(
+                                                            &row.board_code,
+                                                            4000,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(batch) => {
+                                                            let codes: Vec<String> = batch
+                                                                .records()
+                                                                .iter()
+                                                                .map(|r| {
+                                                                    r.instrument_code.clone()
+                                                                })
+                                                                .collect();
+                                                            if !codes.is_empty() {
+                                                                map.insert(row.board_name, codes);
+                                                            }
+                                                        }
+                                                        Err(error) => log::warn!(
+                                                            "[观察池] 板块成分失败 {} {}: {error}",
+                                                            row.board_code,
+                                                            row.board_name
+                                                        ),
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => log::warn!(
+                                                "[观察池] BoardConstituents 桥不可用: {error}"
+                                            ),
+                                        }
+                                        map
+                                    };
+                                    log::info!(
+                                        "[观察池] 东财板块成分 {} 个板块",
+                                        eastmoney_members.len()
+                                    );
                                     match stock_analysis::monitor::ticket_watch_pool::build_watch_pool(
                                         &db,
                                         &date_text,
@@ -12245,6 +12319,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         false,
                                         &limit_up_codes,
                                         &leader_codes,
+                                        &eastmoney_members,
                                     ) {
                                         Ok(report) => {
                                             report.log();

@@ -45,6 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 涨停优先只在 monitor 的 15:40 调度里生效（那里有实时 LimitPools）。
     let limit_up_codes = std::collections::HashSet::new();
     let leader_codes = std::collections::HashSet::new();
+    // CLI 不带实时东财成分股：离线重放只用 board_member（TDX）那一路。
+    let eastmoney_members = std::collections::HashMap::new();
     let report = build_watch_pool(
         db,
         &date.format("%Y-%m-%d").to_string(),
@@ -52,6 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dry_run,
         &limit_up_codes,
         &leader_codes,
+        &eastmoney_members,
     )?;
     println!(
         "\n汇总: scanned={} candidates={} opened={} appended={} skipped_invalid={}{}",

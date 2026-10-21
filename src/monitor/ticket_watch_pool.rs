@@ -187,6 +187,7 @@ pub fn collect_board_rotation(
     per_board: usize,
     limit_up_codes: &std::collections::HashSet<String>,
     leader_codes: &std::collections::HashSet<String>,
+    eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<(usize, Vec<PoolCandidate>), String> {
     #[derive(QueryableByName)]
     struct BoardRow {
@@ -262,6 +263,12 @@ pub fn collect_board_rotation(
     .load(&mut *conn)
     .map_err(|e| format!("板块成分查询失败: {e}"))?;
 
+    // code → 当日涨跌幅，给东财成分股补 pct_chg 用（那些票不在 board_member 里）。
+    let pct_by_code: std::collections::HashMap<String, f64> = rows
+        .iter()
+        .filter_map(|row| row.pct_chg.map(|pct| (row.instrument_code.clone(), pct)))
+        .collect();
+
     let wanted: std::collections::HashSet<&str> =
         boards.iter().map(|board| board.board_name.as_str()).collect();
 
@@ -272,6 +279,29 @@ pub fn collect_board_rotation(
             continue;
         }
         by_board.entry(row.board_name.clone()).or_default().push(row);
+    }
+
+    // 东财板块成分（BK 码 → ExternalV1 Eastmoney 臂）：board_member 是 TDX 体系，
+    // 板块名和行业榜（生猪养殖/电视广播Ⅲ）对不上，实测交集为 0。这条来源由调用方
+    // 按当日榜单 top 板块实时拉取，pct_chg 从同一天日线补（缺失留 None，BR-222）。
+    for (board_name, codes) in eastmoney_members {
+        if !wanted.contains(board_name.as_str()) {
+            continue;
+        }
+        let entry = by_board.entry(board_name.clone()).or_default();
+        let existing: std::collections::HashSet<String> =
+            entry.iter().map(|row| row.instrument_code.clone()).collect();
+        for code in codes {
+            if existing.contains(code) {
+                continue;
+            }
+            let pct_chg = pct_by_code.get(code).copied();
+            entry.push(MemberRow {
+                board_name: board_name.clone(),
+                instrument_code: code.clone(),
+                pct_chg,
+            });
+        }
     }
 
     let mut candidates: Vec<PoolCandidate> = Vec::new();
@@ -360,6 +390,7 @@ pub fn build_watch_pool(
     dry_run: bool,
     limit_up_codes: &std::collections::HashSet<String>,
     leader_codes: &std::collections::HashSet<String>,
+    eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<WatchPoolReport, String> {
     let lookback = lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS);
     let (scanned_rows, mut candidates) = collect_news_catalysts(db, business_date, lookback)?;
@@ -373,6 +404,7 @@ pub fn build_watch_pool(
         BOARD_PER_BOARD,
         limit_up_codes,
         leader_codes,
+        eastmoney_members,
     )?;
     let board_count_raw = board_candidates.len();
     let mut board_added = 0usize;
