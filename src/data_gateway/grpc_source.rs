@@ -4051,16 +4051,30 @@ impl GrpcSource {
         board_code: &str,
         limit: u32,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
-        // `BK####` is only served by the Eastmoney arm; `tdx:` codes keep the
-        // default TDX route by leaving the provider hint empty.
-        let preferred_provider =
-            crate::grpc_client::external_v1::is_eastmoney_board_code(board_code)
-                .then_some("Eastmoney");
+        // 东财 `BK####` 码只有 ExternalV1 的 Eastmoney 臂认；本地桥接的
+        // BoardConstituents 是 Tdx 实现（delegate.rs 里 constituents_by_board
+        // 硬编码 ProviderId::Tdx），传 preferred_provider 也会被忽略。
+        //
+        // 所以 BK 码走 ExternalV1 通道（`GRPC_MARKET_CLIENT_BUNDLE`），
+        // `tdx:` 前缀保持走本地桥接，两条路互不干扰。
+        if crate::grpc_client::external_v1::is_eastmoney_board_code(board_code) {
+            let q = self
+                .query_external_op(
+                    Operation::BoardConstituents,
+                    serde_json::json!({
+                        "board_code": board_code,
+                        "limit": limit,
+                        "preferred_provider": "Eastmoney",
+                    }),
+                )
+                .await?;
+            return convert::board_constituents(&q);
+        }
         let q = self
             .query_op_with_provider(
                 Operation::BoardConstituents,
                 serde_json::json!({ "board_code": board_code, "limit": limit }),
-                preferred_provider,
+                None,
             )
             .await?;
         convert::board_constituents(&q)
