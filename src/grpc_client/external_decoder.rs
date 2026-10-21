@@ -2,8 +2,8 @@
 //! additive protobuf contract, not a digest learned from a server response.
 use super::external_query_transport::{wire_error, EXTERNAL_V1_CLIENT_DESCRIPTOR_SHA256};
 use super::{
-    archived_external_20260928, errors::GrpcError, external_pb::magic::market::v1 as current,
-    historical_external, archived_external_20261001,
+    archived_external_20260928, archived_external_20261001, errors::GrpcError,
+    external_pb::magic::market::v1 as current, historical_external,
 };
 use prost::Message;
 

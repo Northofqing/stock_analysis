@@ -65,6 +65,12 @@ pub(crate) enum ExternalQueryMethod {
     EconomicReleaseSchedule,
     #[serde(rename = "OPERATION_QUALIFIED_TRADING_FACTS")]
     QualifiedTradingFacts,
+    /// 2026-10-19: Windows e2319f5 给 BoardMemberships 加了 Eastmoney provider
+    /// （preferred_provider=Eastmoney → eastmoney:industry:<名称>，与 BoardFlows
+    /// 的 board_name 同源）。之前不在 ExternalV1 路由表里，客户端直接本地
+    /// Unimplemented，请求根本没发出去。
+    #[serde(rename = "OPERATION_BOARD_MEMBERSHIPS")]
+    BoardMemberships,
 }
 
 impl ExternalQueryMethod {
@@ -84,6 +90,7 @@ impl ExternalQueryMethod {
             Self::EconomicReleaseObservations => "EconomicReleaseObservations",
             Self::EconomicReleaseSchedule => "EconomicReleaseSchedule",
             Self::QualifiedTradingFacts => "QualifiedTradingFacts",
+            Self::BoardMemberships => "BoardMemberships",
         }
     }
 
@@ -109,6 +116,7 @@ impl ExternalQueryMethod {
             Self::QualifiedTradingFacts => {
                 "/magic.market.v1.MarketDataService/QualifiedTradingFacts"
             }
+            Self::BoardMemberships => "/magic.market.v1.MarketDataService/BoardMemberships",
         }
     }
 
@@ -146,6 +154,7 @@ impl ExternalQueryMethod {
             Operation::EconomicReleaseObservations => Some(Self::EconomicReleaseObservations),
             Operation::EconomicReleaseSchedule => Some(Self::EconomicReleaseSchedule),
             Operation::QualifiedTradingFacts => Some(Self::QualifiedTradingFacts),
+            Operation::BoardMemberships => Some(Self::BoardMemberships),
             _ => None,
         }
     }
@@ -439,6 +448,7 @@ impl ExternalQueryTransport {
                 ExternalQueryMethod::QualifiedTradingFacts => {
                     client.qualified_trading_facts(request).await
                 }
+                ExternalQueryMethod::BoardMemberships => client.board_memberships(request).await,
             }
         };
         let bind = |mut evidence: ExternalWireEvidenceV1| {

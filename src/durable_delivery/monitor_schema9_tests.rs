@@ -406,9 +406,8 @@ fn monitor_schema9_manual_resolution_keeps_accepted_and_foundation_guards() {
             DecisionState::UncertainManualReview,
             &item.decision_identity,
         );
-        let uncertain_cooldowns = fixture.query_i64(
-            "SELECT count(*) FROM cooldown_reservations WHERE state='Uncertain'",
-        );
+        let uncertain_cooldowns =
+            fixture.query_i64("SELECT count(*) FROM cooldown_reservations WHERE state='Uncertain'");
         let command = ManualResolutionCommand {
             decision_identity: item.decision_identity.clone(),
             disposition: if foundation {

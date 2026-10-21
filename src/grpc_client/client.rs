@@ -857,11 +857,19 @@ impl GrpcMarketClient {
         params: serde_json::Value,
     ) -> Result<QueryResult, GrpcError> {
         if self.profile != ContractProfile::ExternalV1 {
+            eprintln!(
+                "[DEBUG query_external_native] profile={:?}，不是 ExternalV1，拒绝 {:?}",
+                self.profile, operation
+            );
             return Err(GrpcError::Unimplemented {
                 details: Box::default(),
             });
         }
         let route = ExternalQueryMethod::from_external_operation(operation).ok_or_else(|| {
+            eprintln!(
+                "[DEBUG query_external_native] from_external_operation({:?}) 返回 None",
+                operation
+            );
             GrpcError::Unimplemented {
                 details: Box::default(),
             }

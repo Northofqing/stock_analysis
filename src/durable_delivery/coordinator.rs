@@ -2632,7 +2632,8 @@ impl DurableDeliveryCoordinator {
     pub fn open_existing_monitor_schema9(config: CoordinatorConfig) -> Result<Self> {
         config.validate()?;
         let root = crate::production_root::root_for_mode(matches!(
-            &config.environment, super::model::StoreEnvironment::Test { .. }
+            &config.environment,
+            super::model::StoreEnvironment::Test { .. }
         ));
         Self::open_with_schema_scope(config, root, true)
     }
@@ -2649,7 +2650,11 @@ impl DurableDeliveryCoordinator {
         Self::open_with_schema_scope(config, repository_root, false)
     }
 
-    fn open_with_schema_scope(config: CoordinatorConfig, repository_root: &Path, monitor_schema9: bool) -> Result<Self> {
+    fn open_with_schema_scope(
+        config: CoordinatorConfig,
+        repository_root: &Path,
+        monitor_schema9: bool,
+    ) -> Result<Self> {
         ensure_supported_attestation_target()?;
         let database_path = config.repository_relative_database_path()?;
         probe_precreation_attestation_capabilities(
@@ -3476,7 +3481,9 @@ impl DurableDeliveryCoordinator {
         dependencies: &p05_unit::runtime::SqlDependencies,
     ) -> Result<()> {
         self.require_g5b_business_open_tx(transaction, route)?;
-        if self.monitor_schema9 { return Ok(()); }
+        if self.monitor_schema9 {
+            return Ok(());
+        }
         dependencies.require_business_open(transaction, route)
     }
 
@@ -3676,10 +3683,14 @@ impl DurableDeliveryCoordinator {
         }
 
         if self.monitor_schema9 {
-            if origin_observation.is_some() || g5b_admission.is_some() || p05_admission.is_some()
-                || crate::monitor::g5b_analysis_v2::source_is_v2(&envelope.source_binding_canonical) {
+            if origin_observation.is_some()
+                || g5b_admission.is_some()
+                || p05_admission.is_some()
+                || crate::monitor::g5b_analysis_v2::source_is_v2(&envelope.source_binding_canonical)
+            {
                 return Err(DurableDeliveryError::InvalidConfiguration(
-                    "platform origin or Unit admission requires the frozen platform migration".into(),
+                    "platform origin or Unit admission requires the frozen platform migration"
+                        .into(),
                 ));
             }
         } else {
@@ -5157,65 +5168,68 @@ impl DurableDeliveryCoordinator {
         } else {
             false
         };
-        let operation = |transaction: &Transaction<'_>,
-                         dependencies: &p05_unit::runtime::SqlDependencies| {
-            let stored =
-                load_decision(transaction, &command.decision_identity)?.ok_or_else(|| {
-                    DurableDeliveryError::DecisionNotFound(command.decision_identity.clone())
-                })?;
-            if stored.state != DecisionState::UncertainManualReview {
-                return Err(DurableDeliveryError::InvalidManualResolution(format!(
-                    "decision state is {}, expected UncertainManualReview",
-                    stored.state
-                )));
-            }
-            self.require_business_open_declared_tx(transaction, &route, dependencies)?;
-            let attempt_identity = stored.current_attempt_identity.clone().ok_or_else(|| {
-                DurableDeliveryError::InvalidManualResolution(
-                    "uncertain decision has no original attempt".to_owned(),
-                )
-            })?;
-            let (disposition, receipt_canonical, frozen_delivery_audit) = match &command.disposition
-            {
-                ManualDisposition::Accepted { receipt } => {
-                    if let Some(receipt) = receipt {
-                        receipt.validate()?;
-                    }
-                    (
-                        "Accepted",
-                        receipt.as_ref().map(serde_json::to_vec).transpose()?,
-                        Some(canonical_json(&json!({
-                            "decision_identity": command.decision_identity,
-                            "resolution_identity": resolution_identity,
-                            "attempt_identity": attempt_identity,
-                            "operator_identity": command.operator_identity,
-                            "reason": command.reason,
-                            "acceptance_evidence_sha256": evidence_sha256,
-                            "authorization_sha256": authorization_hash,
-                            "authorization_ref": authorization_ref,
-                            "receipt_sha256": receipt
-                                .as_ref()
-                                .map(serde_json::to_vec)
-                                .transpose()?
-                                .map(|bytes| sha256_hex(&bytes)),
-                            "resolved_at": timestamp(command.resolved_at),
-                        }))?),
-                    )
+        let operation =
+            |transaction: &Transaction<'_>, dependencies: &p05_unit::runtime::SqlDependencies| {
+                let stored =
+                    load_decision(transaction, &command.decision_identity)?.ok_or_else(|| {
+                        DurableDeliveryError::DecisionNotFound(command.decision_identity.clone())
+                    })?;
+                if stored.state != DecisionState::UncertainManualReview {
+                    return Err(DurableDeliveryError::InvalidManualResolution(format!(
+                        "decision state is {}, expected UncertainManualReview",
+                        stored.state
+                    )));
                 }
-                ManualDisposition::Rejected => ("Rejected", None, None),
-            };
-            let frozen_delivery_audit_sha256 = frozen_delivery_audit
-                .as_ref()
-                .map(|bytes| sha256_hex(bytes));
-            let accepted_audit_identity = frozen_delivery_audit_sha256.as_ref().map(|audit_hash| {
-                stable_identity(
-                    MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
-                    &[&resolution_identity, audit_hash],
-                )
-            });
-            let accepted_audit_append_state = accepted_audit_identity.as_ref().map(|_| "Pending");
-            transaction.execute(
-                "INSERT INTO manual_resolutions(
+                self.require_business_open_declared_tx(transaction, &route, dependencies)?;
+                let attempt_identity =
+                    stored.current_attempt_identity.clone().ok_or_else(|| {
+                        DurableDeliveryError::InvalidManualResolution(
+                            "uncertain decision has no original attempt".to_owned(),
+                        )
+                    })?;
+                let (disposition, receipt_canonical, frozen_delivery_audit) =
+                    match &command.disposition {
+                        ManualDisposition::Accepted { receipt } => {
+                            if let Some(receipt) = receipt {
+                                receipt.validate()?;
+                            }
+                            (
+                                "Accepted",
+                                receipt.as_ref().map(serde_json::to_vec).transpose()?,
+                                Some(canonical_json(&json!({
+                                    "decision_identity": command.decision_identity,
+                                    "resolution_identity": resolution_identity,
+                                    "attempt_identity": attempt_identity,
+                                    "operator_identity": command.operator_identity,
+                                    "reason": command.reason,
+                                    "acceptance_evidence_sha256": evidence_sha256,
+                                    "authorization_sha256": authorization_hash,
+                                    "authorization_ref": authorization_ref,
+                                    "receipt_sha256": receipt
+                                        .as_ref()
+                                        .map(serde_json::to_vec)
+                                        .transpose()?
+                                        .map(|bytes| sha256_hex(&bytes)),
+                                    "resolved_at": timestamp(command.resolved_at),
+                                }))?),
+                            )
+                        }
+                        ManualDisposition::Rejected => ("Rejected", None, None),
+                    };
+                let frozen_delivery_audit_sha256 = frozen_delivery_audit
+                    .as_ref()
+                    .map(|bytes| sha256_hex(bytes));
+                let accepted_audit_identity =
+                    frozen_delivery_audit_sha256.as_ref().map(|audit_hash| {
+                        stable_identity(
+                            MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN,
+                            &[&resolution_identity, audit_hash],
+                        )
+                    });
+                let accepted_audit_append_state =
+                    accepted_audit_identity.as_ref().map(|_| "Pending");
+                transaction.execute(
+                    "INSERT INTO manual_resolutions(
                resolution_identity,decision_identity,attempt_identity,disposition,
                operator_identity,reason,evidence_canonical,evidence_sha256,
                receipt_canonical,frozen_delivery_audit_canonical,
@@ -5223,93 +5237,93 @@ impl DurableDeliveryCoordinator {
                accepted_audit_identity,accepted_audit_append_state,
                accepted_audit_ref,resolved_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,?15)",
-                params![
-                    resolution_identity,
-                    command.decision_identity,
-                    attempt_identity,
-                    disposition,
-                    command.operator_identity,
-                    command.reason,
-                    command.external_evidence,
-                    evidence_sha256,
-                    receipt_canonical,
-                    frozen_delivery_audit,
-                    frozen_delivery_audit_sha256,
-                    authorization_ref,
-                    accepted_audit_identity,
-                    accepted_audit_append_state,
-                    timestamp(command.resolved_at)
-                ],
-            )?;
-            let envelope = parse_envelope(&stored.envelope_canonical)?;
-            match &command.disposition {
-                ManualDisposition::Accepted { .. } => {
-                    freeze_disposition(
-                        transaction,
-                        &envelope,
-                        None,
-                        Some(&resolution_identity),
-                        None,
-                        "ManualAccepted",
-                        &evidence_sha256,
-                        false,
-                        command.resolved_at,
-                    )?;
-                    mutate_reservations(
-                        transaction,
-                        &stored,
-                        "Accepted",
-                        command.resolved_at,
-                        Some(command.resolved_at),
-                    )?;
-                    transition_existing_state(
-                        transaction,
-                        &stored,
-                        DecisionState::AcceptedAuditPending,
-                        "manual-resolution",
-                        Some(&command.operator_identity),
-                        canonical_json(&json!({
-                            "resolution_identity": resolution_identity,
-                            "authorization_ref": authorization_ref,
-                        }))?,
-                        command.resolved_at,
-                    )?;
+                    params![
+                        resolution_identity,
+                        command.decision_identity,
+                        attempt_identity,
+                        disposition,
+                        command.operator_identity,
+                        command.reason,
+                        command.external_evidence,
+                        evidence_sha256,
+                        receipt_canonical,
+                        frozen_delivery_audit,
+                        frozen_delivery_audit_sha256,
+                        authorization_ref,
+                        accepted_audit_identity,
+                        accepted_audit_append_state,
+                        timestamp(command.resolved_at)
+                    ],
+                )?;
+                let envelope = parse_envelope(&stored.envelope_canonical)?;
+                match &command.disposition {
+                    ManualDisposition::Accepted { .. } => {
+                        freeze_disposition(
+                            transaction,
+                            &envelope,
+                            None,
+                            Some(&resolution_identity),
+                            None,
+                            "ManualAccepted",
+                            &evidence_sha256,
+                            false,
+                            command.resolved_at,
+                        )?;
+                        mutate_reservations(
+                            transaction,
+                            &stored,
+                            "Accepted",
+                            command.resolved_at,
+                            Some(command.resolved_at),
+                        )?;
+                        transition_existing_state(
+                            transaction,
+                            &stored,
+                            DecisionState::AcceptedAuditPending,
+                            "manual-resolution",
+                            Some(&command.operator_identity),
+                            canonical_json(&json!({
+                                "resolution_identity": resolution_identity,
+                                "authorization_ref": authorization_ref,
+                            }))?,
+                            command.resolved_at,
+                        )?;
+                    }
+                    ManualDisposition::Rejected => {
+                        freeze_disposition(
+                            transaction,
+                            &envelope,
+                            None,
+                            Some(&resolution_identity),
+                            None,
+                            "ManualRejected",
+                            &evidence_sha256,
+                            false,
+                            command.resolved_at,
+                        )?;
+                        mutate_reservations(
+                            transaction,
+                            &stored,
+                            "Released",
+                            command.resolved_at,
+                            None,
+                        )?;
+                        transition_existing_state(
+                            transaction,
+                            &stored,
+                            DecisionState::ManualRejectedAuditPending,
+                            "manual-resolution",
+                            Some(&command.operator_identity),
+                            canonical_json(&json!({
+                                "resolution_identity": resolution_identity,
+                                "authorization_ref": authorization_ref,
+                            }))?,
+                            command.resolved_at,
+                        )?;
+                    }
                 }
-                ManualDisposition::Rejected => {
-                    freeze_disposition(
-                        transaction,
-                        &envelope,
-                        None,
-                        Some(&resolution_identity),
-                        None,
-                        "ManualRejected",
-                        &evidence_sha256,
-                        false,
-                        command.resolved_at,
-                    )?;
-                    mutate_reservations(
-                        transaction,
-                        &stored,
-                        "Released",
-                        command.resolved_at,
-                        None,
-                    )?;
-                    transition_existing_state(
-                        transaction,
-                        &stored,
-                        DecisionState::ManualRejectedAuditPending,
-                        "manual-resolution",
-                        Some(&command.operator_identity),
-                        canonical_json(&json!({
-                            "resolution_identity": resolution_identity,
-                            "authorization_ref": authorization_ref,
-                        }))?,
-                        command.resolved_at,
-                    )?;
-                }
-            }
-            Ok(MutationEffect::Changed(()))
-        };
+                Ok(MutationEffect::Changed(()))
+            };
         if ordinary_schema9_rejection {
             self.with_mutation_transaction_declared(&route, operation)?;
         } else {

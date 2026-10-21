@@ -9,11 +9,11 @@ const DATE: &str = "2026-09-23";
 
 #[test]
 fn monitor_schema9_manual_rejected_explicit_p05_check_cannot_bypass_platform_guard() {
-    use crate::durable_delivery::DeliverySubKind;
     use crate::durable_delivery::tests::{
         envelope, monitor_schema9_tests::retained_fixture, now, prepare_reserved,
         reconcile_terminal, uncertainty, MemoryAppendPort, StaticSink,
     };
+    use crate::durable_delivery::DeliverySubKind;
     let fixture = retained_fixture("SCHEMA9_EXPLICIT_P05_MANUAL_GUARD");
     let item = envelope(
         "SCHEMA9_EXPLICIT_P05_MANUAL_GUARD",

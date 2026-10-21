@@ -279,11 +279,7 @@ pub fn apply_outcome(
 /// 只写 `note` + `outcome_filled_at`, **数值列保持 NULL** —— 不补 0
 /// (BR-222: 数据缺失一律 fail-closed, 不用推导值填充).
 /// 写 `outcome_filled_at` 同时让它退出 pending 扫描, 避免每轮重复搜库.
-pub fn mark_outcome_void(
-    conn: &mut SqliteConnection,
-    id: i64,
-    reason: &str,
-) -> Result<(), String> {
+pub fn mark_outcome_void(conn: &mut SqliteConnection, id: i64, reason: &str) -> Result<(), String> {
     diesel::sql_query(
         "UPDATE advice_outcome_tracking SET note = ?, \
          outcome_filled_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \

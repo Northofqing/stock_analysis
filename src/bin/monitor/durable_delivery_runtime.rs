@@ -1131,24 +1131,32 @@ impl AuthoritativeSinkPort for MagiclawAuthoritativeSink {
             ));
         }
         if let Err(reason) = crate::retained_market_observation::validate_authoritative_request(
-            &self.namespace, request, Utc::now(),
+            &self.namespace,
+            request,
+            Utc::now(),
         ) {
-            return AuthoritativeSinkResult::Rejected(stock_analysis::durable_delivery::TypedRejection {
-                reason_code: "retained_observation_physical_guard_rejected".to_owned(),
-                evidence: reason.into_bytes(),
-                retry_authorized: false,
-                observed_at: Utc::now(),
-            });
+            return AuthoritativeSinkResult::Rejected(
+                stock_analysis::durable_delivery::TypedRejection {
+                    reason_code: "retained_observation_physical_guard_rejected".to_owned(),
+                    evidence: reason.into_bytes(),
+                    retry_authorized: false,
+                    observed_at: Utc::now(),
+                },
+            );
         }
         if let Err(reason) = crate::auction_input_alerts::validate_authoritative_request(
-            &self.namespace, request, Utc::now(),
+            &self.namespace,
+            request,
+            Utc::now(),
         ) {
-            return AuthoritativeSinkResult::Rejected(stock_analysis::durable_delivery::TypedRejection {
-                reason_code: "auction_input_physical_guard_rejected".to_owned(),
-                evidence: reason.into_bytes(),
-                retry_authorized: false,
-                observed_at: Utc::now(),
-            });
+            return AuthoritativeSinkResult::Rejected(
+                stock_analysis::durable_delivery::TypedRejection {
+                    reason_code: "auction_input_physical_guard_rejected".to_owned(),
+                    evidence: reason.into_bytes(),
+                    retry_authorized: false,
+                    observed_at: Utc::now(),
+                },
+            );
         }
         crate::notify::deliver_authoritative_blocking(
             &self.namespace,
@@ -1362,7 +1370,11 @@ pub(super) fn retained_observation_occurrence_owned(
         )
         .map(|owner| {
             if let Some(owner) = owner.as_ref() {
-                log::info!("[retained-observation] existing_owner occurrence={} state={:?}; no resend", occurrence, owner.state);
+                log::info!(
+                    "[retained-observation] existing_owner occurrence={} state={:?}; no resend",
+                    occurrence,
+                    owner.state
+                );
             }
             owner.is_some()
         })
@@ -1373,24 +1385,37 @@ pub(super) fn retained_observation_occurrence_owned(
 /// binding. Inspect all mode variants so a global mode change cannot duplicate
 /// the same input episode. No mutation, resume, or retry is authorized here.
 pub(super) fn auction_input_occurrence_source(
-    date: NaiveDate, fingerprint: &str,
+    date: NaiveDate,
+    fingerprint: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    if !is_sha256_hex(fingerprint) { return Err("auction_input_fingerprint_invalid".into()); }
+    if !is_sha256_hex(fingerprint) {
+        return Err("auction_input_fingerprint_invalid".into());
+    }
     let state = runtime_state()?;
     auction_input_occurrence_source_from(&state.coordinator, date, fingerprint)
 }
 
 pub(super) fn auction_input_occurrence_source_from(
-    coordinator: &DurableDeliveryCoordinator, date: NaiveDate, fingerprint: &str,
+    coordinator: &DurableDeliveryCoordinator,
+    date: NaiveDate,
+    fingerprint: &str,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut source = None;
     for mode in ["Full", "Degraded", "Unsafe"] {
         let occurrence = format!("data-mode-v2:{date}:{mode}:{fingerprint}");
-        let owner = coordinator.inspect_exact_occurrence_owner(
-            &date.to_string(), DurablePushKind::DataMode, DeliverySubKind::None, "GLOBAL", &occurrence,
-        ).map_err(|error| error.to_string())?;
+        let owner = coordinator
+            .inspect_exact_occurrence_owner(
+                &date.to_string(),
+                DurablePushKind::DataMode,
+                DeliverySubKind::None,
+                "GLOBAL",
+                &occurrence,
+            )
+            .map_err(|error| error.to_string())?;
         if let Some(owner) = owner {
-            if source.is_some() { return Err("auction_input_multiple_mode_owners".into()); }
+            if source.is_some() {
+                return Err("auction_input_multiple_mode_owners".into());
+            }
             if owner.envelope.retry_authorized || owner.envelope.task_binding.is_some() {
                 return Err("auction_input_original_authority_invalid".into());
             }
@@ -2155,9 +2180,10 @@ pub fn run_production_audited_terminal_replay(
         return Err("terminal_replay_identity_invalid".to_owned());
     }
     let task_identity = crate::review_batch::review_task_identity(business_date, task);
-    let coordinator =
-        DurableDeliveryCoordinator::open_existing_monitor_schema9(CoordinatorConfig::production(owner_instance_identity()))
-            .map_err(|error| format!("terminal replay coordinator open failed: {error}"))?;
+    let coordinator = DurableDeliveryCoordinator::open_existing_monitor_schema9(
+        CoordinatorConfig::production(owner_instance_identity()),
+    )
+    .map_err(|error| format!("terminal replay coordinator open failed: {error}"))?;
     let append = DurableDeliveryImmutableAppend::for_production()
         .map_err(|error| format!("terminal replay audit binding failed: {error}"))?;
     let input = coordinator
@@ -2265,10 +2291,12 @@ fn build_runtime_state(namespace: &RuntimeNamespace) -> Result<Arc<RuntimeState>
     };
     let sink = MagiclawAuthoritativeSink::bind(namespace.clone())?;
     let coordinator = match namespace {
-        RuntimeNamespace::Production => DurableDeliveryCoordinator::open_existing_monitor_schema9(config),
+        RuntimeNamespace::Production => {
+            DurableDeliveryCoordinator::open_existing_monitor_schema9(config)
+        }
         RuntimeNamespace::Test { .. } => DurableDeliveryCoordinator::open(config),
     }
-        .map_err(|error| format!("open durable delivery coordinator: {error}"))?;
+    .map_err(|error| format!("open durable delivery coordinator: {error}"))?;
     Ok(Arc::new(RuntimeState {
         namespace: namespace.clone(),
         coordinator: Arc::new(coordinator),
@@ -2415,7 +2443,11 @@ fn deliver_envelope_blocking_with_p01_origin(
     let decision_identity = envelope.decision_identity.clone();
     // Correlation storage belongs to the frozen platform migration. Retained
     // production P01 still uses its original envelope and counted authority.
-    let origin = if state.namespace == RuntimeNamespace::Production { None } else { origin };
+    let origin = if state.namespace == RuntimeNamespace::Production {
+        None
+    } else {
+        origin
+    };
     let preparation = match origin {
         Some(producer) => state
             .coordinator
@@ -3183,13 +3215,24 @@ mod tests {
 
     #[test]
     fn retained_monitor_scope_startup_skips_missing_platform_owner_storage() {
-        let test_code = format!("TEST_CODE_RETAINED_SCOPE_{}", Utc::now().timestamp_nanos_opt().unwrap());
+        let test_code = format!(
+            "TEST_CODE_RETAINED_SCOPE_{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        );
         let (anchor, state) = replay_state(&test_code);
-        let mut state = Arc::try_unwrap(state).ok().expect("sole isolated state owner");
+        let mut state = Arc::try_unwrap(state)
+            .ok()
+            .expect("sole isolated state owner");
         state.namespace = RuntimeNamespace::Production;
-        let connection = rusqlite::Connection::open(anchor.root.join("durable_delivery.sqlite3")).unwrap();
-        connection.execute_batch("DROP TABLE p05_s2_child_owners").unwrap();
-        assert_eq!(p05_unit::resume_owned_p05_at_startup(&state, "TEST_CODE_ORIGINAL_PENDING").unwrap(), None);
+        let connection =
+            rusqlite::Connection::open(anchor.root.join("durable_delivery.sqlite3")).unwrap();
+        connection
+            .execute_batch("DROP TABLE p05_s2_child_owners")
+            .unwrap();
+        assert_eq!(
+            p05_unit::resume_owned_p05_at_startup(&state, "TEST_CODE_ORIGINAL_PENDING").unwrap(),
+            None
+        );
         assert!(!state.namespace.platform_features_enabled());
         assert!(RuntimeNamespace::Test { test_code }.platform_features_enabled());
     }

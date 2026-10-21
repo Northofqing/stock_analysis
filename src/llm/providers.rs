@@ -7,7 +7,10 @@ use super::{
     openai_compatible_chat_json, openai_compatible_chat_json_with_receipt, LlmError, LlmProvider,
     ReceiptBearingJson,
 };
-use async_openai::{config::{Config, OpenAIConfig}, Client};
+use async_openai::{
+    config::{Config, OpenAIConfig},
+    Client,
+};
 
 // ============================================================================
 // DeepSeek
@@ -79,7 +82,14 @@ impl LlmProvider for DeepSeekProvider {
         request: super::bounded::BoundedJsonRequest<'_>,
         permit: super::bounded::SingleAttemptPermit,
     ) -> Result<super::bounded::BoundedResponse, super::bounded::BoundedFailure> {
-        super::bounded::call(self.client.config(), self.name(), &self.model, request, permit).await
+        super::bounded::call(
+            self.client.config(),
+            self.name(),
+            &self.model,
+            request,
+            permit,
+        )
+        .await
     }
 
     async fn chat_json_with_receipt(
@@ -249,11 +259,26 @@ mod tests {
 
     #[test]
     fn bounded_capability_only_advertises_documented_non_thinking_models() {
-        for model in ["deepseek-flash","deepseek-v4-pro","deepseek-chat","deepseek-reasoner","custom"] {
-            let p=DeepSeekProvider{client:Client::with_config(OpenAIConfig::new().with_api_key("local-only")),model:model.into()};
-            assert_eq!(p.bounded_endpoint().is_some(),matches!(model,"deepseek-flash"|"deepseek-v4-pro"));
+        for model in [
+            "deepseek-flash",
+            "deepseek-v4-pro",
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "custom",
+        ] {
+            let p = DeepSeekProvider {
+                client: Client::with_config(OpenAIConfig::new().with_api_key("local-only")),
+                model: model.into(),
+            };
+            assert_eq!(
+                p.bounded_endpoint().is_some(),
+                matches!(model, "deepseek-flash" | "deepseek-v4-pro")
+            );
         }
-        let minimax=MiniMaxProvider{client:Client::with_config(OpenAIConfig::new().with_api_key("local-only")),model:"MiniMax-M2.7".into()};
+        let minimax = MiniMaxProvider {
+            client: Client::with_config(OpenAIConfig::new().with_api_key("local-only")),
+            model: "MiniMax-M2.7".into(),
+        };
         assert!(minimax.bounded_endpoint().is_none());
     }
     #[test]

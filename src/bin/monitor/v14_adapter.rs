@@ -563,10 +563,16 @@ pub(super) fn v14_gate_auction_input_alert(
     let kind = PushKind::DataMode;
     let (source, kind_str, severity) = map_push_kind(kind);
     let mut event = SignalEvent::new(
-        source, kind_str, None, Local::now(), signal_payload_for_kind(kind), severity,
+        source,
+        kind_str,
+        None,
+        Local::now(),
+        signal_payload_for_kind(kind),
+        severity,
     );
     event.event_id = stock_analysis::push_l1::make_source_fact_event_id(
-        kind_str, report.binding().schedule_occurrence_identity(),
+        kind_str,
+        report.binding().schedule_occurrence_identity(),
     );
     v14_gate_prepared(V14PreparedGate {
         kind,
@@ -1131,7 +1137,9 @@ pub(crate) fn settle_news_flash_dedup(
 ) -> Result<(), String> {
     let kind = match reservation.decision() {
         crate::news_aggregator_init::FlashDecision::Critical { .. } => PushKind::NewsFlashCritical,
-        crate::news_aggregator_init::FlashDecision::Aggregated { .. } => PushKind::NewsFlashAggregated,
+        crate::news_aggregator_init::FlashDecision::Aggregated { .. } => {
+            PushKind::NewsFlashAggregated
+        }
     };
     let (_, expected_kind, _) = map_push_kind(kind);
     if event.event_id != reservation.reservation_identity_sha256() || event.kind != expected_kind {
@@ -1683,6 +1691,36 @@ pub(crate) fn quiet_hour_active_at(now: chrono::NaiveTime) -> bool {
 mod tests {
     use super::*;
 
+    /// 2026-10-19 诊断：生产日志里 HoldingPlan/T0Advice 被 `Denied("frozen")`
+    /// 拦了 693 次（最后一次 13:38），但 `default_profile_for_kind` 明明把
+    /// `frozen_mode_respect` 设成 false。这个测试把三层都打出来：
+    /// profile 的实际值、ctx 的实际 is_frozen、以及 v14_gate 的最终裁决。
+    #[test]
+    fn debug_frozen_gate_holding_plan() {
+        let _guard = TestBannerGuard::full();
+        let profile = default_profile_for_kind(PushKind::HoldingPlan);
+        eprintln!(
+            "[DEBUG] HoldingPlan profile.frozen_mode_respect={} data_mode_min={:?}",
+            profile.frozen_mode_respect, profile.data_mode_min
+        );
+        match current_governance_ctx() {
+            Ok(ctx) => eprintln!(
+                "[DEBUG] ctx.is_frozen={} ctx.data_mode={:?} ctx.is_quiet_hour={}",
+                ctx.is_frozen, ctx.data_mode, ctx.is_quiet_hour
+            ),
+            Err(error) => eprintln!("[DEBUG] ctx error: {error}"),
+        }
+        eprintln!(
+            "[DEBUG] v14_gate(HoldingPlan, 002421) = {:?}",
+            v14_gate(PushKind::HoldingPlan, Some("002421"))
+        );
+        let t0 = default_profile_for_kind(PushKind::T0Advice);
+        eprintln!(
+            "[DEBUG] T0Advice profile.frozen_mode_respect={}",
+            t0.frozen_mode_respect
+        );
+    }
+
     struct TestBannerGuard(Option<crate::push_templates::BannerCtx>);
 
     impl TestBannerGuard {
@@ -2145,20 +2183,29 @@ mod tests {
         assert!(!default_profile_for_kind(PushKind::IntradayMarket).frozen_mode_respect);
         assert!(!default_profile_for_kind(PushKind::T0Advice).frozen_mode_respect);
         assert!(!default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
-        assert_eq!(default_profile_for_kind(PushKind::IntradayMarket).data_mode_min, DataMode::Degraded);
+        assert_eq!(
+            default_profile_for_kind(PushKind::IntradayMarket).data_mode_min,
+            DataMode::Degraded
+        );
     }
 
     #[test]
     fn auction_input_operational_profile_keeps_data_down_policy() {
         let operational = default_profile_for_kind(PushKind::DataMode);
-        assert_eq!(operational.category, stock_analysis::push_l2::TemplateCategory::DataSource);
+        assert_eq!(
+            operational.category,
+            stock_analysis::push_l2::TemplateCategory::DataSource
+        );
         assert_eq!(operational.data_mode_min, DataMode::Down);
         assert!(operational.always_send_on_data_source_down);
         assert!(!operational.frozen_mode_respect);
         assert_eq!(operational.cooldown_secs, 0);
         // 2026-10-15 决策: Frozen 不拦截 AuctionVolume（交易动作类也放行）。
         assert!(!default_profile_for_kind(PushKind::AuctionVolume).frozen_mode_respect);
-        assert_eq!(default_profile_for_kind(PushKind::AuctionVolume).data_mode_min, DataMode::Degraded);
+        assert_eq!(
+            default_profile_for_kind(PushKind::AuctionVolume).data_mode_min,
+            DataMode::Degraded
+        );
     }
 
     #[test]

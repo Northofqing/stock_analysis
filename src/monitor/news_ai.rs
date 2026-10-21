@@ -2488,9 +2488,20 @@ fn parse_observed_at(value: &str) -> Result<DateTime<Utc>, NewsAiError> {
 }
 
 /// 解析 unix epoch 秒(10 位)或毫秒(13 位)格式的时间戳。
+///
+/// 上游（tdx-smart / global bridge）会带 `unix-ms:` 前缀显式标记毫秒，
+/// 与 `market_domain::evidence` 的约定一致；不带前缀的裸数字按位数区分。
+/// 2026-10-20 实测：只有这个解析器漏了前缀，导致全球新闻源整批被
+/// `global source refused: ... neither RFC3339 nor unix epoch` 拒收
+/// （一天 960 次），新闻进不到 AI 评估。`market_domain::evidence`
+/// 早就支持前缀，这里是补齐。
 fn parse_unix_epoch_seconds_or_millis(value: &str) -> Option<DateTime<Utc>> {
-    let digits = value.parse::<i64>().ok()?;
-    if value.len() == 13 {
+    let (digits_text, forced_millis) = match value.strip_prefix("unix-ms:") {
+        Some(rest) => (rest, true),
+        None => (value, false),
+    };
+    let digits = digits_text.parse::<i64>().ok()?;
+    if forced_millis || digits_text.len() == 13 {
         // 毫秒
         DateTime::from_timestamp(digits / 1000, (digits % 1000) as u32 * 1_000_000)
     } else {

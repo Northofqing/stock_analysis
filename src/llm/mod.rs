@@ -248,14 +248,19 @@ pub trait LlmProvider: Send + Sync {
     async fn chat_json(&self, system: &str, user: &str) -> Result<Value, LlmError>;
 
     /// Opt-in bounded capability. Never falls back to the legacy adapter.
-    fn bounded_endpoint(&self) -> Option<String> { None }
+    fn bounded_endpoint(&self) -> Option<String> {
+        None
+    }
 
     async fn chat_json_bounded_with_receipt(
         &self,
         _request: bounded::BoundedJsonRequest<'_>,
         _permit: bounded::SingleAttemptPermit,
     ) -> Result<bounded::BoundedResponse, bounded::BoundedFailure> {
-        Err(bounded::BoundedFailure::new("bounded_capability_unavailable", false))
+        Err(bounded::BoundedFailure::new(
+            "bounded_capability_unavailable",
+            false,
+        ))
     }
 
     /// Call the model and return parsed JSON plus a provider-verified receipt.

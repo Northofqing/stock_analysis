@@ -86,7 +86,10 @@ async fn main() {
             println!("\n[链] {code} 没有候选关系");
         }
         Ok(rows) => {
-            println!("\n[链] {code} 候选关系 {} 条（全部 [AI推断·未核实]）：", rows.len());
+            println!(
+                "\n[链] {code} 候选关系 {} 条（全部 [AI推断·未核实]）：",
+                rows.len()
+            );
             for (object_name, relation, evidence, confidence, _) in rows {
                 let relation_cn = match relation.as_str() {
                     "supplier" => "供应商",

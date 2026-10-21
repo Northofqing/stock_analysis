@@ -1,11 +1,11 @@
 //! Cross-task producer/consumer coverage. Synthetic fixtures grant no source authority.
 use super::*;
 #[allow(dead_code)]
-#[path = "bin/weekly_outcome_review/registry.rs"]
-mod registry;
-#[allow(dead_code)]
 #[path = "bin/weekly_outcome_review/paper_account.rs"]
 mod paper_account;
+#[allow(dead_code)]
+#[path = "bin/weekly_outcome_review/registry.rs"]
+mod registry;
 #[allow(dead_code)]
 #[path = "bin/weekly_outcome_review/report.rs"]
 mod report;

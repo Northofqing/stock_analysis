@@ -260,7 +260,9 @@ pub fn backfill_advice_outcomes(
         match apply_outcome(&mut *conn, row.id, &filled, note.as_deref()) {
             Ok(()) => report.filled += 1,
             Err(error) => {
-                report.errors.push(format!("id={} 写回失败: {error}", row.id));
+                report
+                    .errors
+                    .push(format!("id={} 写回失败: {error}", row.id));
             }
         }
     }

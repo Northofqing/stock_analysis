@@ -1715,7 +1715,10 @@ mod tests {
             let changed = compute_executable_revision(&fixture.root).unwrap();
             assert_ne!(first.hash, changed.hash, "{relative}");
             fs::remove_file(path).unwrap();
-            assert!(compute_executable_revision(&fixture.root).is_err(), "{relative}");
+            assert!(
+                compute_executable_revision(&fixture.root).is_err(),
+                "{relative}"
+            );
         }
     }
 

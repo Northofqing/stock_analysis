@@ -91,6 +91,11 @@ pub fn implemented_operations() -> Vec<Operation> {
         GlobalIndices,
         BoardDirectory,
         BoardConstituents,
+        // 2026-10-19: BoardMemberships 之前只在 method_name 里映射，没进
+        // implemented_operations，导致客户端在发出请求前就本地返回
+        // Unimplemented { details: 全空 }。Windows e2319f5 已给这个 op 加了
+        // Eastmoney provider（preferred_provider=Eastmoney），必须放行。
+        BoardMemberships,
         BoardFlows,
         LimitPools,
         StrongStockReasons,

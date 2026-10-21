@@ -2946,7 +2946,8 @@ pub(super) async fn push_news_flash_v3(
             // Another process has already created this canonical attempt. Keep
             // the weaker process-local identity suppressed and let the next
             // fresh authority snapshot recover its open/terminal state.
-            if let Err(commit_error) = v14_adapter::settle_news_flash_dedup(&event, reservation, true)
+            if let Err(commit_error) =
+                v14_adapter::settle_news_flash_dedup(&event, reservation, true)
             {
                 reason.push_str(&format!("; legacy_l4_commit_failed:{commit_error}"));
             }
@@ -3002,7 +3003,8 @@ pub(super) async fn push_news_flash_v3(
     ) {
         Ok(terminal) => terminal,
         Err(error) => {
-            if let Err(commit_error) = v14_adapter::settle_news_flash_dedup(&event, reservation, true)
+            if let Err(commit_error) =
+                v14_adapter::settle_news_flash_dedup(&event, reservation, true)
             {
                 log::error!(
                     "[NewsFlash][BR-244] terminal audit failed and legacy L4 suppression failed: {commit_error}"
@@ -3609,8 +3611,7 @@ pub async fn push_chain_report_simplified(phase: &str, date: &str) -> bool {
             return false;
         }
     };
-    let simplified =
-        stock_analysis::pipeline::chain_analysis::simplify_report_for_push(&full, 8);
+    let simplified = stock_analysis::pipeline::chain_analysis::simplify_report_for_push(&full, 8);
     if simplified.trim().is_empty() {
         log::warn!("[产业链][飞书简化] 简化结果为空, 跳过推送");
         return false;

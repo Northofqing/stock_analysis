@@ -175,8 +175,8 @@ pub async fn analyze(
         .await
         .map_err(|error| format!("LLM 调用失败: {error}"))?;
 
-    let reply: LlmReply = serde_json::from_value(value)
-        .map_err(|error| format!("LLM 响应解析失败: {error}"))?;
+    let reply: LlmReply =
+        serde_json::from_value(value).map_err(|error| format!("LLM 响应解析失败: {error}"))?;
     report.candidates = reply.relations.len();
 
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
@@ -272,7 +272,8 @@ mod tests {
 
     #[test]
     fn extract_core_finds_business_section() {
-        let text = "☆经营分析☆\n【1.主营业务】\n卖电\n【2.主营构成分析】\n电力 77%\n【3.经营投资】\n其他";
+        let text =
+            "☆经营分析☆\n【1.主营业务】\n卖电\n【2.主营构成分析】\n电力 77%\n【3.经营投资】\n其他";
         let core = extract_business_core(text);
         assert!(core.contains("【2.主营构成分析】"));
         assert!(core.contains("电力 77%"));
