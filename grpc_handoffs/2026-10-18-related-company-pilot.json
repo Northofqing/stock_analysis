@@ -1,0 +1,410 @@
+{
+  "notice": "PILOT derived dataset from public annual reports; not an admitted contract capability. as_of=2025-12-31. Not for redistribution as exchange data.",
+  "as_of": "2025-12-31",
+  "scope": "9 只票 2025 年报；关联方章节 + 控股股东/实控人其他上市公司 + 前十名股东",
+  "counts": {
+    "total": 23,
+    "in_requested_enum": 16,
+    "holds_stake": 2,
+    "same_controller": 14,
+    "out_of_enum": 7
+  },
+  "supply_chain_edges": 0,
+  "excluded_delisted": [
+    {
+      "name": "创兴资源",
+      "code": "600193",
+      "reason": "已退市（退市创兴）",
+      "relation": "联营企业"
+    },
+    {
+      "name": "上海龙宇数据股份有限公司",
+      "code": "603003",
+      "reason": "已退市（退市龙宇）",
+      "relation": "独立董事任职"
+    }
+  ],
+  "edges": [
+    {
+      "subject": "002131",
+      "subject_name": "利欧股份",
+      "object": "920855",
+      "object_name": "浙江大农",
+      "relation": "holds_stake",
+      "relation_text": "联营企业（浙江大农实业股份有限公司；同表列示其全资子公司浙江大农机器有限公司）",
+      "in_requested_enum": true,
+      "note": "北交所上市；持股比例见长期股权投资附注，本节未直接给出",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-29/1225229135.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "000530",
+      "subject_name": "冰山冷热",
+      "object": "301010",
+      "object_name": "晶雪节能",
+      "relation": "holds_stake",
+      "relation_text": "本公司联营企业（江苏晶雪节能科技股份有限公司）",
+      "in_requested_enum": true,
+      "note": "持股比例见附注十、3，本节未直接给出",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-24/1225165559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "600396",
+      "subject_name": "华电辽能",
+      "object": "600268",
+      "object_name": "国电南自",
+      "relation": "same_controller",
+      "relation_text": "受同一最终控制方控制（中国华电集团）",
+      "in_requested_enum": true,
+      "note": "最终控制方为国务院国资委体系",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-30/1225268141.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      },
+      "controller_stake_pct": 53.77
+    },
+    {
+      "subject": "600396",
+      "subject_name": "华电辽能",
+      "object": "601226",
+      "object_name": "华电科工",
+      "relation": "same_controller",
+      "relation_text": "受同一最终控制方控制（中国华电集团）",
+      "in_requested_enum": true,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-30/1225268141.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      },
+      "controller_stake_pct": 63.07
+    },
+    {
+      "subject": "600667",
+      "subject_name": "太极实业",
+      "object": "000581",
+      "object_name": "威孚高科",
+      "relation": "same_controller",
+      "relation_text": "母公司的控股子公司（母公司：无锡产业发展集团）",
+      "in_requested_enum": true,
+      "note": "最终控制方无锡市国资委",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-24/1225165957.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      },
+      "controller_stake_pct": 22.05
+    },
+    {
+      "subject": "000338",
+      "subject_name": "潍柴动力",
+      "object": "000880",
+      "object_name": "潍柴重机",
+      "relation": "same_controller",
+      "relation_text": "同受母公司控制（潍柴控股集团）",
+      "in_requested_enum": true,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "000338",
+      "subject_name": "潍柴动力",
+      "object": "600213",
+      "object_name": "*ST亚星",
+      "relation": "same_controller",
+      "relation_text": "同受母公司控制（潍柴控股集团）",
+      "in_requested_enum": true,
+      "note": "风险警示股",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "000338",
+      "subject_name": "潍柴动力",
+      "object": "000951",
+      "object_name": "中国重汽",
+      "relation": "same_controller",
+      "relation_text": "同一最终控股公司（山东重工集团）",
+      "in_requested_enum": true,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "000338",
+      "subject_name": "潍柴动力",
+      "object": "000680",
+      "object_name": "山推股份",
+      "relation": "same_controller",
+      "relation_text": "同一最终控股公司（山东重工集团）",
+      "in_requested_enum": true,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "000338",
+      "subject_name": "潍柴动力",
+      "object": "000957",
+      "object_name": "中通客车",
+      "relation": "same_controller",
+      "relation_text": "同一最终控股公司（山东重工集团）",
+      "in_requested_enum": true,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "603618",
+      "subject_name": "杭电股份",
+      "object": "002479",
+      "object_name": "富春环保",
+      "relation": "same_controller",
+      "relation_text": "实际控制人施加重大影响的企业",
+      "in_requested_enum": true,
+      "note": "重大影响非控股，严格说不等于同一控制",
+      "evidence": {
+        "report": "杭电股份：2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-22/1225142474.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "000338",
+      "subject_name": "潍柴动力",
+      "object": "600166",
+      "object_name": "福田汽车",
+      "relation": "same_key_management",
+      "relation_text": "同一关键管理人员",
+      "in_requested_enum": false,
+      "note": "需求枚举无此类型",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "000338",
+      "subject_name": "潍柴动力",
+      "object": "000425",
+      "object_name": "徐工机械",
+      "relation": "same_key_management",
+      "relation_text": "同一关键管理人员",
+      "in_requested_enum": false,
+      "note": "需求枚举无此类型",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037559.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "605178",
+      "subject_name": "时空科技",
+      "object": "603303",
+      "object_name": "得邦照明",
+      "relation": "shared_director",
+      "relation_text": "独立董事任职的企业",
+      "in_requested_enum": false,
+      "note": "需求枚举无此类型",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-18/1225122793.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "605178",
+      "subject_name": "时空科技",
+      "object": "000541",
+      "object_name": "佛山照明",
+      "relation": "shared_director",
+      "relation_text": "独立董事任职的企业",
+      "in_requested_enum": false,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-18/1225122793.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "605178",
+      "subject_name": "时空科技",
+      "object": "688513",
+      "object_name": "苑东生物",
+      "relation": "shared_director",
+      "relation_text": "独立董事任职的企业",
+      "in_requested_enum": false,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-18/1225122793.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "605178",
+      "subject_name": "时空科技",
+      "object": "300858",
+      "object_name": "科拓生物",
+      "relation": "shared_director",
+      "relation_text": "独立董事任职的企业",
+      "in_requested_enum": false,
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-18/1225122793.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "002131",
+      "subject_name": "利欧股份",
+      "object": "603275",
+      "object_name": "众辰科技",
+      "relation": "controller_stake",
+      "relation_text": "实际控制人参股的企业",
+      "in_requested_enum": false,
+      "note": "是实控人持股，不是上市公司持股",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-29/1225229135.PDF",
+        "section": "第十节 财务报告 十四、关联方及关联交易",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "600396",
+      "subject_name": "华电辽能",
+      "object": "600027",
+      "object_name": "华电国际",
+      "relation": "same_controller",
+      "relation_text": "华电集团直接及间接持有 45.63% 股权",
+      "in_requested_enum": true,
+      "controller_stake_pct": 45.63,
+      "source_section": "控股股东/实际控制人控制的其他上市公司",
+      "note": "与 600396 同受中国华电集团控制",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-30/1225268141.PDF",
+        "section": "控股股东/实际控制人控制的其他上市公司",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "600396",
+      "subject_name": "华电辽能",
+      "object": "600726",
+      "object_name": "华电能源",
+      "relation": "same_controller",
+      "relation_text": "华电集团直接及间接持有 81.30% 股权",
+      "in_requested_enum": true,
+      "controller_stake_pct": 81.3,
+      "source_section": "控股股东/实际控制人控制的其他上市公司",
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-30/1225268141.PDF",
+        "section": "控股股东/实际控制人控制的其他上市公司",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "600396",
+      "subject_name": "华电辽能",
+      "object": "002039",
+      "object_name": "黔源电力",
+      "relation": "same_controller",
+      "relation_text": "华电集团直接及间接持有 29.72% 股权",
+      "in_requested_enum": true,
+      "controller_stake_pct": 29.72,
+      "source_section": "控股股东/实际控制人控制的其他上市公司",
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-30/1225268141.PDF",
+        "section": "控股股东/实际控制人控制的其他上市公司",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "600396",
+      "subject_name": "华电辽能",
+      "object": "600930",
+      "object_name": "华电新能",
+      "relation": "same_controller",
+      "relation_text": "华电集团直接及间接持有 72.72% 股权",
+      "in_requested_enum": true,
+      "controller_stake_pct": 72.72,
+      "source_section": "控股股东/实际控制人控制的其他上市公司",
+      "note": "",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-30/1225268141.PDF",
+        "section": "控股股东/实际控制人控制的其他上市公司",
+        "as_of": "2025-12-31"
+      }
+    },
+    {
+      "subject": "600667",
+      "subject_name": "太极实业",
+      "object": "603016",
+      "object_name": "新宏泰",
+      "relation": "same_controller",
+      "relation_text": "控股股东产业集团持有 15.65%，其实际控制的国盛资管持有 12.26%",
+      "in_requested_enum": true,
+      "controller_stake_pct": 27.91,
+      "source_section": "控股股东/实际控制人控制的其他上市公司",
+      "note": "合计 27.91%",
+      "evidence": {
+        "report": "2025年年度报告",
+        "url": "https://static.cninfo.com.cn/finalpage/2026-04-24/1225165957.PDF",
+        "section": "控股股东/实际控制人控制的其他上市公司",
+        "as_of": "2025-12-31"
+      }
+    }
+  ]
+}

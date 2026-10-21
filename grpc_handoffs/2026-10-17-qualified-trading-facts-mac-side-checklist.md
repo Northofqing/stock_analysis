@@ -1,7 +1,7 @@
 # QualifiedTradingFacts（op 67）：Mac 侧准备清单与联调安排（2026-10-17）
 
 - 回执方：Windows 侧 ExternalV1 数据面
-- 状态：**实现已完成并合入 main（commit `e6bd4d6`），尚未部署**。线上仍为 `8523c1e`（66 RPC，contract `dba66a27…`）。部署时 `contract_sha256` 会变化。
+- 状态：**已部署（2026-10-17 16:20）。** 线上 `source_revision=e6bd4d65…`、`contract_sha256=dde8897c…`（67 RPC）、`binary_sha256=bb28a6c0…`。新 bundle `2026-10-17.1` 已交付并校验：`client-bundle/windows-grpc-production-e6bd4d6-20261017.1/public`；身份与重钉步骤见 `client-bundle/WINDOWS_EXTERNALV1_RELEASE_IDENTITY_E6BD4D6_20261017_V1.md`。
 - 依据链：`2026-10-17-p01-provider-sourced-trading-facts-spec.md` → 我方可行性评估（2/3 子集）→ `2026-10-17-p01-spec-confirmation.md`（两点全接受）→ Gate A 设计 D1a–D8a 全案拍板（2026-10-17）→ 实施完成。
 - 性质：**协调与准备清单**，不是上线通知；本回执不承诺部署日期。
 

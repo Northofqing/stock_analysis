@@ -20,7 +20,9 @@ D17 / D20 权威事实交接：[证券交易资格与停复牌权威事实](2026
 
 2026-10-17 **已评估**：[Windows 侧数据缺口清单与盘中异动监控需求](2026-10-17-windows-data-gaps-and-intraday-alert-request.md) → [对端评估回执](2026-10-17-windows-data-gaps-and-intraday-alert-evaluation.md)。来单按 P0/P1 汇总 Mac 侧实测缺口并提出「盘中异动监控」需求；回执逐条核对后给出**三处纠正**（Operation 66 实为 `TradingCalendar`；P0-2 `complete=false` 属覆盖 v2 设计内行为；P0-3 系来单方解析器把 4 个比率字段声明为标量、非契约不符）与两份清单（做不了 7 项，含「字面 map→f64 不应做」），并判定**路线 A 不可行 / 路线 B 基础已存在**（`MarketEventService` + 盘中监控循环已运行）。**待 Mac 侧动作 5 项**：①解析器改吃 `{value,unit}`（**已完成**，见 `current_auction_observations.rs::ratio_f64`）②接线 BlockTrades / GlobalIndices / ForeignExchange ③合同重钉核对（pin 四字段与 op 视图）④T0Evidence 盘中复现并附 request_id ⑤确认条件模型与 block_trade 预期。**待 operator 拍板 2 项**：P0-1 权威源路径、P0-2 提额或按 v2 前缀消费。回执附注：push2 族（含 R-09）根因在 Mac 侧网络/代理层（VM 内 DNS 解析为 `198.18.x.x` fake-IP），对端出证据链另件面交。
 
-2026-10-17 **P0-1 实施完成（未部署）**：`2026-10-17-p01-provider-sourced-trading-facts-spec.md` → `2026-10-17-p01-provider-sourced-trading-facts-evaluation.md`（2/3 子集）→ `2026-10-17-p01-spec-confirmation.md` → op 67 `QualifiedTradingFacts` 已合入 main（`e6bd4d6`，未部署）。新增 [Mac 侧准备清单](2026-10-17-qualified-trading-facts-mac-side-checklist.md)：三问答案（枚举值定稿 `tencent-market-statistics`、`UNIMPLEMENTED`/`capability_unadmitted` 形状、`listing_state` 派生）、部署前 5 项、部署后 3 项与 SYNTHETIC 夹具。
+2026-10-17 **P0-1 实施完成（未部署）**：`2026-10-17-p01-provider-sourced-trading-facts-spec.md` → `2026-10-17-p01-provider-sourced-trading-facts-evaluation.md`（2/3 子集）→ `2026-10-17-p01-spec-confirmation.md` → op 67 `QualifiedTradingFacts` 已合入 main 并部署（`e6bd4d6`，2026-10-17；bundle `2026-10-17.1` 已校验交付）。新增 [Mac 侧准备清单](2026-10-17-qualified-trading-facts-mac-side-checklist.md)：三问答案（枚举值定稿 `tencent-market-statistics`、`UNIMPLEMENTED`/`capability_unadmitted` 形状、`listing_state` 派生）、部署前 5 项、部署后 3 项与 SYNTHETIC 夹具。
+
+2026-10-18 **关联公司需求已评估**：[关联公司数据需求](2026-10-18-related-company-data-request.md) → [评估回执](2026-10-18-related-company-data-evaluation.md)。结论：第 2 层（产业链上下游）9 份年报 0 条，公开披露无密度；第 3 层（股权）9 只样本 16 条枚举内关系（2 持股 + 14 同控），另附 7 条枚举外边；建议先走静态 pilot（`2026-10-18-related-company-pilot.json`，as_of=2025-12-31），不建议现在开 `RelatedCompanies` op。字段语义：`controller_stake_pct` 是控制方→对象，不是主体→对象。
 
 ## 范围
 

@@ -441,3 +441,70 @@ encoding_rs = "0.8"   # 新浪板块 GBK 解码
 3. **人工确认链缺失** —— `chain_review` 未写，candidate 进不了决策。
 4. **观察池只有 1 只票** —— 概念共振恒 0，排序无法验证。依赖第 1 条。
 5. **上游商品价格无源** —— 产业链信号只能展示，不能打分。
+
+---
+
+## 十二、Windows 持仓桥（TDX「资金股份」导出）
+
+### 原方案
+
+`holdings_bridge::fetch` 用 `reqwest` 直连 `http://10.211.55.3:18090/holdings`
+（Parallels 内网，Windows 侧小型 HTTP 服务，Bearer 鉴权）。
+
+### 为什么不行（2026-10-20 实测）
+
+同一个 URL，同一台 Mac，只换调用方：
+
+| 调用方 | 上下文 | 结果 |
+|---|---|---|
+| `/usr/bin/curl` | shell | **200** |
+| `/usr/bin/curl` | `launchctl submit` 临时 job | **200** |
+| `/usr/bin/python3` + urllib | shell | **200** |
+| `/usr/bin/python3` + urllib | `launchctl submit` 临时 job | **200** |
+| monitor 进程内 `reqwest::blocking` | launchd `com.stockanalysis.monitor` | **`error sending request`** |
+| monitor 进程内 `reqwest`（async + `SHARED_HTTP_CLIENT`） | 同上 | **`No route to host (os error 65)`** |
+
+排除了这些：
+
+- **不是代理** —— `.env`、plist、进程环境都没有 `*_PROXY`；且 client 已 `.no_proxy()`。
+- **不是 tokio runtime** —— `spawn_blocking` 包过一轮，同样失败。
+- **不是路由** —— `netstat -rn` 里 `10.211.55.3 → bridge100` 一直在，`bridge100 = 10.211.55.2` 处于 RUNNING。
+- **不是网络权限的通用拦截** —— 同一台机上 Python 和 curl 都能连。
+- **不是 Parallels 挂了** —— 同一时刻 curl 200、`prl_naptd` 在跑。
+- **不是外网隔离** —— monitor 同进程连 `61.170.82.99:443`、`localhost:18082`、`localhost:50052` 全部 ESTABLISHED。
+
+留下的解释：**macOS 本地网络权限（Local Network Privacy）只放行系统二进制，不放行
+这个自建后台二进制**。表现为 `EHOSTUNREACH`（错误码 65），而不是「权限被拒」的错误码，
+肉眼很容易误读成「没有路由」。TCC 库需要「完全磁盘访问」才能读，本次没能直接取证，
+结论是由上面这组对照实验推出来的，不是从 TCC 日志读到的。
+
+### 补偿方案
+
+传输层交给 `/usr/bin/curl` 子进程，解析仍留在 Rust：
+
+```
+tokio::process::Command::new("/usr/bin/curl")
+    .args(["-sS", "-m", "20", "-K", "-", "-w", "\n__HTTP_CODE__%{http_code}"])
+```
+
+- token 通过 `-K -`（配置文件从 stdin）传入，**不进 argv**，`ps` 看不到。
+- 状态码由 `-w` 追加在 body 末尾，`rsplit_once("__HTTP_CODE__")` 切开，非 200 直接报错。
+- 同步版 `fetch`（CLI 用）同样走 curl，避免 CLI 能跑、monitor 不能跑的行为分叉。
+
+### 代价
+
+1. 多一次 `fork+exec`（毫秒级，一天只跑两次，可忽略）。
+2. 依赖 `/usr/bin/curl` 存在（macOS 自带，未随系统升级移除过）。
+3. 如果将来在「系统设置 → 隐私与安全性 → 本地网络」里给 monitor 授权成功，
+   可以改回 reqwest；回退点就是 `holdings_bridge::fetch_async` 这一个函数。
+
+### 验证（2026-10-20 20:27）
+
+```
+[20:27:04 INFO] [持仓桥] 16:05 同步成功
+  snapshot_at=2026-10-20T17:07:37+08:00 age=11967s positions=6 inserted=true
+```
+
+`user_position_snapshot` 新增 `ups_v1_6df01713…`（effective_at 用桥的 snapshot_at，
+不是 now），`stock_position` 6 只 open、成本逐项与桥一致，`trades` 中 603915 仍只有
+1 条（`snapshot_inferred`，幂等成立）。
