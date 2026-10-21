@@ -158,6 +158,7 @@ mod paper_scan_runtime_tests;
 use stock_analysis::trading::paper_sell::{
     PaperScanFailure, PaperScanPhase, PaperScanSession, PaperSellResult,
 };
+mod holdings_sync; // 2026-10-20: Windows 持仓桥同步（15:05 / 16:05）
 mod closing_valuation_runtime;
 mod data_mode_probe;
 mod manual_push;
@@ -12504,35 +12505,104 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 持仓桥同步（2026-10-20）：15:05 与 16:05 各一次。
+                    //
+                    // 数据源是 Windows 侧 TDX「资金股份」导出文件（HTTP 桥
+                    // 10.211.55.3:18090），不是券商 API。gRPC 侧没有任何
+                    // 账户/持仓 op，这是唯一能拿到实际持仓的通道。
+                    //
+                    // 两次的理由：15:05 是收盘后第一份；16:05 在明日计划生成
+                    // 之后、统计之前再刷一次，确保用的是当天最终持仓。
+                    if calendar::is_trading_day(advice_report_date) {
+                        static HOLDINGS_SYNC: std::sync::Mutex<
+                            Option<(chrono::NaiveDate, &'static str)>,
+                        > = std::sync::Mutex::new(None);
+                        let slot = if now_time >= chrono::NaiveTime::from_hms_opt(16, 5, 0).unwrap()
+                        {
+                            "16:05"
+                        } else if now_time
+                            >= chrono::NaiveTime::from_hms_opt(15, 5, 0).unwrap()
+                        {
+                            "15:05"
+                        } else {
+                            ""
+                        };
+                        let already = HOLDINGS_SYNC
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|(date, done_slot)| date == advice_report_date && done_slot == slot)
+                            .unwrap_or(false);
+                        if !slot.is_empty() && !already {
+                            // HTTP 走项目共享异步 client（SHARED_HTTP_CLIENT）：
+                            // reqwest::blocking 在 tokio worker 线程上自建 runtime，
+                            // 拿不到可用 reactor，错误只剩 "error sending request"。
+                            match crate::holdings_sync::sync_once(
+                                "http://10.211.55.3:18090",
+                                "client-bundle/holdings-bridge-token.txt",
+                            )
+                            .await
+                            {
+                                Ok(report) => {
+                                    log::info!(
+                                        "[持仓桥] {slot} 同步成功 snapshot_at={} age={:.0}s positions={} inserted={}",
+                                        report.snapshot_at,
+                                        report.age_seconds,
+                                        report.positions,
+                                        report.inserted
+                                    );
+                                    *HOLDINGS_SYNC
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) =
+                                        Some((advice_report_date, slot));
+                                }
+                                Err(error) => {
+                                    log::warn!("[持仓桥] {slot} 同步失败: {error}");
+                                    // 失败也记账：否则每个 tick 都会重试并把日志刷爆
+                                    // （实测同一秒 4 条）。下一个时段（15:05 → 16:05）
+                                    // 仍会再试一次，重启后也会重试。
+                                    *HOLDINGS_SYNC
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) =
+                                        Some((advice_report_date, slot));
+                                }
+                            }
+                        }
+                    }
+
                     // 盘后可买价推送（2026-10-18）：16:00，等 15:50 价格带 + 15:55 均线都落库后再算。
                     // 输出"明日计划"：每只票 买点区间 / 放弃价 / 建议仓位 / 条件，推飞书。
+                    //
+                    // 幂等用**文件 marker**，不能用进程内 static：2026-10-20 实测，
+                    // static 状态在每次重启后清零，重跑本块就再推一次——那天部署重启
+                    // 8 次，用户收到 9 条同样的明日计划。marker 落在 data/ 下，
+                    // 重启、崩溃、KeepAlive 拉起都认。
+                    // 路径相对 cwd，plist 的 WorkingDirectory 已固定在运行根。
                     if calendar::is_trading_day(advice_report_date)
                         && now_time >= chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap()
                     {
-                        static BUY_ZONE_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
-                            std::sync::Mutex::new(None);
-                        let already = BUY_ZONE_LAST
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .map(|d| d == advice_report_date)
-                            .unwrap_or(false);
-                        if !already {
+                        let marker = std::path::Path::new("data/buy_zone_pushed")
+                            .join(advice_report_date.format("%Y-%m-%d").to_string());
+                        if !marker.exists() {
                             if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
                                 let date_text = advice_report_date.format("%Y-%m-%d").to_string();
                                 match stock_analysis::monitor::buy_zone_dispatch::render_plan(
                                     &db, &date_text,
                                 ) {
                                     Ok(text) => {
-                                        log::info!(
-                                            "[可买价] 明日计划生成 {} 字",
-                                            text.chars().count()
-                                        );
+                                        let chars = text.chars().count();
+                                        log::info!("[可买价] 明日计划生成 {chars} 字");
                                         if crate::notify::push_wechat(&text).await {
                                             log::info!("[可买价] 明日计划已推送");
-                                            *BUY_ZONE_LAST
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner()) =
-                                                Some(advice_report_date);
+                                            if let Some(parent) = marker.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            // 写失败要吼出来：推送已经发生，marker 丢了
+                                            // 就意味着下一次重启会重推。
+                                            if let Err(error) = std::fs::write(&marker, chars.to_string()) {
+                                                log::warn!(
+                                                    "[可买价] 幂等标记写入失败（已推送，下次重启可能重推）{date_text}: {error}"
+                                                );
+                                            }
                                         } else {
                                             log::warn!("[可买价] 推送失败, 保留重试");
                                         }
@@ -12540,6 +12610,66 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     Err(error) => log::warn!(
                                         "[可买价] 生成失败, 保留重试 date={date_text}: {error}"
                                     ),
+                                }
+                            }
+                        }
+                    }
+
+                    // 观察池选股表现存档（2026-10-20）：16:05，在明日计划之后跑。
+                    //
+                    // 记录每批票的 D+1/D+3/D+5 收益与胜率。这是判断选股参数
+                    // （每板块取 3 只是否合适）唯一靠得住的数据——盘感调不出来。
+                    // 逐日落盘后在 data/perf_log/<date>.txt 累积。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(16, 5, 0).unwrap()
+                    {
+                        static PERF_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = PERF_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                match db.get_conn() {
+                                    Ok(mut conn) => {
+                                        let options = stock_analysis::monitor::watch_pool_perf::PerfOptions::default();
+                                        match stock_analysis::monitor::watch_pool_perf::render(
+                                            &mut conn, &options,
+                                        ) {
+                                            Ok(text) => {
+                                                let date_text = advice_report_date
+                                                    .format("%Y-%m-%d")
+                                                    .to_string();
+                                                let dir = std::path::Path::new("data/perf_log");
+                                                if let Err(error) = std::fs::create_dir_all(dir) {
+                                                    log::warn!("[观察池表现] 创建目录失败: {error}");
+                                                }
+                                                let path = dir.join(format!("{date_text}.txt"));
+                                                match std::fs::write(&path, &text) {
+                                                    Ok(()) => {
+                                                        log::info!(
+                                                            "[观察池表现] 已存档 {} 字 -> {}",
+                                                            text.chars().count(),
+                                                            path.display()
+                                                        );
+                                                        *PERF_LAST
+                                                            .lock()
+                                                            .unwrap_or_else(|e| e.into_inner()) =
+                                                            Some(advice_report_date);
+                                                    }
+                                                    Err(error) => log::warn!(
+                                                        "[观察池表现] 写文件失败: {error}"
+                                                    ),
+                                                }
+                                            }
+                                            Err(error) => {
+                                                log::warn!("[观察池表现] 生成失败: {error}")
+                                            }
+                                        }
+                                    }
+                                    Err(error) => log::warn!("[观察池表现] 取连接失败: {error}"),
                                 }
                             }
                         }
