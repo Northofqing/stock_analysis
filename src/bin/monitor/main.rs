@@ -12166,11 +12166,48 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             "[板块成分] 榜单建表失败 date={date_text}: {error}"
                                         ),
                                     }
+                                    // 2026-10-21：当日涨停集合，供板块轮动选票「涨停优先」。
+                                    // 不依赖 stock_daily —— 当天常常只有几十只票（10-19 47 只 /
+                                    // 10-20 46 只），price_date 会退到 5 天前，选出来的是「5 天前
+                                    // 涨过一波」的票。拉取失败时退回纯涨幅排序，不阻断观察池。
+                                    let limit_up_codes: std::collections::HashSet<String> =
+                                        match stock_analysis::data_gateway::grpc_source::bridge_for(
+                                            "LimitPools",
+                                        ) {
+                                            Ok(bridge) => match bridge
+                                                .limit_pools(advice_report_date)
+                                            {
+                                                Ok(batch) => batch
+                                                    .records()
+                                                    .iter()
+                                                    .map(|entry| {
+                                                        entry.instrument.code().to_owned()
+                                                    })
+                                                    .collect(),
+                                                Err(error) => {
+                                                    log::warn!(
+                                                        "[观察池] 涨停池拉取失败，本轮退回涨幅排序: {error}"
+                                                    );
+                                                    std::collections::HashSet::new()
+                                                }
+                                            },
+                                            Err(error) => {
+                                                log::warn!(
+                                                    "[观察池] 涨停池桥不可用，本轮退回涨幅排序: {error}"
+                                                );
+                                                std::collections::HashSet::new()
+                                            }
+                                        };
+                                    log::info!(
+                                        "[观察池] 当日涨停 {} 只（板块轮动涨停优先）",
+                                        limit_up_codes.len()
+                                    );
                                     match stock_analysis::monitor::ticket_watch_pool::build_watch_pool(
                                         &db,
                                         &date_text,
                                         None,
                                         false,
+                                        &limit_up_codes,
                                     ) {
                                         Ok(report) => {
                                             report.log();

@@ -176,11 +176,16 @@ pub fn collect_news_catalysts(
 ///
 /// 为什么成分股用上一完整交易日涨幅排序而不是当日：`stock_daily` 当日只有活跃票
 /// 样本（2026-10-19 仅 9 只），拿它排序会把 1241 只里的强票挡在外面。
+/// 涨停判定阈值（主板/中小板 10% 板）。用 pct_chg 判，不依赖 stock_daily.is_limit_up
+/// —— 那个字段在 kline.rs:650 硬编码 false，用它等于永远判不出涨停。
+const LIMIT_UP_PCT: f64 = 9.85;
+
 pub fn collect_board_rotation(
     db: &DatabaseManager,
     business_date: &str,
     top_boards: usize,
     per_board: usize,
+    limit_up_codes: &std::collections::HashSet<String>,
 ) -> Result<(usize, Vec<PoolCandidate>), String> {
     #[derive(QueryableByName)]
     struct BoardRow {
@@ -273,11 +278,33 @@ pub fn collect_board_rotation(
         let Some(mut members) = by_board.remove(&board.board_name) else {
             continue;
         };
-        // 涨幅缺失的排最后（BR-222：不补 0）
+        // 排序：今日涨停优先，其次按涨幅降序，涨幅缺失的排最后（BR-222：不补 0）。
+        //
+        // 2026-10-21 改动原因：原逻辑只看「上一交易日涨幅」。stock_daily 当天常常
+        // 只有几十只票（10-19 47 只 / 10-20 46 只），price_date 会退到 5 天前，
+        // 于是选出来的是「5 天前涨过一波」的票——10-21 选中 002976 瑞玛精密
+        //（10-16 +9.52%，之后两天跌 9%），而当天真正封板的 002929/002313/002792
+        // 一只都没进。涨停集合由调用方实时拉 LimitPools 传入，不依赖日线。
         members.sort_by(|a, b| {
-            b.pct_chg
-                .partial_cmp(&a.pct_chg)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let a_limit = a
+                .pct_chg
+                .map(|v| v >= LIMIT_UP_PCT)
+                .unwrap_or(false);
+            let b_limit = b
+                .pct_chg
+                .map(|v| v >= LIMIT_UP_PCT)
+                .unwrap_or(false);
+            let a_today = limit_up_codes.contains(&a.instrument_code);
+            let b_today = limit_up_codes.contains(&b.instrument_code);
+            // 今日实时涨停 > 日线涨停 > 涨幅高 > 涨幅缺失
+            b_today
+                .cmp(&a_today)
+                .then(b_limit.cmp(&a_limit))
+                .then(
+                    b.pct_chg
+                        .partial_cmp(&a.pct_chg)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
         });
         let pct_text = board
             .change_pct
@@ -325,6 +352,7 @@ pub fn build_watch_pool(
     business_date: &str,
     lookback_days: Option<i64>,
     dry_run: bool,
+    limit_up_codes: &std::collections::HashSet<String>,
 ) -> Result<WatchPoolReport, String> {
     let lookback = lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS);
     let (scanned_rows, mut candidates) = collect_news_catalysts(db, business_date, lookback)?;
@@ -336,6 +364,7 @@ pub fn build_watch_pool(
         business_date,
         BOARD_TOP_N,
         BOARD_PER_BOARD,
+        limit_up_codes,
     )?;
     let board_count_raw = board_candidates.len();
     let mut board_added = 0usize;
