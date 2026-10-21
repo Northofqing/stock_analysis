@@ -12174,6 +12174,18 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     ) {
                                         Ok(report) => {
                                             report.log();
+                                            // P2：观察池建完立刻给「确实有买点」的票推入场区间
+                                            // （observing → entry_proposed）。必须早于 16:00 明日计划，
+                                            // 否则明日计划读到的是上一轮的旧 stage。
+                                            match stock_analysis::monitor::ticket_entry_proposal::propose_for_observing(
+                                                &db,
+                                                &date_text,
+                                            ) {
+                                                Ok(proposal) => log::info!("{}", proposal.summary_line()),
+                                                Err(error) => log::warn!(
+                                                    "[入场参考] 失败 date={date_text}: {error}"
+                                                ),
+                                            }
                                             *WATCH_POOL_LAST
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner()) =

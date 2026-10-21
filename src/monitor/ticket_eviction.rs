@@ -95,7 +95,7 @@ pub fn evict_stale_observations(db: &DatabaseManager, as_of: &str) -> Result<Evi
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
 
     let observing: Vec<String> = diesel::sql_query(
-        "SELECT code FROM ticket_lifecycle WHERE close_date IS NULL AND stage = 'observing'",
+        "SELECT code FROM ticket_lifecycle WHERE close_date IS NULL AND stage IN ('observing','entry_proposed')",
     )
     .load::<CodeRow>(&mut conn)
     .map_err(|e| e.to_string())?

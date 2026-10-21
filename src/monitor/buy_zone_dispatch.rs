@@ -301,7 +301,7 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
     // 观察池：active ticket 里排除已持仓的（持仓走另一段）。
     let watch_rows: Vec<WatchRow> = diesel::sql_query(
         "SELECT code, source, open_date FROM ticket_lifecycle \
-          WHERE close_date IS NULL AND stage = 'observing'",
+          WHERE close_date IS NULL AND stage IN ('observing','entry_proposed')",
     )
     .load(&mut conn)
     .map_err(|error| error.to_string())?;

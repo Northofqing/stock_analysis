@@ -136,29 +136,47 @@ def check_p14(main, days):
 
 
 def check_p13(main, days):
-    """P1.3 op67 价格带落库：要有表且最近交易日有行。"""
+    """P1.3 价格带落库：查 trading_fact_snapshot（不是 stock_daily）。
+
+    2026-10-21 修正：初版查 stock_daily 的 price_band 列，判成「未做」，
+    实际实现落在独立表 trading_fact_snapshot，15:50 调度，
+    标的 = 当日 active tickets + 当前持仓。
+    """
     r = Result("P1.3", "价格带落库")
-    candidates = ["stock_daily", "trading_fact_daily", "price_band_daily"]
-    found = None
-    for t in candidates:
-        if table_exists(main, t):
-            cols = [c[1] for c in main.execute(f"PRAGMA table_info({t})")]
-            if any("price_band" in c for c in cols) or any("limit_up" in c for c in cols):
-                found = (t, cols)
-                break
-    if not found:
+    if not table_exists(main, "trading_fact_snapshot"):
         r.status = FAIL
-        r.detail = "没有任何表带 price_band / limit_up 列"
+        r.detail = "trading_fact_snapshot 表不存在"
         return r
-    t, cols = found
-    band_col = next((c for c in cols if "price_band" in c), None)
-    if not band_col:
+    rows = main.execute(
+        """SELECT trade_date, COUNT(*), COUNT(limit_up), COUNT(price_band_source)
+           FROM trading_fact_snapshot
+           GROUP BY trade_date ORDER BY trade_date DESC LIMIT ?""",
+        (days,),
+    ).fetchall()
+    if not rows:
         r.status = FAIL
-        r.detail = f"{t} 有 limit_up 但无 price_band 列"
+        r.detail = "表存在但无数据"
         return r
-    n = main.execute(f"SELECT COUNT(*) FROM {t} WHERE {band_col} IS NOT NULL").fetchone()[0]
-    r.detail = f"{t}.{band_col} 非空 {n} 行"
-    r.status = OK if n > 0 else FAIL
+    latest = rows[0][0]
+    total = sum(x[1] for x in rows)
+    band = sum(x[2] for x in rows)
+    src = sum(x[3] for x in rows)
+    r.detail = (
+        f"{len(rows)} 天 / {total} 行（最新 {latest}）"
+        f" limit_up 非空 {band}/{total} price_band_source 非空 {src}/{total}"
+    )
+    try:
+        lag = (datetime.now().date() - datetime.strptime(latest, "%Y-%m-%d").date()).days
+    except Exception:
+        lag = 999
+    if lag > 7:
+        r.status = PARTIAL
+        r.detail += f" | 最新一天距今 {lag} 天，可能已停跑"
+    elif band == 0:
+        r.status = PARTIAL
+        r.detail += " | 全部 NULL（非快照日，按 BR-222 不补值）"
+    else:
+        r.status = OK
     return r
 
 

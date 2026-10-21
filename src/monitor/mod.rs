@@ -60,6 +60,7 @@ pub mod signal_fusion;
 pub mod signal_state;
 pub mod ticket_event_sync; // 2026-10-17: 投递记账 (Delivered → ticket_event; 观察池/持仓才建票)
 pub mod ticket_eviction; // 2026-10-18: 观察池淘汰 (超期/跌幅, 只管 observing)
+pub mod ticket_entry_proposal; // 2026-10-21: P2 入场参考 (observing → entry_proposed，复用 buy_zone)
 pub mod ticket_priority; // 2026-10-18: 观察池票优先级 (5 维加权排序)
 pub mod ticket_stage_sync; // 2026-10-18: 持仓快照驱动 stage 自动流转 (观察→持有→退出)
 pub mod ticket_watch_pool; // 2026-10-17: 观察池生成 (新闻催化; 板块轮动待接写入方)
