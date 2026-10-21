@@ -276,6 +276,34 @@ pub fn build_external_query_request(
                 Value::Object(request),
             )
         }
+        Operation::BoardConstituents => {
+            // The default TDX arm rejects BK#### codes, so the provider is part
+            // of the delivered request contract here and is passed through to
+            // the envelope field, never nested inside the payload.
+            ensure_only_keys(&params, &["board_code", "limit", "preferred_provider"])?;
+            let board_code = canonical_board_code(&params)?;
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .filter(|limit| (1..=4000).contains(limit))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            // Explicit when the caller supplies it; otherwise the envelope stays
+            // empty and `GrpcMarketClient::query_with_provider` can pin the route.
+            let preferred_provider = match params.get("preferred_provider") {
+                Some(value) => value
+                    .as_str()
+                    .filter(|provider| matches!(*provider, "Eastmoney" | "Tdx"))
+                    .ok_or(ExternalContractError::InvalidParameters)?
+                    .to_owned(),
+                None => String::new(),
+            };
+            (
+                "magic.market.board_constituents.request",
+                1,
+                preferred_provider,
+                serde_json::json!({"board_code": board_code, "limit": limit}),
+            )
+        }
         _ => return Err(ExternalContractError::UndeliveredOperation),
     };
 
@@ -443,6 +471,97 @@ fn assemble_request(
             content_type: "application/json; charset=utf-8".to_string(),
             data,
         }),
+    })
+}
+
+/// True for an Eastmoney board code: `BK####`, any case, optional `eastmoney:` prefix.
+///
+/// Shared with the gateway so the code shape that decides the provider route and
+/// the code shape the contract accepts can never drift apart.
+pub fn is_eastmoney_board_code(code: &str) -> bool {
+    let upper = code.trim().to_ascii_uppercase();
+    let code = upper.strip_prefix("EASTMONEY:").unwrap_or(&upper);
+    code.is_ascii()
+        && code.len() == 6
+        && code.starts_with("BK")
+        && code[2..].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// `BK####`, optionally prefixed with `eastmoney:`, normalised to upper case.
+fn canonical_board_code(params: &Value) -> Result<String, ExternalContractError> {
+    let raw = params
+        .get("board_code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or(ExternalContractError::InvalidParameters)?;
+    if !is_eastmoney_board_code(raw) {
+        return Err(ExternalContractError::InvalidParameters);
+    }
+    let upper = raw.to_ascii_uppercase();
+    let code = upper.strip_prefix("EASTMONEY:").unwrap_or(&upper);
+    Ok(code.to_owned())
+}
+
+/// One ExternalV1 `BoardConstituents` answer: the board fields once, plus the
+/// instrument list. Wire records are `magic.market.board_membership` payloads,
+/// so every record must agree on board and category before anything is grouped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalBoardConstituents {
+    pub board_code: String,
+    pub board_name: String,
+    pub category: String,
+    pub instruments: Vec<InstrumentId>,
+}
+
+pub fn group_external_board_constituents(
+    records: &[Value],
+) -> Result<ExternalBoardConstituents, ExternalContractError> {
+    let first = records
+        .first()
+        .ok_or(ExternalContractError::InvalidParameters)?;
+    let board_code = first
+        .get("board_code")
+        .and_then(Value::as_str)
+        .ok_or(ExternalContractError::InvalidParameters)?
+        .to_owned();
+    let board_name = first
+        .get("board_name")
+        .and_then(Value::as_str)
+        .ok_or(ExternalContractError::InvalidParameters)?
+        .to_owned();
+    let category = first
+        .get("category")
+        .and_then(Value::as_str)
+        .ok_or(ExternalContractError::InvalidParameters)?
+        .to_owned();
+    let mut instruments = Vec::with_capacity(records.len());
+    let mut seen = std::collections::HashSet::with_capacity(records.len());
+    for record in records {
+        let same_board = record.get("board_code").and_then(Value::as_str)
+            == Some(board_code.as_str())
+            && record.get("board_name").and_then(Value::as_str) == Some(board_name.as_str())
+            && record.get("category").and_then(Value::as_str) == Some(category.as_str());
+        if !same_board {
+            return Err(ExternalContractError::InvalidParameters);
+        }
+        let instrument: InstrumentId = serde_json::from_value(
+            record
+                .get("instrument")
+                .cloned()
+                .ok_or(ExternalContractError::InvalidParameters)?,
+        )
+        .map_err(|_| ExternalContractError::InvalidParameters)?;
+        let identity = format!("{:?}:{}", instrument.exchange(), instrument.code());
+        if !seen.insert(identity) {
+            return Err(ExternalContractError::InvalidParameters);
+        }
+        instruments.push(instrument);
+    }
+    Ok(ExternalBoardConstituents {
+        board_code,
+        board_name,
+        category,
+        instruments,
     })
 }
 
@@ -864,17 +983,74 @@ mod tests {
 
     #[test]
     fn rejects_live_but_undelivered_external_contracts_before_io() {
-        for operation in [
-            Operation::RealtimeQuotes,
-            Operation::BoardConstituents,
-            Operation::UpperLimitPoolReview,
-        ] {
+        for operation in [Operation::RealtimeQuotes, Operation::UpperLimitPoolReview] {
             assert_eq!(
                 build_external_query_request(operation, json!({})).unwrap_err(),
                 ExternalContractError::UndeliveredOperation,
                 "{operation:?} must not be inferred from local types"
             );
         }
+    }
+
+    #[test]
+    fn board_constituents_requires_bk_code_limit_and_explicit_provider() {
+        let request = build_external_query_request(
+            Operation::BoardConstituents,
+            json!({"board_code": "bk1512", "limit": 100, "preferred_provider": "Eastmoney"}),
+        )
+        .expect("board constituents request");
+        let (schema, data, allow_unadmitted) = payload_json(request.clone());
+        assert_eq!(schema, "magic.market.board_constituents.request");
+        assert_eq!(data, json!({"board_code": "BK1512", "limit": 100}));
+        assert!(!allow_unadmitted);
+        assert_eq!(request.preferred_provider, "Eastmoney");
+
+        let unpinned = build_external_query_request(
+            Operation::BoardConstituents,
+            json!({"board_code": "BK1512", "limit": 3}),
+        )
+        .expect("provider-less board constituents request");
+        assert!(unpinned.preferred_provider.is_empty());
+
+        for params in [
+            json!({"board_code": "tdx:industry:融资融券", "limit": 3, "preferred_provider": "Tdx"}),
+            json!({"board_code": "BK1512", "limit": 0, "preferred_provider": "Eastmoney"}),
+            json!({"board_code": "BK1512", "limit": 4001, "preferred_provider": "Eastmoney"}),
+            json!({"board_code": "BK1512", "limit": 3, "preferred_provider": "Ths"}),
+            json!({"board_code": "BK1512", "limit": 3, "preferred_provider": "Eastmoney", "category": "Industry"}),
+        ] {
+            assert_eq!(
+                build_external_query_request(Operation::BoardConstituents, params).unwrap_err(),
+                ExternalContractError::InvalidParameters
+            );
+        }
+    }
+
+    #[test]
+    fn board_constituent_records_group_into_one_board_and_instruments() {
+        let records = vec![
+            json!({"instrument": {"exchange": "Shenzhen", "code": "002714", "asset_class": "Equity"},
+                   "board_code": "BK1512", "board_name": "生猪养殖", "category": "Unknown"}),
+            json!({"instrument": {"exchange": "Shanghai", "code": "600975", "asset_class": "Equity"},
+                   "board_code": "BK1512", "board_name": "生猪养殖", "category": "Unknown"}),
+        ];
+        let grouped = group_external_board_constituents(&records).expect("grouped");
+        assert_eq!(grouped.board_code, "BK1512");
+        assert_eq!(grouped.board_name, "生猪养殖");
+        assert_eq!(grouped.category, "Unknown");
+        assert_eq!(grouped.instruments.len(), 2);
+        assert_eq!(grouped.instruments[0].code(), "002714");
+
+        let mismatched = vec![
+            json!({"instrument": {"exchange": "Shenzhen", "code": "002714", "asset_class": "Equity"},
+                   "board_code": "BK1512", "board_name": "生猪养殖", "category": "Unknown"}),
+            json!({"instrument": {"exchange": "Shenzhen", "code": "002714", "asset_class": "Equity"},
+                   "board_code": "BK0425", "board_name": "工程建设", "category": "Unknown"}),
+        ];
+        assert_eq!(
+            group_external_board_constituents(&mismatched).unwrap_err(),
+            ExternalContractError::InvalidParameters
+        );
     }
 
     #[test]

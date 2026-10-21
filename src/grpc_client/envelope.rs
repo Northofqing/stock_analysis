@@ -57,6 +57,22 @@ pub fn build_query_request(
     })
 }
 
+/// Same envelope, but with an explicit provider route.
+///
+/// `build_query_request` keeps `preferred_provider` empty so Composition chooses;
+/// a caller that must pin a provider (for example an Eastmoney `BK####` board
+/// code, which the default TDX arm rejects) uses this constructor instead of
+/// hand-editing the envelope.
+pub fn build_query_request_with_provider(
+    op: Operation,
+    payload: serde_json::Value,
+    preferred_provider: &str,
+) -> Result<QueryRequest, EnvelopeError> {
+    let mut request = build_query_request(op, payload)?;
+    request.preferred_provider = preferred_provider.to_owned();
+    Ok(request)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryAdmission {
     Unspecified,

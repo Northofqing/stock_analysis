@@ -2984,6 +2984,17 @@ impl GrpcSource {
     }
 
     async fn query_op(&self, op: Operation, params: Value) -> Result<QueryResult, GatewayError> {
+        self.query_op_with_provider(op, params, None).await
+    }
+
+    /// Same as [`Self::query_op`] with an explicit provider route. Only the
+    /// ExternalV1 profile carries it; LocalBridgeV1 ignores the hint.
+    async fn query_op_with_provider(
+        &self,
+        op: Operation,
+        params: Value,
+        preferred_provider: Option<&str>,
+    ) -> Result<QueryResult, GatewayError> {
         #[cfg(test)]
         if let Some(result) = take_test_query_response() {
             return result.map_err(|error| map_current_routed_query_error(op, &error));
@@ -3009,7 +3020,7 @@ impl GrpcSource {
                 .clone()
         };
         client
-            .query(op, params)
+            .query_with_provider(op, params, preferred_provider)
             .await
             .map_err(|e| map_current_routed_query_error(op, &e))
     }
@@ -4040,10 +4051,16 @@ impl GrpcSource {
         board_code: &str,
         limit: u32,
     ) -> Result<GatewayBatch<BoardMembershipRecord>, GatewayError> {
+        // `BK####` is only served by the Eastmoney arm; `tdx:` codes keep the
+        // default TDX route by leaving the provider hint empty.
+        let preferred_provider =
+            crate::grpc_client::external_v1::is_eastmoney_board_code(board_code)
+                .then_some("Eastmoney");
         let q = self
-            .query_op(
+            .query_op_with_provider(
                 Operation::BoardConstituents,
                 serde_json::json!({ "board_code": board_code, "limit": limit }),
+                preferred_provider,
             )
             .await?;
         convert::board_constituents(&q)

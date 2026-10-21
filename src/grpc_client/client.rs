@@ -143,6 +143,15 @@ impl ProfileQueryRequest {
             Self::External(request) => request.encode_to_vec(),
         }
     }
+
+    /// Pin the provider route on either profile's envelope.
+    pub(crate) fn with_preferred_provider(mut self, provider: &str) -> Self {
+        match &mut self {
+            Self::Local(request) => request.preferred_provider = provider.to_owned(),
+            Self::External(request) => request.preferred_provider = provider.to_owned(),
+        }
+        self
+    }
 }
 
 pub(crate) enum DataCallAuthorized {
@@ -787,6 +796,20 @@ impl GrpcMarketClient {
         op: Operation,
         payload: serde_json::Value,
     ) -> Result<QueryResult, GrpcError> {
+        self.query_with_provider(op, payload, None).await
+    }
+
+    /// Same contract as [`Self::query`], but pins an ExternalV1 provider route.
+    ///
+    /// The route is set before the request is built: an Eastmoney board code such
+    /// as `BK1512` is only served by the Eastmoney arm, while the LocalBridgeV1
+    /// profile has no provider routing, so the hint is ignored there.
+    pub async fn query_with_provider(
+        &mut self,
+        op: Operation,
+        payload: serde_json::Value,
+        preferred_provider: Option<&str>,
+    ) -> Result<QueryResult, GrpcError> {
         if op == Operation::EconomicCalendar {
             return Err(GrpcError::Unimplemented {
                 details: Box::new(ErrorDetail {
@@ -802,7 +825,10 @@ impl GrpcMarketClient {
                 details: Box::default(),
             });
         }
-        let request = build_native_profile_query_request(self.profile, op, payload)?;
+        let mut request = build_native_profile_query_request(self.profile, op, payload)?;
+        if let (Some(provider), ContractProfile::ExternalV1) = (preferred_provider, &self.profile) {
+            request = request.with_preferred_provider(provider);
+        }
 
         let mut attempt: u32 = 1;
         loop {
