@@ -44,12 +44,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CLI 不拉实时涨停池：离线重放时按历史日线排序即可，
     // 涨停优先只在 monitor 的 15:40 调度里生效（那里有实时 LimitPools）。
     let limit_up_codes = std::collections::HashSet::new();
+    let leader_codes = std::collections::HashSet::new();
     let report = build_watch_pool(
         db,
         &date.format("%Y-%m-%d").to_string(),
         lookback,
         dry_run,
         &limit_up_codes,
+        &leader_codes,
     )?;
     println!(
         "\n汇总: scanned={} candidates={} opened={} appended={} skipped_invalid={}{}",

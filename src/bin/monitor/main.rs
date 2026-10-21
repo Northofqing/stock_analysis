@@ -12202,12 +12202,49 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         "[观察池] 当日涨停 {} 只（板块轮动涨停优先）",
                                         limit_up_codes.len()
                                     );
+                                    // 板块领涨股集合：BoardFlows 逐板块给 leader_code，
+                                    // 用来做「龙头必选」。昨晚日志里的 BoardFlows 失败
+                                    // （provider_transport Eastmoney）今天已不复现，实测
+                                    // Industry/Concept 两种 category 都能返回 leader_code。
+                                    // 拉取失败不阻断，只是退化成纯涨幅排序。
+                                    let leader_codes: std::collections::HashSet<String> = {
+                                        let mut set = std::collections::HashSet::new();
+                                        for kind in [
+                                            stock_analysis::data_gateway::board::BoardKind::Industry,
+                                            stock_analysis::data_gateway::board::BoardKind::Concept,
+                                        ] {
+                                            match stock_analysis::data_gateway::board::BoardDataGateway::default()
+                                                .day1_flows(kind, 10)
+                                                .await
+                                            {
+                                                Ok(batch) => {
+                                                    for fact in batch.records() {
+                                                        if let Some(code) = &fact.leader_code {
+                                                            let code = code.trim();
+                                                            if !code.is_empty() {
+                                                                set.insert(code.to_owned());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => log::warn!(
+                                                    "[观察池] 板块龙头拉取失败({kind:?}): {error}"
+                                                ),
+                                            }
+                                        }
+                                        set
+                                    };
+                                    log::info!(
+                                        "[观察池] 板块龙头 {} 只（龙头优先）",
+                                        leader_codes.len()
+                                    );
                                     match stock_analysis::monitor::ticket_watch_pool::build_watch_pool(
                                         &db,
                                         &date_text,
                                         None,
                                         false,
                                         &limit_up_codes,
+                                        &leader_codes,
                                     ) {
                                         Ok(report) => {
                                             report.log();

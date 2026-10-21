@@ -186,6 +186,7 @@ pub fn collect_board_rotation(
     top_boards: usize,
     per_board: usize,
     limit_up_codes: &std::collections::HashSet<String>,
+    leader_codes: &std::collections::HashSet<String>,
 ) -> Result<(usize, Vec<PoolCandidate>), String> {
     #[derive(QueryableByName)]
     struct BoardRow {
@@ -296,9 +297,14 @@ pub fn collect_board_rotation(
                 .unwrap_or(false);
             let a_today = limit_up_codes.contains(&a.instrument_code);
             let b_today = limit_up_codes.contains(&b.instrument_code);
-            // 今日实时涨停 > 日线涨停 > 涨幅高 > 涨幅缺失
+            // 板块领涨股（BoardFlows.leader_code）：不要求它今天涨停，
+            // 但它是板块里资金认的那一只，优先级仅次于今日涨停。
+            let a_leader = leader_codes.contains(&a.instrument_code);
+            let b_leader = leader_codes.contains(&b.instrument_code);
+            // 今日实时涨停 > 板块龙头 > 日线涨停 > 涨幅高 > 涨幅缺失
             b_today
                 .cmp(&a_today)
+                .then(b_leader.cmp(&a_leader))
                 .then(b_limit.cmp(&a_limit))
                 .then(
                     b.pct_chg
@@ -353,6 +359,7 @@ pub fn build_watch_pool(
     lookback_days: Option<i64>,
     dry_run: bool,
     limit_up_codes: &std::collections::HashSet<String>,
+    leader_codes: &std::collections::HashSet<String>,
 ) -> Result<WatchPoolReport, String> {
     let lookback = lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS);
     let (scanned_rows, mut candidates) = collect_news_catalysts(db, business_date, lookback)?;
@@ -365,6 +372,7 @@ pub fn build_watch_pool(
         BOARD_TOP_N,
         BOARD_PER_BOARD,
         limit_up_codes,
+        leader_codes,
     )?;
     let board_count_raw = board_candidates.len();
     let mut board_added = 0usize;
