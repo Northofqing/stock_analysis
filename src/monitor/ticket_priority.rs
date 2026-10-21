@@ -195,13 +195,14 @@ fn board_score(conn: &mut SqliteConnection, code: &str, as_of: &str) -> Option<f
 pub fn rank_watch_pool(db: &DatabaseManager, as_of: &str) -> Result<Vec<PriorityRow>, String> {
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
 
-    let codes: Vec<String> =
-        diesel::sql_query("SELECT code FROM ticket_lifecycle WHERE close_date IS NULL ORDER BY code")
-            .load::<CodeRow>(&mut conn)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|row| row.code)
-            .collect();
+    let codes: Vec<String> = diesel::sql_query(
+        "SELECT code FROM ticket_lifecycle WHERE close_date IS NULL ORDER BY code",
+    )
+    .load::<CodeRow>(&mut conn)
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| row.code)
+    .collect();
 
     if codes.is_empty() {
         return Ok(Vec::new());
@@ -215,51 +216,51 @@ pub fn rank_watch_pool(db: &DatabaseManager, as_of: &str) -> Result<Vec<Priority
         let board = board_score(&mut conn, code, as_of);
 
         // 可买价 / 仓位：走 buy_zone + position_sizing，失败不影响排序
-        let (buy, size, zone_reason) = match crate::monitor::buy_zone::compute(&mut conn, code, as_of)
-        {
-            Ok(Some(zone)) => {
-                let advice = crate::monitor::position_sizing::advise(code, &zone);
-                // 可买分要区分趋势：空头排列里的"买点"是下跌中继的反弹，
-                // 不是趋势票的回踩。实测 2026-10-18：不加这个门槛时，
-                // 空头排列的票拿 100 分直接排在前四，反而把真正的趋势票压下去。
-                let buy_value = if zone.overheated {
-                    Some(0.0)
-                } else if zone.at_support {
-                    Some(match zone.trend {
-                        crate::monitor::buy_zone::Trend::Bullish => 40.0,
-                        crate::monitor::buy_zone::Trend::Tangled => 30.0,
-                        crate::monitor::buy_zone::Trend::Bearish => 20.0,
-                        crate::monitor::buy_zone::Trend::Unknown => 30.0,
-                    })
-                } else if zone.entry_low.is_some() {
-                    Some(match zone.trend {
-                        crate::monitor::buy_zone::Trend::Bullish => 100.0,
-                        crate::monitor::buy_zone::Trend::Tangled => 80.0,
-                        crate::monitor::buy_zone::Trend::Bearish => 60.0,
-                        crate::monitor::buy_zone::Trend::Unknown => 70.0,
-                    })
-                } else {
-                    None
-                };
-                let size_value = if advice.suggested_pct > 0.0 {
-                    Some((advice.suggested_pct / 0.30).clamp(0.0, 1.0) * 100.0)
-                } else {
-                    Some(0.0)
-                };
-                let reason = if zone.overheated {
-                    Some("超买，不参与".to_string())
-                } else if zone.at_support {
-                    Some("贴 20 日低点，等支撑确认".to_string())
-                } else if zone.entry_low.is_some() {
-                    Some("有买点区间".to_string())
-                } else {
-                    None
-                };
-                (buy_value, size_value, reason)
-            }
-            Ok(None) => (None, None, None),
-            Err(_) => (None, None, None),
-        };
+        let (buy, size, zone_reason) =
+            match crate::monitor::buy_zone::compute(&mut conn, code, as_of) {
+                Ok(Some(zone)) => {
+                    let advice = crate::monitor::position_sizing::advise(code, &zone);
+                    // 可买分要区分趋势：空头排列里的"买点"是下跌中继的反弹，
+                    // 不是趋势票的回踩。实测 2026-10-18：不加这个门槛时，
+                    // 空头排列的票拿 100 分直接排在前四，反而把真正的趋势票压下去。
+                    let buy_value = if zone.overheated {
+                        Some(0.0)
+                    } else if zone.at_support {
+                        Some(match zone.trend {
+                            crate::monitor::buy_zone::Trend::Bullish => 40.0,
+                            crate::monitor::buy_zone::Trend::Tangled => 30.0,
+                            crate::monitor::buy_zone::Trend::Bearish => 20.0,
+                            crate::monitor::buy_zone::Trend::Unknown => 30.0,
+                        })
+                    } else if zone.entry_low.is_some() {
+                        Some(match zone.trend {
+                            crate::monitor::buy_zone::Trend::Bullish => 100.0,
+                            crate::monitor::buy_zone::Trend::Tangled => 80.0,
+                            crate::monitor::buy_zone::Trend::Bearish => 60.0,
+                            crate::monitor::buy_zone::Trend::Unknown => 70.0,
+                        })
+                    } else {
+                        None
+                    };
+                    let size_value = if advice.suggested_pct > 0.0 {
+                        Some((advice.suggested_pct / 0.30).clamp(0.0, 1.0) * 100.0)
+                    } else {
+                        Some(0.0)
+                    };
+                    let reason = if zone.overheated {
+                        Some("超买，不参与".to_string())
+                    } else if zone.at_support {
+                        Some("贴 20 日低点，等支撑确认".to_string())
+                    } else if zone.entry_low.is_some() {
+                        Some("有买点区间".to_string())
+                    } else {
+                        None
+                    };
+                    (buy_value, size_value, reason)
+                }
+                Ok(None) => (None, None, None),
+                Err(_) => (None, None, None),
+            };
         if let Some(reason) = zone_reason {
             reasons.push(reason);
         }

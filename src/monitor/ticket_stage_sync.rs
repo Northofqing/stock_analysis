@@ -74,7 +74,10 @@ pub fn sync_stages_from_positions(
     as_of: &str,
 ) -> Result<StageReport, String> {
     let positions = crate::portfolio::load_positions().unwrap_or_default();
-    let held: HashSet<String> = positions.iter().map(|position| position.code.clone()).collect();
+    let held: HashSet<String> = positions
+        .iter()
+        .map(|position| position.code.clone())
+        .collect();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
 
     #[derive(QueryableByName)]

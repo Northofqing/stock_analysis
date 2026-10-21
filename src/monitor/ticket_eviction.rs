@@ -89,10 +89,7 @@ fn latest_close_through(conn: &mut SqliteConnection, code: &str, date: &str) -> 
     .and_then(|row| row.close)
 }
 
-pub fn evict_stale_observations(
-    db: &DatabaseManager,
-    as_of: &str,
-) -> Result<EvictReport, String> {
+pub fn evict_stale_observations(db: &DatabaseManager, as_of: &str) -> Result<EvictReport, String> {
     let as_of_date = NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
         .map_err(|error| format!("as_of 非法 ({as_of}): {error}"))?;
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;

@@ -27,9 +27,11 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let Some(code) = args.iter().skip(1).find(|arg| !arg.starts_with("--")) else {
-        return Err("用法: ticket_open <code> [--date YYYY-MM-DD] [--stage S] [--note T] \
+        return Err(
+            "用法: ticket_open <code> [--date YYYY-MM-DD] [--stage S] [--note T] \
                     [--close YYYY-MM-DD] [--event T]"
-            .into());
+                .into(),
+        );
     };
 
     let path = std::env::var("STOCK_DB").ok().map(std::path::PathBuf::from);

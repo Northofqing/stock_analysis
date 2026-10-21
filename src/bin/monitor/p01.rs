@@ -222,6 +222,21 @@ pub struct P01BoundHead {
     pub code: String,
     pub name: String,
     pub news: Vec<P01BoundNews>,
+    /// 前一交易日收盘价（涨停池给出的 price）。
+    ///
+    /// P01 在 09:00 推送，集合竞价尚未结束，拿不到当日实时价；涨停池的
+    /// price 是唯一可锚定的推荐价，用于事后算 D+1/D+3 收益。
+    /// 这些记账字段**不进** [`P01InputBinding::canonical_source_bytes`]，
+    /// 所以不影响 source binding hash 和 decision identity。
+    pub recommend_price: Option<f64>,
+    /// 连板数（涨停池 streak）
+    pub streak: Option<u32>,
+    /// 封单额（元）
+    pub sealed_amount: Option<f64>,
+    /// 换手率，保留 Ratio::get 的原值（单位随源）
+    pub turnover: Option<f64>,
+    /// 炸板次数
+    pub break_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -581,6 +596,15 @@ pub fn bind_p01_sources(
         ));
     }
 
+    // 记账用：把涨停池里同 code 的封板质量字段带到 head 上。
+    // 这些字段不进 canonical_source_bytes，不影响 source binding hash。
+    let pool_by_code: std::collections::HashMap<&str, _> = completed
+        .limit_pool
+        .records()
+        .iter()
+        .map(|entry| (entry.instrument.code(), entry))
+        .collect();
+
     let mut heads = Vec::with_capacity(head_codes.len());
     for (row, code) in completed.chain_rows.iter().zip(&head_codes) {
         let name = identity_names.get(code).cloned().ok_or_else(|| {
@@ -599,11 +623,17 @@ pub fn bind_p01_sources(
                 context,
             )
         })?;
+        let pool = pool_by_code.get(code.as_str());
         heads.push(P01BoundHead {
             concept: row.concept.clone(),
             code: code.clone(),
             name,
             news,
+            recommend_price: pool.map(|entry| entry.price.get()),
+            streak: pool.and_then(|entry| entry.streak).map(|value| value.get()),
+            sealed_amount: pool.and_then(|entry| entry.sealed_amount).map(|value| value.get()),
+            turnover: pool.and_then(|entry| entry.turnover).map(|value| value.get()),
+            break_count: pool.and_then(|entry| entry.break_count),
         });
     }
 
@@ -1501,6 +1531,8 @@ async fn run_p01_once_with_ports<P: P01Ports>(
         Ok(input) => input,
         Err(failure) => return failure_outcome(failure),
     };
+    // 推送成功后要开票记账；input 随后会被 move 进 P01PreparedAttempt
+    let bookkeeping_heads = input.heads.clone();
     let mode = render_mode(mode);
     let text = match ports.render(mode, &input) {
         Ok(text) => text,
@@ -1547,7 +1579,80 @@ async fn run_p01_once_with_ports<P: P01Ports>(
         },
         Err(failure) => failure_outcome(failure),
     };
+    // P01 推送成功（durable 已确认 Delivered）后开票记账。
+    // best-effort：失败只记日志，绝不影响已经完成的投递。
+    if matches!(outcome, P01RunOutcome::Delivered { .. }) {
+        record_p01_tickets(context, &bookkeeping_heads, observed_at);
+    }
     outcome.with_source_evidence_sha256(source_evidence_sha256)
+}
+
+/// P01 入选票写入 ticket 台账（第三个开票入口，`source=p01_preopen`）。
+///
+/// 约束：
+/// - best-effort：取连接/写库失败只 `log::warn`，绝不回滚已完成的推送
+/// - `open_ticket` 是 `INSERT OR IGNORE`，靠 `(code, open_date)` 唯一索引幂等，
+///   同一票同日重复推送不会产生第二条 ticket
+/// - `stage` 固定 `observing`：这是观察入口，不代表已建仓
+fn record_p01_tickets(
+    context: P01BusinessContext,
+    heads: &[P01BoundHead],
+    observed_at: DateTime<Local>,
+) {
+    if heads.is_empty() {
+        return;
+    }
+    let db = stock_analysis::database::DatabaseManager::get();
+    let mut conn = match db.get_conn() {
+        Ok(conn) => conn,
+        Err(error) => {
+            log::warn!("[P-01][bookkeeping] 取连接失败，跳过开票: {error}");
+            return;
+        }
+    };
+    let open_date = context.business_date.format("%Y-%m-%d").to_string();
+    let event_at = observed_at.to_rfc3339();
+    for head in heads {
+        let note = format!(
+            "P01盘前热点（依据 {}）｜{}｜推荐价 {:?}｜连板 {:?}｜封单 {:?}｜换手 {:?}｜炸板 {:?}",
+            context.evidence_date,
+            head.concept,
+            head.recommend_price,
+            head.streak,
+            head.sealed_amount,
+            head.turnover,
+            head.break_count,
+        );
+        match stock_analysis::database::ticket_lifecycle::open_ticket(
+            &mut conn,
+            &head.code,
+            &open_date,
+            "observing",
+            "p01_preopen",
+            Some(&note),
+        ) {
+            Ok(ticket_id) => {
+                if let Err(error) = stock_analysis::database::ticket_lifecycle::append_event(
+                    &mut conn,
+                    ticket_id,
+                    &event_at,
+                    "catalyst",
+                    Some("PreopenNewsHot"),
+                    None,
+                    Some(&format!("P01 入选：{}", head.concept)),
+                ) {
+                    log::warn!("[P-01][bookkeeping] ticket#{ticket_id} 记事件失败: {error}");
+                }
+                log::info!(
+                    "[P-01][bookkeeping] opened ticket#{ticket_id} {} {} price={:?}",
+                    head.code,
+                    head.name,
+                    head.recommend_price
+                );
+            }
+            Err(error) => log::warn!("[P-01][bookkeeping] {} 开票失败: {error}", head.code),
+        }
+    }
 }
 
 async fn audit_p01_outcome(

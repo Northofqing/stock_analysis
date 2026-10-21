@@ -65,6 +65,31 @@ P1.3 op 67 价格带每日落库
 - 做不到：非快照日返回 null（按 BR-222 保持 NULL，不补值）。
 - **前置**：op 67 当前只有请求构造，没有业务调用点；本项即第一个调用点。
 
+### P1.4 P01 推送 → 自动开票（第三个开票入口，2026-10-21 新增）
+
+- 原因：P01「盘前热点」每天 09:00 推 3 只昨日涨停股，但 P1.2 的记账范围只有
+  `T0Advice / HoldingPlan / CloseCall`，且明确「票不存在则跳过（不自动开票）」。
+  结果是推完就断——不进观察池、不留推荐价、无法算 D+1/D+3，也无法验证选股是否有效。
+  实测 10-21 推的 002696/002724 当日续板，但库里没有任何记录能追溯这次推荐。
+- 动作：`run_p01_once_with_ports` 在 `P01RunOutcome::Delivered` 之后调用
+  `record_p01_tickets`，对每只入选票 `open_ticket(stage='observing', source='p01_preopen')`
+  + `append_event(kind='catalyst', push_kind='PreopenNewsHot')`。
+- 记账字段：`P01BoundHead` 新增 `recommend_price / streak / sealed_amount / turnover / break_count`，
+  在 `bind_p01_sources` 里按 code 从 `LimitPools` 的 `LimitPoolEntry` 取。
+  **这些字段不进 `canonical_source_bytes`**，所以不影响 source binding hash 和 decision identity。
+- 推荐价口径：**前一交易日收盘价**。P01 在 09:00 推送，集合竞价尚未结束，拿不到当日实时价，
+  涨停池的 `price` 是唯一可锚定的价格。note 里写明「推荐价」来源，避免被当成当日成交价。
+- 约束：
+  - best-effort：取连接/写库失败只 `log::warn`，绝不回滚已完成的推送
+  - `open_ticket` 是 `INSERT OR IGNORE` + `(code, open_date)` 唯一索引，同票同日重复推送不产生第二张票
+  - 票已有活跃 ticket 时（如 003029 由板块轮动先开），只补事件，不新开
+- 验证：日志出现 `[P-01][bookkeeping] opened ticket#N <code> <name> price=Some(..)`；
+  `SELECT COUNT(*) FROM ticket_lifecycle WHERE source='p01_preopen'` 增长。
+- 做不到：**历史回填拿不到推荐价**——`delivery_decisions.envelope` 里只有
+  `ordered_limit_pool_record_hashes`，没有价格字段。回填脚本
+  (`backfill_p01_tickets.py`) 只能写 NULL，按 BR-222 不补推导值。
+  另：2026-08 ~ 2026-10-09 的 15 个业务日推送正文格式不同，解析不出股票代码，未回填。
+
 ### P2 可买价（观察池 → 入场参考）
 
 - 复用：`decision/holding_plan.rs` 的支撑/压力位逻辑 + `stock_daily` 的 ma5/ma10/ma20/volume_ratio。

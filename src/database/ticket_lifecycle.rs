@@ -143,18 +143,20 @@ pub fn open_ticket(
         #[diesel(sql_type = BigInt)]
         id: i64,
     }
-    diesel::sql_query(
-        "SELECT id FROM ticket_lifecycle WHERE code = ? AND open_date = ? LIMIT 1",
-    )
-    .bind::<Text, _>(code)
-    .bind::<Text, _>(open_date)
-    .get_result::<Id>(conn)
-    .map(|row| row.id)
-    .map_err(|e| format!("ticket id lookup failed ({code} {open_date}): {e}"))
+    diesel::sql_query("SELECT id FROM ticket_lifecycle WHERE code = ? AND open_date = ? LIMIT 1")
+        .bind::<Text, _>(code)
+        .bind::<Text, _>(open_date)
+        .get_result::<Id>(conn)
+        .map(|row| row.id)
+        .map_err(|e| format!("ticket id lookup failed ({code} {open_date}): {e}"))
 }
 
 /// 更新 stage（只在 ticket 仍活跃时生效）。
-pub fn set_stage(conn: &mut SqliteConnection, ticket_id: i64, stage: &str) -> Result<usize, String> {
+pub fn set_stage(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    stage: &str,
+) -> Result<usize, String> {
     diesel::sql_query(
         "UPDATE ticket_lifecycle SET stage = ?, updated_at = CURRENT_TIMESTAMP \
          WHERE id = ? AND close_date IS NULL",
@@ -253,10 +255,7 @@ pub fn find_active_ticket(
 }
 
 /// 取该票的全部生命周期（含已关闭），按 open_date 升序。
-pub fn load_tickets(
-    conn: &mut SqliteConnection,
-    code: &str,
-) -> Result<Vec<Ticket>, String> {
+pub fn load_tickets(conn: &mut SqliteConnection, code: &str) -> Result<Vec<Ticket>, String> {
     #[derive(QueryableByName)]
     struct Row {
         #[diesel(sql_type = BigInt)]
@@ -339,10 +338,8 @@ pub fn count_active(conn: &mut SqliteConnection) -> Result<i64, String> {
         #[diesel(sql_type = BigInt)]
         n: i64,
     }
-    diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM ticket_lifecycle WHERE close_date IS NULL",
-    )
-    .get_result::<Count>(conn)
-    .map(|row| row.n)
-    .map_err(|e| format!("ticket count failed: {e}"))
+    diesel::sql_query("SELECT COUNT(*) AS n FROM ticket_lifecycle WHERE close_date IS NULL")
+        .get_result::<Count>(conn)
+        .map(|row| row.n)
+        .map_err(|e| format!("ticket count failed: {e}"))
 }
