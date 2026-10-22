@@ -11784,7 +11784,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 &auction_hhmm,
                                 limit_pool_date,
                                 &notified_at_tick_start,
-                                stock_analysis::data_gateway::current_auction_observations::AuctionStage::Live,
+                                // 按当前时间选 stage：09:25 前 Live（量比缺属正常），
+                                // 09:25 起 Final（量比唯一可靠来源）。
+                                stock_analysis::data_gateway::current_auction_observations::AuctionStage::for_now(),
                             )
                             .await
                             {

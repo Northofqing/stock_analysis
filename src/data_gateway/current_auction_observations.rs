@@ -16,6 +16,27 @@ pub enum AuctionStage {
     Final,
 }
 
+impl AuctionStage {
+    /// 按当前本地时间选 stage。
+    ///
+    /// - `< 09:25` 用 `Live`：集中撮合还在进行，价格逐段变化。量比只有 09:15
+    ///   首段有值，其余时点缺量比属正常态，**不判失败**（`auction_volume_ratio`
+    ///   是 `Option`，convert 的 numeric 校验用 `.flatten()` 跳过 `None`）。
+    /// - `>= 09:25` 用 `Final`：09:25 集中撮合出终态，这也是量比**唯一可靠**
+    ///   的来源。09:25–09:30 的 Final 通路有效（2026-10-19 的 `phase=matched`
+    ///   修复；此前「final 被拒」是 stage 与 data_status 不匹配，不是契约坏了）。
+    pub fn for_now() -> Self {
+        let now = chrono::Local::now().time();
+        let cutoff = chrono::NaiveTime::from_hms_opt(9, 25, 0)
+            .expect("09:25 是合法的时间常量");
+        if now < cutoff {
+            Self::Live
+        } else {
+            Self::Final
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CurrentAuctionRequest {
     instruments: Vec<InstrumentId>,
