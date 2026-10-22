@@ -68,27 +68,59 @@ class Result:
 
 
 def check_p11(main, days, log_lines):
-    """P1.1 观察池：最近 N 个交易日必须有过 opened>0 或 news_candidates>0。"""
+    """P1.1 观察池：最近 N 个交易日必须真的选出了候选票。
+
+    判定口径（2026-10-22 修正）：看 `board_candidates`，不只看 `opened`。
+
+    原因：`opened=0` 不等于失败 —— 选中的票已在 ticket_lifecycle 里时，
+    走 `appended` 补事件路径，不新开票。2026-10-21 22:13 实测
+    `boards=30 board_candidates=7 board_added=7 total=7 opened=0 appended=7`，
+    观察池明明跑通并选出 7 只，旧口径仍判「未达标」。
+
+    真正表示"观察池空转"的是 `board_candidates=0`。
+    """
     r = Result("P1.1", "观察池构建")
     opened = news_cand = 0
+    board_cand = 0
     ok_days = 0
+    empty_rounds = 0
     for line in log_lines:
+        # 兼容两种历史格式：带 board_candidates 的新格式 / 不带它的旧格式
         m = re.search(
-            r"\[观察池\] news_scanned=(\d+) news_candidates=(\d+).*?total=(\d+) opened=(\d+)",
+            r"\[观察池\] news_scanned=(\d+) news_candidates=(\d+)"
+            r"(?: boards=(\d+) board_candidates=(\d+) board_added=(\d+))?"
+            r".*?total=(\d+) opened=(\d+)",
             line,
         )
         if not m:
             continue
         news_cand += int(m.group(2))
-        opened += int(m.group(4))
-        if int(m.group(2)) > 0 or int(m.group(4)) > 0:
+        candidates = int(m.group(4)) if m.group(4) is not None else int(m.group(6))
+        opened_here = int(m.group(7))
+        board_cand += candidates
+        opened += opened_here
+        if candidates > 0 or opened_here > 0 or int(m.group(2)) > 0:
             ok_days += 1
-    r.detail = f"日志累计 opened={opened} news_candidates={news_cand} 有产出的轮次={ok_days}"
+        elif m.group(4) is not None:
+            empty_rounds += 1
+
+    r.detail = (
+        f"日志累计 board_candidates={board_cand} opened={opened} "
+        f"news_candidates={news_cand} 有产出的轮次={ok_days}"
+    )
     if ok_days > 0:
         r.status = OK
-    elif opened == 0 and news_cand == 0:
+        if opened == 0:
+            r.detail += " | opened=0 属正常（选中的票已在库，走 appended 补事件）"
+    elif empty_rounds > 0:
         r.status = FAIL
-        r.detail += " | 新闻通道 0 产出（依赖 news_ai_assessment）"
+        r.detail += (
+            f" | {empty_rounds} 轮 board_candidates=0，观察池真空转"
+            "（查 BoardFlows / 东财 BK 成分股 / news_ai_assessment）"
+        )
+    else:
+        r.status = FAIL
+        r.detail += " | 日志里没有观察池轮次（调度未触发或日志已被轮转）"
     return r
 
 

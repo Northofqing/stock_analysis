@@ -39,13 +39,35 @@
 
 ### P1 让票真的被跟踪（一切的前置）
 
-P1.1 monitor 每日调度观察池
+P1.1 monitor 每日调度观察池 — **已完成（2026-10-19 上线，10-21/10-22 两轮加固）**
 
 - 位置：`src/bin/monitor/main.rs::market_loop`，按 `static X_LAST: Mutex<Option<NaiveDate>>` 模式。
 - 时机：交易日 15:40 之后（盘后，新闻评估已产出），每日一次。
 - 动作：`ticket_watch_pool::build_watch_pool(db, date, lookback=5, dry_run=false)`。
-- 验证：日志出现 `[观察池] scanned=N candidates=M opened=K appended=J`；
-  `SELECT COUNT(*) FROM ticket_lifecycle WHERE source='news_catalyst'` 增长。
+- **四个选票入口（2026-10-21 扩到 4 个）**：
+
+  | 入口 | source | 数据来源 | 状态 |
+  |---|---|---|---|
+  | 新闻催化 | `news_catalyst` | `news_ai_assessment` | **断供**（停 10-14，见已知约束 6.2） |
+  | 板块轮动 | `board_rotation` | 当日板块榜 top10 的成分股 | 已通 |
+  | P01 盘前热点 | `p01_preopen` | `LimitPools`（前一交易日涨停池） | 已通 |
+  | 实际持仓 | `holding` | `stock_position` | 已通 |
+
+- **板块轮动的选票优先级（2026-10-21 改，`8b41528ae` + `7e1f13b3f`）**：
+
+  ```
+  今日涨停 > 板块龙头 > 日线涨停 > 涨幅降序 > 涨幅缺失（BR-222 不补 0）
+  ```
+
+  - `LIMIT_UP_PCT = 9.85`，用 `pct_chg` 判涨停，**不依赖 `stock_daily.is_limit_up`**
+    （该列在 `kline.rs:650` / `repository.rs:92,254` 硬编码 false，不可信）。
+  - 板块龙头取实时 `BoardFlows.leader_code`，不落库（避免触发 BR-159 验链）。
+  - **板块成分股必须用东财 BK 码**：`board_ranking_daily`（东财 `BK1512 生猪养殖`）与
+    `board_member`（TDX `tdx:industry:融资融券`）**名字和代码交集都是 0**，语义也不同
+    （行业细分 vs 风格题材）。所以 `BoardConstituents` 按 BK 码走 ExternalV1 通道。
+- 验证：日志 `[观察池] boards=N board_candidates=M board_added=K total=T opened=O appended=A`。
+  **`opened=0` 不等于失败** —— 选中的票已在库里时会走 `appended` 补事件路径。
+  判"有没有产出"看 `board_candidates > 0`。
 - 做不到：输入源断供时（`news_ai_assessment` 无新增）只会开存量票，日志必须如实报 0。
 
 P1.2 推送 → ticket_event 自动记账（best-effort）
@@ -90,13 +112,31 @@ P1.3 op 67 价格带每日落库
   (`backfill_p01_tickets.py`) 只能写 NULL，按 BR-222 不补推导值。
   另：2026-08 ~ 2026-10-09 的 15 个业务日推送正文格式不同，解析不出股票代码，未回填。
 
-### P2 可买价（观察池 → 入场参考）
+### P2 可买价（观察池 → 入场参考）— **已完成（2026-10-21，`32628135f`）**
 
-- 复用：`decision/holding_plan.rs` 的支撑/压力位逻辑 + `stock_daily` 的 ma5/ma10/ma20/volume_ratio。
-- 输出：**参考区间 + 触发条件**，不是单一价格。例："12.30-12.55 区间，需放量站上 ma5"。
-- 写入：`ticket_event(kind=entry_proposed)` + `ticket_lifecycle.stage='entry_proposed'`。
-- 验证：dry-run 输出每个候选的区间与依据字段（ma/量比/前高）。
+- 实现：`src/monitor/ticket_entry_proposal.rs::propose_for_observing`
+  **复用 `buy_zone::compute`**，不另写价位算法。
+- 输出：**参考区间 + 触发条件**，不是单一价格。实测产出例：
+  `22.82-23.28｜回踩 ma10 23.05 附近可买；确认条件：量比>1.2｜放弃 19.34`
+- 分型给区间（按 `buy_zone` 的均线判型）：
+  - **多头**：`entry = ma10 ±1%`，放弃价 `max(ma20, 20日低) × 0.99`
+  - **空头 / 纠缠**：上沿 `min(close×1.01, ma5)`，下沿不低于 20 日低
+  - **已在 20 日低附近**：只报放弃价，不报买入区间
+- 跳过规则（不推进，写日志说明原因，**不编区间**）：
+  - 连板 / 近 5 日涨幅过大 / 偏离 ma5 超买 → `skipped_overheat`
+  - 数据不足（无 `stock_daily`）→ `skipped_no_data`（BR-222）
+  - 已在支撑位 → `skipped_at_support`
+  - 同日同票已有 `entry_proposed` → `skipped_duplicate`
+- 写入：`ticket_event(kind=entry_proposed)` + `ticket_lifecycle.stage='observing' → 'entry_proposed'`。
+- **下游必须同步改 stage 查询**（2026-10-21 修）：
+  `buy_zone_dispatch.rs:304` 与 `ticket_eviction.rs:98` 由 `stage = 'observing'`
+  改为 `stage IN ('observing','entry_proposed')`，否则票推进后从明日计划消失、且永不淘汰。
+- 验证：日志 `[入场参考] scanned=N proposed=P overheated=O at_support=S no_data=D duplicate=U errors=E`；
+  `SELECT COUNT(*) FROM ticket_event WHERE event_kind='entry_proposed'` 增长。
+- 实测（2026-10-22 10:24 验收）：`entry_proposed` 事件 33 个、状态 32 个，`observing` 从 40 降到 10。
 - 做不到：不预测涨停；无 `stock_daily` 覆盖的票不给区间（只标注"数据不足"）。
+  P01 回填那批（603096/603533/605058/002343/600825/000530/002696/002724）就是这一类，
+  它们的 `observing` 会一直停着，直到补齐日线。
 
 ### P3 定向监控（观察池的票）
 
@@ -339,3 +379,91 @@ $ holding_plan_probe 601811 2026-10-16
 - `Owned` 分支从未被测到过（生产库里 9-23 之前的 HoldingPlan 记录也不会有
   correlation 观测，所以历史决策读出来都是 `Missing`）。
 - 修复后能不能真的产生新决策：要等下一个交易日的 I-04 触发。
+
+## 七、已知约束（2026-10-22 补，此前散落在代码注释和排查记录里）
+
+这一节记的不是"待做项"，是**已经确认的系统性约束**。每条都改变了某段代码的正确写法，
+但之前没有写进任何文档，导致同一类问题反复被当成新故障排查。
+
+### 7.1 DataMode 是全局的，L5 用它判所有推送 —— 会误伤不依赖行情的推送
+
+```
+push_l5/governance.rs:181
+  ctx.data_mode > profile.data_mode_min → Deny("data_quality")
+
+v14_adapter.rs:1515  is_live_trading_kind() 里的 16 个 PushKind → data_mode_min = Degraded
+                     其余 → Down
+```
+
+`DataMode` 由**全局能力集**决定（`data_mode.rs`：Quote staleness > 120s → Unsafe），
+但**推送的数据来源各不相同**：
+
+| 推送 | 实际数据源 | L5 依据 |
+|---|---|---|
+| P-02 竞价量能 | op 61 `CurrentAuctionObservations` | 全局 DataMode |
+| HoldingPlan / T0Advice | `RealtimeQuotes` | 全局 DataMode |
+| 收盘总结 / 复盘 | 日线 + 账户快照 | 全局 DataMode |
+
+2026-10-22 实测：op 61 `outcome=available accepted=50`，数据完全正常，但因为
+`RealtimeQuotes` 失败导致 `DataMode=Unsafe`，P-02 被 `Deny(data_quality)` 拒推。
+
+**结论**：L5 的 `data_mode_min` 与推送真实数据源之间没有映射关系。
+要修有两步：短期把不依赖实时报价的 kind 移出 `is_live_trading_kind`；
+长期建 `PushKind → 所需数据能力` 的映射表。**这两步都还没做。**
+
+### 7.2 `RealtimeQuotes` 是价格型功能的共同上游，它一断全断
+
+2026-10-22 实测：`Sina` 与 `Tencent` 双 provider 同时返回
+`no_verified_batch / 服务端内部错误`，连锁后果：
+
+```
+P3.3 同板块关联票        62 次「关联票查询失败」→ 规则空转
+[竞价][Scanner]          consumer_unavailable=scanner_realtime_quote_not_acquired
+P-02 竞价量能            DataMode=Unsafe → L5 Deny(data_quality)
+持仓价格检测             「持仓价格检测暂停」
+```
+
+**排查顺序**：任何"价格型推送没发""票没被跟踪"的现象，**先看 RealtimeQuotes 通不通**，
+再往下看业务逻辑。直接查业务层会绕远。
+
+### 7.3 集合竞价的量比只有 final 有，live 只有 09:15 首段
+
+```
+AuctionStage::for_now()   （2026-10-22，c7102301c）
+  < 09:25  → Live
+  >= 09:25 → Final
+```
+
+- `live` 阶段的 `auction_volume_ratio` 只在 **09:15 首段**有值，其余时点返回 null。
+  convert 层对此是宽容的（`auction_volume_ratio: Option<f64>`，`numeric` 校验用
+  `.flatten()` 跳过 None），**不判失败**。
+- 但 `prepare_auction_volume_snapshot:8546` 仍把无量比的票整条丢弃
+  （2026-10-22 09:20 实测 `valid_rows=0 / missing_volume_ratio_rows=50`）。
+  **这条没改**——量能榜没有量比就没有排序依据，改成"照收"需要先定
+  09:25 前的排名口径。
+- 结论：**09:25 前 P-02 不该产生量能榜**，这是数据属性决定的，不是 bug。
+
+### 7.4 `no_last_traded_price` 的隔离逻辑尚未经过任何真实流量
+
+`e014bb75f` 加了 `KnownReasonCode::NoLastTradedPrice` 和
+`GrpcSource::realtime_quotes_with_isolation()`（二分隔离坏票）。
+但截至 2026-10-22，生产日志里该 reason_code 出现 **0 次**——Windows 还没开始发这个码。
+
+**这行代码是空转的**。验证方法：等日志出现
+`[观察池] RealtimeQuotes 被 no_last_traded_price 拒绝, 二分隔离后 取到 N 只 / 隔离 M 只`
+才算真正跑过。
+
+另：proto 的 `ErrorDetail`（全部 35 份版本）都**没有** instruments 列表字段，
+所以"按消息里的票列表剔除"在现有契约下无法实现，二分是唯一可行解。
+要和列表方案，需要 Windows 在 `ErrorDetail` 加 `repeated string instruments = 12`。
+
+### 7.5 个股新闻通道断供（2026-10-14 起）
+
+`news_ai_assessment` 最后一条 **2026-10-14**，之后 7 天零新增。
+后果：观察池的 `news_candidates=0`，四个选票入口里的"新闻催化"这一路
+**七天没有进过一张票**。
+
+排查入口（未查）：`main.rs:9333` 的 `admitted` 过滤。
+
+**注意区分**：全球新闻路径正常（`news_ai_global_critical_v1` 一直在跑，
+`seq` 持续增长），断的只是个股那条。
