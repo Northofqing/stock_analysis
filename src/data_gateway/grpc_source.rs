@@ -2575,6 +2575,22 @@ where
     block_on(future)
 }
 
+/// `realtime_quotes_with_isolation` 的结果。
+///
+/// 刻意不用 `GatewayBatch`：不同子批的 `batch_id` 不同，把多批结果拼进一个
+/// `GatewayBatch` 会伪造批次身份（BR-159 验链会失效）。隔离出来的票单独列，
+/// 由调用方决定是走 OrderBooks 兜底还是本轮丢弃。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RealtimeQuoteIsolation {
+    /// 成功取到的行情（可能来自多个子批，各自带自己的 batch_id）。
+    pub quotes: Vec<RealtimeMarketQuote>,
+    /// 需要调用方兜底的票：单票仍报 no_last_traded_price，或整批非该原因失败，
+    /// 或二分请求数触顶。**没有价格**，不要当 0 用。
+    pub isolated: Vec<String>,
+    /// 实际发出的请求数，用于观测二分代价。
+    pub requests: usize,
+}
+
 /// gRPC 客户端桥: 每 op 一个查询方法, 内部 client.query (§10 重试语义) + convert。
 /// 连接是惰性 async (`ensure_connected`, 在方法层做) — 同步方法在 blocking 线程
 /// 经 block_on 调用, async 方法在 runtime worker 调用; 首连放在方法层避免
@@ -3545,6 +3561,72 @@ impl GrpcSource {
             batch.evidence().provider,
         )?;
         Ok(batch)
+    }
+
+    /// 整批 RealtimeQuotes 被 `no_last_traded_price` 拒绝时，二分隔离坏票后重试。
+    ///
+    /// 背景：provider 对「当日无最新成交价」的 instrument（停牌 / 未开盘 /
+    /// 一字板封死）会把整批请求判失败。这一条是业务态不是故障，不该让一只
+    /// 票拖垮整批行情。
+    ///
+    /// 策略：整批失败 → 对半拆 → 逐层拆到单票。复杂度 O(k·log n)，k 是坏票数；
+    /// 全部坏票的极端情况退化成 O(n)。请求数上限 `MAX_BISECT_REQUESTS` 兜底，
+    /// 超限的 chunk 直接判为坏票。
+    ///
+    /// 注意：不同子批的 `batch_id` 不同，**不能**把多批结果拼成一个
+    /// `GatewayBatch`（那会伪造批次身份）。所以这里返回独立结构，由调用方
+    /// 决定怎么用；本函数不造价格、不补 previous_close。
+    pub(crate) async fn realtime_quotes_with_isolation(
+        &self,
+        codes: &[String],
+    ) -> RealtimeQuoteIsolation {
+        const MAX_BISECT_REQUESTS: usize = 64;
+
+        let mut accepted: Vec<RealtimeMarketQuote> = Vec::new();
+        let mut isolated: Vec<String> = Vec::new();
+        let mut queue: Vec<Vec<String>> = vec![codes.to_vec()];
+        let mut requests = 0usize;
+
+        while let Some(chunk) = queue.pop() {
+            if chunk.is_empty() {
+                continue;
+            }
+            if requests >= MAX_BISECT_REQUESTS {
+                isolated.extend(chunk);
+                continue;
+            }
+            requests += 1;
+
+            let answer = self
+                .query_op(
+                    Operation::RealtimeQuotes,
+                    serde_json::json!({ "codes": chunk }),
+                )
+                .await;
+            match answer {
+                Ok(q) => match convert::realtime_quotes_at(&q, chrono::Utc::now()) {
+                    Ok(GatewayBatch::Available { records, .. }) => accepted.extend(records),
+                    Ok(GatewayBatch::VerifiedEmpty(_)) => isolated.extend(chunk),
+                    Err(_) => isolated.extend(chunk),
+                },
+                Err(error) => {
+                    let no_price = error.reason_code() == "no_last_traded_price";
+                    if no_price && chunk.len() > 1 {
+                        let mid = chunk.len() / 2;
+                        queue.push(chunk[..mid].to_vec());
+                        queue.push(chunk[mid..].to_vec());
+                    } else {
+                        isolated.extend(chunk);
+                    }
+                }
+            }
+        }
+
+        RealtimeQuoteIsolation {
+            quotes: accepted,
+            isolated,
+            requests,
+        }
     }
 
     /// Quote-only permissive ingress. Shared evidence stays strict while

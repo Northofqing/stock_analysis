@@ -132,6 +132,28 @@ pub async fn scan(
     let quotes = match bridge.realtime_quotes_async(&codes).await {
         Ok(GatewayBatch::Available { records, .. }) => records,
         Ok(GatewayBatch::VerifiedEmpty(_)) => return Ok(Vec::new()),
+        // 整批被「当日无最新成交价」拒绝（停牌 / 未开盘 / 一字板封死）。
+        // 这条是业务态不是故障，二分隔离出坏票，好票继续参与异动判断；
+        // 坏票本轮直接丢，不造价格（BR-222）。
+        Err(error) if error.reason_code() == "no_last_traded_price" => {
+            let isolated = bridge.realtime_quotes_with_isolation(&codes).await;
+            log::warn!(
+                "[观察池] RealtimeQuotes 被 no_last_traded_price 拒绝, 二分隔离后 \
+                 取到 {} 只 / 隔离 {} 只 / 请求 {} 次{}",
+                isolated.quotes.len(),
+                isolated.isolated.len(),
+                isolated.requests,
+                if isolated.isolated.is_empty() {
+                    String::new()
+                } else {
+                    format!("（隔离: {}）", isolated.isolated.join(","))
+                }
+            );
+            if isolated.quotes.is_empty() {
+                return Ok(Vec::new());
+            }
+            isolated.quotes
+        }
         Err(error) => return Err(format!("行情拉取失败: {error}")),
     };
 

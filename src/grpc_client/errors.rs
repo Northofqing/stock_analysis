@@ -365,6 +365,10 @@ enum KnownReasonCode {
     ExternalQueryRejected,
     ProviderResponseInvalid,
     SourcePreconditionFailed,
+    /// 业务态: 该 instrument 当日无最新成交价（停牌/未开盘/一字板封死），
+    /// 由 provider 分类，非服务故障。RealtimeQuotes 收到后先剔除再重试，
+    /// 仍失败的票走 OrderBooks（买卖盘报价）。
+    NoLastTradedPrice,
 }
 
 impl KnownReasonCode {
@@ -395,6 +399,7 @@ impl KnownReasonCode {
             "external_query_rejected" => Self::ExternalQueryRejected,
             "provider_response_invalid" => Self::ProviderResponseInvalid,
             "source_precondition_failed" => Self::SourcePreconditionFailed,
+            "no_last_traded_price" => Self::NoLastTradedPrice,
             _ => return None,
         })
     }
@@ -426,6 +431,7 @@ impl KnownReasonCode {
             Self::ExternalQueryRejected => "external_query_rejected",
             Self::ProviderResponseInvalid => "provider_response_invalid",
             Self::SourcePreconditionFailed => "source_precondition_failed",
+            Self::NoLastTradedPrice => "no_last_traded_price",
         }
     }
 }
