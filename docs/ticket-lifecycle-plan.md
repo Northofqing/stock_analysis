@@ -12,6 +12,7 @@
 - 2026-10-20：观察池选股表现存档（perf_log 16:05）上线——**本文件此前漏记，2026-10-22 补**。
 - 2026-10-21：选票入口扩到 4 个（+P01 +持仓）；板块选票优先级（涨停>龙头>涨幅）；P1.4 P01 自动开票（推荐价=昨收）；P2 可买价完成；下游 stage 查询同步修（buy_zone_dispatch.rs:304 / ticket_eviction.rs:98）。
 - 2026-10-22：P-02 stage 按时间切换（c7102301c）；`no_last_traded_price` 隔离重试（e014bb75f，未经过真实流量）；第一轮全面评审（见「调整记录」）。
+- 2026-10-23：批 0 入库（eddb6d49e）；批 1 分型体系全部落地 + 批 2 七项接线 + 批 4.1/4.2 口径修正（见「1.7 实施记录」）。
 
 ## 调整记录
 
@@ -802,9 +803,9 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
 `STOCK_DB=<运行根>/data/stock_analysis.db ./target/release/daily_bars_build --date 2026-10-22 --all`，
 新版本自带 10s 单只超时、每 200 只一事务、45 分钟预算，跑完看 `fetched / failed` 与覆盖。
 
-### 批 1 分型体系
+### 批 1 分型体系 — **已完成（2026-10-23）**
 
-**1.1 分型（regime）计算（D1/D2 的地基）**
+**1.1 分型（regime）计算（D1/D2 的地基）— 已完成（2026-10-23）**
 
 - 存储：**不加列**——用 `ticket_event(kind='regime', summary='emotion|trend|<reason>')`，
   每日 **15:42**（观察池建完）对 active tickets 重算，取每票最新一条为当前型。
@@ -813,13 +814,13 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
   （阈值按 1.2 分板）；其余趋势型。
 - 验证：日志 `[分型] emotion=N trend=M`；SQL 每票最新 regime。
 
-**1.2 20cm 阈值分档（修 B.10）**
+**1.2 20cm 阈值分档（修 B.10）— 已完成（2026-10-23）**
 
 - 新增 util `limit_up_pct(code)`：300/301/688/689 → **19.5**，其余 → **9.85**；
   替换 `ticket_watch_pool::LIMIT_UP_PCT` 全部用法、regime 判定、回测脚本。
 - 边界：ST 5% 板无名称源可判别，不处理，文档注明。
 
-**1.3 情绪票竞价买价（Q2=c / Q4=0.5%）**
+**1.3 情绪票竞价买价（Q2=c / Q4=0.5%）— 已完成（2026-10-23）**
 
 - 位置：`auction_watch_loop`（main.rs:14437），09:25-09:32 `observe()` 拉完调出口。
 - 动作：取 regime=emotion 活跃票，按竞价涨幅分档：`>+6%` 不给价（「高开过多不追」）；
@@ -828,7 +829,7 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
   marker `data/auction_price/<date>`。
 - 验证：日志 `[竞价买价] emotion=N quoted=Q skipped_high=K`；marker 存在。
 
-**1.4 盘中突破确认（Q5=昨日最高价，复用 candidate_triggered 模板）**
+**1.4 盘中突破确认（Q5=昨日最高价）— 已完成（2026-10-23，模板未用，见 1.7 偏差 2）**
 
 - 位置：`watch_pool_monitor::scan` 新增第五规则。缓存：每日 09:26 / 13:01 预热
   entry_proposed 票的 `buy_zone::compute` 与昨高（`stock_daily.high`），内存 HashMap，
@@ -840,7 +841,7 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
   无分钟线回测，上线后观察记录两周。
 - 验证：日志 `[触发确认] scanned=N triggered=M`；表行数增长。
 
-**1.5 价格失效（entry_invalidated，复用另一模板）**
+**1.5 价格失效（entry_invalidated）— 已完成（2026-10-23，板块退出条件未做，见 1.7 偏差 3）**
 
 - 条件任一：现价 < 放弃价（缓存同上）；所属板块退出 top10（C 规则日检）；thesis 失效
   （批 2）；时效——趋势型超 3 交易日、情绪型跨日。
@@ -848,22 +849,62 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
   **只作废价格，不淘汰票**（stage 不变）。
 - 验证：日志 `[价格失效] n=`；事件表增长。
 
-**1.6 淘汰/复盘窗参数化（D2）**
+**1.6 淘汰/复盘窗参数化（D2）— 已完成（2026-10-23）**
 
 - `ticket_eviction`：emotion → `MAX_OBSERVE_DAYS=5`；trend → 10（现行为）；型别取 1.1 事件。
 - `watch_pool_perf`：emotion 批 D+1/D+3、trend 批 D+5/D+10 分列输出。
 - 验证：淘汰日志 reason 带型别；perf_log 两段。
 
-### 批 2 接线拓展
+**1.7 实施记录（2026-10-23，批 1 全部落地）**
 
-**2.1 09:25 板块热度（拓 1.1，并入 1.3 同一条消息）**：竞价 rows 按 board_member 聚合，
+批 0 先入库成独立 commit `eddb6d49e`（工作区原本挂着 8 个未提交文件，
+没有可回滚基线就无法判断本批改动是否真把问题修好）。
+
+| 项 | 落地位置 | 实际动作 |
+|---|---|---|
+| 1.1 | `monitor/ticket_regime.rs`（新）+ `main.rs` 15:37 块 | `Regime::{Emotion,Trend}`、`classify`、`resolve`（无事件则现算）、`recompute_active`。写 `ticket_event(kind='regime', summary='emotion\|理由')`；**只在型别/理由变化时追加**，值相同跳过（重启重放不产生重复行）。`observe_days()` 5/10、`perf_periods()` D+1/D+3 与 D+5/D+10 由这一处定义，淘汰/复盘/竞价买价/触发确认全部复用。 |
+| 1.2 | `ticket_regime::limit_up_pct` | 300/301/688/689 → 19.5，其余 9.85。替换 `ticket_watch_pool` 的 `LIMIT_UP_PCT` 常量与 `buy_zone` 的 `LIMIT_UP_PCT_THRESHOLD`（原 9.8，20cm 板连板数虚高 → 超买门误杀）。回归测试：`300750` +10.02% 判趋势型、`002696` +10.02% 判情绪型。 |
+| 1.3 | `monitor/ticket_auction_price.rs`（新）+ `auction_watch_loop` | 复用同一批 `AuctionRow`（不额外拉 op 61）。分档：>+6% 不给价 / +2~+6% 轻仓 / -2~+2% 上浮 0.5% 保成交 / <-2% 低开博弈区；正文固定带「竞价买入当日 T+1 不可卖」。推送成功才写 marker `data/auction_price/<date>`，失败保留重试。无情绪型票 → 不推空消息，日志写「不是失败」。 |
+| 1.4 | `monitor/ticket_entry_trigger.rs`（新）+ `watch_pool_monitor_loop` | 每日 09:26 / 13:01 两个槽位预热 `entry_proposed` 票的昨高 + `buy_zone` 区间 + 分型（内存 HashMap），扫描只比价。条件：现价 ≥ 昨高 且 当日涨幅 < 6%。命中写 `candidate_trigger_selection`（PK 天然 1 票/日一次）+ `ticket_event(kind='entry_triggered')`，即时推送。 |
+| 1.5 | 同上 + `main.rs` 15:42 块 | 盘中：现价 < 放弃价 → `kind='entry_invalidated'`（摘要不带现价，带进去永远判不出重复）。盘后：趋势型 > 3 个交易日、情绪型跨日未触发 → 同一事件。**只作废价格，不改 stage**。 |
+| 1.6 | `ticket_eviction` + `watch_pool_perf` | 淘汰上限取 `ticket_regime::resolve(...).observe_days()`，reason 带型别；`watch_pool_perf` 分两段输出（情绪 D+1/D+3、趋势 D+5/D+10），CLI `--days` 仍可显式窗口。 |
+
+与方案原文的偏差（以代码为准）：
+
+1. **1.1 调度从 15:42 提前到 15:37**。15:38 的淘汰要用当日分型决定观察期上限，
+   排在淘汰之后等于永远用昨天的型；分型只依赖日线，15:37 可算，不需要等 15:40 观察池。
+2. **1.4 没有用 `render_candidate_triggered` 模板**。该模板必填 `grade` / 三类证据质量 /
+   仓位上限，这些在本链路没有数据源，硬填等于编造（BR-222）。改为简明文案
+   （`⚡ 突破确认 代码 名称 现价 涨幅 — 型别｜突破昨高 …；区间 …`），
+   `candidate_trigger_selection` 照原方案落表，后续接上证据质量再换模板。
+3. **1.5 的「所属板块退出 top10」条件未实现**。`board_member` 只覆盖成分拉取成功的板块，
+   「表里没有」≠「不属于」，用它作废价格会误杀；明日计划的 C 规则已经在做同一件事，
+   再叠一条会重复扣票。已改为 2.8 的「所属板块退潮」标注（提示不拦截）。
+4. **1.6 的 perf 分母变了**：来源从 `board_rotation/news_catalyst` 扩到
+   `+p01_preopen/money_flow/holding` —— 原来 P01 与资金流票完全不在选股表现里，
+   等于只统计了一半推荐。
+
+验证（本机，2026-10-23 深夜，**非交易时段**）：
+
+- `cargo check --lib --bin monitor` 通过（仅存量 unused 警告）。
+- `cargo test --lib ticket_`：33 passed / 0 failed（含 1.1 的 5 个、1.2 的板别阈值、
+  1.3 的 5 个分档、1.4/1.5 的 4 个判据）。`cargo test --lib watch_pool_perf` 同批跑。
+- **没有产出可验**：分型/竞价/触发全部依赖交易时段与实时行情，今晚只能证明「编得过、测得过」。
+  真正的验收是下一交易日：日志出现 `[分型] scanned= emotion= trend=`、
+  `[竞价买价] emotion=N quoted=Q`、`[触发确认] 预热`、`[价格失效] 时效检查`，
+  且 `scripts/phase_acceptance.py` 新增的「批1.1/1.3/1.4/1.5」四项至少达到「部分」。
+- 运行根未部署：本批只改主仓；部署按规则 3（两次 release + `diff -rq` + 盘后重启）。
+
+### 批 2 接线拓展（2026-10-23：11 项完成 7 项）
+
+**2.1 09:25 板块热度（拓 1.1，并入 1.3 同一条消息）— 已完成（2026-10-23）**：竞价 rows 按 board_member 聚合，
 输出 top5「板块名 + 竞价均涨幅 + 竞价量比中位」；不足 5 个按实际。
 
 **2.2 thesis 存档与理由失效（拓 1.3）**：open_ticket 时写 `kind='thesis'`
 （板块/催化/来源）；每日 **15:50** 核对板块是否仍在 top10（board_ranking_daily 前一交易日），
 不在且连续 2 日 → `kind='thesis_invalidated'`；eviction 增第三规则（理由失效出池）。
 
-**2.3 资金流选票入口（拓 7）**：观察池新增 `collect_money_flow_boards`——读
+**2.3 资金流选票入口（拓 7）— 已完成（2026-10-23）**：观察池新增 `collect_money_flow_boards`——读
 `board_ranking_daily rank_fid='f62'` 前一日 top10 → 成分股取涨幅前 3，source='money_flow'；
 日志 `mf_candidates=N`；10-21 前无 f62 数据则跳过（不补造）。
 
@@ -876,7 +917,7 @@ post_close_news_review 与盘中 scan 新闻规则改用 `entity_linker` 对 new
 **2.6 ReviewLhb 接入复盘**：LHB 复盘生成后，对活跃 emotion 票匹配，写 `kind='lhb'`
 摘要（席位/净买额）；链路走网关直取，不依赖死表 lhb_daily。
 
-**2.7 排雷（拓 6 部分）**：每日 **16:20** 扫 F10 四类文本关键词
+**2.7 排雷（拓 6 部分）— 已完成（2026-10-23）**：每日 **16:20** 扫 F10 四类文本关键词
 （退市/立案/预亏/商誉减值/减持/解禁，取原文 40 字片段），命中写 `kind='risk_flag'`；
 render_plan 渲染「⚠ 有雷」；event_calendar 可用则加解禁/财报日历行。
 边界：关键词误报，两周调词表。
@@ -884,19 +925,43 @@ render_plan 渲染「⚠ 有雷」；event_calendar 可用则加解禁/财报日
 capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧零消费——
 公告通道不是不存在，是没接线；F10 关键词扫是过渡，公告 op 探针通过后可升级为权威源。
 
-**2.8 fading × 持仓（拓 4.1）**：**15:36**（轮动信号 15:34 之后）fading ∪ board_member
+**2.8 fading × 持仓（拓 4.1）— 已完成（2026-10-23）**：**15:36**（轮动信号 15:34 之后）fading ∪ board_member
 × 持仓/ticket，render_plan 头部逐票标注「所属板块退潮」。
 
-**2.9 监控分级（拓 2.1）**：scan 规则分级——L1（价格 ±3%、新闻命中）→ push_wechat
+**2.9 监控分级（拓 2.1）— 已完成（2026-10-23）**：scan 规则分级——L1（价格 ±3%、新闻命中）→ push_wechat
 即时（限 1 次/票/30min）；L2（tick 变动、关联票）→ 仅日志（现行为）。
 
-**2.10 止盈/目标价（拓 3.1）**：render_plan 持仓段加目标价 = 20 日最高、
+**2.10 止盈/目标价（拓 3.1）— 已完成（2026-10-23）**：render_plan 持仓段加目标价 = 20 日最高、
 移动止盈线 = max(成本, 近 5 日低) 破位提示；不做自动卖。
 
-**2.11 priority 排序接线（拓 8）**：render_plan 新买入段按 `rank_watch_pool` 分数排序，
+**2.11 priority 排序接线（拓 8）— 已完成（2026-10-23）**：render_plan 新买入段按 `rank_watch_pool` 分数排序，
 标注 ①②③ 建议顺序。
 
-### 批 3 预算层（Q3=30%）
+**2.12 实施记录（2026-10-23，批 2 完成 7/11）**
+
+| 项 | 落地位置 | 实际动作 | 验收看什么 |
+|---|---|---|---|
+| 2.1 | `ticket_auction_price::board_heat` | 竞价 rows 按 `board_member` 聚合，只取成员 ≥2 的板块，按竞价均涨幅取前 5，量比给中位数；并入 1.3 同一条消息（不另推）。 | 竞价推送正文出现「📊 板块热度」段 |
+| 2.3 | `ticket_watch_pool::collect_money_flow_boards` | 把板块路抽成 `collect_board_picks(board_date, rank_fid, source, label, …)`，f3→`board_rotation`、**前一交易日 f62**→`money_flow`。f62 无数据返回 0，不补造。 | 观察池日志 `mf_boards= mf_candidates= mf_added=`；`phase_acceptance.py` 的「批2.3」 |
+| 2.7 | `monitor/ticket_risk_flag.rs` + `main.rs` 15:52 | F10 四类原文扫 6 个关键词（退市/立案/预亏/商誉减值/减持/解禁），命中写 `kind='risk_flag'` + 抽 ±20 字片段，一条消息汇总推送；`render_plan` 持仓段与新买入段渲染「⚠ 有雷（标注，不挡操作）」。 | 日志 `[排雷] scanned= hits= written=`；明日计划正文出现「⚠ 有雷」 |
+| 2.8 | `buy_zone_dispatch::render_plan` | 读 `board_rotation_signal status='fading'`，持仓票与新买入票逐票标「⚠ 所属板块退潮」。 | 退潮板块的持仓票正文多一行 |
+| 2.9 | `watch_pool_monitor_loop` | L1（价格 ±3%、新闻命中）→ `push_wechat` 即时，沿用 30 分钟同票同因去重；L2（较上次急变、同板块关联票）→ 仅日志。 | 日志出现 L1 推送；L2 仍只进日志 |
+| 2.10 | `buy_zone_dispatch` 持仓段 | 目标价 = 20 日最高（参考）；移动止盈 = max(成本, 近 5 日低)，跌破提示；不自动卖、不改建议动作。 | 持仓段出现「目标价」「移动止盈」两行 |
+| 2.11 | `buy_zone_dispatch` 新买入段 | 按 `ticket_priority::rank_watch_pool` 分数降序，①②③ 标建议顺序并附分数；取不到分数退回建议仓位排序并在正文写明。**只排序不拦截**。 | 新买入候选按分数从高到低，第四名起用数字 |
+
+未做（保持原状，没有半实现）：
+
+- **2.2 thesis 存档/理由失效**：存档一步即可（`open_ticket` 时写 `kind='thesis'`），
+  但「连续 2 日不在 top10 → 理由失效并出池」与明日计划的 C 规则、2.8 的退潮标注
+  是同一判据的第三次实现，先确认要合并还是分工，再动手（方案 8.6 A.2 也要求先定这件事）。
+- **2.4 新闻降级（entity_linker）**：`news_ai_assessment` 断供要先确认恢复路径；
+  降级链一旦上线会和恢复后的主链重复记账，需先定「谁优先」。
+- **2.5 概念扩展（concept_peers 并入 P3.3）**：`peers_of` 每次全表扫描，
+  16 只票一轮就是 16 次全扫；要先改成一次装载再按票分组，否则 30 秒一轮会压库。
+- **2.6 ReviewLhb 接入复盘**：LHB 是投递链路产物，不是库表；需要先从投递归档解码
+  才能拿到席位数据，属独立探源项。
+
+### 批 3 预算层（Q3=30%）— 未开工（见 3.4）
 
 **3.1 周预算状态**：本周已用 = 本周新增持仓成本（快照 `position_opened` 对应
 quantity × snapshot cost_price 求和）；预算 = 总资产（user_account_summary，缺则
@@ -907,17 +972,33 @@ quantity × snapshot cost_price 求和）；预算 = 总资产（user_account_su
 **3.3 排序花钱**：候选按 priority 分数降序，逐票标「建议顺序 / 占用预算 / 剩余预算」；
 超预算标「排队」——**不拦截**。
 
-### 批 4 复盘归因
+**3.4 状态（2026-10-23）：未开工。** 前置是一件没定的事：本周新增仓位的权威口径。
+方案写「快照 `position_opened` 对应 quantity × 快照 cost_price」，但 `position_opened`
+事件只在相邻两份快照的差量里产生，跨周的第一份快照没有基线；用
+`trade_ledger` 的推断买入又是另一套口径（BR-215 允许它缺）。两个口径对不上时
+预算会算错，而预算层只标注不拦截——错标注比没有标注更误导。先定口径，再写代码。
 
-**4.1 perf_log 口径修正（修 B.11）**：基准价按 source 分——`p01_preopen` → open_date
+### 批 4 复盘归因（2026-10-23：4.1/4.2 完成）
+
+**4.1 perf_log 口径修正（修 B.11）— 已完成（2026-10-23）**：基准价按 source 分——`p01_preopen` → open_date
 **开盘价**（当日可买）；其余 → open_date 收盘价。
 
-**4.2 基准对照**：批次胜率旁加「全市场等权同日收益」；样本 <800 标「基准不可信」。
+**4.2 基准对照 — 已完成（2026-10-23）**：批次胜率旁加「全市场等权同日收益」；样本 <800 标「基准不可信」。
 
 **4.3 入口归因周报（拓 5.1 + 5.2）**：**周五 17:00** 聚合按 source × D+1/D+3
 胜率/均值/超额；亏损票条件对照附后；push_wechat 简化版（报告整理简化后推送）。
 
 **4.4 归档**：周报同时写 `data/perf_log/<date>_weekly.txt`。
+
+**4.5 实施记录（2026-10-23，4.1/4.2 完成，4.3/4.4 未做）**
+
+- 4.1 已完成：`watch_pool_perf::render` 基准价按 source 分——`p01_preopen` 取
+  `open_date` 开盘价（09:00 开票、当日可买），其余取收盘价；来源扩到
+  `board_rotation / news_catalyst / p01_preopen / money_flow / holding`。
+- 4.2 已完成：批次汇总每个窗口多一列「D+N 市场」= 同日全市场等权收益 + 样本数；
+  样本 < 800 标「不可信」（当前日线覆盖只有几十只，这一列会如实显示不可信）。
+- 未做：4.3 入口归因周报（周五 17:00）与 4.4 归档 —— 依赖 4.1/4.2 的产出先跑满一周，
+  且要新增周日历判断（节假日顺延），排在下一批。
 
 ### 批 5 探源
 

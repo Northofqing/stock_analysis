@@ -25,19 +25,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = DatabaseManager::try_get().ok_or("数据库未初始化")?;
     let mut conn = db.get_conn()?;
 
-    let periods: Vec<usize> = arg_value(&args, "--days")
-        .unwrap_or_else(|| "1,3,5".to_string())
-        .split(',')
-        .filter_map(|part| part.trim().parse().ok())
-        .collect();
+    // 不传 --days：按分型分窗（情绪 D+1/D+3、趋势 D+5/D+10，D2）。
+    // 传了 --days：按显式窗口统计，临时对账用。
+    let explicit_periods: Option<Vec<usize>> = arg_value(&args, "--days").map(|value| {
+        value
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect()
+    });
 
     let options = PerfOptions {
-        periods: if periods.is_empty() {
-            vec![1, 3, 5]
-        } else {
-            periods
-        },
+        periods: explicit_periods.clone().unwrap_or_else(|| vec![1, 3, 5]),
         since: arg_value(&args, "--since"),
+        per_regime: explicit_periods.is_none(),
     };
 
     print!("{}", render(&mut conn, &options)?);

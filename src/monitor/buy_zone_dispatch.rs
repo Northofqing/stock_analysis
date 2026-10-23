@@ -129,6 +129,43 @@ struct SectorRow {
     board_name: String,
 }
 
+/// 排雷摘要（最近 5 天的 `risk_flag` 事件，每票取最新一条）。
+#[derive(QueryableByName)]
+struct RiskRow {
+    #[diesel(sql_type = Text)]
+    code: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    summary: Option<String>,
+}
+
+/// 只取板块名（退潮板块集合用；`SectorRow` 两列都有，不能混用）。
+#[derive(QueryableByName)]
+struct BoardNameRow {
+    #[diesel(sql_type = Text)]
+    board_name: String,
+}
+
+/// 最近 `bars` 根日线的最低价（移动止盈线用）。数据不足返回 None（不补值）。
+fn recent_low(conn: &mut SqliteConnection, code: &str, as_of: &str, bars: i64) -> Option<f64> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Nullable<Double>)]
+        low: Option<f64>,
+    }
+    diesel::sql_query(
+        "SELECT MIN(low) AS low FROM ( \
+           SELECT low FROM stock_daily \
+            WHERE code = ?1 AND date <= ?2 AND low IS NOT NULL \
+            ORDER BY date DESC LIMIT ?3)",
+    )
+    .bind::<Text, _>(code)
+    .bind::<Text, _>(as_of)
+    .bind::<BigInt, _>(bars)
+    .get_result::<Row>(conn)
+    .ok()
+    .and_then(|row| row.low)
+}
+
 /// 当日板块头部：主线 / 新进 / 退潮。
 ///
 /// 数据来自 `board_rotation_signal`（15:34 调度写入）。没有数据时明确写
@@ -177,11 +214,7 @@ fn render_board_header(conn: &mut SqliteConnection, as_of: &str) -> String {
         lines.push(format!("  主线：{text}"));
     }
 
-    let new_boards: Vec<&RotationRow> = rows
-        .iter()
-        .filter(|r| r.status == "new")
-        .take(6)
-        .collect();
+    let new_boards: Vec<&RotationRow> = rows.iter().filter(|r| r.status == "new").take(6).collect();
     if new_boards.is_empty() {
         lines.push("  新进：无".to_string());
     } else {
@@ -193,19 +226,18 @@ fn render_board_header(conn: &mut SqliteConnection, as_of: &str) -> String {
         lines.push(format!("  新进：{text}"));
     }
 
-    let fading: Vec<&RotationRow> = rows.iter().filter(|r| r.status == "fading").take(5).collect();
+    let fading: Vec<&RotationRow> = rows
+        .iter()
+        .filter(|r| r.status == "fading")
+        .take(5)
+        .collect();
     if fading.is_empty() {
         lines.push("  退潮：无".to_string());
     } else {
         let text = fading
             .iter()
             .map(|r| match r.rank_prev {
-                Some(prev) => format!(
-                    "{}（第{}→第{}）",
-                    r.board_name,
-                    prev + 1,
-                    r.rank_today + 1
-                ),
+                Some(prev) => format!("{}（第{}→第{}）", r.board_name, prev + 1, r.rank_today + 1),
                 None => format!("{}（第{}）", r.board_name, r.rank_today + 1),
             })
             .collect::<Vec<_>>()
@@ -220,17 +252,13 @@ fn render_board_header(conn: &mut SqliteConnection, as_of: &str) -> String {
 ///
 /// 不再按 `kind='concept'` 过滤——`board_ranking_daily` 的榜单里概念与行业
 /// 混排，只查 concept 会让行业票永远匹配不到 top10。
-fn load_sectors(
-    conn: &mut SqliteConnection,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let rows: Vec<SectorRow> = diesel::sql_query(
-        "SELECT instrument_code, board_name FROM board_member",
-    )
-    .load(conn)
-    .unwrap_or_default();
+fn load_sectors(conn: &mut SqliteConnection) -> std::collections::HashMap<String, Vec<String>> {
+    let rows: Vec<SectorRow> =
+        diesel::sql_query("SELECT instrument_code, board_name FROM board_member")
+            .load(conn)
+            .unwrap_or_default();
 
-    let mut map: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for row in rows {
         map.entry(row.instrument_code)
             .or_default()
@@ -319,6 +347,31 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
     let t1_locked = crate::monitor::trade_ledger::today_bought_quantities(db).unwrap_or_default();
 
     let sectors = load_sectors(&mut conn);
+    // 批 2.8（拓 4.1）：当日退潮板块名。持仓/观察票若属于这些板块，正文逐票标注
+    // 「所属板块退潮」——这是「板块还在不在」的直接证据，不额外算分。
+    let fading_boards: std::collections::HashSet<String> = diesel::sql_query(
+        "SELECT board_name FROM board_rotation_signal \
+          WHERE trade_date = ? AND status = 'fading'",
+    )
+    .bind::<Text, _>(as_of)
+    .load::<BoardNameRow>(&mut conn)
+    .map(|rows| rows.into_iter().map(|row| row.board_name).collect())
+    .unwrap_or_default();
+    // 批 2.7：最近 5 天的排雷标注（15:52 写入）。只标注，不参与买点与仓位计算。
+    let risk_flags: std::collections::HashMap<String, String> = diesel::sql_query(
+        "SELECT t.code AS code, e.summary AS summary \
+           FROM ticket_event e JOIN ticket_lifecycle t ON t.id = e.ticket_id \
+          WHERE e.event_kind = 'risk_flag' AND date(e.event_at) >= date(?1, '-5 day') \
+          ORDER BY e.event_at ASC, e.id ASC",
+    )
+    .bind::<Text, _>(as_of)
+    .load::<RiskRow>(&mut conn)
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| row.summary.map(|summary| (row.code, summary)))
+            .collect()
+    })
+    .unwrap_or_default();
     // C 规则：今日榜单 top10 的板块名，票所属板块全不在其中 → 退出候选。
     let active_set: std::collections::HashSet<String> =
         active_boards(&mut conn, as_of, ACTIVE_BOARD_TOP_N)
@@ -342,12 +395,17 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
         parts.push("💼 持仓：无".to_string());
     } else {
         parts.push(String::new());
-        parts.push(format!("💼 持仓 {} 只（只给加仓/止损，不给买点）", holdings.len()));
+        parts.push(format!(
+            "💼 持仓 {} 只（只给加仓/止损，不给买点）",
+            holdings.len()
+        ));
         let mut ordered = holdings.clone();
         ordered.sort_by(|a, b| a.code.cmp(&b.code));
         for position in &ordered {
             let locked = t1_locked.get(&position.code).copied().unwrap_or(0);
-            let zone = buy_zone::compute(&mut conn, &position.code, as_of).ok().flatten();
+            let zone = buy_zone::compute(&mut conn, &position.code, as_of)
+                .ok()
+                .flatten();
 
             parts.push(String::new());
             let close_text = zone
@@ -360,13 +418,36 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
                 .unwrap_or_else(|| "—".to_string());
             parts.push(format!(
                 "{} {}  {} 股  成本 {:.3}  现价 {}  浮盈亏 {}",
-                position.code, position.name, position.shares, position.cost_price, close_text, pnl_text
+                position.code,
+                position.name,
+                position.shares,
+                position.cost_price,
+                close_text,
+                pnl_text
             ));
 
             if locked > 0 {
-                parts.push(format!(
-                    "  ⚠ 今日买入 {locked} 股，T+1 锁定，今日不可卖"
-                ));
+                parts.push(format!("  ⚠ 今日买入 {locked} 股，T+1 锁定，今日不可卖"));
+            }
+            if let Some(flag) = risk_flags.get(&position.code) {
+                parts.push(format!("  ⚠ 有雷：{flag}（标注，不挡操作）"));
+            }
+
+            if let Some(boards) = sectors.get(&position.code) {
+                let faded: Vec<&String> = boards
+                    .iter()
+                    .filter(|board| fading_boards.contains(board.as_str()))
+                    .collect();
+                if !faded.is_empty() {
+                    parts.push(format!(
+                        "  ⚠ 所属板块退潮：{}",
+                        faded
+                            .iter()
+                            .map(|board| board.as_str())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ));
+                }
             }
 
             if let Some(zone) = &zone {
@@ -378,6 +459,16 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
                 ));
                 if let Some(abandon) = zone.abandon {
                     parts.push(format!("  止损：跌破 {abandon}"));
+                }
+                // 批 2.10（拓 3.1）：止盈侧只给参考线，不做自动卖。
+                if let Some(high) = zone.high_20d {
+                    parts.push(format!("  目标价：{high:.2}（20 日最高，参考）"));
+                }
+                if let Some(low5) = recent_low(&mut conn, &position.code, as_of, 5) {
+                    let trail = low5.max(position.cost_price);
+                    parts.push(format!(
+                        "  移动止盈：跌破 {trail:.2} 提示（成本与近 5 日低取高）"
+                    ));
                 }
             } else {
                 parts.push("  加仓价：不给（日线数据缺失）".to_string());
@@ -469,16 +560,35 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
             }
         }
 
+        // 批 2.11（拓 8）：按 `ticket_priority` 五维加权分数排序，而不是按建议仓位。
+        // 仓位是「该放多少钱」，排序该回答「先买谁」。取不到分数（例如当日 15:44
+        // 的优先级还没跑）时退回建议仓位排序，并在正文写明。
+        let priority: std::collections::HashMap<String, f64> =
+            match crate::monitor::ticket_priority::rank_watch_pool(db, as_of) {
+                Ok(rows) => rows.into_iter().map(|row| (row.code, row.total)).collect(),
+                Err(_) => std::collections::HashMap::new(),
+            };
+        let priority_used = rows.iter().any(|row| priority.contains_key(&row.code));
         rows.sort_by(|left, right| {
-            right
-                .advice
-                .suggested_pct
-                .partial_cmp(&left.advice.suggested_pct)
+            let left_score = priority.get(&left.code).copied();
+            let right_score = priority.get(&right.code).copied();
+            right_score
+                .partial_cmp(&left_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .advice
+                        .suggested_pct
+                        .partial_cmp(&left.advice.suggested_pct)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| left.code.cmp(&right.code))
         });
 
         parts.push(format!("🎯 新买入候选 {} 只", rows.len()));
+        if priority_used {
+            parts.push("按优先级分数排序（①最强），仓位另列。".to_string());
+        }
         for (index, row) in rows.iter().enumerate() {
             parts.push(String::new());
             let board = sectors
@@ -486,7 +596,21 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
                 .and_then(|boards| boards.first())
                 .map(|b| format!("  〔{b}〕"))
                 .unwrap_or_default();
-            parts.push(format!("{}. {}{}", index + 1, row.label, board));
+            // ①②③ 标建议顺序；第四名之后用数字（圆圈字符只到 ③ 好读）。
+            let marker = match index {
+                0 => "①".to_string(),
+                1 => "②".to_string(),
+                2 => "③".to_string(),
+                other => format!("{}.", other + 1),
+            };
+            let score_text = priority
+                .get(&row.code)
+                .map(|score| format!("  优先级 {score:.1}"))
+                .unwrap_or_default();
+            parts.push(format!("{marker} {}{}{score_text}", row.label, board));
+            if let Some(flag) = risk_flags.get(&row.code) {
+                parts.push(format!("  ⚠ 有雷：{flag}（标注，不挡买入）"));
+            }
             // 去掉第一行（重复的 label + 收盘），其余照旧。
             let body = row.render();
             let mut lines = body.lines();
@@ -510,7 +634,12 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
             let preview = if dropped.len() > 6 {
                 format!(
                     "{} 等",
-                    dropped.iter().take(6).cloned().collect::<Vec<_>>().join("、")
+                    dropped
+                        .iter()
+                        .take(6)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("、")
                 )
             } else {
                 dropped.join("、")
@@ -532,7 +661,11 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
 
         if !rejected.is_empty() {
             parts.push(String::new());
-            parts.push(format!("剔除 {} 只：{}", rejected.len(), rejected.join("；")));
+            parts.push(format!(
+                "剔除 {} 只：{}",
+                rejected.len(),
+                rejected.join("；")
+            ));
         }
         let _ = no_sector;
     }

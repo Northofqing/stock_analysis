@@ -57,6 +57,12 @@ pub struct WatchPoolReport {
     pub board_candidates: usize,
     /// 板块路新增（不与新闻重合）的票数
     pub board_added: usize,
+    /// 资金流路（f62）命中板块数
+    pub mf_scanned_rows: usize,
+    /// 资金流路原始候选数
+    pub mf_candidates: usize,
+    /// 资金流路新增（不与其他两路重合）的票数
+    pub mf_added: usize,
     /// 合并后总候选数
     pub candidates: usize,
     pub opened: usize,
@@ -70,12 +76,16 @@ impl WatchPoolReport {
     pub fn log(&self) {
         log::info!(
             "[观察池] news_scanned={} news_candidates={} boards={} board_candidates={} board_added={} \
-             total={} opened={} appended={} skipped_invalid={} dry_run={}",
+             mf_boards={} mf_candidates={} mf_added={} total={} opened={} appended={} \
+             skipped_invalid={} dry_run={}",
             self.scanned_rows,
             self.news_candidates,
             self.board_scanned_rows,
             self.board_candidates,
             self.board_added,
+            self.mf_scanned_rows,
+            self.mf_candidates,
+            self.mf_added,
             self.candidates,
             self.opened,
             self.appended,
@@ -96,6 +106,9 @@ fn is_valid_code(code: &str) -> bool {
 fn source_label(source: &str) -> &'static str {
     match source {
         "board_rotation" => "板块轮动",
+        "money_flow" => "资金流",
+        "p01_preopen" => "P01 盘前",
+        "holding" => "持仓",
         _ => "新闻",
     }
 }
@@ -176,13 +189,20 @@ pub fn collect_news_catalysts(
 ///
 /// 为什么成分股用上一完整交易日涨幅排序而不是当日：`stock_daily` 当日只有活跃票
 /// 样本（2026-10-19 仅 9 只），拿它排序会把 1241 只里的强票挡在外面。
-/// 涨停判定阈值（主板/中小板 10% 板）。用 pct_chg 判，不依赖 stock_daily.is_limit_up
-/// —— 那个字段在 kline.rs:650 硬编码 false，用它等于永远判不出涨停。
-const LIMIT_UP_PCT: f64 = 9.85;
-
-pub fn collect_board_rotation(
+/// 涨停判定阈值按板分档（2026-10-23 批 1.2）：20cm 板 19.5%、其余 9.85%，见
+/// [`crate::monitor::ticket_regime::limit_up_pct`]。用 pct_chg 判，不依赖
+/// `stock_daily.is_limit_up` —— 那个字段在 kline.rs:650 硬编码 false，用它等于永远判不出涨停。
+/// 板块路候选的通用实现：`board_date` 的榜（`rank_fid`）top N → 成分股 → 每板块前 M。
+///
+/// `source` / `label` 由调用方给：涨幅榜 `f3` 记 `board_rotation`，主力净流入榜 `f62`
+/// 记 `money_flow`（批 2.3）——两者是独立信号，不能混成一个来源，否则复盘归因分不开。
+#[allow(clippy::too_many_arguments)]
+fn collect_board_picks(
     db: &DatabaseManager,
-    business_date: &str,
+    board_date: &str,
+    rank_fid: &str,
+    source: &'static str,
+    label: &str,
     top_boards: usize,
     per_board: usize,
     limit_up_codes: &std::collections::HashSet<String>,
@@ -204,14 +224,15 @@ pub fn collect_board_rotation(
     let boards: Vec<BoardRow> = diesel::sql_query(
         "SELECT board_name, MIN(rank_position) AS rank_position, MAX(change_pct) AS change_pct \
            FROM board_ranking_daily \
-          WHERE trade_date = ?1 AND rank_position < ?2 \
+          WHERE trade_date = ?1 AND rank_fid = ?2 AND rank_position < ?3 \
           GROUP BY board_name \
           ORDER BY rank_position",
     )
-    .bind::<diesel::sql_types::Text, _>(business_date.to_owned())
+    .bind::<diesel::sql_types::Text, _>(board_date.to_owned())
+    .bind::<diesel::sql_types::Text, _>(rank_fid.to_owned())
     .bind::<diesel::sql_types::Integer, _>(top_boards as i32)
     .load(&mut *conn)
-    .map_err(|e| format!("板块榜查询失败: {e}"))?;
+    .map_err(|e| format!("{label}榜查询失败: {e}"))?;
 
     let scanned = boards.len();
     if boards.is_empty() {
@@ -228,7 +249,7 @@ pub fn collect_board_rotation(
         "SELECT date FROM stock_daily WHERE date <= ?1 \
           GROUP BY date HAVING COUNT(*) >= 50 ORDER BY date DESC LIMIT 1",
     )
-    .bind::<diesel::sql_types::Text, _>(business_date.to_owned())
+    .bind::<diesel::sql_types::Text, _>(board_date.to_owned())
     .load::<DateRow>(&mut *conn)
     .map_err(|e| format!("日线日期查询失败: {e}"))?
     .into_iter()
@@ -269,8 +290,10 @@ pub fn collect_board_rotation(
         .filter_map(|row| row.pct_chg.map(|pct| (row.instrument_code.clone(), pct)))
         .collect();
 
-    let wanted: std::collections::HashSet<&str> =
-        boards.iter().map(|board| board.board_name.as_str()).collect();
+    let wanted: std::collections::HashSet<&str> = boards
+        .iter()
+        .map(|board| board.board_name.as_str())
+        .collect();
 
     let mut by_board: std::collections::HashMap<String, Vec<MemberRow>> =
         std::collections::HashMap::new();
@@ -278,7 +301,10 @@ pub fn collect_board_rotation(
         if !wanted.contains(row.board_name.as_str()) {
             continue;
         }
-        by_board.entry(row.board_name.clone()).or_default().push(row);
+        by_board
+            .entry(row.board_name.clone())
+            .or_default()
+            .push(row);
     }
 
     // 东财板块成分（BK 码 → ExternalV1 Eastmoney 臂）：board_member 是 TDX 体系，
@@ -289,8 +315,10 @@ pub fn collect_board_rotation(
             continue;
         }
         let entry = by_board.entry(board_name.clone()).or_default();
-        let existing: std::collections::HashSet<String> =
-            entry.iter().map(|row| row.instrument_code.clone()).collect();
+        let existing: std::collections::HashSet<String> = entry
+            .iter()
+            .map(|row| row.instrument_code.clone())
+            .collect();
         for code in codes {
             if existing.contains(code) {
                 continue;
@@ -319,11 +347,11 @@ pub fn collect_board_rotation(
         members.sort_by(|a, b| {
             let a_limit = a
                 .pct_chg
-                .map(|v| v >= LIMIT_UP_PCT)
+                .map(|v| v >= crate::monitor::ticket_regime::limit_up_pct(&a.instrument_code))
                 .unwrap_or(false);
             let b_limit = b
                 .pct_chg
-                .map(|v| v >= LIMIT_UP_PCT)
+                .map(|v| v >= crate::monitor::ticket_regime::limit_up_pct(&b.instrument_code))
                 .unwrap_or(false);
             let a_today = limit_up_codes.contains(&a.instrument_code);
             let b_today = limit_up_codes.contains(&b.instrument_code);
@@ -355,24 +383,31 @@ pub fn collect_board_rotation(
                 .map(|value| format!("{value:+.2}%"))
                 .unwrap_or_else(|| "无日线".to_owned());
             let note = format!(
-                "板块轮动 #{} {} ({}) 成分股 {} 涨幅 {}",
+                "{label} #{} {} ({}) 成分股 {} 涨幅 {}",
                 board.rank_position + 1,
                 board.board_name,
                 pct_text,
                 price_date,
                 leader_pct
             );
-            match candidates.iter_mut().find(|item| item.code == member.instrument_code) {
+            match candidates
+                .iter_mut()
+                .find(|item| item.code == member.instrument_code)
+            {
                 Some(existing) => {
                     existing.hits += 1;
-                    existing.note.push_str(&format!("；亦属 #{} {}", board.rank_position + 1, board.board_name));
+                    existing.note.push_str(&format!(
+                        "；亦属 #{} {}",
+                        board.rank_position + 1,
+                        board.board_name
+                    ));
                 }
                 None => candidates.push(PoolCandidate {
                     code: member.instrument_code.clone(),
-                    latest_at: business_date.to_owned(),
+                    latest_at: board_date.to_owned(),
                     hits: 1,
                     note,
-                    source: "board_rotation",
+                    source,
                 }),
             }
         }
@@ -381,6 +416,75 @@ pub fn collect_board_rotation(
     Ok((scanned, candidates))
 }
 
+/// 板块轮动路：当日涨幅榜（`f3`）top N → 成分股 → 按上一完整交易日涨幅挑每板块前 M。
+pub fn collect_board_rotation(
+    db: &DatabaseManager,
+    business_date: &str,
+    top_boards: usize,
+    per_board: usize,
+    limit_up_codes: &std::collections::HashSet<String>,
+    leader_codes: &std::collections::HashSet<String>,
+    eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<(usize, Vec<PoolCandidate>), String> {
+    collect_board_picks(
+        db,
+        business_date,
+        "f3",
+        "board_rotation",
+        "板块轮动",
+        top_boards,
+        per_board,
+        limit_up_codes,
+        leader_codes,
+        eastmoney_members,
+    )
+}
+
+/// 资金流路（批 2.3 / 拓 7）：**前一交易日** `f62` 主力净流入榜 top N → 成分股 → 每板块前 M。
+///
+/// 为什么用前一交易日而不是当日：观察池 15:40 就跑，f62 盘后榜此时可能还没落全；
+/// 用前一交易日的完整榜比赌当日半成品可靠。10-21 之前 f62 无数据 → 返回 0，不补造。
+pub fn collect_money_flow_boards(
+    db: &DatabaseManager,
+    business_date: &str,
+    top_boards: usize,
+    per_board: usize,
+    limit_up_codes: &std::collections::HashSet<String>,
+    leader_codes: &std::collections::HashSet<String>,
+    eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<(usize, Vec<PoolCandidate>), String> {
+    #[derive(QueryableByName)]
+    struct DateRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        trade_date: String,
+    }
+    let prev: Option<String> = {
+        let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+        diesel::sql_query(
+            "SELECT MAX(trade_date) AS trade_date FROM board_ranking_daily \
+              WHERE rank_fid = 'f62' AND trade_date < ?1",
+        )
+        .bind::<diesel::sql_types::Text, _>(business_date.to_owned())
+        .get_result::<DateRow>(&mut *conn)
+        .ok()
+        .map(|row| row.trade_date)
+    };
+    let Some(prev) = prev else {
+        return Ok((0, Vec::new()));
+    };
+    collect_board_picks(
+        db,
+        &prev,
+        "f62",
+        "money_flow",
+        "资金流",
+        top_boards,
+        per_board,
+        limit_up_codes,
+        leader_codes,
+        eastmoney_members,
+    )
+}
 
 /// 同日同票同摘要的 catalyst 事件只写一次（2026-10-22）。
 ///
@@ -437,7 +541,10 @@ pub fn build_watch_pool(
     let board_count_raw = board_candidates.len();
     let mut board_added = 0usize;
     for candidate in board_candidates {
-        match candidates.iter_mut().find(|item| item.code == candidate.code) {
+        match candidates
+            .iter_mut()
+            .find(|item| item.code == candidate.code)
+        {
             // 新闻已在池中：把板块信息并进同一条 note，不另开一条。
             Some(existing) => {
                 existing.hits += candidate.hits;
@@ -451,6 +558,36 @@ pub fn build_watch_pool(
         }
     }
 
+    // 第三路：资金流（f62 前一交易日主力净流入榜）。与板块路同一套成分/排序口径，
+    // 只是榜不同 —— 两条榜可能选到同一只票，合并进同一条 note（hits 累加）。
+    let (mf_scanned, mf_candidates) = collect_money_flow_boards(
+        db,
+        business_date,
+        BOARD_TOP_N,
+        BOARD_PER_BOARD,
+        limit_up_codes,
+        leader_codes,
+        eastmoney_members,
+    )?;
+    let mf_count_raw = mf_candidates.len();
+    let mut mf_added = 0usize;
+    for candidate in mf_candidates {
+        match candidates
+            .iter_mut()
+            .find(|item| item.code == candidate.code)
+        {
+            Some(existing) => {
+                existing.hits += candidate.hits;
+                existing.note.push_str(" | ");
+                existing.note.push_str(&candidate.note);
+            }
+            None => {
+                candidates.push(candidate);
+                mf_added += 1;
+            }
+        }
+    }
+
     let mut report = WatchPoolReport {
         scanned_rows,
         candidates: candidates.len(),
@@ -458,6 +595,9 @@ pub fn build_watch_pool(
         board_scanned_rows: board_scanned,
         board_candidates: board_count_raw,
         board_added,
+        mf_scanned_rows: mf_scanned,
+        mf_candidates: mf_count_raw,
+        mf_added,
         dry_run,
         ..Default::default()
     };

@@ -42,9 +42,12 @@ const VOLUME_CONFIRM: f64 = 1.2;
 const MAX_DEVIATION_FROM_MA5: f64 = 0.10;
 const MAX_GAIN_5D: f64 = 0.25;
 const MIN_LIMIT_UP_STREAK_TO_SKIP: usize = 3;
-/// 涨停判定阈值（pct_chg 是百分数）。主板 10% / 创业板科创板 20% / ST 5%；
-/// 取 9.8 既能覆盖主板，也能捕获 20% 板的涨停（其值 >= 19.9）。
-const LIMIT_UP_PCT_THRESHOLD: f64 = 9.8;
+/// 涨停判定阈值（pct_chg 是百分数）。2026-10-23 批 1.2 改按板分档：
+/// 20cm 板（300/301/688/689）19.5%、其余 9.85%，与 `ticket_regime::limit_up_pct` 同源。
+/// 原 9.8 会把 20cm 板 +10% 的普通上涨计成涨停，连板数虚高 → 超买门误杀。
+fn limit_up_threshold(code: &str) -> f64 {
+    crate::monitor::ticket_regime::limit_up_pct(code)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trend {
@@ -254,11 +257,12 @@ pub fn compute(
 
     // ---- 三道超买门（2026-10-17 由 601811 三连板暴露）----
     // 连板：从最新往前数连续 pct_chg >= 阈值的天数
+    let limit_up_gate = limit_up_threshold(code);
     let limit_up_streak = bars
         .iter()
         .take_while(|row| {
             row.pct_chg
-                .map(|value| value >= LIMIT_UP_PCT_THRESHOLD)
+                .map(|value| value >= limit_up_gate)
                 .unwrap_or(false)
         })
         .count();

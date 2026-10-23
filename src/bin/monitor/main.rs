@@ -158,9 +158,9 @@ mod paper_scan_runtime_tests;
 use stock_analysis::trading::paper_sell::{
     PaperScanFailure, PaperScanPhase, PaperScanSession, PaperSellResult,
 };
-mod holdings_sync; // 2026-10-20: Windows 持仓桥同步（15:05 / 16:05）
 mod closing_valuation_runtime;
 mod data_mode_probe;
+mod holdings_sync; // 2026-10-20: Windows 持仓桥同步（15:05 / 16:05）
 mod manual_push;
 mod market_data; // BR-148: capability probes remain independent from governance DataMode
 
@@ -5627,7 +5627,9 @@ async fn full_universe_bars_loop() {
                     report.failed
                 );
                 if coverage < 800 {
-                    log::warn!("[日线全量] 覆盖异常：今日 stock_daily 仅 {coverage} 只（阈值 800）");
+                    log::warn!(
+                        "[日线全量] 覆盖异常：今日 stock_daily 仅 {coverage} 只（阈值 800）"
+                    );
                     let alert = format!(
                         "⚠ 日线覆盖异常（{date_text}）：stock_daily 今日仅 {coverage} 只，选票与归因基准会失真。检查 bridge / HistoricalBars。"
                     );
@@ -11527,7 +11529,6 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 let session = calendar::session_label();
 
                 if session.contains("休市") || session.contains("盘后") {
-
                     // 盘后必须立刻跳出等待循环：15:30-16:00 的十个盘后调度
                     // （板块榜/观察池/优先级/价格带/明日计划）全在 while 之后，
                     // 不 break 就永远执行不到。2026-10-19 定位。
@@ -12194,6 +12195,43 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 分型重算（批 1.1，2026-10-23）：15:37，持仓变化之后、淘汰之前。
+                    //
+                    // 为什么是 15:37 而不是方案原文的 15:42：15:38 的淘汰规则要用当日分型
+                    // 决定观察期上限（情绪型 5 天 / 趋势型 10 天），排在淘汰之后等于永远用昨天的型。
+                    // 分型只依赖日线（昨日已落库），15:37 时可算，不需要等观察池。
+                    //
+                    // 幂等：`recompute_active` 只在型别/理由变化时写事件，重启重放不会产生重复行，
+                    // 所以这里 static 只当加速缓存（不写文件 marker）。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 37, 0).unwrap()
+                    {
+                        static REGIME_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = REGIME_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::ticket_regime::recompute_active(
+                                    &db, &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        report.log();
+                                        *REGIME_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[分型] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 观察池淘汰（2026-10-18）：超期/跌幅出池，只管 observing。
                     // 放在 15:40 观察池生成之前：先清掉已不成立的观察，再生成新的。
                     if calendar::is_trading_day(advice_report_date)
@@ -12257,10 +12295,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     let date_text =
                                         advice_report_date.format("%Y-%m-%d").to_string();
                                     match stock_analysis::monitor::board_member::build_from_ranking(
-                                        &db,
-                                        &date_text,
-                                        10,
-                                        10_000,
+                                        &db, &date_text, 10, 10_000,
                                     )
                                     .await
                                     {
@@ -12283,9 +12318,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                 Ok(batch) => batch
                                                     .records()
                                                     .iter()
-                                                    .map(|entry| {
-                                                        entry.instrument.code().to_owned()
-                                                    })
+                                                    .map(|entry| entry.instrument.code().to_owned())
                                                     .collect(),
                                                 Err(error) => {
                                                     log::warn!(
@@ -12345,7 +12378,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     // （ExternalV1 Eastmoney 臂）。board_member 是 TDX 体系
                                     // （tdx:industry:融资融券），与东财行业榜（BK1512 生猪养殖）
                                     // 的名字和代码交集都是 0，实测候选一直是 0。
-                                    let eastmoney_members: std::collections::HashMap<String, Vec<String>> = {
+                                    let eastmoney_members: std::collections::HashMap<
+                                        String,
+                                        Vec<String>,
+                                    > = {
                                         let mut map = std::collections::HashMap::new();
                                         // 2026-10-22: gn_ 板块是新浪概念码，TDX 目录里很多名字不存在；
                                         // 失败属于预期缺口，合并成一行 info，不逐板块 warn。
@@ -12359,17 +12395,19 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         }
                                         let tops: Vec<BRow> = match db.get_conn() {
                                             Ok(mut conn) => {
-                                              use diesel::RunQueryDsl as _;
-                                              diesel::sql_query(
-                                                "SELECT board_name, board_code \
+                                                use diesel::RunQueryDsl as _;
+                                                diesel::sql_query(
+                                                    "SELECT board_name, board_code \
                                                  FROM board_ranking_daily \
                                                  WHERE trade_date = ? AND rank_fid = 'f3' \
                                                    AND rank_position < 10 \
                                                  GROUP BY board_name, board_code",
-                                            )
-                                            .bind::<diesel::sql_types::Text, _>(date_text.clone())
-                                              .load(&mut conn)
-                                              .unwrap_or_default()
+                                                )
+                                                .bind::<diesel::sql_types::Text, _>(
+                                                    date_text.clone(),
+                                                )
+                                                .load(&mut conn)
+                                                .unwrap_or_default()
                                             }
                                             Err(error) => {
                                                 log::warn!("[观察池] 板块榜查询失败: {error}");
@@ -12392,9 +12430,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                             let codes: Vec<String> = batch
                                                                 .records()
                                                                 .iter()
-                                                                .map(|r| {
-                                                                    r.instrument_code.clone()
-                                                                })
+                                                                .map(|r| r.instrument_code.clone())
                                                                 .collect();
                                                             if !codes.is_empty() {
                                                                 map.insert(row.board_name, codes);
@@ -12408,7 +12444,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                                     row.board_name
                                                                 );
                                                             } else {
-                                                                tdx_misses.push(row.board_name.clone());
+                                                                tdx_misses
+                                                                    .push(row.board_name.clone());
                                                             }
                                                         }
                                                     }
@@ -12584,6 +12621,54 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 价格失效时效检查（批 1.5，2026-10-23）：15:42，入场参考给完之后。
+                    //
+                    // 只处理 entry_proposed：趋势型超过 3 个交易日、情绪型跨日仍未触发
+                    // → 记 kind='entry_invalidated'。**不改 stage、不淘汰票** ——
+                    // 淘汰仍归 15:38 的 ticket_eviction（观察期上限按分型 5/10 天）。
+                    // 盘中「跌破放弃价」那一条在 watch_pool_monitor_loop 里即时判，
+                    // 这里补的是「一直没触发、价格窗口已过期」这一种。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 42, 0).unwrap()
+                    {
+                        static EXPIRY_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = EXPIRY_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::ticket_entry_trigger::invalidate_expired(
+                                    &db, &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        report.log();
+                                        if !report.invalidated.is_empty() {
+                                            let mut text = format!("【{date_text} 价格失效】\n");
+                                            for (code, reason) in &report.invalidated {
+                                                text.push_str(&format!("\n{code} {reason}\n"));
+                                            }
+                                            text.push_str(
+                                                "\n只作废价格，票仍在观察池；淘汰与否看观察期上限。",
+                                            );
+                                            if !crate::notify::push_wechat(&text).await {
+                                                log::warn!("[价格失效] 推送失败（事件已记账）");
+                                            }
+                                        }
+                                        *EXPIRY_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[价格失效] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 观察池票优先级（2026-10-18）：15:44，观察池生成之后、记账之前。
                     // 五维加权：新闻催化 30% / 板块强度 20% / 可买价 25% / 仓位 15% / 概念共振 10%。
                     // 缺失维度从分母剔除，不当作 0 分。
@@ -12751,8 +12836,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         }
                                     }
 
-                                    let registry =
-                                        stock_analysis::llm::LlmRegistry::from_env();
+                                    let registry = stock_analysis::llm::LlmRegistry::from_env();
                                     match registry.select("chain_analysis") {
                                         Some(provider) => {
                                             let mut analyzed = 0usize;
@@ -12817,9 +12901,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let slot = if now_time >= chrono::NaiveTime::from_hms_opt(16, 5, 0).unwrap()
                         {
                             "16:05"
-                        } else if now_time
-                            >= chrono::NaiveTime::from_hms_opt(15, 5, 0).unwrap()
-                        {
+                        } else if now_time >= chrono::NaiveTime::from_hms_opt(15, 5, 0).unwrap() {
                             "15:05"
                         } else {
                             ""
@@ -12827,7 +12909,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         let already = HOLDINGS_SYNC
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .map(|(date, done_slot)| date == advice_report_date && done_slot == slot)
+                            .map(|(date, done_slot)| {
+                                date == advice_report_date && done_slot == slot
+                            })
                             .unwrap_or(false);
                         if !slot.is_empty() && !already {
                             // HTTP 走项目共享异步 client（SHARED_HTTP_CLIENT）：
@@ -12847,9 +12931,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         report.positions,
                                         report.inserted
                                     );
-                                    *HOLDINGS_SYNC
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner()) =
+                                    *HOLDINGS_SYNC.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some((advice_report_date, slot));
                                 }
                                 Err(error) => {
@@ -12857,9 +12939,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     // 失败也记账：否则每个 tick 都会重试并把日志刷爆
                                     // （实测同一秒 4 条）。下一个时段（15:05 → 16:05）
                                     // 仍会再试一次，重启后也会重试。
-                                    *HOLDINGS_SYNC
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner()) =
+                                    *HOLDINGS_SYNC.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some((advice_report_date, slot));
                                 }
                             }
@@ -12867,6 +12947,46 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     }
 
                     // 盘后可买价推送（2026-10-18）：16:00，等 15:50 价格带 + 15:55 均线都落库后再算。
+                    // 排雷标注（批 2.7，2026-10-23）：15:52，明日计划之前。
+                    //
+                    // 方案原文写 16:20，但 16:00 就生成明日计划 —— 排在计划之后等于当天
+                    // 的雷只进库不进正文。改到 15:52（价格带/均线已落，计划还没生成）。
+                    // 只扫 F10 原文关键词，**标注不挡买入**：埋雷是唯一不能靠次日纠错的风险。
+                    // 关键词会误报（「不存在退市风险」也命中），上线后两周调词表。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 52, 0).unwrap()
+                    {
+                        static RISK_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = RISK_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::ticket_risk_flag::scan(
+                                    &db, &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        report.log();
+                                        if let Some(text) = report.render(&date_text) {
+                                            if !crate::notify::push_wechat(&text).await {
+                                                log::warn!("[排雷] 推送失败（事件已记账）");
+                                            }
+                                        }
+                                        *RISK_LAST.lock().unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[排雷] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 输出"明日计划"：每只票 买点区间 / 放弃价 / 建议仓位 / 条件，推飞书。
                     //
                     // 幂等用**文件 marker**，不能用进程内 static：2026-10-20 实测，
@@ -12907,7 +13027,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                             }
                                             // 写失败要吼出来：推送已经发生，marker 丢了
                                             // 就意味着下一次重启会重推。
-                                            if let Err(error) = std::fs::write(&marker, chars.to_string()) {
+                                            if let Err(error) =
+                                                std::fs::write(&marker, chars.to_string())
+                                            {
                                                 log::warn!(
                                                     "[可买价] 幂等标记写入失败（已推送，下次重启可能重推）{date_text}: {error}"
                                                 );
@@ -12953,7 +13075,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                     .to_string();
                                                 let dir = std::path::Path::new("data/perf_log");
                                                 if let Err(error) = std::fs::create_dir_all(dir) {
-                                                    log::warn!("[观察池表现] 创建目录失败: {error}");
+                                                    log::warn!(
+                                                        "[观察池表现] 创建目录失败: {error}"
+                                                    );
                                                 }
                                                 let path = dir.join(format!("{date_text}.txt"));
                                                 match std::fs::write(&path, &text) {
@@ -14613,6 +14737,38 @@ async fn auction_watch_loop() {
                 for row in &rows {
                     log::info!("[竞价观察] {}", row.render());
                 }
+                // 批 1.3（2026-10-23）：情绪型票给竞价买价，趋势型仍走 ma 回踩。
+                // 与竞价观察共用同一批 rows，不额外拉一次 op 61。
+                let date_text = today.format("%Y-%m-%d").to_string();
+                let price_marker = std::path::Path::new("data/auction_price").join(&date_text);
+                match stock_analysis::monitor::ticket_auction_price::build(&db, &date_text, &rows) {
+                    Ok(report) => {
+                        log::info!("{}", report.summary_line());
+                        for error in &report.errors {
+                            log::warn!("[竞价买价] {error}");
+                        }
+                        match report.render(&date_text) {
+                            Some(text) => {
+                                if crate::notify::push_wechat(&text).await {
+                                    if let Some(parent) = price_marker.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    if let Err(error) =
+                                        std::fs::write(&price_marker, report.summary_line())
+                                    {
+                                        log::warn!(
+                                            "[竞价买价] marker 写入失败（重启会重推）: {error}"
+                                        );
+                                    }
+                                } else {
+                                    log::warn!("[竞价买价] 推送失败, 下一轮重试（不写 marker）");
+                                }
+                            }
+                            None => log::info!("[竞价买价] 无情绪型票, 今晚不推（不是失败）"),
+                        }
+                    }
+                    Err(error) => log::warn!("[竞价买价] 生成失败, 下一轮重试: {error}"),
+                }
                 done_for = Some(today);
             }
             Err(error) => log::warn!("[竞价观察] 拉取失败, 下一轮重试: {error}"),
@@ -14625,6 +14781,11 @@ async fn watch_pool_monitor_loop() {
 
     let mut last_prices: HashMap<String, f64> = HashMap::new();
     let mut alerted_at: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    // 批 1.4/1.5（2026-10-23）：入场判据缓存。每日 09:26 / 13:01 各预热一次，
+    // 扫描只比价不查库（buy_zone 含日线聚合，30 秒一轮重算会把主库读爆）。
+    let mut trigger_cache: Option<stock_analysis::monitor::ticket_entry_trigger::TriggerCache> =
+        None;
+    let mut trigger_slot: Option<u8> = None;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -14646,6 +14807,33 @@ async fn watch_pool_monitor_loop() {
             continue;
         };
 
+        // 预热槽位：上午（09:26 起）/ 下午（13:01 起）。换槽重算一次，
+        // 因为当日涨停/分型在中午可能变化（情绪型票封板）。
+        let date_text = now.format("%Y-%m-%d").to_string();
+        let slot: u8 = if time >= chrono::NaiveTime::from_hms_opt(13, 1, 0).unwrap() {
+            1
+        } else {
+            0
+        };
+        if trigger_cache.is_none() || trigger_slot != Some(slot) {
+            match stock_analysis::monitor::ticket_entry_trigger::warm(&db, &date_text) {
+                Ok(cache) => {
+                    log::info!(
+                        "[触发确认] 预热日={date_text} 槽={} 标的={} 跳过={}",
+                        slot,
+                        cache.targets.len(),
+                        cache.skipped.len()
+                    );
+                    for skip in &cache.skipped {
+                        log::info!("[触发确认] 跳过 {skip}");
+                    }
+                    trigger_cache = Some(cache);
+                    trigger_slot = Some(slot);
+                }
+                Err(error) => log::warn!("[触发确认] 预热失败, 本轮跳过: {error}"),
+            }
+        }
+
         let alerts =
             match stock_analysis::monitor::watch_pool_monitor::scan(&db, &last_prices).await {
                 Ok(alerts) => alerts,
@@ -14665,11 +14853,54 @@ async fn watch_pool_monitor_loop() {
             }
             alerted_at.insert(key, now_utc);
             log::info!("[定向监控] {}", alert.render());
+            // 批 2.9（拓 2.1）事件分级：价格 ±3% 与新闻命中是 L1，即时推；
+            // 「较上次急变」「同板块关联票」是 L2，只进日志（现行为）。
+            // 30 分钟同票同因去重由上面的 alerted_at 承担。
+            let level1 = alert.reason.contains("新闻") || alert.reason.contains("日内");
+            if level1 {
+                let text = format!("【{} 定向监控】{}", date_text, alert.render());
+                if !crate::notify::push_wechat(&text).await {
+                    log::warn!("[定向监控] {} L1 推送失败（日志已记）", alert.code);
+                }
+            }
         }
 
         // 只更新触发过的票的价格。未触发的票变动 <1%，继续用旧价无影响。
         for alert in &alerts {
             last_prices.insert(alert.code.clone(), alert.price);
+        }
+
+        // 入场触发 / 价格失效：即时推送（时间敏感，不做 30 分钟聚合）。
+        if let Some(cache) = &trigger_cache {
+            if !cache.is_empty() {
+                match stock_analysis::monitor::ticket_entry_trigger::evaluate(cache).await {
+                    Ok(hits) => {
+                        for hit in &hits {
+                            match stock_analysis::monitor::ticket_entry_trigger::record(
+                                &db, &date_text, hit,
+                            ) {
+                                Ok(stock_analysis::monitor::ticket_entry_trigger::RecordOutcome::Recorded) => {
+                                    log::info!(
+                                        "[触发确认] {} {} {:?}",
+                                        hit.code,
+                                        hit.action.as_str(),
+                                        hit.basis()
+                                    );
+                                    let text = format!("【{}】", date_text) + &hit.render();
+                                    if !crate::notify::push_wechat(&text).await {
+                                        log::warn!("[触发确认] {} 推送失败（事件已记账）", hit.code);
+                                    }
+                                }
+                                Ok(stock_analysis::monitor::ticket_entry_trigger::RecordOutcome::Duplicate) => {}
+                                Err(error) => {
+                                    log::warn!("[触发确认] {} 记账失败: {error}", hit.code)
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => log::warn!("[触发确认] 判定失败: {error}"),
+                }
+            }
         }
     }
 }

@@ -351,6 +351,136 @@ def check_p6(main, days):
     return r
 
 
+def check_batch1(main, log_lines):
+    """批 1 分型体系（2026-10-23）—— 只认产出：事件行 + 专属日志行。
+
+    判据与方案 1.x 一一对应：
+    - 1.1 分型：活跃票里有分型事件的比例；日志出现 `[分型] scanned=`
+    - 1.3 竞价买价：日志出现 `[竞价买价] emotion=`；`quoted>0` 才算有价
+    - 1.4 突破确认：`entry_triggered` 事件 + `[触发确认] 预热` 日志
+    - 1.5 价格失效：`entry_invalidated` 事件 + `[价格失效] 时效检查` 日志
+    - 2.3 资金流入口：观察池日志的 `mf_candidates` 字段 + f62 榜行数
+    """
+    out = []
+
+    r = Result("批1.1", "分型 regime")
+    if not table_exists(main, "ticket_event"):
+        r.status = FAIL
+        r.detail = "ticket_event 缺失"
+        out.append(r)
+    else:
+        n = main.execute(
+            "SELECT COUNT(*) FROM ticket_event WHERE event_kind='regime'"
+        ).fetchone()[0]
+        active = main.execute(
+            "SELECT COUNT(*) FROM ticket_lifecycle WHERE close_date IS NULL"
+        ).fetchone()[0]
+        covered = main.execute(
+            """SELECT COUNT(DISTINCT t.id) FROM ticket_lifecycle t
+               JOIN ticket_event e ON e.ticket_id = t.id AND e.event_kind='regime'
+               WHERE t.close_date IS NULL"""
+        ).fetchone()[0]
+        log_hit = sum(1 for line in log_lines if "[分型]" in line)
+        r.detail = (
+            f"regime 事件 {n} 条；活跃票 {active} 只中已分型 {covered} 只；"
+            f"日志 [分型] {log_hit} 行"
+        )
+        if n == 0 or covered == 0:
+            r.status = FAIL
+        elif covered < active or log_hit == 0:
+            r.status = PARTIAL
+        else:
+            r.status = OK
+        out.append(r)
+
+    r = Result("批1.3", "竞价买价")
+    quoted = 0
+    emotion = 0
+    lines = 0
+    for line in log_lines:
+        m = re.search(r"\[竞价买价\] emotion=(\d+) quoted=(\d+)", line)
+        if not m:
+            continue
+        lines += 1
+        emotion = max(emotion, int(m.group(1)))
+        quoted = max(quoted, int(m.group(2)))
+    r.detail = f"[竞价买价] 日志 {lines} 行，情绪型最多 {emotion} 只、给价 {quoted} 只"
+    if lines == 0:
+        r.status = FAIL
+        r.detail += " | 没有这条日志（调度未触发或代码未部署）"
+    elif emotion == 0:
+        r.status = PARTIAL
+        r.detail += " | 当日无情绪型票，属数据形态不是失败"
+    elif quoted == 0:
+        r.status = PARTIAL
+        r.detail += " | 情绪型票全部落在不给价档（高开过多/缺价）"
+    else:
+        r.status = OK
+    out.append(r)
+
+    r = Result("批1.4", "突破确认")
+    triggered = main.execute(
+        "SELECT COUNT(*) FROM ticket_event WHERE event_kind='entry_triggered'"
+    ).fetchone()[0]
+    warm = sum(1 for line in log_lines if "[触发确认] 预热" in line)
+    r.detail = f"entry_triggered 事件 {triggered} 条；[触发确认] 预热 {warm} 行"
+    if warm == 0:
+        r.status = FAIL
+        r.detail += " | 预热未发生（entry_proposed 为空或调度未跑到）"
+    elif triggered == 0:
+        r.status = PARTIAL
+        r.detail += " | 有预热但当日无票站上昨高"
+    else:
+        r.status = OK
+    out.append(r)
+
+    r = Result("批1.5", "价格失效")
+    invalidated = main.execute(
+        "SELECT COUNT(*) FROM ticket_event WHERE event_kind='entry_invalidated'"
+    ).fetchone()[0]
+    expiry = sum(1 for line in log_lines if "[价格失效] 时效检查" in line)
+    r.detail = f"entry_invalidated 事件 {invalidated} 条；[价格失效] 时效检查 {expiry} 行"
+    if expiry == 0:
+        r.status = FAIL
+        r.detail += " | 15:42 时效检查没有日志"
+    elif invalidated == 0:
+        r.status = PARTIAL
+        r.detail += " | 无失效（票都还在价格窗口内）"
+    else:
+        r.status = OK
+    out.append(r)
+
+    r = Result("批2.3", "资金流入口")
+    mf_log = 0
+    mf_candidates = 0
+    for line in log_lines:
+        m = re.search(r"\[观察池\] .*?mf_candidates=(\d+)", line)
+        if not m:
+            continue
+        mf_log += 1
+        mf_candidates = max(mf_candidates, int(m.group(1)))
+    f62_days = 0
+    if table_exists(main, "board_ranking_daily"):
+        f62_days = main.execute(
+            "SELECT COUNT(DISTINCT trade_date) FROM board_ranking_daily WHERE rank_fid='f62'"
+        ).fetchone()[0]
+    r.detail = f"观察池日志 {mf_log} 行，mf_candidates 最多 {mf_candidates}；f62 榜 {f62_days} 天"
+    if mf_log == 0:
+        r.status = FAIL
+        r.detail += " | 日志没有 mf_candidates 字段（新代码未部署）"
+    elif f62_days == 0:
+        r.status = PARTIAL
+        r.detail += " | f62 榜无数据（东财臂被拦截），入口空转属上游缺口"
+    elif mf_candidates == 0:
+        r.status = PARTIAL
+        r.detail += " | 有 f62 数据但没选出票（bk 映射/成分缺失）"
+    else:
+        r.status = OK
+    out.append(r)
+
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=5)
@@ -383,6 +513,7 @@ def main():
         check_p5(main_db, args.days),
         check_p6(main_db, args.days),
     ]
+    checks.extend(check_batch1(main_db, log_lines))
 
     print(f"=== ticket 阶段验收（{datetime.now():%Y-%m-%d %H:%M}，日志 {len(log_lines)} 行）===\n")
     for c in checks:

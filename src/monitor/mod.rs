@@ -43,12 +43,12 @@ pub mod g5b_analysis_v2;
 pub mod g5b_empty_v2;
 pub mod g5b_physical_v2;
 pub(crate) mod g5b_selection_v2;
+pub mod holdings_bridge; // 2026-10-20: Windows 持仓桥（TDX 导出快照，只读 HTTP）
 mod integration;
 pub mod news_ai;
 pub mod news_monitor;
 pub mod news_outcomes;
 pub mod outcome_data;
-pub mod trade_ledger; // 交易流水: 手工录入 + 快照差分推断 (2026-10-19)
 pub mod position_change_detect; // 2026-10-18: 加仓/减仓识别 (相邻快照比 quantity)
 pub mod position_sizing; // 2026-10-18: 仓位建议 (风险预算, 只建议不阻断)
 pub mod prediction;
@@ -58,13 +58,17 @@ pub mod risk;
 pub mod scanner;
 pub mod signal_fusion;
 pub mod signal_state;
+pub mod ticket_auction_price; // 2026-10-23: 情绪票 09:25 竞价买价 + 板块热度 (批 1.3/2.1)
+pub mod ticket_entry_proposal; // 2026-10-21: P2 入场参考 (observing → entry_proposed，复用 buy_zone)
+pub mod ticket_entry_trigger; // 2026-10-23: 盘中突破确认 + 价格失效 (批 1.4/1.5)
 pub mod ticket_event_sync; // 2026-10-17: 投递记账 (Delivered → ticket_event; 观察池/持仓才建票)
 pub mod ticket_eviction; // 2026-10-18: 观察池淘汰 (超期/跌幅, 只管 observing)
-pub mod ticket_entry_proposal; // 2026-10-21: P2 入场参考 (observing → entry_proposed，复用 buy_zone)
 pub mod ticket_priority; // 2026-10-18: 观察池票优先级 (5 维加权排序)
+pub mod ticket_regime; // 2026-10-23: 分型 (情绪型/趋势型) —— D1/D2 地基，写 ticket_event(kind=regime)
+pub mod ticket_risk_flag; // 2026-10-23: 排雷标注 (F10 关键词, 只标注不挡买入, 批 2.7)
 pub mod ticket_stage_sync; // 2026-10-18: 持仓快照驱动 stage 自动流转 (观察→持有→退出)
 pub mod ticket_watch_pool; // 2026-10-17: 观察池生成 (新闻催化; 板块轮动待接写入方)
+pub mod trade_ledger; // 交易流水: 手工录入 + 快照差分推断 (2026-10-19)
 pub mod trading_fact_snapshot; // 2026-10-17: op 67 价格带每日落库 (快照日有值, 错过永久丢)
-pub mod holdings_bridge; // 2026-10-20: Windows 持仓桥（TDX 导出快照，只读 HTTP）
 pub mod watch_pool_monitor; // 2026-10-18: 观察池定向监控 (30s 异动扫描)
 pub mod watch_pool_perf; // 2026-10-20: 观察池选股表现 (N 日收益/胜率)
