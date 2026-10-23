@@ -63,6 +63,7 @@ pub mod ticket_entry_proposal; // 2026-10-21: P2 入场参考 (observing → ent
 pub mod ticket_entry_trigger; // 2026-10-23: 盘中突破确认 + 价格失效 (批 1.4/1.5)
 pub mod ticket_event_sync; // 2026-10-17: 投递记账 (Delivered → ticket_event; 观察池/持仓才建票)
 pub mod ticket_eviction; // 2026-10-18: 观察池淘汰 (超期/跌幅, 只管 observing)
+pub mod ticket_lhb_sync; // 2026-10-24: ReviewLhb 归档 → ticket_event(kind=lhb)，只记情绪型活跃票
 pub mod ticket_priority; // 2026-10-18: 观察池票优先级 (5 维加权排序)
 pub mod ticket_regime; // 2026-10-23: 分型 (情绪型/趋势型) —— D1/D2 地基，写 ticket_event(kind=regime)
 pub mod ticket_risk_flag; // 2026-10-23: 排雷标注 (F10 关键词, 只标注不挡买入, 批 2.7)

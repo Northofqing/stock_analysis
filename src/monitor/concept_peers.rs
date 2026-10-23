@@ -118,58 +118,96 @@ fn resolve_name(conn: &mut SqliteConnection, code: &str) -> Option<String> {
     None
 }
 
+/// 一次装载 `stock_concepts`（全表一次查询）。
+///
+/// 2026-10-24：原 `peers_of` 每调用一次就全表扫描一次。P3.3 每 30 秒一轮、
+/// 观察池十几只票 → 每轮十几次全表扫描，直接压主库。改为「装一次、按票分组」。
+pub struct ConceptIndex {
+    parsed: Vec<(String, HashSet<String>)>,
+    malformed: usize,
+}
+
+impl ConceptIndex {
+    pub fn load(db: &DatabaseManager) -> Result<Self, String> {
+        let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+        let rows: Vec<ConceptRow> = diesel::sql_query("SELECT code, concepts FROM stock_concepts")
+            .load(&mut conn)
+            .map_err(|e| e.to_string())?;
+        let mut parsed: Vec<(String, HashSet<String>)> = Vec::new();
+        let mut malformed = 0usize;
+        for row in rows {
+            match serde_json::from_str::<Vec<String>>(&row.concepts) {
+                Ok(list) => parsed.push((row.code, list.into_iter().collect())),
+                Err(_) => malformed += 1,
+            }
+        }
+        if malformed > 0 {
+            log::warn!("[概念共现] {malformed} 行 concepts 不是合法 JSON 数组，已跳过");
+        }
+        Ok(Self { parsed, malformed })
+    }
+
+    pub fn malformed(&self) -> usize {
+        self.malformed
+    }
+
+    /// 某只票的同概念票（不带名称：调用方一般已有行情里的名称）。
+    fn peers_in(&self, code: &str, min_shared: usize) -> Vec<Peer> {
+        let Some((_, target)) = self.parsed.iter().find(|(candidate, _)| candidate == code) else {
+            return Vec::new();
+        };
+        let mut peers: Vec<Peer> = self
+            .parsed
+            .iter()
+            .filter(|(candidate, _)| candidate != code)
+            .filter_map(|(candidate, set)| {
+                let mut shared: Vec<String> = target
+                    .intersection(set)
+                    .filter(|tag| !is_generic(tag))
+                    .cloned()
+                    .collect();
+                if shared.len() < min_shared {
+                    return None;
+                }
+                shared.sort();
+                Some(Peer {
+                    code: candidate.clone(),
+                    name: None,
+                    shared,
+                })
+            })
+            .collect();
+        peers.sort_by(|a, b| {
+            b.shared
+                .len()
+                .cmp(&a.shared.len())
+                .then_with(|| a.code.cmp(&b.code))
+        });
+        peers
+    }
+
+    /// 一批票的同概念票：`subject -> peers`。全表只装载一次。
+    pub fn peers_many(
+        &self,
+        codes: &[String],
+        min_shared: usize,
+    ) -> std::collections::HashMap<String, Vec<Peer>> {
+        codes
+            .iter()
+            .map(|code| (code.clone(), self.peers_in(code, min_shared)))
+            .filter(|(_, peers)| !peers.is_empty())
+            .collect()
+    }
+}
+
 /// 给定一只票，返回共享概念数 >= `min_shared` 的其他票，按共享数降序。
 pub fn peers_of(db: &DatabaseManager, code: &str, min_shared: usize) -> Result<Vec<Peer>, String> {
+    let index = ConceptIndex::load(db)?;
+    if !index.parsed.iter().any(|(candidate, _)| candidate == code) {
+        return Err(format!("{code} 不在 stock_concepts 里"));
+    }
+    let mut peers = index.peers_in(code, min_shared);
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let rows: Vec<ConceptRow> = diesel::sql_query("SELECT code, concepts FROM stock_concepts")
-        .load(&mut conn)
-        .map_err(|e| e.to_string())?;
-
-    let mut parsed: Vec<(String, HashSet<String>)> = Vec::new();
-    let mut malformed = 0usize;
-    for row in rows {
-        match serde_json::from_str::<Vec<String>>(&row.concepts) {
-            Ok(list) => parsed.push((row.code, list.into_iter().collect())),
-            Err(_) => malformed += 1,
-        }
-    }
-    if malformed > 0 {
-        log::warn!("[概念共现] {malformed} 行 concepts 不是合法 JSON 数组，已跳过");
-    }
-
-    let target = parsed
-        .iter()
-        .find(|(candidate, _)| candidate == code)
-        .map(|(_, set)| set.clone())
-        .ok_or_else(|| format!("{code} 不在 stock_concepts 里"))?;
-
-    let mut peers: Vec<Peer> = parsed
-        .iter()
-        .filter(|(candidate, _)| candidate != code)
-        .filter_map(|(candidate, set)| {
-            let mut shared: Vec<String> = target
-                .intersection(set)
-                .filter(|tag| !is_generic(tag))
-                .cloned()
-                .collect();
-            if shared.len() < min_shared {
-                return None;
-            }
-            shared.sort();
-            Some(Peer {
-                code: candidate.clone(),
-                name: None,
-                shared,
-            })
-        })
-        .collect();
-
-    peers.sort_by(|a, b| {
-        b.shared
-            .len()
-            .cmp(&a.shared.len())
-            .then_with(|| a.code.cmp(&b.code))
-    });
     for peer in &mut peers {
         peer.name = resolve_name(&mut conn, &peer.code);
     }
@@ -201,5 +239,26 @@ mod tests {
     #[test]
     fn default_threshold_is_two() {
         assert_eq!(DEFAULT_MIN_SHARED, 2);
+    }
+
+    #[test]
+    fn peers_many_loads_once_and_groups_by_subject() {
+        let index = ConceptIndex {
+            parsed: vec![
+                ("600001".to_string(), set(&["光伏", "风电"])),
+                ("600002".to_string(), set(&["光伏", "风电", "储能"])),
+                ("600003".to_string(), set(&["光伏", "融资融券"])),
+                ("600004".to_string(), set(&["白酒"])),
+            ],
+            malformed: 0,
+        };
+        let map = index.peers_many(
+            &["600001".to_string(), "600004".to_string()],
+            DEFAULT_MIN_SHARED,
+        );
+        let first = map.get("600001").expect("600001 有同概念票");
+        assert_eq!(first.len(), 1, "只有 600002 共享 2 个非通用概念");
+        assert_eq!(first[0].code, "600002");
+        assert!(map.get("600004").is_none(), "白酒无共现票");
     }
 }

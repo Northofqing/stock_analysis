@@ -5552,6 +5552,52 @@ fn log_startup_profile(
     );
 }
 
+/// 龙虎榜归档同步（批 2.6，2026-10-24）：21:40 起跑，marker `data/lhb_sync/<date>`。
+///
+/// 数据源是 `ReviewLhb` 的投递归档（表 `lhb_daily` 停在 7-12）。探针实测正文含
+/// 「营业部/席位/净买」，所以不需要新 op，只需要把归档读出来匹配活跃情绪票。
+/// 21:00 推送、21:40 起跑留 40 分钟余量；当日没有 LHB 推送（decisions=0）不写 marker，
+/// 5 分钟后重试。
+async fn lhb_sync_loop() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        let now = chrono::Local::now();
+        let today = now.date_naive();
+        if !calendar::is_trading_day(today) {
+            continue;
+        }
+        if now.time() < chrono::NaiveTime::from_hms_opt(21, 40, 0).unwrap() {
+            continue;
+        }
+        let date_text = today.format("%Y-%m-%d").to_string();
+        let marker = std::path::Path::new("data/lhb_sync").join(&date_text);
+        if marker.exists() {
+            continue;
+        }
+        let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+            continue;
+        };
+        let path = std::path::Path::new("data/durable_delivery.sqlite3");
+        match stock_analysis::monitor::ticket_lhb_sync::sync_from_delivery(&db, path, &date_text, 3)
+        {
+            Ok(report) => {
+                report.log();
+                if report.decisions == 0 {
+                    log::info!("[龙虎榜] 当日还没有 ReviewLhb 投递, 5 分钟后重试");
+                    continue;
+                }
+                if let Some(parent) = marker.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(error) = std::fs::write(&marker, format!("written={}", report.written)) {
+                    log::warn!("[龙虎榜] marker 写入失败（会重复扫描，事件有幂等）: {error}");
+                }
+            }
+            Err(error) => log::warn!("[龙虎榜] 同步失败, 5 分钟后重试: {error}"),
+        }
+    }
+}
+
 /// 全市场日线刷新（2026-10-22，修 B.8）。独立长驻任务，**不再放在 market_loop 里**。
 ///
 /// 2965 只串行拉取 + 写入本来就要几十分钟，放在盘后调度链里会把 16:00 明日计划、
@@ -6890,6 +6936,8 @@ async fn main() {
         let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
         // 全市场日线：独立任务，21:30 起跑，不占 market_loop（理由见函数注释）。
         let full_universe_bars = tokio::spawn(full_universe_bars_loop());
+        // 龙虎榜归档同步：21:40 起跑（ReviewLhb 21:00 推送之后）。
+        let lhb_sync = tokio::spawn(lhb_sync_loop());
         // T0Evidence 证据缺省降级事件（对端 3faa9d8 起在 Subscribe 通道推送）：
         // **纯观测**订阅，只记录与计数，不参与任何准入门控。未配置外连 bundle 时
         // 保持长驻（不返回），避免被生命周期监督当成提前结束；循环自身退避重连。
@@ -6932,6 +6980,7 @@ async fn main() {
             ("opening_static_readiness", opening_static_readiness),
             ("opening_live_readiness", opening_live_readiness),
             ("full_universe_bars", full_universe_bars),
+            ("lhb_sync", lhb_sync),
             (
                 "t0_evidence_degradation_subscriber",
                 t0_evidence_degradation,

@@ -200,8 +200,8 @@ pub async fn scan(
         if let Some(peers) = peer_alerts.get(&quote.code) {
             for peer in peers {
                 reasons.push(format!(
-                    "同板块「{}」{} {} {:+.2}%",
-                    peer.board_name, peer.code, peer.name, peer.change_pct
+                    "{}「{}」{} {} {:+.2}%",
+                    peer.source, peer.board_name, peer.code, peer.name, peer.change_pct
                 ));
             }
         }
@@ -239,6 +239,8 @@ struct PeerHit {
     name: String,
     price: f64,
     change_pct: f64,
+    /// 「同板块」/「同概念」——两个来源的强弱不同，文案里必须能分开
+    source: &'static str,
     board_name: String,
 }
 
@@ -265,11 +267,10 @@ async fn load_peer_alerts(
 
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     // board_member 只有千级行，全量取回在 Rust 侧过滤，避免动态 IN 绑定。
-    let members: Vec<MemberRow> = diesel::sql_query(
-        "SELECT board_code, board_name, instrument_code FROM board_member",
-    )
-    .load(&mut conn)
-    .map_err(|error| format!("板块成分查询失败: {error}"))?;
+    let members: Vec<MemberRow> =
+        diesel::sql_query("SELECT board_code, board_name, instrument_code FROM board_member")
+            .load(&mut conn)
+            .map_err(|error| format!("板块成分查询失败: {error}"))?;
     drop(conn);
 
     let watched: HashSet<&str> = codes.iter().map(String::as_str).collect();
@@ -311,6 +312,29 @@ async fn load_peer_alerts(
             break;
         }
     }
+    // 批 2.5（拓 2.3，2026-10-24）：概念共现作为第二来源。
+    // `stock_concepts` 覆盖 1265 只，比 `board_member` 的采集范围广；
+    // 一次装载（ConceptIndex）后按票分组，不再逐票全表扫。
+    let concept_map: HashMap<String, Vec<crate::monitor::concept_peers::Peer>> =
+        match crate::monitor::concept_peers::ConceptIndex::load(db) {
+            Ok(index) => index.peers_many(codes, crate::monitor::concept_peers::DEFAULT_MIN_SHARED),
+            Err(error) => {
+                log::warn!("[观察池] 概念装载失败, 本轮只用板块: {error}");
+                HashMap::new()
+            }
+        };
+    let mut candidate_set: HashSet<String> = candidates.iter().cloned().collect();
+    'concept_candidates: for peers in concept_map.values() {
+        for peer in peers {
+            if candidates.len() >= PEER_QUERY_LIMIT {
+                break 'concept_candidates;
+            }
+            if candidate_set.insert(peer.code.clone()) {
+                candidates.push(peer.code.clone());
+            }
+        }
+    }
+
     if candidates.is_empty() {
         return Ok(HashMap::new());
     }
@@ -353,6 +377,7 @@ async fn load_peer_alerts(
                         name: quote.name.clone(),
                         price: quote.price,
                         change_pct: quote.change_percent,
+                        source: "同板块",
                         board_name: (*board_name).to_owned(),
                     });
                 if quote.change_percent > slot.change_pct {
@@ -361,6 +386,37 @@ async fn load_peer_alerts(
                     slot.price = quote.price;
                     slot.change_pct = quote.change_percent;
                 }
+            }
+        }
+    }
+
+    // 同概念只报最强一只（概念组多，逐组报会刷屏）。
+    for (subject, peers) in &concept_map {
+        for peer in peers {
+            let Some(quote) = by_code.get(peer.code.as_str()) else {
+                continue;
+            };
+            if quote.change_percent < PEER_CHANGE_THRESHOLD {
+                continue;
+            }
+            let slot = best
+                .entry(subject.clone())
+                .or_default()
+                .entry("concept".to_string())
+                .or_insert_with(|| PeerHit {
+                    code: quote.code.clone(),
+                    name: quote.name.clone(),
+                    price: quote.price,
+                    change_pct: quote.change_percent,
+                    source: "同概念",
+                    board_name: peer.shared.join("、"),
+                });
+            if quote.change_percent > slot.change_pct {
+                slot.code = quote.code.clone();
+                slot.name = quote.name.clone();
+                slot.price = quote.price;
+                slot.change_pct = quote.change_percent;
+                slot.board_name = peer.shared.join("、");
             }
         }
     }
