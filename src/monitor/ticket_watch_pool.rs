@@ -440,10 +440,12 @@ pub fn collect_board_rotation(
     )
 }
 
-/// 资金流路（批 2.3 / 拓 7）：**前一交易日** `f62` 主力净流入榜 top N → 成分股 → 每板块前 M。
+/// 资金流路（批 2.3 / 拓 7）：`f62` 主力净流入榜 top N → 成分股 → 每板块前 M。
 ///
-/// 为什么用前一交易日而不是当日：观察池 15:40 就跑，f62 盘后榜此时可能还没落全；
-/// 用前一交易日的完整榜比赌当日半成品可靠。10-21 之前 f62 无数据 → 返回 0，不补造。
+/// 取**当日**榜（`board_ranking_daily` 15:30 已写），取不到再退最近一日：
+/// 成分映射（`eastmoney_members`）是调用方按**当日**榜单 top 板块拉的 BK 成分，
+/// 用前一交易日的榜会拿名字对不上的成分表 —— 那样入口会永远选出 0 只。
+/// 10-21 之前 f62 无数据 → 返回 0，不补造。
 pub fn collect_money_flow_boards(
     db: &DatabaseManager,
     business_date: &str,
@@ -462,7 +464,7 @@ pub fn collect_money_flow_boards(
         let mut conn = db.get_conn().map_err(|e| e.to_string())?;
         diesel::sql_query(
             "SELECT MAX(trade_date) AS trade_date FROM board_ranking_daily \
-              WHERE rank_fid = 'f62' AND trade_date < ?1",
+              WHERE rank_fid = 'f62' AND trade_date <= ?1",
         )
         .bind::<diesel::sql_types::Text, _>(business_date.to_owned())
         .get_result::<DateRow>(&mut *conn)

@@ -942,12 +942,17 @@ capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧�
 | 项 | 落地位置 | 实际动作 | 验收看什么 |
 |---|---|---|---|
 | 2.1 | `ticket_auction_price::board_heat` | 竞价 rows 按 `board_member` 聚合，只取成员 ≥2 的板块，按竞价均涨幅取前 5，量比给中位数；并入 1.3 同一条消息（不另推）。 | 竞价推送正文出现「📊 板块热度」段 |
-| 2.3 | `ticket_watch_pool::collect_money_flow_boards` | 把板块路抽成 `collect_board_picks(board_date, rank_fid, source, label, …)`，f3→`board_rotation`、**前一交易日 f62**→`money_flow`。f62 无数据返回 0，不补造。 | 观察池日志 `mf_boards= mf_candidates= mf_added=`；`phase_acceptance.py` 的「批2.3」 |
+| 2.3 | `ticket_watch_pool::collect_money_flow_boards` | 把板块路抽成 `collect_board_picks(board_date, rank_fid, source, label, …)`，f3→`board_rotation`、**当日 f62**→`money_flow`（当日榜不在才退最近一日）。f62 无数据返回 0，不补造。 | 观察池日志 `mf_boards= mf_candidates= mf_added=`；`phase_acceptance.py` 的「批2.3」 |
 | 2.7 | `monitor/ticket_risk_flag.rs` + `main.rs` 15:52 | F10 四类原文扫 6 个关键词（退市/立案/预亏/商誉减值/减持/解禁），命中写 `kind='risk_flag'` + 抽 ±20 字片段，一条消息汇总推送；`render_plan` 持仓段与新买入段渲染「⚠ 有雷（标注，不挡操作）」。 | 日志 `[排雷] scanned= hits= written=`；明日计划正文出现「⚠ 有雷」 |
 | 2.8 | `buy_zone_dispatch::render_plan` | 读 `board_rotation_signal status='fading'`，持仓票与新买入票逐票标「⚠ 所属板块退潮」。 | 退潮板块的持仓票正文多一行 |
 | 2.9 | `watch_pool_monitor_loop` | L1（价格 ±3%、新闻命中）→ `push_wechat` 即时，沿用 30 分钟同票同因去重；L2（较上次急变、同板块关联票）→ 仅日志。 | 日志出现 L1 推送；L2 仍只进日志 |
 | 2.10 | `buy_zone_dispatch` 持仓段 | 目标价 = 20 日最高（参考）；移动止盈 = max(成本, 近 5 日低)，跌破提示；不自动卖、不改建议动作。 | 持仓段出现「目标价」「移动止盈」两行 |
 | 2.11 | `buy_zone_dispatch` 新买入段 | 按 `ticket_priority::rank_watch_pool` 分数降序，①②③ 标建议顺序并附分数；取不到分数退回建议仓位排序并在正文写明。**只排序不拦截**。 | 新买入候选按分数从高到低，第四名起用数字 |
+
+偏差（与 2.3 原文）：原文写「前一交易日 f62」，实现改为**当日 f62**。原因是成分映射
+（`eastmoney_members`）由调用方按**当日**榜单 top 板块拉 BK 成分——用前一交易日的榜，
+名字/代码对不上，入口会永远选出 0 只。`board_ranking_daily` 的 f62 在 15:30 已写，
+15:40 观察池读得到；当日没有才退最近一日（此时成分可能缺，`mf_candidates=0` 属预期）。
 
 未做（保持原状，没有半实现）：
 

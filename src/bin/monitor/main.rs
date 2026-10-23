@@ -12399,7 +12399,8 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                 diesel::sql_query(
                                                     "SELECT board_name, board_code \
                                                  FROM board_ranking_daily \
-                                                 WHERE trade_date = ? AND rank_fid = 'f3' \
+                                                 WHERE trade_date = ? \
+                                                   AND rank_fid IN ('f3','f62') \
                                                    AND rank_position < 10 \
                                                  GROUP BY board_name, board_code",
                                                 )
@@ -14786,6 +14787,8 @@ async fn watch_pool_monitor_loop() {
     let mut trigger_cache: Option<stock_analysis::monitor::ticket_entry_trigger::TriggerCache> =
         None;
     let mut trigger_slot: Option<u8> = None;
+    // 预热失败时的退避：行情/日线缺失会让 warm 每次都失败，30 秒重试等于压库。
+    let mut trigger_warm_failed_at: Option<std::time::Instant> = None;
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -14815,7 +14818,11 @@ async fn watch_pool_monitor_loop() {
         } else {
             0
         };
-        if trigger_cache.is_none() || trigger_slot != Some(slot) {
+        let warm_due = trigger_cache.is_none() || trigger_slot != Some(slot);
+        let warm_allowed = trigger_warm_failed_at
+            .map(|at| at.elapsed() >= std::time::Duration::from_secs(300))
+            .unwrap_or(true);
+        if warm_due && warm_allowed {
             match stock_analysis::monitor::ticket_entry_trigger::warm(&db, &date_text) {
                 Ok(cache) => {
                     log::info!(
@@ -14829,8 +14836,12 @@ async fn watch_pool_monitor_loop() {
                     }
                     trigger_cache = Some(cache);
                     trigger_slot = Some(slot);
+                    trigger_warm_failed_at = None;
                 }
-                Err(error) => log::warn!("[触发确认] 预热失败, 本轮跳过: {error}"),
+                Err(error) => {
+                    trigger_warm_failed_at = Some(std::time::Instant::now());
+                    log::warn!("[触发确认] 预热失败, 5 分钟内不重试: {error}")
+                }
             }
         }
 
@@ -14845,7 +14856,12 @@ async fn watch_pool_monitor_loop() {
 
         let now_utc = chrono::Utc::now();
         for alert in &alerts {
-            let key = format!("{}|{}", alert.code, alert.reason);
+            // 批 2.9（拓 2.1）事件分级：价格 ±3% 与新闻命中是 L1，即时推；
+            // 「较上次急变」「同板块关联票」是 L2，只进日志（现行为）。
+            let level1 = alert.reason.contains("新闻") || alert.reason.contains("日内");
+            // 去重键用 (票, 级别) 而不是 reason 全文：「日内 +3.52%」每轮数字都变，
+            // 按全文去重等于没去重，会每 30 秒推一条。方案要求 1 次/票/30 分钟。
+            let key = format!("{}|{}", alert.code, if level1 { "L1" } else { "L2" });
             if let Some(previous) = alerted_at.get(&key) {
                 if (now_utc - *previous).num_minutes() < 30 {
                     continue;
@@ -14853,10 +14869,6 @@ async fn watch_pool_monitor_loop() {
             }
             alerted_at.insert(key, now_utc);
             log::info!("[定向监控] {}", alert.render());
-            // 批 2.9（拓 2.1）事件分级：价格 ±3% 与新闻命中是 L1，即时推；
-            // 「较上次急变」「同板块关联票」是 L2，只进日志（现行为）。
-            // 30 分钟同票同因去重由上面的 alerted_at 承担。
-            let level1 = alert.reason.contains("新闻") || alert.reason.contains("日内");
             if level1 {
                 let text = format!("【{} 定向监控】{}", date_text, alert.render());
                 if !crate::notify::push_wechat(&text).await {
