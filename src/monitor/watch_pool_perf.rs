@@ -29,7 +29,7 @@ use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Double, Text};
 
 use crate::monitor::buy_zone::resolve_name;
-use crate::monitor::ticket_regime::Regime;
+use crate::monitor::ticket_regime::{self, Regime};
 
 /// 市场基准的最小可信样本数（4.2）。
 pub const MIN_MARKET_SAMPLE: usize = 800;
@@ -64,12 +64,6 @@ struct DateRow {
     trade_date: String,
 }
 
-#[derive(QueryableByName)]
-struct RegimeRow {
-    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
-    summary: Option<String>,
-}
-
 struct BatchTicket {
     open_date: String,
     code: String,
@@ -101,20 +95,21 @@ impl Default for PerfOptions {
     }
 }
 
-/// 该 ticket 的最新分型；没有分型事件时按趋势型统计
-/// （趋势型窗口更长，晚给结论比错给结论安全）。
-fn latest_regime(conn: &mut SqliteConnection, ticket_id: i64) -> Regime {
-    let summary = diesel::sql_query(
-        "SELECT summary FROM ticket_event \
-          WHERE ticket_id = ? AND event_kind = 'regime' \
-          ORDER BY event_at DESC, id DESC LIMIT 1",
-    )
-    .bind::<BigInt, _>(ticket_id)
-    .get_result::<RegimeRow>(conn)
-    .ok()
-    .and_then(|row| row.summary);
-    summary
-        .and_then(|text| text.split('|').next().and_then(Regime::parse))
+/// 该 ticket 的分型：优先取最新 `regime` 事件；**没有事件则按同一套规则现算**
+/// （`ticket_regime::resolve`），不要默认趋势型。
+///
+/// 2026-10-24 修正：原来没有事件时一律当趋势型，于是「情绪型 D+1/D+3」永远是空表 ——
+/// 分型代码还没部署的那段时间，周报会一行都看不到。现算和调度写事件用的是同一判据
+/// （来源 P01 ∪ 近 5 根日线涨停），所以两条路径结论一致。
+fn latest_regime(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    code: &str,
+    source: &str,
+    as_of: &str,
+) -> Regime {
+    ticket_regime::resolve(conn, ticket_id, code, source, as_of)
+        .map(|decision| decision.regime)
         .unwrap_or(Regime::Trend)
 }
 
@@ -203,7 +198,9 @@ pub fn render(conn: &mut SqliteConnection, options: &PerfOptions) -> Result<Stri
     let mut batches: Vec<BatchTicket> = Vec::new();
     for ticket in tickets {
         let name = resolve_name(conn, &ticket.code).unwrap_or_default();
-        let regime = latest_regime(conn, ticket.id);
+        // 「今天」= 日历上最后一个交易日：分型现算要用它做回看边界。
+        let as_of = calendar.last().map(String::as_str).unwrap_or("");
+        let regime = latest_regime(conn, ticket.id, &ticket.code, &ticket.source, as_of);
         // 4.1：P01 09:00 开票、当日可买 → 基准取开盘价；其余盘后开票 → 收盘价。
         let base_price = if ticket.source == "p01_preopen" {
             opens
