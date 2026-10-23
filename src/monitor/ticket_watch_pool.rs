@@ -382,6 +382,34 @@ pub fn collect_board_rotation(
 }
 
 
+/// 同日同票同摘要的 catalyst 事件只写一次（2026-10-22）。
+///
+/// 观察池块在重启/补跑时会整轮重放：`open_ticket` 已按 code 去重，但「追加催化」
+/// 这条路径原来没有判重，同一批票的 catalyst 会再写一遍（10-22 重启后 3 只票各多一条）。
+/// 返回 `true` 表示本次真的写入了。
+fn append_catalyst_once(
+    conn: &mut diesel::SqliteConnection,
+    ticket_id: i64,
+    event_at: &str,
+    business_date: &str,
+    summary: &str,
+) -> Result<bool, String> {
+    if ticket_lifecycle::event_exists_same_day(conn, ticket_id, "catalyst", business_date, summary)?
+    {
+        return Ok(false);
+    }
+    ticket_lifecycle::append_event(
+        conn,
+        ticket_id,
+        event_at,
+        "catalyst",
+        None,
+        None,
+        Some(summary),
+    )?;
+    Ok(true)
+}
+
 /// 把候选写进观察池。`dry_run=true` 只打印。
 pub fn build_watch_pool(
     db: &DatabaseManager,
@@ -462,16 +490,9 @@ pub fn build_watch_pool(
                     item.latest_at,
                     item.note
                 );
-                match ticket_lifecycle::append_event(
-                    &mut *conn,
-                    active.id,
-                    &now,
-                    "catalyst",
-                    None,
-                    None,
-                    Some(&summary),
-                ) {
-                    Ok(()) => report.appended += 1,
+                match append_catalyst_once(&mut *conn, active.id, &now, business_date, &summary) {
+                    Ok(true) => report.appended += 1,
+                    Ok(false) => {} // 同日同摘要已记过（重启/补跑重放）
                     Err(error) => report.errors.push(error),
                 }
             }
@@ -493,14 +514,13 @@ pub fn build_watch_pool(
                 ) {
                     Ok(ticket_id) => {
                         report.opened += 1;
-                        if let Err(error) = ticket_lifecycle::append_event(
+                        let first_summary = format!("首次入池, 命中 {} 条催化", item.hits);
+                        if let Err(error) = append_catalyst_once(
                             &mut *conn,
                             ticket_id,
                             &now,
-                            "catalyst",
-                            None,
-                            None,
-                            Some(&format!("首次入池, 命中 {} 条催化", item.hits)),
+                            business_date,
+                            &first_summary,
                         ) {
                             report.errors.push(error);
                         }

@@ -5552,6 +5552,99 @@ fn log_startup_profile(
     );
 }
 
+/// 全市场日线刷新（2026-10-22，修 B.8）。独立长驻任务，**不再放在 market_loop 里**。
+///
+/// 2965 只串行拉取 + 写入本来就要几十分钟，放在盘后调度链里会把 16:00 明日计划、
+/// 19:00 严格复盘顶住（10-22 实测：15:55 那班被同链路长任务挤到 21:16 才结束）。
+///
+/// 口径 = stock_concepts ∪ board_member ∪ 活跃 ticket ∪ 持仓（实测约 2965 只）；
+/// marker `data/daily_bars_full/<date>` 判重，重启不重放。
+async fn full_universe_bars_loop() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        let now = chrono::Local::now();
+        let today = now.date_naive();
+        if !calendar::is_trading_day(today) {
+            continue;
+        }
+        if now.time() < chrono::NaiveTime::from_hms_opt(21, 30, 0).unwrap() {
+            continue;
+        }
+        let date_text = today.format("%Y-%m-%d").to_string();
+        let marker = std::path::Path::new("data/daily_bars_full").join(&date_text);
+        if marker.exists() {
+            continue;
+        }
+        let db = match stock_analysis::database::DatabaseManager::try_get() {
+            Some(db) => db,
+            None => {
+                log::warn!("[日线全量] 数据库不可用, 本轮跳过");
+                continue;
+            }
+        };
+        let codes = db.get_conn().ok().and_then(|mut conn| {
+            stock_analysis::monitor::daily_bars_indicators::collect_full_universe_codes(&mut conn)
+                .ok()
+        });
+        let codes = match codes {
+            Some(list) if !list.is_empty() => list,
+            _ => {
+                log::warn!("[日线全量] 标的查询为空或失败, 本轮跳过");
+                continue;
+            }
+        };
+        match stock_analysis::monitor::daily_bars_indicators::refresh_daily_bars_and_ma(
+            &db,
+            &date_text,
+            Some(&codes),
+        )
+        .await
+        {
+            Ok(report) => {
+                report.log();
+                // 覆盖度自检：当日全市场日线不足 800 只 → 告警。
+                #[derive(diesel::QueryableByName)]
+                struct Cov {
+                    #[diesel(sql_type = diesel::sql_types::BigInt)]
+                    n: i64,
+                }
+                use diesel::RunQueryDsl as _;
+                let coverage: i64 = db
+                    .get_conn()
+                    .ok()
+                    .and_then(|mut conn| {
+                        diesel::sql_query("SELECT COUNT(*) AS n FROM stock_daily WHERE date = ?")
+                            .bind::<diesel::sql_types::Text, _>(date_text.clone())
+                            .get_result::<Cov>(&mut conn)
+                            .ok()
+                    })
+                    .map(|row| row.n)
+                    .unwrap_or(0);
+                log::info!(
+                    "[日线全量] targets={} written={} failed={} coverage_today={coverage}",
+                    report.targets,
+                    report.persisted_bars,
+                    report.failed
+                );
+                if coverage < 800 {
+                    log::warn!("[日线全量] 覆盖异常：今日 stock_daily 仅 {coverage} 只（阈值 800）");
+                    let alert = format!(
+                        "⚠ 日线覆盖异常（{date_text}）：stock_daily 今日仅 {coverage} 只，选票与归因基准会失真。检查 bridge / HistoricalBars。"
+                    );
+                    let _ = crate::notify::push_wechat(&alert).await;
+                }
+                if let Some(parent) = marker.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(error) = std::fs::write(&marker, coverage.to_string()) {
+                    log::warn!("[日线全量] marker 写入失败（重启会重放）: {error}");
+                }
+            }
+            Err(error) => log::warn!("[日线全量] 失败, 保留重试 date={date_text}: {error}"),
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let process_started = std::time::Instant::now();
@@ -6793,6 +6886,8 @@ async fn main() {
         let position_chain_refresh = tokio::spawn(position_chain_refresh_loop());
         let opening_static_readiness = tokio::spawn(opening_static_readiness_loop());
         let opening_live_readiness = tokio::spawn(opening_live_readiness_loop());
+        // 全市场日线：独立任务，21:30 起跑，不占 market_loop（理由见函数注释）。
+        let full_universe_bars = tokio::spawn(full_universe_bars_loop());
         // T0Evidence 证据缺省降级事件（对端 3faa9d8 起在 Subscribe 通道推送）：
         // **纯观测**订阅，只记录与计数，不参与任何准入门控。未配置外连 bundle 时
         // 保持长驻（不返回），避免被生命周期监督当成提前结束；循环自身退避重连。
@@ -6834,6 +6929,7 @@ async fn main() {
             ("position_chain_refresh", position_chain_refresh),
             ("opening_static_readiness", opening_static_readiness),
             ("opening_live_readiness", opening_live_readiness),
+            ("full_universe_bars", full_universe_bars),
             (
                 "t0_evidence_degradation_subscriber",
                 t0_evidence_degradation,
@@ -12145,11 +12241,16 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     {
                         static WATCH_POOL_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
                             std::sync::Mutex::new(None);
+                        // 2026-10-22: 持久判重。static 在重启后清零，而「时间已过→补跑」
+                        // 会让整轮重放（10-21 一晚跑了 3 轮，catalyst 事件同批票写 3 遍）。
+                        let pool_marker = std::path::Path::new("data/watch_pool")
+                            .join(advice_report_date.format("%Y-%m-%d").to_string());
                         let already = WATCH_POOL_LAST
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .map(|d| d == advice_report_date)
-                            .unwrap_or(false);
+                            .unwrap_or(false)
+                            || pool_marker.exists();
                         if !already {
                             match stock_analysis::database::DatabaseManager::try_get() {
                                 Some(db) => {
@@ -12246,6 +12347,9 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     // 的名字和代码交集都是 0，实测候选一直是 0。
                                     let eastmoney_members: std::collections::HashMap<String, Vec<String>> = {
                                         let mut map = std::collections::HashMap::new();
+                                        // 2026-10-22: gn_ 板块是新浪概念码，TDX 目录里很多名字不存在；
+                                        // 失败属于预期缺口，合并成一行 info，不逐板块 warn。
+                                        let mut tdx_misses: Vec<String> = Vec::new();
                                         #[derive(diesel::QueryableByName)]
                                         struct BRow {
                                             #[diesel(sql_type = diesel::sql_types::Text)]
@@ -12296,17 +12400,30 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                                 map.insert(row.board_name, codes);
                                                             }
                                                         }
-                                                        Err(error) => log::warn!(
-                                                            "[观察池] 板块成分失败 {} {}: {error}",
-                                                            row.board_code,
-                                                            row.board_name
-                                                        ),
+                                                        Err(error) => {
+                                                            if row.board_code.starts_with("BK") {
+                                                                log::warn!(
+                                                                    "[观察池] 板块成分失败 {} {}: {error}",
+                                                                    row.board_code,
+                                                                    row.board_name
+                                                                );
+                                                            } else {
+                                                                tdx_misses.push(row.board_name.clone());
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                             Err(error) => log::warn!(
                                                 "[观察池] BoardConstituents 桥不可用: {error}"
                                             ),
+                                        }
+                                        if !tdx_misses.is_empty() {
+                                            log::info!(
+                                                "[观察池] 非东财板块成分缺口 {} 个（TDX 目录无此名，预期）: {}",
+                                                tdx_misses.len(),
+                                                tdx_misses.join(",")
+                                            );
                                         }
                                         map
                                     };
@@ -12341,6 +12458,23 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                                 .lock()
                                                 .unwrap_or_else(|e| e.into_inner()) =
                                                 Some(advice_report_date);
+                                            // 2026-10-22: 写持久 marker（重启后不再重放本日轮次）。
+                                            if let Some(parent) = pool_marker.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            let marker_text = format!(
+                                                "news_candidates={} board_candidates={} total={} opened={} appended={}",
+                                                report.news_candidates,
+                                                report.board_candidates,
+                                                report.candidates,
+                                                report.opened,
+                                                report.appended
+                                            );
+                                            if let Err(error) = std::fs::write(&pool_marker, marker_text) {
+                                                log::warn!(
+                                                    "[观察池] marker 写入失败（重启会重放）date={date_text}: {error}"
+                                                );
+                                            }
                                         }
                                         Err(error) => log::warn!(
                                             "[观察池] 生成失败, 保留重试 date={advice_report_date}: {error}"
@@ -12754,6 +12888,18 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     Ok(text) => {
                                         let chars = text.chars().count();
                                         log::info!("[可买价] 明日计划生成 {chars} 字");
+                                        // 2026-10-22: 正文归档。明日计划不走投递库（无审计归档），
+                                        // 本地留全文是事后复查的唯一途径。
+                                        let archive = std::path::Path::new("data/buy_zone_archive")
+                                            .join(format!("{date_text}.txt"));
+                                        if let Some(parent) = archive.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        if let Err(error) = std::fs::write(&archive, &text) {
+                                            log::warn!(
+                                                "[可买价] 正文归档失败 date={date_text}: {error}"
+                                            );
+                                        }
                                         if crate::notify::push_wechat(&text).await {
                                             log::info!("[可买价] 明日计划已推送");
                                             if let Some(parent) = marker.parent() {
@@ -12877,6 +13023,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                             }
                         }
                     }
+
+                    // 全市场日线（2026-10-22，修 B.8）：**不再放在这里**。
+                    // 2965 只串行拉取 + 写入本来就要几十分钟到一小时，放在盘后调度链里
+                    // 会把后面的块（16:00 明日计划、19:00 复盘）顶住——10-22 实测 15:55
+                    // 那班被同类长任务挤到 21:16 才结束。已改为独立任务
+                    // `full_universe_bars_loop()`（main 里 spawn）。
                 }
 
                 if session == MarketSession::Morning || session == MarketSession::Afternoon {

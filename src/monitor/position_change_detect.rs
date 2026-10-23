@@ -266,6 +266,10 @@ fn record(
             return;
         }
     };
+    if let Ok(true) = ticket_lifecycle::event_exists_same_day(conn, ticket.id, kind, as_of, summary)
+    {
+        return; // 幂等：同日同票同摘要已记过（重启补跑/多轮扫描）
+    }
     if let Err(error) =
         ticket_lifecycle::append_event(conn, ticket.id, as_of, kind, None, None, Some(summary))
     {

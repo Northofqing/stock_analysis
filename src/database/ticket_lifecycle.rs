@@ -126,6 +126,31 @@ pub fn open_ticket(
     source: &str,
     note: Option<&str>,
 ) -> Result<i64, String> {
+    // 2026-10-22: 同 code 活跃票防护。
+    //
+    // 同一只票已有活跃 ticket（observing / entry_proposed / holding）时不再新开：
+    // 跨日重复入选（如 P01 连推两日）会造出孤儿票——find_active_ticket 只取最新
+    // 一张，淘汰扫描按 code 走也永远命中新票，旧的 entry_proposed 票逃逸 10 天 /
+    // 15% 两条规则永远关不掉，明日计划还会同票列两行。
+    if let Some(existing) = find_active_ticket(conn, code)? {
+        // 记录一次「重复入选」事件，让选股信号在票的历史里可见（同日幂等）。
+        let summary = format!("重复入选（已有 ticket#{}）", existing.id);
+        let already = event_exists_same_day(conn, existing.id, "catalyst", open_date, &summary)
+            .unwrap_or(false);
+        if !already {
+            let _ = append_event(
+                conn,
+                existing.id,
+                open_date,
+                "catalyst",
+                None,
+                None,
+                Some(&summary),
+            );
+        }
+        return Ok(existing.id);
+    }
+
     diesel::sql_query(
         "INSERT OR IGNORE INTO ticket_lifecycle (code, open_date, stage, source, note) \
          VALUES (?, ?, ?, ?, ?)",
@@ -210,6 +235,35 @@ pub fn append_event(
     .execute(conn)
     .map_err(|e| format!("ticket event insert failed (ticket={ticket_id}): {e}"))?;
     Ok(())
+}
+
+/// 同日同票同摘要的事件是否已存在（幂等判重，2026-10-22）。
+///
+/// 用于持仓差量识别：同一份快照被重复比对时（重启补跑、多轮扫描），
+/// 同一笔「新建仓 500 股」不会重复写多条事件。
+pub fn event_exists_same_day(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    event_kind: &str,
+    event_at: &str,
+    summary: &str,
+) -> Result<bool, String> {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let row: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM ticket_event \
+          WHERE ticket_id = ? AND event_kind = ? AND date(event_at) = date(?) AND summary = ?",
+    )
+    .bind::<BigInt, _>(ticket_id)
+    .bind::<Text, _>(event_kind)
+    .bind::<Text, _>(event_at)
+    .bind::<Text, _>(summary)
+    .get_result(conn)
+    .map_err(|e| format!("ticket event dedup query failed (ticket={ticket_id}): {e}"))?;
+    Ok(row.n > 0)
 }
 
 /// 取该票当前活跃的 ticket（close_date IS NULL）；没有则 None。
@@ -342,4 +396,114 @@ pub fn count_active(conn: &mut SqliteConnection) -> Result<i64, String> {
         .get_result::<Count>(conn)
         .map(|row| row.n)
         .map_err(|e| format!("ticket count failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diesel::connection::SimpleConnection;
+
+    fn connection() -> SqliteConnection {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE ticket_lifecycle (\
+               id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL, open_date DATE NOT NULL, \
+               close_date DATE, stage TEXT NOT NULL, source TEXT NOT NULL, note TEXT, \
+               created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+               updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);\
+             CREATE UNIQUE INDEX idx_ticket_lifecycle_code_open ON ticket_lifecycle(code, open_date);\
+             CREATE TABLE ticket_event (\
+               id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL, \
+               event_at TIMESTAMP NOT NULL, event_kind TEXT NOT NULL, push_kind TEXT, \
+               occurrence_identity TEXT, summary TEXT, \
+               created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+        )
+        .expect("ticket schema");
+        conn
+    }
+
+    fn scalar(conn: &mut SqliteConnection, sql: &str) -> i64 {
+        #[derive(QueryableByName)]
+        struct N {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        diesel::sql_query(sql)
+            .get_result::<N>(conn)
+            .expect("count query")
+            .n
+    }
+
+    /// B.1 回归（2026-10-22）：跨日重复入选不再产生第二张活跃票，
+    /// 重复信号本身记入事件流（同日幂等），票关闭后才允许开新票。
+    #[test]
+    fn open_ticket_reuses_active_ticket_and_records_repeat_selection() {
+        let mut conn = connection();
+        let first = open_ticket(
+            &mut conn,
+            "603278",
+            "2026-10-19",
+            "observing",
+            "board_rotation",
+            None,
+        )
+        .expect("first open");
+        let repeated = open_ticket(
+            &mut conn,
+            "603278",
+            "2026-10-22",
+            "observing",
+            "board_rotation",
+            None,
+        )
+        .expect("repeat open");
+        assert_eq!(repeated, first, "同 code 应复用既有活跃票");
+        assert_eq!(
+            scalar(&mut conn, "SELECT COUNT(*) AS n FROM ticket_lifecycle"),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &mut conn,
+                "SELECT COUNT(*) AS n FROM ticket_event WHERE event_kind = 'catalyst'"
+            ),
+            1,
+            "重复入选应记一条 catalyst 事件"
+        );
+
+        let same_day = open_ticket(
+            &mut conn,
+            "603278",
+            "2026-10-22",
+            "observing",
+            "board_rotation",
+            None,
+        )
+        .expect("same day open");
+        assert_eq!(same_day, first);
+        assert_eq!(
+            scalar(
+                &mut conn,
+                "SELECT COUNT(*) AS n FROM ticket_event WHERE event_kind = 'catalyst'"
+            ),
+            1,
+            "同日重复入选不重复写事件"
+        );
+
+        close_ticket(&mut conn, first, "2026-10-23", "exited").expect("close");
+        let reopened = open_ticket(
+            &mut conn,
+            "603278",
+            "2026-10-26",
+            "observing",
+            "board_rotation",
+            None,
+        )
+        .expect("reopen");
+        assert_ne!(reopened, first, "关闭后应开新票");
+        assert_eq!(
+            scalar(&mut conn, "SELECT COUNT(*) AS n FROM ticket_lifecycle"),
+            2
+        );
+    }
 }

@@ -21,6 +21,7 @@
 
 use std::collections::BTreeSet;
 
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{Double, Nullable, Text};
 use serde_json::json;
@@ -29,6 +30,25 @@ use crate::database::DatabaseManager;
 
 /// 拉多少天：ma20 需要 20 条，多拉 10 天给停牌/缺口留余量。
 const LOOKBACK_DAYS: usize = 30;
+
+/// 单只标的的拉取硬超时（2026-10-22）。
+///
+/// 本地桥在 provider 全部失败时会一只票耗 30~60 秒（`router_sources_exhausted`），
+/// 全市场一轮因此能拖到 90 分钟以上；超时即记失败并跳过，不再等。
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 每多少只落一次库（2026-10-22）。
+///
+/// 原来是「全部拉完再一次性事务」：一轮 90 分钟，中途被杀就一条都不写。
+/// 分批提交后已拉到的部分先落盘，重跑仍是幂等 upsert。
+const PERSIST_CHUNK: usize = 200;
+
+/// 单轮拉取的时间预算（2026-10-22）。
+///
+/// 本机桥被别的高频任务（分析师一致预期失败重试等）挤住时，HistoricalBars 会整体变慢；
+/// 没有预算的话一轮能跑通宵，把第二天的盘前链路一起拖住。到点即停止取数、把已拿到的
+/// 批次提交后返回，未覆盖的部分留给下一轮或手工 CLI 补。
+const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(45 * 60);
 const MA_SHORT: usize = 5;
 const MA_MID: usize = 10;
 const MA_LONG: usize = 20;
@@ -39,20 +59,39 @@ pub struct DailyBarsReport {
     pub fetched: usize,
     pub persisted_bars: usize,
     pub with_ma20: usize,
+    /// 失败/跳过的标的数（`errors` 只保留前 [`MAX_REPORTED_ERRORS`] 条明细）。
+    pub failed: usize,
     pub errors: Vec<String>,
 }
 
+/// 失败明细最多保留多少条（全市场一轮失败上百只是常态，逐条打日志会淹没可读性）。
+const MAX_REPORTED_ERRORS: usize = 20;
+
 impl DailyBarsReport {
+    fn note_failure(&mut self, message: String) {
+        self.failed += 1;
+        if self.errors.len() < MAX_REPORTED_ERRORS {
+            self.errors.push(message);
+        }
+    }
+
     pub fn log(&self) {
         log::info!(
-            "[日线均线] targets={} fetched={} persisted_bars={} with_ma20={}",
+            "[日线均线] targets={} fetched={} persisted_bars={} with_ma20={} failed={}",
             self.targets,
             self.fetched,
             self.persisted_bars,
-            self.with_ma20
+            self.with_ma20,
+            self.failed
         );
         for error in &self.errors {
             log::warn!("[日线均线] {error}");
+        }
+        if self.failed > self.errors.len() {
+            log::warn!(
+                "[日线均线] 其余 {} 条失败明细省略",
+                self.failed - self.errors.len()
+            );
         }
     }
 }
@@ -76,6 +115,33 @@ fn collect_target_codes(conn: &mut SqliteConnection) -> Result<Vec<String>, Stri
         codes.insert(position.code);
     }
     Ok(codes.into_iter().collect())
+}
+
+/// 全市场口径（2026-10-22）：概念票 ∪ 板块成分 ∪ 活跃 ticket ∪ 持仓。
+///
+/// 供 21:30 全量刷新使用；`collect_target_codes` 保持「活跃池」口径不变
+/// （15:55 轻量轮只服务 P2 的逐票均线）。板块轮动的「上一交易日涨幅排序」和
+/// 归因基准都依赖全市场日线，只用活跃池会把候选面压到几十只。
+pub fn collect_full_universe_codes(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<String>, String> {
+    #[derive(QueryableByName)]
+    struct CodeRow {
+        #[diesel(sql_type = Text)]
+        code: String,
+    }
+    let rows: Vec<CodeRow> = diesel::sql_query(
+        "SELECT code FROM ( \
+           SELECT code FROM stock_concepts \
+           UNION SELECT instrument_code AS code FROM board_member \
+           UNION SELECT code FROM ticket_lifecycle WHERE close_date IS NULL \
+           UNION SELECT code FROM stock_position WHERE status = 'open') \
+         WHERE code IS NOT NULL AND code != '' \
+         ORDER BY code",
+    )
+    .load(conn)
+    .map_err(|e| format!("全市场标的查询失败: {e}"))?;
+    Ok(rows.into_iter().map(|row| row.code).collect())
 }
 
 /// 均值（含当日）。不足窗口返回 None。
@@ -111,26 +177,72 @@ pub async fn refresh_daily_bars_and_ma(
     let bridge = crate::data_gateway::grpc_source::bridge_for("HistoricalBars")
         .map_err(|e| e.to_string())?;
 
-    // 先全部拉取（async），再统一写库，避免长时间持有数据库连接
-    let mut fetched: Vec<(String, Vec<crate::data_provider::KlineData>, String)> = Vec::new();
-    for code in &codes {
-        match bridge.daily_bars_async(code, LOOKBACK_DAYS).await {
-            Ok(crate::data_gateway::GatewayBatch::Available { records, evidence }) => {
+    // 2026-10-22：单只硬超时 + 分批落库。
+    // 全市场 2965 只时，失败码每只 30~60 秒会把一轮拖到 90 分钟以上，
+    // 而「全部拉完再写」意味着中途被杀就一条都不落盘。
+    let mut pending: Vec<(String, Vec<crate::data_provider::KlineData>, String)> =
+        Vec::with_capacity(PERSIST_CHUNK);
+    let fetch_started = std::time::Instant::now();
+    for (index, code) in codes.iter().enumerate() {
+        if fetch_started.elapsed() >= FETCH_BUDGET {
+            log::warn!(
+                "[日线均线] 拉取预算 {} 分钟用尽，已处理 {}/{}，剩余交给下一轮或 CLI 补",
+                FETCH_BUDGET.as_secs() / 60,
+                index,
+                codes.len()
+            );
+            break;
+        }
+        match tokio::time::timeout(FETCH_TIMEOUT, bridge.daily_bars_async(code, LOOKBACK_DAYS)).await
+        {
+            Ok(Ok(crate::data_gateway::GatewayBatch::Available { records, evidence })) => {
                 report.fetched += 1;
-                fetched.push((code.clone(), records, format!("{:?}", evidence.provider)));
+                pending.push((code.clone(), records, format!("{:?}", evidence.provider)));
             }
-            Ok(crate::data_gateway::GatewayBatch::VerifiedEmpty(_)) => {
-                report.errors.push(format!("{code}: 返回空批次"));
+            Ok(Ok(crate::data_gateway::GatewayBatch::VerifiedEmpty(_))) => {
+                report.note_failure(format!("{code}: 返回空批次"));
             }
-            Err(error) => report.errors.push(format!("{code}: {error}")),
+            Ok(Err(error)) => report.note_failure(format!("{code}: {error}")),
+            Err(_) => report.note_failure(format!(
+                "{code}: 拉取超时（>{}s），跳过",
+                FETCH_TIMEOUT.as_secs()
+            )),
+        }
+        if pending.len() >= PERSIST_CHUNK {
+            persist_bars_batch(db, &mut pending, &mut report)?;
+            log::info!(
+                "[日线均线] 进度 {}/{} fetched={} failed={}",
+                index + 1,
+                codes.len(),
+                report.fetched,
+                report.failed
+            );
         }
     }
-    if fetched.is_empty() {
-        return Ok(report);
-    }
+    persist_bars_batch(db, &mut pending, &mut report)?;
 
+    let _ = json!({"as_of": as_of});
+    Ok(report)
+}
+
+/// 把一批已拉到的日线写进 `stock_daily`（单事务），成功后清空该批。
+///
+/// 2026-10-22：写入必须在一个事务里——逐条 INSERT 各自提交时实测只有
+/// ≈1500 行/分钟（8.9 万行要 1 小时），单事务后是秒级；批之间仍可增量落盘。
+fn persist_bars_batch(
+    db: &DatabaseManager,
+    pending: &mut Vec<(String, Vec<crate::data_provider::KlineData>, String)>,
+    report: &mut DailyBarsReport,
+) -> Result<(), String> {
+    if pending.is_empty() {
+        return Ok(());
+    }
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    for (code, mut bars, source) in fetched {
+    conn.batch_execute("BEGIN IMMEDIATE")
+        .map_err(|e| format!("日线写入事务开启失败: {e}"))?;
+    let mut write_error: Option<String> = None;
+    'batch: for entry in pending.iter_mut() {
+        let (code, bars, source) = entry;
         bars.sort_by_key(|bar| bar.date);
         let closes: Vec<f64> = bars.iter().map(|bar| bar.close).collect();
         let volumes: Vec<f64> = bars.iter().map(|bar| bar.volume).collect();
@@ -171,7 +283,7 @@ pub async fn refresh_daily_bars_and_ma(
                     data_source=excluded.data_source,\
                     updated_at=CURRENT_TIMESTAMP",
             )
-            .bind::<Text, _>(&code)
+            .bind::<Text, _>(code.as_str())
             .bind::<Text, _>(bar.date.to_string())
             .bind::<Nullable<Double>, _>(Some(bar.open))
             .bind::<Nullable<Double>, _>(Some(bar.high))
@@ -185,14 +297,27 @@ pub async fn refresh_daily_bars_and_ma(
             .bind::<Nullable<Double>, _>(ma20)
             .bind::<Nullable<Double>, _>(volume_ratio)
             .bind::<Nullable<Text>, _>(Some(source.as_str()))
-            .execute(&mut *conn)
-            .map_err(|e| format!("{code} {} 写入失败: {e}", bar.date))?;
-            report.persisted_bars += written;
+            .execute(&mut *conn);
+            match written {
+                Ok(written) => report.persisted_bars += written,
+                Err(error) => {
+                    write_error = Some(format!("{code} {} 写入失败: {error}", bar.date));
+                    break 'batch;
+                }
+            }
         }
     }
-
-    let _ = json!({"as_of": as_of});
-    Ok(report)
+    match write_error {
+        Some(error) => {
+            let _ = conn.batch_execute("ROLLBACK");
+            return Err(error);
+        }
+        None => conn
+            .batch_execute("COMMIT")
+            .map_err(|e| format!("日线写入提交失败: {e}"))?,
+    }
+    pending.clear();
+    Ok(())
 }
 
 #[cfg(test)]

@@ -299,9 +299,13 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
         holdings.iter().map(|p| p.code.clone()).collect();
 
     // 观察池：active ticket 里排除已持仓的（持仓走另一段）。
+    // 2026-10-22: 按 code 去重——同票跨日重复入选时（历史遗留的多活跃票）
+    // 不能在同一份计划里出现两行；取最早 open_date 作为「首次入池」上下文。
     let watch_rows: Vec<WatchRow> = diesel::sql_query(
-        "SELECT code, source, open_date FROM ticket_lifecycle \
-          WHERE close_date IS NULL AND stage IN ('observing','entry_proposed')",
+        "SELECT code, MIN(source) AS source, MIN(open_date) AS open_date \
+           FROM ticket_lifecycle \
+          WHERE close_date IS NULL AND stage IN ('observing','entry_proposed') \
+          GROUP BY code",
     )
     .load(&mut conn)
     .map_err(|error| error.to_string())?;

@@ -4,6 +4,98 @@
 依据：operator 2026-10-17 给出的五条诉求 + 当日代码/数据实测
 定位：这是**方案**，不是承诺。每阶段都写明"能验证什么"和"做不到什么"。
 
+## 演化史
+
+- 2026-10-17：起草，定 P1~P6 阶段与顺序原则。
+- 2026-10-18：定位 P4 停供真因（schema v10 表缺失 + `{e}` 空渲染），探针法确立；观察池定向监控、竞价观测、淘汰规则上线。
+- 2026-10-19：P1.1 调度上线；P3.1/P3.3、T+1 禁卖、P5 轮动信号与选票入口、P6 二层归因（CLI）完成；HoldingPlan 恢复投递。
+- 2026-10-20：观察池选股表现存档（perf_log 16:05）上线——**本文件此前漏记，2026-10-22 补**。
+- 2026-10-21：选票入口扩到 4 个（+P01 +持仓）；板块选票优先级（涨停>龙头>涨幅）；P1.4 P01 自动开票（推荐价=昨收）；P2 可买价完成；下游 stage 查询同步修（buy_zone_dispatch.rs:304 / ticket_eviction.rs:98）。
+- 2026-10-22：P-02 stage 按时间切换（c7102301c）；`no_last_traded_price` 隔离重试（e014bb75f，未经过真实流量）；第一轮全面评审（见「调整记录」）。
+
+## 调整记录
+
+### 2026-10-22 第一轮全面评审（代码 + 数据对账）
+
+对账方法：`scripts/phase_acceptance.py` + 生产库直查 + 日志字节锚点 + 回测。
+
+**A. 状态修正（文档与实际不符）**
+
+| 项 | 原文 | 实际 | 处理 |
+|---|---|---|---|
+| P6 归因 benchmark | 已完成 | CLI-only，main.rs 零调度，表停 10-16 缺 3 个交易日 | 降级为未达标，待接调度 |
+| 关联公司 | 未做 | 15:52 作业每日在跑（花 DeepSeek 费用），产出 object_code 153/153 全 NULL 不可用 | 改为「产出不可用」 |
+| ticket_priority | 未提 | 15:44 每日计算但只落日志，无表无推送无消费者 | 记入缺陷清单 |
+| perf_log | 未提 | 16:05 每日 D+1/D+3/D+5 存档，是唯一在跑的选股效果跟踪 | 补记（演化史） |
+
+**B. 缺陷立案（待修，按优先级）**
+
+1. 同 code 多活跃票无防护：002696/002724/603278 各 2 张活跃；find_active_ticket 只取最新 → 旧票逃逸淘汰规则成孤儿；明日计划查询不按 code 去重。
+2. entry_proposed 价位一次性：propose 只扫 observing（ticket_entry_proposal.rs:96），32 张票价位冻结在 10-21；归因锚定价口径未定。
+3. 提案与淘汰规则矛盾：603096 同日收到买入提案（18.71-19.08）与淘汰（-22.6%）。
+4. position 事件幂等缺失：603915「新建仓 500 股」重复写 6 次。
+5. 明日计划绕过投递库直推：无 L5 门禁、无审计归档、P1.2 永远记不到它。
+6. P3.3 行情断时空转刷 WARN（88 次）无升级出口；P3.1 新闻事件 0 条，该路径从未被真实数据验证。
+7. 板块资金流信号链断裂（分三段，实证）：
+   ① 盘中推送链一直活——2026-10-20 11:27 Delivered「机器人概念 主力+65.95 亿」；
+   ② 盘后 f62 落库 2026-10-21 才通（10-16/19/20 只有 f3 涨幅榜，f62 零行；
+   10-21 起 f62 有真实数据，当日 top=电子 +58.35 亿）；
+   ③ 消费端零接线——观察池选股只用 f3 涨幅排名，f62 资金流 top 板块不进任何选股/复盘/thesis。
+   后果实证：10-20 资金流第 1 名的机器人概念因涨幅排名第 11 差一名未进选股，两信号无交叉。
+   历史回填说明：10-21 之前的资金流只能从投递归档 rendered_content 解码补，f62 表补不了。
+8. **全市场日线自 10-17 起断更（正在发生）。** stock_daily 每日行数：10-16 = 1248 只，
+   10-19 = 54、10-20 = 53、10-21 = 47——只剩观察池/持仓/涨停池碰过的票。
+   连锁后果：① 板块轮动选票的「上一完整交易日」判定退化为 `HAVING COUNT(*)>=50`
+   （ticket_watch_pool.rs:228），54 行技术过线但候选面塌缩——10-21 实锤 boards=30
+   候选只有 7 只（30 板块×3 只应约 90）；② attribution_benchmark 的市场基准
+   （需样本≥50）从此不可信；③ perf_log 的胜率没有同日基准可对照，超额算不出；
+   ④ 新进池票若日线未刷新，P2 提案 no_data 跳过。修复：补 daily_bars_build 全市场
+   10-17 至今，并把全市场日线纳入调度或加覆盖度告警。
+9. **P1.1 观察池判重用进程内 static（WATCH_POOL_LAST），重启即重放。** 10-21 同一晚跑了
+   3 轮，catalyst 事件 24 条 = P01 3 条 + 轮动 7 只×3 轮——同一批票的「首次入池」事件
+   重复写 3 遍。明日计划在 10-20 已因同款教训改用文件 marker，P1.1 没跟着改。
+10. **涨停阈值 9.85 不分板。** 20cm 板（300/301/688）涨 9.85~19.5% 不是涨停，但被
+    pct_chg>=9.85 计为涨停：实测 151 个样本 / 93 只票（占 20cm 板全部 >=9.85 样本的
+    58%）。同一阈值同时用于：分型规则（近 5 日有涨停）、P1.1 涨停优先选票、两块回测。
+    主板（002/600/603/000/605/001/601）无此问题（>=19.5% 为 0）。
+11. **perf_log 基准口径不统一。** 16:05 存档统一用 open_date 收盘作基准
+    （watch_pool_perf.rs:11）——对 15:40 开票的观察池票合理（次日才能买），
+    但 P01 票 09:00 开票、当日可买，D+1 指标系统性地晚算一天。
+12. **D3 预算层只有总量没有集中度。** 30%/周 限总额，不限同板块集中度——轮动入口的票
+    天然同板块扎堆（10-19/20 批次 34 只全是板块来源），同时触发时预算会全部压进一个板块。
+
+**C. 运营决策（operator 拍板）**
+
+| 编号 | 决策 | 结果 |
+|---|---|---|
+| D1 | 情绪型票允许突破买，超买门对情绪型豁免 | 通过 |
+| D2 | 持股周期不定全局值，按票的趋势分型（每日重算，型变参数变） | 通过 |
+| D3 | 组合预算 = 单周新增仓位上限 + 优先级排序花钱，只标注不拦截 | 通过，30% |
+| Q2 | 情绪票入场价 | 竞价价 + 盘中突破确认，两者都给 |
+
+**D. 数据否决（回测推翻原提议）**
+
+原拟「竞价低开 >2% 放弃」→ 全库 1977 个涨停次日样本回测否决：
+低开 >2% 子集是唯一正期望分组（开盘买→收盘 +1.16%、胜率 47.7%、n=304）；
+高开 >6% 才是死亡区（-1.97%、胜率 28.4%、n=338）。
+**改为：不设低开放弃线；高开帽 >6% 不给买价。**
+
+**E. 回测证实**
+
+- 回踩模型对情绪票不适用：涨停次日盘中触及 ma10(±1%) 仅 15.4%（221/1436）。
+- 10-21 实发 33 个提案中 18 个（55%）按新分型是情绪型——发的是统计上不会成交的价。
+- 竞价/开盘买情绪票裸基线为负期望（均值 -0.36%，n=1977；连板 -0.40%/首板 -0.35%）：
+  D1 解决「价能成交」，不保证「成交能赚」，正期望要靠高开帽 + 板块热度过滤的子集规则，
+  该规则上线前无数据支持，先观察记录两周。
+- 边界：样本来自 stock_daily（约 1200+ 只），生存者偏差未排除；竞价维度用开盘价近似，
+  历史竞价数据从未落库。
+
+**F. 拓展立项**
+
+见 8.5：拓 1.1 / 1.3 / 2.1 / 2.3 / 3.1 / 4.1 / 5.1 / 5.2 / 6 可直接排期；
+拓 2.2 / 3.2 需先探源或定口径。实施批次：批 0 修复 B.1/B.5 → 批 1 分型体系（Q2 已拍）
+→ 批 2 纯接线拓展 → 批 3 预算层（Q3 已拍）→ 批 4 探源。可复用资产盘点见 8.6。
+
 ## 一、目标（operator 原话拆解）
 
 1. 以周为周期（按板块轮动而非固定周），周末/周初用新闻催化 + 上周板块轮动迹象，
@@ -467,3 +559,410 @@ AuctionStage::for_now()   （2026-10-22，c7102301c）
 
 **注意区分**：全球新闻路径正常（`news_ai_global_critical_v1` 一直在跑，
 `seq` 持续增长），断的只是个股那条。
+
+## 八、运营决策与拓展（2026-10-22 拍板）
+
+### 8.1 三项已拍板
+
+| 决策 | 内容 | 影响面 |
+|---|---|---|
+| D1 | 情绪型票**允许突破买**：超买门（连板/近 5 日涨幅/偏离 ma5）对情绪型豁免，放弃条件改为市场信号（竞价弱）而非涨幅计数 | P2 入场模型、P01 链路 |
+| D2 | 持股周期**不定全局值**，按票的趋势分型：情绪型短周期、趋势型长周期；型每日盘后重算，型变参数切换 | 淘汰规则、复盘窗口、候选 TTL |
+| D3 | 组合预算 = **单周新增仓位上限 + 优先级排序花钱**，超出只标注不拦截（不接熔断） | position_sizing、明日计划 |
+
+### 8.2 分型规则（草案）
+
+- 情绪型：`source='p01_preopen'` 或 近 5 个交易日内出现过涨停
+  （`stock_daily.pct_chg >= 9.85`，与 P1.1 的涨停口径一致，不依赖 `is_limit_up`）。
+- 趋势型：其余，走 `buy_zone` 现有回踩模型。
+- 每日盘后重算一次分型，型变则生命周期参数当日切换。
+
+### 8.3 分型参数表
+
+| 参数 | 情绪型 | 趋势型 |
+|---|---|---|
+| 入场方式 | 竞价价 / 突破确认（待 Q2 定） | ma 回踩区间（现有 buy_zone） |
+| 超买门 | 豁免涨幅与偏离门 | 保留现状 |
+| 放弃条件 | 竞价弱（建议低开 >2%） | 击穿放弃价（现有） |
+| 淘汰 | 5 自然日 | 10 自然日（不变） |
+| 复盘窗 | D+1 / D+3 | D+5 / D+10 |
+
+### 8.4 待拍板参数（均已拍定，2026-10-22）
+
+- Q2 情绪票入场价口径：**已拍 = 两者都给**。09:25 竞价价直给
+  + 盘中突破确认价提醒（依赖 RealtimeQuotes，断供时降级为只发竞价价）。
+  **执行参数按 2026-10-22 回测修订**：不设低开放弃线（涨停次日低开 >2% 子集是
+  唯一正期望分组：开盘买→收盘均值 +1.16%、胜率 47.7%，n=304）；改为**高开帽**——
+  竞价涨幅 >6% 不给买价（该子集均值 -1.97%、胜率 28.4%，n=338，是唯一的死亡区）。
+- Q3 单周新增仓位上限：**已拍 = 30% 总资产**，超出部分只标注排队、不拦截。
+- Q4 竞价上浮保成交：**默认 0.5%**（待 operator 可改）。
+- Q5 突破确认基准：**默认昨日最高价**（分钟锚点可靠性未验证，不采用）。
+
+### 8.5 拓展项清单（2026-10-22 评审结论）
+
+能直接排期（无需决策）：竞价板块热度榜（拓 1.1）、买入理由存档 + 理由失效出池（拓 1.3）、
+监控事件分级（拓 2.1）、板块内地位变化（拓 2.3）、止盈/目标价侧（拓 3.1）、
+fading × 持仓逐票预警（拓 4.1）、按入口归因周报（拓 5.1）、亏损票对照组归因（拓 5.2）、
+财报排雷标注 + 归因加业绩维（拓 6，见下）、资金流消费接线（拓 7，2026-10-22 operator 批准，排批 2）。
+
+拓 7 板块资金流消费接线（对应缺陷 B.7）：f62 盘后落库 10-21 已通，**剩的是消费**——
+① 观察池选股加一路「f62 资金流 top 板块」入口（与涨幅榜并行，资金来源标注进 ticket note）；
+② thesis 存档（拓 1.3）理由可写「主力净流入第 N」；③ 复盘周报加资金流维度。
+历史缺口（10-21 前）只能解投递归档补，不回填 f62 表。
+
+拓 6 财报/盈利的角色定位（2026-10-22 评审）：**排雷 + 归因，不进选票打分**。
+短线票行情由资金/情绪驱动，财报是季度低频信息，打分只会系统性错过最强票；
+但 T+1 下买入当日不能纠错，暴雷是唯一不能自愈的风险——排雷是标注（不挡买入）。
+现状：F10 文本已 100% 覆盖活跃票（stock_f10_profile 44/44，四类定性文本，无结构化数字）；
+实锤 002076 文本含「退市」、002131/002421 含「立案」（002131 还是持仓票）、多只含减持/解禁，
+无人消费。pe/eps/roe 槽位存在但硬编码 None（outcome_daily_bars.rs:2535 / review.rs:3005）。
+d15 券商研报/盈利预测 op 合同里有定义，生产可调性未验证（探针同 holding_plan_probe 思路）。
+时效：10 月底三季报披露窗口，业绩变脸/预增是当前最强催化与雷，个股新闻通道断供正堵死此窗口。
+代价声明：关键词抽取会误报（「退市」常现于模板化风险提示），需抽上下文 + 两周调词表。
+
+需先探源/定口径：商品行情源（拓 2.2，chain_relation_candidate 已有商品名但无价格源）、
+推荐价 vs 实际成交偏差复盘（拓 3.2，摊薄成本归因口径未验证）。
+
+明确不做：自动调参、股权穿透式关联公司、开盘集合竞价自动执行。
+
+### 8.6 可复用资产盘点（2026-10-22 代码全扫，含死活证据）
+
+**A 类（活着，可直接接入）**
+
+1. `candidate_trigger_selection` 表 + `render_candidate_triggered/invalidated` 模板
+   （0 行/0 调用，骨架在）→ 触发确认闭环（批 1，模板复用不重写）。
+2. `catalyst_watchlist_daily`（258 行至 10-20）+ `catalyst_watchlist_outcome`
+   （135 行，含次日涨跌/是否续板/streak_today）→ 情绪票复盘（批 1）。
+   注意：与 ticket 是并行两套打板跟踪，开工前先定「合并（推荐）还是分工」。
+3. `entity_linker.rs`（规则消解新闻→股票，零 LLM 成本，零调用）→ P3.1 新闻断供降级（批 2）。
+4. `concept_peers.rs`（stock_concepts 1265 只概念标签，覆盖比 board_member 广）
+   → 拓 2.3 板块内地位变化（批 2）。
+5. `render_auction_volume` 板块聚合版 + op 61 → 拓 1.1 竞价板块热度榜（批 2）。
+6. ReviewLhb 推送链路活着（10-19/10-21 Delivered，网关直取，不依赖死于 7-12 的 lhb_daily 表）
+   → 情绪票复盘「谁在买」席位维度（批 2）。
+7. `render_event_calendar` 模板（从未接线）+ event_calendar/economic_calendar 网关
+   → 排雷日历（批 2，拓 6 配套）。
+
+**B 类（死了，设计可挖）**
+
+- `prediction_*` 全家（samples/verifier/outcome_tracker，76 行死于 7-17）：
+  「预测 vs 结果」验证框架的完整结构 → 拓 5 归因口径参考，别重新发明。
+- WatchlistTracking 推送（死于 9-24）：证据——「只跟踪不行动的观察表推送」价值低，不复活。
+- SectorTop / SectorAnomaly 模板（8-14 后未投递）：板块榜推送要复活时可用。
+
+**C 类（明确不做，现阶段）**
+
+- 多 agent 买卖指标辩论系统：项目不存在此类设施（LLM 仅在 news_ai / chain_ai / g5b
+  三处做文本分析与口径治理）。规则指标的归因还没跑顺，现阶段加 LLM 信号只会多一条
+  无法归因的线。若未来立项，DeepSeek 通道与 g5b 治理是现成地基。
+
+## 十、执行细节（逐步）
+
+> 通用前提：
+> - 所有新增一次性调度用**文件 marker 判重**（`data/<feature>/<date>`），不用进程内 static；
+> - 所有新增推送走 `notify::push_wechat` + 本地归档（`data/<feature>_archive/<date>.txt`），
+>   **暂不新建 durable push_kind**（避免 v14 指纹 / L5 门禁变更），后续批次再收编；
+> - 每批部署按规则 3：主仓 release 编译 → `diff -rq 主仓/src 运行根/src` 对齐 →
+>   运行根 release 编译 → **盘后/深夜重启**（盘中不重启）；
+> - 每批验收 = 连续 3 个交易日日志出现专属成功行 + 表/文件产出可查（规则 22）。
+
+### 批 0 前置修复（当天可动）
+
+**0.1 全市场日线补齐与调度（修 B.8）**
+
+- 手工补数（今晚盘后，盘中禁止）：`STOCK_DB=<运行根>/data/stock_analysis.db daily_bars_build
+  --codes <stock_concepts ∪ board_member.instrument_code ∪ ticket ∪ 持仓>`；HistoricalBars
+  返回全历史，一次补齐 10-17 至今。
+- 代码：`daily_bars_indicators.rs` 新增 `collect_full_universe_codes()`；新增调度块 **21:30**，
+  marker `data/daily_bars_full/<date>`；完成后 `SELECT COUNT(*) FROM stock_daily WHERE date=<today>`，
+  `<800` → `log::warn` + push_wechat「日线覆盖异常：今日 N 只」。
+- 验证：次日 `stock_daily` 当日行数 ≥800；日志 `[日线全量] targets=N written=M failed=K`。
+
+**0.2 同 code 多活跃票防护（修 B.1）**
+
+- 位置：`database/ticket_lifecycle.rs::open_ticket`。
+- 动作：INSERT 前先 `find_active_ticket(code)`；命中且 stage ∈ {observing, entry_proposed}
+  → 不新开，`append_event(kind='catalyst', summary='重复入选（已有 ticket#N）')` 并返回旧 id。
+  stage=holding/exited 不拦（持仓票归快照管）。
+- 配套：`buy_zone_dispatch.rs:302` 观察池查询改 `SELECT code, MIN(source), MIN(open_date) …
+  GROUP BY code`（去重）。
+- 验证：日志 `[观察池] opened=0 appended=N` 的 N 含重复入选；SQL 同 code 活跃票 ≤1。
+
+**0.3 明日计划归档 + 去重（修 B.5 缺口）**
+
+- 位置：`main.rs:12757` 推送成功后。
+- 动作：写 `data/buy_zone_archive/<date>.txt` 全文（字符数=日志 `[可买价] 明日计划生成 N 字`），
+  写失败 `log::warn`；去重见 0.2 配套。
+- 验证：归档文件存在且字数一致；正文同 code 只出现一次。
+
+**0.4 P1.1 marker 化（修 B.9）**
+
+- 位置：`main.rs:12135` 观察池块。marker `data/watch_pool/<date>`，成功（含 opened=0、appended>0）
+  后写；失败不写、保留重试。static 只留作当日快速跳过缓存。
+- 验证：当晚重启多次，日志 `[观察池] boards=` 每交易日只出现一次。
+
+**0.5 position 事件幂等（修 B.4）**
+
+- 位置：`main.rs:12068` 快照比对写事件前。
+- 动作：`SELECT 1 FROM ticket_event WHERE ticket_id=? AND event_kind=? AND date(event_at)=?
+  AND summary=?`，存在则跳过。
+- 验证：同摘要同日重复事件（603915 式 ×6）消失。
+
+**0.6 实施记录（2026-10-22，代码已改）**
+
+| 项 | 落地位置 | 实际动作 |
+|---|---|---|
+| 0.1 | `monitor/daily_bars_indicators.rs:86` | 新增 `collect_full_universe_codes()`：`stock_concepts ∪ board_member.instrument_code ∪ 活跃 ticket ∪ open 持仓`；今日实测口径 **2965 只** |
+| 0.1 | `bin/monitor/main.rs`（15:55 块之后） | 新增 21:30 全量块：marker `data/daily_bars_full/<date>`；成功写 `[日线全量] targets= written= coverage_today=`；`coverage < 800` → `log::warn` + push_wechat 告警 |
+| 0.1 | `bin/daily_bars_build.rs` | 新增 `--all`（与 21:30 同一口径），作为手工补数 / 21:30 路径的验证入口 |
+| 0.2 | `database/ticket_lifecycle.rs:135` | 同 code 命中活跃票 → 直接返回既有 id，并补写 `catalyst` 事件「重复入选（已有 ticket#N）」（同日幂等） |
+| 0.2 | `monitor/buy_zone_dispatch.rs:302` | 观察池查询改 `MIN(source)/MIN(open_date) … GROUP BY code` |
+| 0.3 | `bin/monitor/main.rs`（明日计划推送前） | 正文归档 `data/buy_zone_archive/<date>.txt`，写失败 `log::warn` |
+| 0.4 | `bin/monitor/main.rs`（观察池块） | marker `data/watch_pool/<date>`，内容 `news_candidates/board_candidates/total/opened/appended`；成功才写、失败保留重试 |
+| 0.5 | `ticket_lifecycle.rs::event_exists_same_day` + `monitor/position_change_detect.rs:269` | 写事件前查 `(ticket_id, event_kind, date(event_at), summary)`，命中跳过 |
+| 附 | `bin/monitor/main.rs`（板块成分循环） | `gn_` 板块成分失败不再逐条 warn（预期缺口），合并成一行 info；BK 码失败仍 warn |
+
+与方案原文的偏差（以代码为准，后续不再回改方案）：
+
+1. **0.2 原文「holding/exited 不拦」，实现为「任何 `close_date IS NULL` 的活跃票都复用」**（含 holding）。
+   理由：一只票同一时间只应有一张票；持仓票的加仓/减仓走 HoldingPlan，不需要第二张 observing 票，
+   而选股信号以 `catalyst` 事件落在原票上，不丢信息。exited 的票 `close_date` 非空，自然不拦，可重新开票。
+2. 0.1 的 marker 内容写覆盖数（`<date>` 文件里就是 coverage），日志行同时打印，便于次日不查库也能判断。
+3. 21:30 块放在 `market_loop` 盘后段（15:55 轻量轮之后），与 19:00 严格复盘、16:00 明日计划互不阻塞；
+   2965 只串行拉取在同一 loop 内约需数分钟，21:30 之后该 loop 无其它调度。
+
+改前现网实测（2026-10-22 盘后只读查询）：
+
+- `stock_daily` 逐日行数：10-14/15/16 = **1248**；10-19 = **54**；10-20 = **53**；10-21 = **49**；10-22 = **45**。
+- 同 code 多活跃票 3 组：`002696`（#62 #64）、`002724`（#63 #65）、`603278`（#37 #66）。
+- ticket 55（603915）`position_opened` 在 2026-10-20 有 **6 条**。
+- 明日计划观察池：44 行 → 按 code 去重后 **41** 行（修好当天即少 3 行重复）。
+
+**0.7 验证与容量实测（2026-10-22）**
+
+编译 / 单测：
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 类型检查 | `cargo check --bin monitor` | 通过（仅存量 unused import 警告） |
+| debug 构建 | `cargo build --bin daily_bars_build` | `Finished dev in 9m40s`，891 条警告全部为存量 |
+| 运行根 release | `cargo build --release --bin daily_bars_build --bin monitor` | `Finished release in 14m28s`；改事务后重建 `8m35s` |
+| 单测（新增） | `cargo test --lib ticket_lifecycle` | `open_ticket_reuses_active_ticket_and_records_repeat_selection ... ok`（1 passed / 0 failed，5622 filtered out） |
+
+单测覆盖的行为（B.1 回归）：同 code 第二次入选复用既有票 id、不新增行；重复入选写一条
+`catalyst`「重复入选（已有 ticket#N）」；同日再入选不重复写事件；票关闭（`close_date` 非空）后可重新开票。
+
+SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询可执行、`GROUP BY code` 去重
+（44→41）、全市场口径查询（2965）。
+
+容量实测（`--all` 2965 只，运行根 release，串行 HistoricalBars）：
+
+- 正常段约 **66 次请求/分钟**，平均 1.55 次/只（含 provider 回退）；
+- 失败码走 `router_sources_exhausted`，单只 30~60 秒，尾段退化到 **约 2 次/分钟**；
+- 请求结果分布：`available` 4373 / `partial` 115 / `unavailable` 115（≈5% 非 available）；
+- 写入：原实现每条 INSERT 独立隐式事务，实测 **≈1500 行/分钟**（2965 只 × 30 天 ≈ 8.9 万行 ≈ 1 小时）；
+  已改单事务 `BEGIN IMMEDIATE … COMMIT`，中断整批回滚，写入降到秒级。
+
+结论与待办：**全量一轮 40 分钟起步，失败码越多越长**，21:30 那一班必须给单只设硬超时
+（建议 10s）并跳过已知失败码，否则会拖到 22:10 以后；写入已不再是瓶颈。
+
+**0.8 容量三项修正（2026-10-22 夜，operator 选「先修再跑」）**
+
+| 问题 | 改法 | 位置 |
+|---|---|---|
+| 21:30 全量占住 `market_loop`，把同链路的盘后块顶住（10-22 实测 15:55 那班被挤到 21:16 才结束，且多只票 `HistoricalBars 服务端内部错误`） | 拆成独立长驻任务 `full_universe_bars_loop()`：`tokio::spawn` 后挂进 `background_tasks` 生命周期；`market_loop` 里只留注释指向它 | `bin/monitor/main.rs` |
+| 失败码每只 30~60 秒，尾巴把一轮拖到 90 分钟 | 单只硬超时 `FETCH_TIMEOUT = 10s`，超时计 `failed` 并跳过；失败明细只留前 20 条，其余只计数 | `monitor/daily_bars_indicators.rs` |
+| 「全部拉完再一次性事务」——中途被杀一条都不写 | 每 `PERSIST_CHUNK = 200` 只一个事务提交，批间打 `[日线均线] 进度 i/N fetched= failed=`；失败批回滚、已提交批保留 | 同上 |
+| 单轮没有上限，桥被挤住时会跑通宵 | `FETCH_BUDGET = 45 分钟`：到点停止取数，把已拿到的批次提交后返回，剩余留给下一轮或 CLI 补 | 同上 |
+| 观察池块重放会重复写 catalyst（10-22 重启后 ticket 18/22/54 各多一条） | 新增 `append_catalyst_once()`：同日同票同摘要只写一次，`report.appended` 只统计真正写入的 | `monitor/ticket_watch_pool.rs` |
+
+`DailyBarsReport` 增加 `failed` 字段，`log()` 改为
+`targets= fetched= persisted_bars= with_ma20= failed=`；`daily_bars_build` 汇总行同步。
+
+补数结果：手工三次尝试都没跑完——第一次运行根旧二进制不认 `--codes`（只刷了 46 只）；
+第二、三次被失败码尾巴拖住（60~90 分钟仍在拉取阶段）手动终止，**未提交任何行**。
+改成独立任务 + 10s 超时 + 每 200 只分批提交后，由 21:30 任务重新拉取，结果见 0.9。
+
+**0.9 2026-10-22 夜间验收（实际结果）**
+
+- 21:30 全量任务：**没有跑成**。22:39 重启后新任务在 22:45 启动，但本机桥在此之前
+  已经因 `Too many open files (os error 24)` 停止服务（旧进程 EMFILE，22:39:34），
+  所有 HistoricalBars 请求都在 10s 客户端超时处被取消（`The operation was cancelled`）。
+- 桥重启：`kickstart -k` 后主线程停在 `StatementIterator::next`（`sample` 证实），
+  即启动期的全链审计；大库上耗时约 **19 分钟**，前几次重启都在审计中途被杀，看起来像卡死。
+  最终 23:29 恢复监听。
+- 顺带修掉一个基础设施问题：桥的 plist 没有 `SoftResourceLimits`，继承系统
+  `maxfiles=256`，旧进程 22:39 就是被 fd 耗尽打死的。已加
+  `SoftResourceLimits.NumberOfFiles = 8192`（备份 `com.northofqing.grpc-market-server.plist.bak-*`）。
+- 为不再和桥的启动抢锁：今晚 **停掉 monitor、写 `data/daily_bars_full/2026-10-22` marker
+  跳过全量**，23:29 重新拉起 monitor（PID 19189，状态 0）。
+- `stock_daily` 当日覆盖仍为 **47**（10-21=49、10-22=47），**没有补到全量**。
+
+遗留（明早开盘前）：用新 CLI 补 10-22——
+`STOCK_DB=<运行根>/data/stock_analysis.db ./target/release/daily_bars_build --date 2026-10-22 --all`，
+新版本自带 10s 单只超时、每 200 只一事务、45 分钟预算，跑完看 `fetched / failed` 与覆盖。
+
+### 批 1 分型体系
+
+**1.1 分型（regime）计算（D1/D2 的地基）**
+
+- 存储：**不加列**——用 `ticket_event(kind='regime', summary='emotion|trend|<reason>')`，
+  每日 **15:42**（观察池建完）对 active tickets 重算，取每票最新一条为当前型。
+  理由：ticket_lifecycle 加列要动 schema 版本（v9 钉死，P4 教训）。
+- 规则：情绪型 = `source='p01_preopen'` ∪ 近 5 交易日出现涨停
+  （阈值按 1.2 分板）；其余趋势型。
+- 验证：日志 `[分型] emotion=N trend=M`；SQL 每票最新 regime。
+
+**1.2 20cm 阈值分档（修 B.10）**
+
+- 新增 util `limit_up_pct(code)`：300/301/688/689 → **19.5**，其余 → **9.85**；
+  替换 `ticket_watch_pool::LIMIT_UP_PCT` 全部用法、regime 判定、回测脚本。
+- 边界：ST 5% 板无名称源可判别，不处理，文档注明。
+
+**1.3 情绪票竞价买价（Q2=c / Q4=0.5%）**
+
+- 位置：`auction_watch_loop`（main.rs:14437），09:25-09:32 `observe()` 拉完调出口。
+- 动作：取 regime=emotion 活跃票，按竞价涨幅分档：`>+6%` 不给价（「高开过多不追」）；
+  `+2~+6%` 给竞价价标「轻仓」；`-2~+2%` 给 竞价价×1.005 标「保成交」；`<-2%` 给竞价价
+  标「低开博弈区」。组一条 push_wechat，文案必带「竞价买入当日 T+1 不可卖」；
+  marker `data/auction_price/<date>`。
+- 验证：日志 `[竞价买价] emotion=N quoted=Q skipped_high=K`；marker 存在。
+
+**1.4 盘中突破确认（Q5=昨日最高价，复用 candidate_triggered 模板）**
+
+- 位置：`watch_pool_monitor::scan` 新增第五规则。缓存：每日 09:26 / 13:01 预热
+  entry_proposed 票的 `buy_zone::compute` 与昨高（`stock_daily.high`），内存 HashMap，
+  扫描只比价不查库。
+- 条件：现价 ≥ 昨日最高 且 当日涨幅 <6% → push `render_candidate_triggered` 文案
+  （1 票/日限 1 次，复用 alerted_at）；写 `candidate_trigger_selection` +
+  `ticket_event(kind='entry_triggered')`。
+- 边界：RealtimeQuotes 合同无量比字段（2026-08-31 注释），**不加量能条件**；
+  无分钟线回测，上线后观察记录两周。
+- 验证：日志 `[触发确认] scanned=N triggered=M`；表行数增长。
+
+**1.5 价格失效（entry_invalidated，复用另一模板）**
+
+- 条件任一：现价 < 放弃价（缓存同上）；所属板块退出 top10（C 规则日检）；thesis 失效
+  （批 2）；时效——趋势型超 3 交易日、情绪型跨日。
+- 动作：push `render_candidate_invalidated` + `ticket_event(kind='entry_invalidated')`；
+  **只作废价格，不淘汰票**（stage 不变）。
+- 验证：日志 `[价格失效] n=`；事件表增长。
+
+**1.6 淘汰/复盘窗参数化（D2）**
+
+- `ticket_eviction`：emotion → `MAX_OBSERVE_DAYS=5`；trend → 10（现行为）；型别取 1.1 事件。
+- `watch_pool_perf`：emotion 批 D+1/D+3、trend 批 D+5/D+10 分列输出。
+- 验证：淘汰日志 reason 带型别；perf_log 两段。
+
+### 批 2 接线拓展
+
+**2.1 09:25 板块热度（拓 1.1，并入 1.3 同一条消息）**：竞价 rows 按 board_member 聚合，
+输出 top5「板块名 + 竞价均涨幅 + 竞价量比中位」；不足 5 个按实际。
+
+**2.2 thesis 存档与理由失效（拓 1.3）**：open_ticket 时写 `kind='thesis'`
+（板块/催化/来源）；每日 **15:50** 核对板块是否仍在 top10（board_ranking_daily 前一交易日），
+不在且连续 2 日 → `kind='thesis_invalidated'`；eviction 增第三规则（理由失效出池）。
+
+**2.3 资金流选票入口（拓 7）**：观察池新增 `collect_money_flow_boards`——读
+`board_ranking_daily rank_fid='f62'` 前一日 top10 → 成分股取涨幅前 3，source='money_flow'；
+日志 `mf_candidates=N`；10-21 前无 f62 数据则跳过（不补造）。
+
+**2.4 新闻降级（P3.1 配套）**：`news_ai_assessment` 连续 N 日无新增时，
+post_close_news_review 与盘中 scan 新闻规则改用 `entity_linker` 对 news_items 近 5 日匹配
+→ `kind='news_mention'`，news_dedup 去重。
+
+**2.5 概念扩展（拓 2.3）**：P3.3 关联票 = board_member ∪ concept_peers；日志带来源分布。
+
+**2.6 ReviewLhb 接入复盘**：LHB 复盘生成后，对活跃 emotion 票匹配，写 `kind='lhb'`
+摘要（席位/净买额）；链路走网关直取，不依赖死表 lhb_daily。
+
+**2.7 排雷（拓 6 部分）**：每日 **16:20** 扫 F10 四类文本关键词
+（退市/立案/预亏/商誉减值/减持/解禁，取原文 40 字片段），命中写 `kind='risk_flag'`；
+render_plan 渲染「⚠ 有雷」；event_calendar 可用则加解禁/财报日历行。
+边界：关键词误报，两周调词表。
+补充（2026-10-22 路由盘点）：ExternalV1 合同里有 `Announcements` / `MarketAnnouncements`
+capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧零消费——
+公告通道不是不存在，是没接线；F10 关键词扫是过渡，公告 op 探针通过后可升级为权威源。
+
+**2.8 fading × 持仓（拓 4.1）**：**15:36**（轮动信号 15:34 之后）fading ∪ board_member
+× 持仓/ticket，render_plan 头部逐票标注「所属板块退潮」。
+
+**2.9 监控分级（拓 2.1）**：scan 规则分级——L1（价格 ±3%、新闻命中）→ push_wechat
+即时（限 1 次/票/30min）；L2（tick 变动、关联票）→ 仅日志（现行为）。
+
+**2.10 止盈/目标价（拓 3.1）**：render_plan 持仓段加目标价 = 20 日最高、
+移动止盈线 = max(成本, 近 5 日低) 破位提示；不做自动卖。
+
+**2.11 priority 排序接线（拓 8）**：render_plan 新买入段按 `rank_watch_pool` 分数排序，
+标注 ①②③ 建议顺序。
+
+### 批 3 预算层（Q3=30%）
+
+**3.1 周预算状态**：本周已用 = 本周新增持仓成本（快照 `position_opened` 对应
+quantity × snapshot cost_price 求和）；预算 = 总资产（user_account_summary，缺则
+最近 real_account_snapshot）× 30%；余量 = 预算 − 已用。
+
+**3.2 集中度**：单板块本周新增 ≤ 15%（预算一半）；超限票在明日计划标「板块集中度高·排队」。
+
+**3.3 排序花钱**：候选按 priority 分数降序，逐票标「建议顺序 / 占用预算 / 剩余预算」；
+超预算标「排队」——**不拦截**。
+
+### 批 4 复盘归因
+
+**4.1 perf_log 口径修正（修 B.11）**：基准价按 source 分——`p01_preopen` → open_date
+**开盘价**（当日可买）；其余 → open_date 收盘价。
+
+**4.2 基准对照**：批次胜率旁加「全市场等权同日收益」；样本 <800 标「基准不可信」。
+
+**4.3 入口归因周报（拓 5.1 + 5.2）**：**周五 17:00** 聚合按 source × D+1/D+3
+胜率/均值/超额；亏损票条件对照附后；push_wechat 简化版（报告整理简化后推送）。
+
+**4.4 归档**：周报同时写 `data/perf_log/<date>_weekly.txt`。
+
+### 批 5 探源
+
+**5.1 商品行情源（拓 2.2）**：探新浪/东财商品接口可用性；可用则
+chain_relation_candidate 商品名→价格日更；不可用则关闭该项并记录。
+
+**5.2 成交偏差（拓 3.2）**：先做离线分析（entry_proposed 区间 vs 快照 cost_price
+偏差分布），口径确认后再上报表。
+
+### 跨端依赖（Windows / ExternalV1，2026-10-22 路由盘点）
+
+外发文档：`docs/handoff-windows-externalv1-20261022.md`（→ 对端回执
+`…-response.md` → 我方答复 `…-macreply.md`）。
+
+**对端回执要点（2026-10-22 15:40–15:56 mTLS 实测）：**
+
+- **P0（新增，比原第 1 项紧急）**：push2.eastmoney.com 家族被源出口 IP（116.237.144.102）
+  端点级拦截，自 10-21 20:38 起。影响 BoardConstituents(Eastmoney) / BoardFlows(f3/f62) /
+  MarketRankings / FundFlow 分钟线 / BoardMemberships(Eastmoney)。实测我们 10-22 的
+  f62 榜落库 **0 行**，f3 新浪臂 175 行正常。对端三选一（等/换 IP/IPv6），我们选等。
+  **原判断「板块榜 f3/f62 均已通」作废。**
+- 原第 1 项（5 个板块失败）**责任在我们**：这 5 个板块只有新浪码 `gn_*`、无 BK 映射，
+  我们的请求按设计回退到 `tdx:industry:<名>`，TDX 两个目录里没有这些名字。
+  修正：只有 `BK…` 码的板块走 Eastmoney 臂，`gn_*` 不再回退 TDX。
+- 第 2 项 no_last_traded_price：对端 63d488c 已于 10-22 09:00 上线并按契约发码
+  （消息形如 `no last-traded price … N instrument(s): codes`，retryable=false）；
+  我们 09:00 后日志仍 0 次——**通道归属待确认**（我们行情走本机桥，可能不是直连 ExternalV1）。
+- 第 3 项 typed instruments：字段 12 可用但需对端 Gate A。**operator 拍板 = 要**，
+  请对端走 Gate A 增加 `repeated string instruments = 12`；字段上线前我们维持二分隔离，
+  不另做文案解析。字段上线后：解析 instruments → 剔除缺价码 → 重试（调用量 2N → 2）。
+  **Gate A 已拍（2026-10-22）**：D1a / D2a / D3a / D4a / D5a，附三条补充要求
+  （顶层字段=最终失败臂列表、交付附 Gate C 真实样本、文案逐字节不变）——
+  见 `docs/handoff-windows-externalv1-20261022-gatea-decision.md`。
+  交付后我方动作：更新 vendored proto 并重生成客户端 → Gate C 样本验证解码 →
+  切换为列表剔除。
+- 第 4 项量比/成交额：`amount`（当日累计成交额）已在每条 quote 里；`volume_ratio` 仅竞价
+  记录有。1.4 的量能条件改用「amount vs 5 日均额」，不追新字段。
+- 第 5 项 HistoricalBars：根因是对端 Tencent 解码器不接受除权日第 7 元素（分红对象）；
+  已修未部署。**我们的日线走本机桥**，需确认桥是否共用同一 crate；另：带 start/end 的
+  请求会被 Tencent 臂整体拒绝，桥需改为「省略日期 + limit」。
+
+真需要对端的（更新后）：
+1. P0 恢复（等待）+ 恢复后按 BK 清单回记录数。
+2. 本机桥 RealtimeQuotes/HistoricalBars 的通道归属答复（转发 or 桥内实现）。
+3. `no_last_traded_price` 消息格式视为合同承诺（已答应）。
+
+**不是对端问题的（明确排除）**：个股新闻断供（news_items 每日 570~690 条在进，
+AI 评估 Mac 侧断）、公告通道未接线（Mac 侧）、竞价 op 61/涨停池已通。

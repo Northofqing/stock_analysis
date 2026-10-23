@@ -67,12 +67,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --codes 600519,300750,... 显式指定标的；不传则沿用
     // active tickets + 持仓。补新闻票、板块成分的历史日线时用这个。
-    let codes_override: Option<Vec<String>> = arg_value(&args, "--codes").map(|raw| {
+    let mut codes_override: Option<Vec<String>> = arg_value(&args, "--codes").map(|raw| {
         raw.split(',')
             .map(|item| item.trim().to_owned())
             .filter(|item| !item.is_empty())
             .collect()
     });
+    // --all: 与 monitor 21:30 全量刷新同一口径（概念票 ∪ 板块成分 ∪ 活跃票 ∪ 持仓）。
+    // 断更后手工补历史、或验证 21:30 那条路径时用。
+    if args.iter().any(|arg| arg == "--all") {
+        let mut conn = db.get_conn()?;
+        let codes = stock_analysis::monitor::daily_bars_indicators::collect_full_universe_codes(
+            &mut conn,
+        )?;
+        println!("[日线均线] --all 全市场口径 {} 只", codes.len());
+        codes_override = Some(codes);
+    }
 
     match &codes_override {
         Some(list) => println!(
@@ -91,8 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "\n汇总: targets={} fetched={} persisted_bars={} with_ma20={}",
-        report.targets, report.fetched, report.persisted_bars, report.with_ma20
+        "\n汇总: targets={} fetched={} persisted_bars={} with_ma20={} failed={}",
+        report.targets, report.fetched, report.persisted_bars, report.with_ma20, report.failed
     );
     if report.fetched > 0 && report.with_ma20 == 0 {
         println!("  （with_ma20=0 = 拉到的历史不足 20 个交易日，ma20 全 NULL，P2 仍不可做）");
