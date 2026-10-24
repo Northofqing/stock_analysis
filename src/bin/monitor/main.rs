@@ -5605,6 +5605,59 @@ async fn lhb_sync_loop() {
 ///
 /// 口径 = stock_concepts ∪ board_member ∪ 活跃 ticket ∪ 持仓（实测约 2965 只）；
 /// marker `data/daily_bars_full/<date>` 判重，重启不重放。
+/// 2026-10-24：通达信盘后文件同步（Windows VM → Mac → stock_daily）。
+///
+/// 21:30 先跑这一步：provider 四路（Tdx/Tencent/Sina/Baidu）从 2026-10-19 起全灭，
+/// 盘后 `.day` 是唯一稳定能出数的路径。脚本退出码：
+/// 0 成功 / 20 文件过期（TDX 客户端没下当日）/ 21 传输失败 / 22 导入失败 / 23 覆盖不足。
+async fn tdx_lday_daily_sync(date_text: &str) -> bool {
+    let script = std::path::Path::new("scripts/sync_tdx_lday.sh");
+    if !script.exists() {
+        log::warn!("[日线全量] 缺少 scripts/sync_tdx_lday.sh，退回 provider 路径");
+        return false;
+    }
+    let output = tokio::process::Command::new("bash")
+        .arg(script)
+        .env("SYNC_TARGET_DATE", date_text)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match tokio::time::timeout(std::time::Duration::from_secs(1200), output).await {
+        Ok(Ok(result)) => {
+            for line in String::from_utf8_lossy(&result.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                log::info!("{line}");
+            }
+            for line in String::from_utf8_lossy(&result.stderr)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+            {
+                log::warn!("{line}");
+            }
+            match result.status.code() {
+                Some(0) => true,
+                Some(code) => {
+                    log::warn!(
+                        "[日线全量] 通达信同步未成功 exit={code}（20=客户端未下当日 21=传输 22=导入 23=覆盖不足）"
+                    );
+                    false
+                }
+                None => false,
+            }
+        }
+        Ok(Err(error)) => {
+            log::warn!("[日线全量] 通达信同步启动失败: {error}");
+            false
+        }
+        Err(_) => {
+            log::warn!("[日线全量] 通达信同步超时（20 分钟）");
+            false
+        }
+    }
+}
+
 async fn full_universe_bars_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
@@ -5621,6 +5674,20 @@ async fn full_universe_bars_loop() {
         if marker.exists() {
             continue;
         }
+        // 2026-10-24：先走通达信盘后文件。脚本自己校验「文件最新日期 >= 今天」
+        // 与「当日覆盖 >= 800」，成功就在这里结束，不再跑 provider 全量
+        // （那条路从 10-19 起四路全灭，仍会烧 45 分钟预算）。
+        if tdx_lday_daily_sync(&date_text).await {
+            log::info!("[日线全量] 通达信盘后文件导入完成，跳过 provider 路径 date={date_text}");
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(error) = std::fs::write(&marker, "tdx_lday") {
+                log::warn!("[日线全量] marker 写入失败（重启会重放）: {error}");
+            }
+            continue;
+        }
+        log::warn!("[日线全量] 通达信盘后文件不可用，退回 provider 路径 date={date_text}");
         let db = match stock_analysis::database::DatabaseManager::try_get() {
             Some(db) => db,
             None => {
