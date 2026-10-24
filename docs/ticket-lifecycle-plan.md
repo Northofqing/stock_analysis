@@ -14,6 +14,7 @@
 - 2026-10-22：P-02 stage 按时间切换（c7102301c）；`no_last_traded_price` 隔离重试（e014bb75f，未经过真实流量）；第一轮全面评审（见「调整记录」）。
 - 2026-10-23：批 0 入库（eddb6d49e）；批 1 分型体系全部落地 + 批 2 七项接线 + 批 4.1/4.2 口径修正（621ea15cf，见「1.7 实施记录」）。
 - 2026-10-24：批 2 补 2.5 概念扩展、2.6 龙虎榜归档接线；批 5 两项探源出结论（5.1 商品源可用、5.2 提案零成交）；2.4 探针证明降级不成立。
+- 2026-10-24（下午）：日线改走**通达信盘后文件**（`tdx_day_import`），6,187,698 行进库、覆盖 5,229 只、2021-08 起（0.11）；桥内补齐 Tencent 7 字段并重启（见 0.12）。
 
 ## 调整记录
 
@@ -798,6 +799,47 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
   perf 的 D+N（除活跃票）、市场基准（n=47~53）、P6 归因样本、5.2 成交偏差的基准价。
 - 已做的事：把实测报文写进 `handoff-windows-externalv1-20261024.md` 第 3 项并升级为 P0；
   周报（4.3/4.4）代码不依赖 10-23 数据，可先跑，10-22 批次会显示空行。
+
+**0.11 2026-10-24 盘后文件通路：日线改走通达信 vipdoc（实测结果）**
+
+- 0.10 的四路全灭是**实时行情服务器协议**的问题；复盘用的日线本来不必走它。
+  通达信盘后数据（`C:\new_tdx64\vipdoc\{sh,sz}\lday\*.day`）是本地定长文件，
+  自带成交额、约 5 年历史、无限流 —— operator 2026-10-24 指出这条，确实是更合适的源。
+- 落地：`src/bin/tdx_day_import.rs`（新）。记录 32 字节：
+  `date u32(YYYYMMDD)`、`open/high/low/close u32(分)`、`amount f32(元)`、`volume u32(股)`、`reserved`。
+  入库口径：价格 /100、volume /100（股→手，与 `stock_daily` 既有口径一致；
+  用 000001 10-22 对账：TDX 129,764,872 股 → 1,297,648.72 手，与桥给的值逐位相同）、
+  amount 原样、`pct_chg` 用文件内前收算。只收 A 股（`sh6*`、`sz00*`/`sz30*`），
+  指数（sh000/sh880/sz399）与 B 股（sh9*/sz2*）跳过；不动 `ma*`/`volume_ratio`。
+- 传输：Windows VM 里 `\\Mac\Home` 是**离线缓存**（Windows 侧 `dir` 能看到 4,846 个文件，
+  Mac 侧一个都没有）；最后走「VM 内 tar 打包 → `curl -T` PUT 到 Mac 的临时上传端」，
+  315 MB 两个包约 30 秒传完。
+- 实测（2026-10-24 11:47）：`files=5227 rows=6187698 errors=0 range=2021-08-02..2026-10-22 elapsed=289s`；
+  `stock_daily` 从 49,016 行 / 3,194 只 → **6,187,758 行 / 5,229 只**；
+  2026-10-22 覆盖 47 → **5,218** 只。库 2.68 GB → 4.6 GB。
+- 边界：TDX 本地只保留约 1,264 根（2021-08 起），更早的历史没有；
+  文件 mtime 停在 10-22 16:00，**2026-10-23 仍缺** —— 要在 Windows 上跑一次
+  「盘后数据下载」后再同步。
+- 未做：MA 回补（导入行 `ma5/10/20`、`volume_ratio` 为空，15:55 任务只算当日）、
+  21:30 增量同步、把 `daily_bars_build` 的 provider 路径降级为备用。
+
+**0.12 2026-10-24 桥内修复：Tencent 接受 7 字段 + 重启（实际结果）**
+
+- 归因更正：0.10 写的「死在 Windows 侧 provider 路由」是错的，已向对方收回两次。
+  `router_sources_exhausted` 是本机 `data_gateway::review::HistoricalDailyBars` + `router` 的输出，
+  请求不出 Mac（对方 10:02 用 ExternalV1 实测 Tencent 30 条成功，同源 crate 不同 pin）。
+- 修复：`magic-market-data-rs @ 75ee2a2` 的 `magic-tencent-rs` 日线行要求恰好 6 字段，
+  除权日行带第 7 个元素（分红对象）。已 vendored 到
+  `.worktrees/tdx-local-provider-20260923/vendor/magic-tencent-rs` 并加 `[patch]`，
+  改为非分钟线接受 6/7 字段、忽略第 7 个（仍 Unadjusted）。release 4m20s。
+- 部署：10:15 换二进制（旧的在 `grpc_market_server.bak-20261024`），10:20 监听（285s）。
+- 探针：默认路由 `provider=Baidu complete=true`，000001/30 根含 2026-10-23；
+  但 `daily_bars_build --all` 仍 `fetched=0` —— Tencent 不再报 7 字段，
+  改成 **`daily amount is unavailable`**（`historical_bars.rs:863` 要求每根都有 amount）；
+  Sina 同一道门，Tdx 空 payload，Baidu 403。四路都不给 amount，桥这条路对日线不构成解锁。
+- 结论：日线的正解是 0.11 的盘后文件；桥保持现状（RealtimeQuotes 等价格型功能正常）。
+- 待查：显式 `preferred_provider` 四种全部 `router_sources_exhausted`（生产不传，
+  不阻塞；与默认路由落到 Baidu 相矛盾，需要单独复现）。
 
 **0.9 2026-10-22 夜间验收（实际结果）**
 
