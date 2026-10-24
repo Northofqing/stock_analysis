@@ -92,6 +92,8 @@ pub struct WeeklyReport {
     pub losers: Vec<WeeklyRow>,
     pub d1_n: usize,
     pub d3_n: usize,
+    /// 有票但没有基准价（当日无开盘/收盘行）→ 不进分母，但要在口径里报出来
+    pub no_base_price: usize,
     /// 市场基准样本不足的交易日数
     pub thin_market_days: usize,
     pub errors: Vec<String>,
@@ -169,13 +171,14 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
 
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
 
-    let calendar: Vec<String> =
-        diesel::sql_query("SELECT DISTINCT trade_date FROM board_ranking_daily ORDER BY trade_date")
-            .load::<DateRow>(&mut conn)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|row| row.trade_date)
-            .collect();
+    let calendar: Vec<String> = diesel::sql_query(
+        "SELECT DISTINCT trade_date FROM board_ranking_daily ORDER BY trade_date",
+    )
+    .load::<DateRow>(&mut conn)
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(|row| row.trade_date)
+    .collect();
     if calendar.is_empty() {
         return Err("板块榜为空，没有交易日历".to_string());
     }
@@ -247,7 +250,9 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
         ) {
             Ok(decision) => decision,
             Err(error) => {
-                report.errors.push(format!("{} 分型失败: {error}", ticket.code));
+                report
+                    .errors
+                    .push(format!("{} 分型失败: {error}", ticket.code));
                 continue;
             }
         };
@@ -266,7 +271,10 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
                 .copied()
         };
         let Some(base) = base else {
-            continue; // 无基准价：不补值，也不进分母
+            // 无基准价：不补值，也不进分母，但必须计数——否则「开票 40 只」和
+            // ticket_lifecycle 里的 41 只对不上，读的人会以为漏票。
+            report.no_base_price += 1;
+            continue;
         };
         let Some(start_index) = day_index.get(ticket.open_date.as_str()).copied() else {
             continue;
@@ -315,7 +323,11 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
     labels.sort();
     labels.dedup();
     for label in labels {
-        let rows: Vec<&WeeklyRow> = report.rows.iter().filter(|row| row.source == label).collect();
+        let rows: Vec<&WeeklyRow> = report
+            .rows
+            .iter()
+            .filter(|row| row.source == label)
+            .collect();
         let d1: Vec<f64> = rows.iter().filter_map(|row| row.d1).collect();
         if let Some((n, win_rate, mean, median)) = summarize(&d1) {
             let excess: Vec<f64> = rows.iter().filter_map(|row| row.excess_d1).collect();
@@ -333,7 +345,11 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
             });
         }
     }
-    report.stats.sort_by(|a, b| b.mean.partial_cmp(&a.mean).unwrap_or(std::cmp::Ordering::Equal));
+    report.stats.sort_by(|a, b| {
+        b.mean
+            .partial_cmp(&a.mean)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut losers: Vec<WeeklyRow> = report
         .rows
@@ -355,10 +371,16 @@ impl WeeklyReport {
             "【选股周报 {}~{}】\n本周开票 {} 只（D+1 可算 {} / D+3 可算 {}）\n",
             self.week_start,
             self.week_end,
-            self.rows.len(),
+            self.rows.len() + self.no_base_price,
             self.d1_n,
             self.d3_n
         );
+        if self.no_base_price > 0 {
+            out.push_str(&format!(
+                "其中 {} 只无基准价（当日无行情行），不参与统计\n",
+                self.no_base_price
+            ));
+        }
         if self.rows.is_empty() {
             out.push_str("本周没有开票。\n");
             return out;
@@ -376,7 +398,11 @@ impl WeeklyReport {
             ));
         }
 
-        let emotion = self.rows.iter().filter(|row| row.regime == Regime::Emotion).count();
+        let emotion = self
+            .rows
+            .iter()
+            .filter(|row| row.regime == Regime::Emotion)
+            .count();
         out.push_str(&format!(
             "\n分型：情绪型 {} / 趋势型 {}\n",
             emotion,
@@ -392,7 +418,9 @@ impl WeeklyReport {
                     row.name,
                     row.source,
                     row.regime.label(),
-                    row.d1.map(|value| format!("{value:+.2}%")).unwrap_or_default()
+                    row.d1
+                        .map(|value| format!("{value:+.2}%"))
+                        .unwrap_or_default()
                 ));
             }
         }
