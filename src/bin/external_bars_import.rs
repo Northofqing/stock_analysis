@@ -5,12 +5,16 @@
 //! 避免把 `tdx_day` 的成交额和来源标记冲掉（数据合同第 3 条第 4/5 款）。
 //!
 //! 用法：
-//!   external_bars_import --codes 000001,600519 --date 2026-10-23 --limit 5
-//!   external_bars_import --codes 000001 --limit 3 --dry-run
-//!   external_bars_import --codes 000001 --db <path> --bundle <client-bundle>
+//!   external_bars_import --codes 000001,600519 --date 2026-10-23 --window-days 10
+//!   external_bars_import --missing-for-date 2026-10-23 --db <path>
+//!   external_bars_import --codes 000001 --date 2026-10-23 --dry-run
+//!
+//! `--missing-for-date` 用库内 universe（`stock_daily` 全部 code）减去该日已有行，
+//! 得到需要补的代码；文件同步失败后的兜底就走这条。
 //!
 //! 退出码：0 全部成功；2 有失败（明细已打印）；3 参数错误。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -35,43 +39,93 @@ fn source_label_for(provider: &str) -> String {
     }
 }
 
+/// 该日缺失的代码：库内 universe − 已有行。
+fn missing_codes_for_date(db: &std::path::Path, date: &str) -> Result<Vec<String>, String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("打开数据库失败: {error}"))?;
+    let mut universe_stmt = connection
+        .prepare("SELECT DISTINCT code FROM stock_daily")
+        .map_err(|error| format!("universe 查询失败: {error}"))?;
+    let universe: HashSet<String> = universe_stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("universe 读取失败: {error}"))?
+        .filter_map(Result::ok)
+        .collect();
+    let mut present_stmt = connection
+        .prepare("SELECT code FROM stock_daily WHERE date = ?1")
+        .map_err(|error| format!("当日查询失败: {error}"))?;
+    let present: HashSet<String> = present_stmt
+        .query_map([date], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("当日读取失败: {error}"))?
+        .filter_map(Result::ok)
+        .collect();
+    let mut missing: Vec<String> = universe.difference(&present).cloned().collect();
+    missing.sort();
+    Ok(missing)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let codes: Vec<String> = match arg_value(&args, "--codes") {
-        Some(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|code| !code.is_empty())
-            .map(str::to_owned)
-            .collect(),
+    let db_path = arg_value(&args, "--db")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("STOCK_DB").ok().map(PathBuf::from));
+    let missing_for = arg_value(&args, "--missing-for-date");
+    let target_date = match arg_value(&args, "--date").or_else(|| missing_for.clone()) {
+        Some(raw) => raw,
         None => {
-            eprintln!("缺少 --codes（逗号分隔的 6 位代码）");
+            eprintln!("缺少 --date 或 --missing-for-date（目标交易日 YYYY-MM-DD）");
             std::process::exit(3);
         }
     };
-    let limit: u32 = arg_value(&args, "--limit")
-        .and_then(|raw| raw.parse().ok())
-        .unwrap_or(10);
-    let target_date = arg_value(&args, "--date").unwrap_or_else(|| {
-        eprintln!("缺少 --date（目标交易日 YYYY-MM-DD）");
-        std::process::exit(3);
-    });
     let target = match chrono::NaiveDate::parse_from_str(&target_date, "%Y-%m-%d") {
         Ok(date) => date,
         Err(error) => {
-            eprintln!("--date 解析失败: {error}");
+            eprintln!("日期解析失败: {error}");
             std::process::exit(3);
         }
     };
-    // 窗口天数：日期区间由服务端校验，太窄会被连续性检查拒绝。
+    let codes: Vec<String> = match &missing_for {
+        Some(date) => {
+            let Some(db) = db_path.as_deref() else {
+                eprintln!("--missing-for-date 需要 --db 或 STOCK_DB");
+                std::process::exit(3);
+            };
+            match missing_codes_for_date(db, date) {
+                Ok(codes) => codes,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(3);
+                }
+            }
+        }
+        None => match arg_value(&args, "--codes") {
+            Some(raw) => raw
+                .split(',')
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            None => {
+                eprintln!("缺少 --codes 或 --missing-for-date");
+                std::process::exit(3);
+            }
+        },
+    };
+    if codes.is_empty() {
+        println!("done targets=0 fetched=0 inserted=0 existing=0 failed=0（该日无缺失）");
+        return;
+    }
+
+    let limit: u32 = arg_value(&args, "--limit")
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(15);
+    // 窗口天数：服务端会校验区间连续性，太窄会被拒绝。
     let window_days: i64 = arg_value(&args, "--window-days")
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(10);
     let start = target - chrono::Duration::days(window_days);
     let dry_run = args.iter().any(|arg| arg == "--dry-run");
-    let db_path = arg_value(&args, "--db")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("STOCK_DB").ok().map(PathBuf::from));
     let bundle = arg_value(&args, "--bundle")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE").map(PathBuf::from))
@@ -101,7 +155,7 @@ fn main() {
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut rows: Vec<ExternalDailyBar> = Vec::new();
 
-    for code in &codes {
+    for (index, code) in codes.iter().enumerate() {
         let Some(exchange) = exchange_for_code(code) else {
             failed.push((code.clone(), "ExternalV1 不覆盖（非沪深股票）".to_owned()));
             continue;
@@ -120,16 +174,38 @@ fn main() {
             }
             Err(error) => failed.push((code.clone(), error)),
         }
+        if index % 200 == 199 {
+            println!(
+                "progress {}/{} fetched={} failed={}",
+                index + 1,
+                codes.len(),
+                fetched,
+                failed.len()
+            );
+        }
     }
 
     if dry_run {
         for bar in &rows {
             println!(
                 "{} {} O={:.2} H={:.2} L={:.2} C={:.2} vol={:.0} amount={:?} provider={}",
-                bar.code, bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.amount, bar.provider
+                bar.code,
+                bar.date,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                bar.amount,
+                bar.provider
             );
         }
-        println!("dry_run targets={} fetched={} failed={}", codes.len(), fetched, failed.len());
+        println!(
+            "dry_run targets={} fetched={} failed={}",
+            codes.len(),
+            fetched,
+            failed.len()
+        );
         for (code, error) in &failed {
             println!("  ! {code}: {error}");
         }
@@ -154,7 +230,6 @@ fn main() {
 
     for bar in &rows {
         // 只补缺：已存在的 (code,date) 一律跳过，保留既有来源与成交额。
-        // 来源标记必须如实反映实际 provider，不能一律写成 tencent-web。
         let source_label = source_label_for(&bar.provider);
         let changed = connection.execute(
             "INSERT INTO stock_daily (code, date, open, high, low, close, volume, amount, data_source) \
