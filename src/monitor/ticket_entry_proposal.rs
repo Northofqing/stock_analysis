@@ -179,7 +179,22 @@ pub fn propose_for_observing(
         }
 
         match ticket_lifecycle::set_stage(&mut conn, ticket.id, "entry_proposed") {
-            Ok(changed) if changed > 0 => report.proposed.push(code.clone()),
+            Ok(changed) if changed > 0 => {
+                report.proposed.push(code.clone());
+                // 2026-10-24：归因扩到入场提案（原表只接 T0Advice）。
+                // best-effort：失败只记 error，不影响提案本身。
+                if let Err(error) =
+                    crate::database::advice_outcome_tracking::record_advice_push_simple(
+                        &mut conn,
+                        "EntryProposal",
+                        as_of,
+                        &code,
+                        &chrono::Utc::now().to_rfc3339(),
+                    )
+                {
+                    report.errors.push(format!("{code} 归因落库失败: {error}"));
+                }
+            }
             Ok(_) => {
                 // 事件写了但 stage 没动：票可能刚被别处推进/关闭。不算失败，
                 // 但要能看到，否则会以为推成功了。

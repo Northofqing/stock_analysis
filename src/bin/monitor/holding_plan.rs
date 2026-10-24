@@ -361,6 +361,42 @@ pub(super) async fn dispatch_tick(
 }
 
 async fn dispatch_candidate(candidate: HoldingPlanCandidate) -> Result<(), String> {
+    // 2026-10-24：归因扩到 HoldingPlan（原表只接 T0Advice）。
+    // 先取 code/date（candidate 随后 move 进内层），成功投递后 best-effort 落一行。
+    let tracking = (
+        candidate
+            .instrument()
+            .ok()
+            .map(|instrument| instrument.code().to_owned()),
+        candidate
+            .business_date()
+            .ok()
+            .map(|date| date.format("%Y-%m-%d").to_string()),
+    );
+    let result = dispatch_candidate_inner(candidate).await;
+    if result.is_ok() {
+        if let (Some(code), Some(date)) = tracking {
+            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                if let Ok(mut conn) = db.get_conn() {
+                    if let Err(error) =
+                        stock_analysis::database::advice_outcome_tracking::record_advice_push_simple(
+                            &mut conn,
+                            "HoldingPlan",
+                            &date,
+                            &code,
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                    {
+                        log::warn!("[建议跟踪] HoldingPlan 落库失败 code={code}: {error}");
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+async fn dispatch_candidate_inner(candidate: HoldingPlanCandidate) -> Result<(), String> {
     let candidate =
         match durable_delivery_runtime::reconcile_holding_plan_candidate(candidate).await? {
             durable_delivery_runtime::HoldingPlanLocalProgress::PhysicalAccepted => return Ok(()),

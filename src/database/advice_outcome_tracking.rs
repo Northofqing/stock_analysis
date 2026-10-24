@@ -98,6 +98,19 @@ fn add_column_if_missing(conn: &mut SqliteConnection, definition: &str) {
 }
 
 /// 记录一次建议推送 (幂等: occurrence_identity 唯一). 返回 true = 新插入.
+/// 简化落行（2026-10-24）：不走 presentation binding 的推送路径用这个。
+/// occurrence_identity 由 `(push_kind, business_date, code)` 派生，天然幂等。
+pub fn record_advice_push_simple(
+    conn: &mut SqliteConnection,
+    push_kind: &str,
+    business_date: &str,
+    code: &str,
+    pushed_at: &str,
+) -> Result<(), String> {
+    let occurrence = format!("{push_kind}:{business_date}:{code}");
+    record_advice_push(conn, &occurrence, business_date, push_kind, code, pushed_at).map(|_| ())
+}
+
 pub fn record_advice_push(
     conn: &mut SqliteConnection,
     occurrence_identity: &str,

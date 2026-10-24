@@ -644,6 +644,8 @@ d15 券商研报/盈利预测 op 合同里有定义，生产可调性未验证�
 6. ReviewLhb 推送链路活着（10-19/10-21 Delivered，网关直取，不依赖死于 7-12 的 lhb_daily 表）
    → 情绪票复盘「谁在买」席位维度（批 2）。
 7. `render_event_calendar` 模板（从未接线）+ event_calendar/economic_calendar 网关
+   → 2026-10-24 核查：ExternalV1 只有 `EconomicReleaseSchedule`（FRED 美国宏观发布日期，
+   只有日期没有时间/国别，也不是 A 股解禁/财报日历）。**没有对的源，故不接线**，不是遗漏。
    → 排雷日历（批 2，拓 6 配套）。
 
 **B 类（死了，设计可挖）**
@@ -1095,6 +1097,22 @@ capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧�
   最后一条 2026-10-14），不是新闻采集；②在 55 只票上做实体识别没有增量；
   ③P3.1 的新闻监控已经在用 `news_items.code`，不受 AI 断供影响。
   真正该做的是查 AI 评估为什么停（另立排查项），不是再加一条读同一份窄数据的链。
+
+### 0.16 建议归因扩面（2026-10-24 已完成）
+
+- 背景：`advice_outcome_tracking` 原来只接 `T0Advice`（20 行 / 10-19~10-22），
+  HoldingPlan 与入场提案的推送不进归因表 —— 只有一种建议在闭环，其余建议质量无数据。
+- 实施：
+  - `record_advice_push_simple`：`occurrence_identity = push_kind:date:code`，天然幂等；
+  - 入场提案：`ticket_entry_proposal::propose_for_observing` 在 stage 推进成功后落
+    `push_kind='EntryProposal'`（best-effort，失败只记 error 不挡提案）；
+  - 持仓建议：`holding_plan::dispatch_candidate` 包一层，投递成功（含 AlreadyOwned 二次治理路径）
+    后落 `push_kind='HoldingPlan'`；
+  - 回填：把已有 37 条 `entry_proposed` 事件补成归因行（10-21 33 / 10-22 4），
+    等 15:50 的 `backfill_advice_outcomes` 算 T+1/T+3。
+- 现状（SQL）：`T0Advice` 20 行 + `EntryProposal` 37 行。
+- 验证：`cargo check --lib --bin monitor` 0 error（该模块无单测，编译与 SQL 计数为证）。
+- 边界：明日计划是整段推送、没有逐票 binding，不落归因；它的逐票价格以 `entry_proposed` 为准（已覆盖）。
 
 ### 0.15 方法论加固（2026-10-24 已完成：代码 + 单测 + 实数据 + 部署）
 
