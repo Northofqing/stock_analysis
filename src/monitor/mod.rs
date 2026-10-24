@@ -68,6 +68,7 @@ pub mod ticket_priority; // 2026-10-18: 观察池票优先级 (5 维加权排序
 pub mod ticket_regime; // 2026-10-23: 分型 (情绪型/趋势型) —— D1/D2 地基，写 ticket_event(kind=regime)
 pub mod ticket_risk_flag; // 2026-10-23: 排雷标注 (F10 关键词, 只标注不挡买入, 批 2.7)
 pub mod ticket_stage_sync; // 2026-10-18: 持仓快照驱动 stage 自动流转 (观察→持有→退出)
+pub mod ticket_weekly_report; // 2026-10-24: 选股周报 (source × D+1/D+3 胜率/均值/中位/超额, 批 4.3)
 pub mod ticket_watch_pool; // 2026-10-17: 观察池生成 (新闻催化; 板块轮动待接写入方)
 pub mod trade_ledger; // 交易流水: 手工录入 + 快照差分推断 (2026-10-19)
 pub mod trading_fact_snapshot; // 2026-10-17: op 67 价格带每日落库 (快照日有值, 错过永久丢)

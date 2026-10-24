@@ -12997,6 +12997,55 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     }
 
                     // 盘后可买价推送（2026-10-18）：16:00，等 15:50 价格带 + 15:55 均线都落库后再算。
+                    // 选股周报（批 4.3/4.4，2026-10-24）：周五 17:00，一周一次。
+                    //
+                    // 为什么是 17:00：15:55 均线、15:52 排雷、16:00 明日计划都跑完了，
+                    // 周报读的是当天已落库的数据，不再和盘后链抢时点。
+                    // 归档文件本身就是判重 marker（`data/perf_log/<date>_weekly.txt`）：
+                    // 写成功才算跑过，重启不重推（铁律 12）。
+                    if calendar::is_trading_day(advice_report_date)
+                        && chrono::Datelike::weekday(&advice_report_date) == chrono::Weekday::Fri
+                        && now_time >= chrono::NaiveTime::from_hms_opt(17, 0, 0).unwrap()
+                    {
+                        let date_text = advice_report_date.format("%Y-%m-%d").to_string();
+                        let archive = std::path::Path::new("data/perf_log")
+                            .join(format!("{date_text}_weekly.txt"));
+                        if !archive.exists() {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                match stock_analysis::monitor::ticket_weekly_report::build(
+                                    &db, &date_text,
+                                ) {
+                                    Ok(report) => {
+                                        for error in &report.errors {
+                                            log::warn!("[选股周报] {error}");
+                                        }
+                                        let text = report.render();
+                                        if crate::notify::push_wechat(&text).await {
+                                            if let Some(parent) = archive.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            if let Err(error) = std::fs::write(&archive, &text) {
+                                                log::warn!(
+                                                    "[选股周报] 归档写入失败（下周会重推）: {error}"
+                                                );
+                                            } else {
+                                                log::info!(
+                                                    "[选股周报] {date_text} 已推送并归档 {} 字",
+                                                    text.chars().count()
+                                                );
+                                            }
+                                        } else {
+                                            log::warn!("[选股周报] 推送失败, 下一轮重试");
+                                        }
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[选股周报] 生成失败 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 排雷标注（批 2.7，2026-10-23）：15:52，明日计划之前。
                     //
                     // 方案原文写 16:20，但 16:00 就生成明日计划 —— 排在计划之后等于当天
