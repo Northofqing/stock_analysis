@@ -785,6 +785,20 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
 第二、三次被失败码尾巴拖住（60~90 分钟仍在拉取阶段）手动终止，**未提交任何行**。
 改成独立任务 + 10s 超时 + 每 200 只分批提交后，由 21:30 任务重新拉取，结果见 0.9。
 
+**0.10 2026-10-24 补数复盘：被对端 HistoricalBars 阻断（实际结果）**
+
+- 用新 CLI（10s 单只超时 / 每 200 只一事务 / 45 分钟预算）跑
+  `daily_bars_build --date 2026-10-23 --all`：
+  `targets=2965 fetched=0 persisted_bars=0 failed=270`，`stock_daily` 当日仍 **0 行**。
+- 真因不在超时设置：单票直调桥（000001, days=30）返回 `router_sources_exhausted`，
+  四路全灭 —— Tdx `[E2103] declared bars without row bytes`、
+  Tencent `day bar row has 7 fields; expected 6`（即 handoff 第 3 项那处「已修未部署」）、
+  Sina `daily amount is unavailable at 2026-09-04`（质量门整批拒）、Baidu 403。
+- 结论：**全市场日线在补上之前，任何依赖它的验收都不成立** ——
+  perf 的 D+N（除活跃票）、市场基准（n=47~53）、P6 归因样本、5.2 成交偏差的基准价。
+- 已做的事：把实测报文写进 `handoff-windows-externalv1-20261024.md` 第 3 项并升级为 P0；
+  周报（4.3/4.4）代码不依赖 10-23 数据，可先跑，10-22 批次会显示空行。
+
 **0.9 2026-10-22 夜间验收（实际结果）**
 
 - 21:30 全量任务：**没有跑成**。22:39 重启后新任务在 22:45 启动，但本机桥在此之前
