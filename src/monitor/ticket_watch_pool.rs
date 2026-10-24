@@ -196,6 +196,27 @@ pub fn collect_news_catalysts(
 ///
 /// `source` / `label` 由调用方给：涨幅榜 `f3` 记 `board_rotation`，主力净流入榜 `f62`
 /// 记 `money_flow`（批 2.3）——两者是独立信号，不能混成一个来源，否则复盘归因分不开。
+/// 盘中选票用的实时快照（2026-10-24：operator 要求 15:05 前推一次、盘后再一次）。
+///
+/// 盘前/盘中的问题：当日 `stock_daily` 还没落库，`collect_board_picks` 只能 join
+/// 最近一个样本足够的交易日 —— 2026-10-19 那批因此用了 10-16 的涨幅（note 里可查），
+/// 选出来的是「3 天前涨过一波」的票。这个结构用来把实时涨幅注入排序。
+#[derive(Debug, Clone)]
+pub struct LiveSnapshot {
+    /// code → 当日实时涨跌幅（%）
+    pub pct_by_code: std::collections::HashMap<String, f64>,
+    /// note 里的口径标签，例如「盘中14:50」
+    pub label: String,
+    /// 写进 `ticket_lifecycle.source`，与盘后 `board_rotation` 分开记，方便复盘对比
+    pub source: &'static str,
+}
+
+/// 涨幅口径：有实时值就用实时值，否则回落到日线；两者都没有返回 None（不补 0）。
+fn effective_pct(live: Option<&LiveSnapshot>, code: &str, daily: Option<f64>) -> Option<f64> {
+    live.and_then(|snapshot| snapshot.pct_by_code.get(code).copied())
+        .or(daily)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_board_picks(
     db: &DatabaseManager,
@@ -208,7 +229,11 @@ fn collect_board_picks(
     limit_up_codes: &std::collections::HashSet<String>,
     leader_codes: &std::collections::HashSet<String>,
     eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
+    live: Option<&LiveSnapshot>,
 ) -> Result<(usize, Vec<PoolCandidate>), String> {
+    // 盘中路用独立的 source 记账（board_rotation_pm），盘后仍用调用方传入的值。
+    let source = live.map(|snapshot| snapshot.source).unwrap_or(source);
+
     #[derive(QueryableByName)]
     struct BoardRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -239,27 +264,6 @@ fn collect_board_picks(
         return Ok((0, Vec::new()));
     }
 
-    // 最近一个样本足够的交易日（当日只有活跃票时退到上一交易日）。
-    #[derive(QueryableByName)]
-    struct DateRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        date: String,
-    }
-    let price_date: Option<String> = diesel::sql_query(
-        "SELECT date FROM stock_daily WHERE date <= ?1 \
-          GROUP BY date HAVING COUNT(*) >= 50 ORDER BY date DESC LIMIT 1",
-    )
-    .bind::<diesel::sql_types::Text, _>(board_date.to_owned())
-    .load::<DateRow>(&mut *conn)
-    .map_err(|e| format!("日线日期查询失败: {e}"))?
-    .into_iter()
-    .next()
-    .map(|row| row.date);
-
-    let Some(price_date) = price_date else {
-        return Ok((scanned, Vec::new()));
-    };
-
     #[derive(QueryableByName)]
     struct MemberRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -270,19 +274,63 @@ fn collect_board_picks(
         pct_chg: Option<f64>,
     }
 
-    // 一次取当日全部成分股行情，Rust 侧按板块名过滤。
-    //
-    // 不用 `IN (?,?,…)` 动态绑定：diesel 的 `query = query.bind(..)` 会改变返回类型
-    // （`SqlQuery` → `UncheckedBind`），循环里赋值编不过。board_member 只有万级行，
-    // 全量 join 一次足够。
-    let rows: Vec<MemberRow> = diesel::sql_query(
-        "SELECT m.board_name, m.instrument_code, d.pct_chg \
-           FROM board_member m \
-           JOIN stock_daily d ON d.code = m.instrument_code AND d.date = ?1",
-    )
-    .bind::<diesel::sql_types::Text, _>(price_date.clone())
-    .load(&mut *conn)
-    .map_err(|e| format!("板块成分查询失败: {e}"))?;
+    // 两种取成员方式：
+    // - 盘后（live=None）：join 当日（或最近样本足够的）日线取涨幅；
+    // - 盘中（live=Some）：当日日线还没落库，join 会返回 0 行 —— 直接读 board_member，
+    //   涨幅用实时行情覆盖（缺失留 None，不补 0）。
+    let (rows, price_label): (Vec<MemberRow>, String) = match live {
+        Some(snapshot) => {
+            #[derive(QueryableByName)]
+            struct MemberCodeRow {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                board_name: String,
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                instrument_code: String,
+            }
+            let base: Vec<MemberCodeRow> =
+                diesel::sql_query("SELECT board_name, instrument_code FROM board_member")
+                    .load(&mut *conn)
+                    .map_err(|e| format!("{label}板块成分查询失败: {e}"))?;
+            let rows = base
+                .into_iter()
+                .map(|row| MemberRow {
+                    pct_chg: effective_pct(Some(snapshot), &row.instrument_code, None),
+                    board_name: row.board_name,
+                    instrument_code: row.instrument_code,
+                })
+                .collect();
+            (rows, snapshot.label.clone())
+        }
+        None => {
+            #[derive(QueryableByName)]
+            struct DateRow {
+                #[diesel(sql_type = diesel::sql_types::Text)]
+                date: String,
+            }
+            let price_date: Option<String> = diesel::sql_query(
+                "SELECT date FROM stock_daily WHERE date <= ?1 \
+                  GROUP BY date HAVING COUNT(*) >= 50 ORDER BY date DESC LIMIT 1",
+            )
+            .bind::<diesel::sql_types::Text, _>(board_date.to_owned())
+            .load::<DateRow>(&mut *conn)
+            .map_err(|e| format!("日线日期查询失败: {e}"))?
+            .into_iter()
+            .next()
+            .map(|row| row.date);
+            let Some(price_date) = price_date else {
+                return Ok((scanned, Vec::new()));
+            };
+            let rows: Vec<MemberRow> = diesel::sql_query(
+                "SELECT m.board_name, m.instrument_code, d.pct_chg \
+                   FROM board_member m \
+                   JOIN stock_daily d ON d.code = m.instrument_code AND d.date = ?1",
+            )
+            .bind::<diesel::sql_types::Text, _>(price_date.clone())
+            .load(&mut *conn)
+            .map_err(|e| format!("板块成分查询失败: {e}"))?;
+            (rows, price_date)
+        }
+    };
 
     // code → 当日涨跌幅，给东财成分股补 pct_chg 用（那些票不在 board_member 里）。
     let pct_by_code: std::collections::HashMap<String, f64> = rows
@@ -387,7 +435,7 @@ fn collect_board_picks(
                 board.rank_position + 1,
                 board.board_name,
                 pct_text,
-                price_date,
+                price_label,
                 leader_pct
             );
             match candidates
@@ -425,6 +473,7 @@ pub fn collect_board_rotation(
     limit_up_codes: &std::collections::HashSet<String>,
     leader_codes: &std::collections::HashSet<String>,
     eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
+    live: Option<&LiveSnapshot>,
 ) -> Result<(usize, Vec<PoolCandidate>), String> {
     collect_board_picks(
         db,
@@ -437,6 +486,7 @@ pub fn collect_board_rotation(
         limit_up_codes,
         leader_codes,
         eastmoney_members,
+        live,
     )
 }
 
@@ -454,6 +504,7 @@ pub fn collect_money_flow_boards(
     limit_up_codes: &std::collections::HashSet<String>,
     leader_codes: &std::collections::HashSet<String>,
     eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
+    live: Option<&LiveSnapshot>,
 ) -> Result<(usize, Vec<PoolCandidate>), String> {
     #[derive(QueryableByName)]
     struct DateRow {
@@ -485,6 +536,7 @@ pub fn collect_money_flow_boards(
         limit_up_codes,
         leader_codes,
         eastmoney_members,
+        live,
     )
 }
 
@@ -525,6 +577,7 @@ pub fn build_watch_pool(
     limit_up_codes: &std::collections::HashSet<String>,
     leader_codes: &std::collections::HashSet<String>,
     eastmoney_members: &std::collections::HashMap<String, Vec<String>>,
+    live: Option<&LiveSnapshot>,
 ) -> Result<WatchPoolReport, String> {
     let lookback = lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS);
     let (scanned_rows, mut candidates) = collect_news_catalysts(db, business_date, lookback)?;
@@ -539,6 +592,7 @@ pub fn build_watch_pool(
         limit_up_codes,
         leader_codes,
         eastmoney_members,
+        live,
     )?;
     let board_count_raw = board_candidates.len();
     let mut board_added = 0usize;
@@ -570,6 +624,7 @@ pub fn build_watch_pool(
         limit_up_codes,
         leader_codes,
         eastmoney_members,
+        live,
     )?;
     let mf_count_raw = mf_candidates.len();
     let mut mf_added = 0usize;
@@ -676,4 +731,33 @@ pub fn build_watch_pool(
 
     report.log();
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn live_snapshot(value: f64) -> LiveSnapshot {
+        let mut pct_by_code = std::collections::HashMap::new();
+        pct_by_code.insert("000001".to_string(), value);
+        LiveSnapshot {
+            pct_by_code,
+            label: "盘中14:50".to_string(),
+            source: "board_rotation_pm",
+        }
+    }
+
+    #[test]
+    fn live_pct_overrides_daily_and_missing_stays_none() {
+        let live = live_snapshot(3.5);
+        // 实时值优先于日线
+        assert_eq!(effective_pct(Some(&live), "000001", Some(-1.0)), Some(3.5));
+        // 实时缺失时回落到日线
+        assert_eq!(effective_pct(Some(&live), "600000", Some(-1.0)), Some(-1.0));
+        // 两者都缺失：None，不补 0（BR-222）
+        assert_eq!(effective_pct(Some(&live), "600000", None), None);
+        // 盘后口径：只用日线
+        assert_eq!(effective_pct(None, "000001", Some(2.0)), Some(2.0));
+        assert_eq!(effective_pct(None, "000001", None), None);
+    }
 }

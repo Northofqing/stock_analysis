@@ -12526,6 +12526,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                         &limit_up_codes,
                                         &leader_codes,
                                         &eastmoney_members,
+                                        None,
                                     ) {
                                         Ok(report) => {
                                             report.log();
@@ -12569,6 +12570,80 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }
                                 }
                                 None => log::warn!("[观察池] 数据库不可用, 本轮跳过"),
+                            }
+                        }
+                    }
+
+                    // 盘中选票（2026-10-24）：14:50 跑一轮，15:05 前推送。
+                    //
+                    // 与 15:40 盘后那轮只差数据口径：板块榜用当日实时（BoardFlows）、
+                    // 成分股涨幅用实时行情（RealtimeQuotes），来源记 board_rotation_pm；
+                    // 盘后那轮仍用 15:30 落库的最终榜 + 当日日线，来源 board_rotation。
+                    // 每天只尝试一次（失败不重试），避免在收盘前把桥打满。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(14, 50, 0).unwrap()
+                    {
+                        static WATCH_POOL_PM_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let pm_marker = std::path::Path::new("data/watch_pool_intraday")
+                            .join(advice_report_date.format("%Y-%m-%d").to_string());
+                        let already = WATCH_POOL_PM_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false)
+                            || pm_marker.exists();
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text =
+                                    advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::watch_pool_intraday::run(
+                                    &db, &date_text,
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        log::info!("{}", report.summary_line());
+                                        let text = stock_analysis::monitor::watch_pool_intraday::render_push(&db, &report);
+                                        if !text.is_empty() {
+                                            if crate::notify::push_wechat(&text).await {
+                                                log::info!(
+                                                    "[盘中选票] 已推送 {} 只",
+                                                    report.picks.len()
+                                                );
+                                            } else {
+                                                log::warn!("[盘中选票] 推送失败（票已入池）");
+                                            }
+                                        }
+                                        if let Some(parent) = pm_marker.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let marker_text = format!(
+                                            "boards={} members={} quoted={} candidates={} opened={}",
+                                            report.boards,
+                                            report.member_codes,
+                                            report.quoted,
+                                            report.candidates,
+                                            report.opened
+                                        );
+                                        if let Err(error) = std::fs::write(&pm_marker, marker_text)
+                                        {
+                                            log::warn!(
+                                                "[盘中选票] marker 写入失败（重启会重放）: {error}"
+                                            );
+                                        }
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[盘中选票] 失败, 今日不再重试 date={date_text}: {error}"
+                                    ),
+                                }
+                                // 成功失败都记账：失败时靠 15:40 盘后那轮兜底。
+                                *WATCH_POOL_PM_LAST
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) =
+                                    Some(advice_report_date);
+                            } else {
+                                log::warn!("[盘中选票] 数据库不可用, 本轮跳过");
                             }
                         }
                     }

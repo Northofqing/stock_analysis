@@ -1074,6 +1074,25 @@ capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧�
   ③ P3.1 的新闻监控已经在用 `news_items.code`，不受 AI 断供影响。
   真正该做的是查 AI 评估为什么停（另立排查项），不是再加一条读同一份窄数据的链。
 
+**2.13 盘中选票（14:50）— 已完成（2026-10-24，operator 当日拍板）**
+
+- 口径：**15:05 前推一次 + 盘后（15:40）再一次**。两轮用同一套选票代码，只差数据源：
+  盘中那轮板块榜用 `BoardFlows` 当日实时、成分股涨幅用 `RealtimeQuotes`；
+  盘后那轮仍用 15:30 落库的最终榜 + 当日日线。
+- 落点：`src/monitor/watch_pool_intraday.rs`（新）+ `main.rs` 14:50 块 +
+  `ticket_watch_pool::LiveSnapshot`。盘中轮开出的票 `source='board_rotation_pm'`、
+  note 带「盘中14:50」，与盘后 `board_rotation` 分开记账，复盘时可直接对比两个时点。
+- 为什么必须新加：`collect_board_picks` 靠 `stock_daily` 的当日涨幅排序，而盘前/盘中当日行
+  还没落库，会退到 2~3 个交易日前的日期（10-19 那批 note 是「成分股 2026-10-16」，
+  见 0.13）。盘中轮改成直接读 `board_member` + 实时涨幅覆盖（`effective_pct`：
+  实时优先、缺失回落日线、两者都无则 None，不补 0）。
+- 幂等：marker `data/watch_pool_intraday/<date>`；每交易日只尝试一次（失败不重试，
+  靠 15:40 盘后轮兜底），避免收盘前把桥打满。
+- 推送：只在本轮有新票时推，正文含代码/名称/板块/实时涨幅，末尾注明「15:40 还会再选一次」。
+- 验证：`cargo check --lib --bin monitor` 通过；`cargo test --lib ticket_watch_pool` 1 passed
+  （`live_pct_overrides_daily_and_missing_stays_none`）。**未验真实流量**：
+  14:50 的板块榜与行情批次要等下个交易日（2026-10-26）才第一次跑。
+
 ### 批 3 预算层（Q3=30%）— 未开工（见 3.4）
 
 **3.1 周预算状态**：本周已用 = 本周新增持仓成本（快照 `position_opened` 对应
