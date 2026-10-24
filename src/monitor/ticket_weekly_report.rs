@@ -52,12 +52,35 @@ struct BarRow {
     close: f64,
     #[diesel(sql_type = diesel::sql_types::Nullable<Double>)]
     open: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Double>)]
+    low: Option<f64>,
 }
 
 #[derive(QueryableByName)]
 struct DateRow {
     #[diesel(sql_type = Text)]
     trade_date: String,
+}
+
+/// 成交可行性（0.15-2）：提案区间 vs 次日最低价。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillStatus {
+    /// 次日最低价 ≤ 区间下沿（可在区间内成交）
+    Filled,
+    /// 只触及区间上半段
+    Touched,
+    /// 完全没碰到区间
+    Missed,
+}
+
+impl FillStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Filled => "可成交",
+            Self::Touched => "半触及",
+            Self::Missed => "未触及",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +94,13 @@ pub struct WeeklyRow {
     pub d3: Option<f64>,
     /// 个股 D+1 − 同日全市场等权（样本不足时 None）
     pub excess_d1: Option<f64>,
+    /// 60 日 beta（全市场等权为市场组合）
+    pub beta: Option<f64>,
+    /// 个股 D+N − beta × 市场 D+N（alpha）
+    pub alpha_d1: Option<f64>,
+    pub alpha_d3: Option<f64>,
+    /// 提案区间在次日是否可成交
+    pub fill: Option<FillStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +111,16 @@ pub struct SourceStat {
     pub mean: f64,
     pub median: f64,
     pub excess: Option<f64>,
+    /// beta 调整后的 alpha 与 bootstrap 95% 区间
+    pub alpha_d1: Option<f64>,
+    pub alpha_d1_ci: Option<(f64, f64)>,
+    pub alpha_d3: Option<f64>,
+    pub alpha_d3_ci: Option<(f64, f64)>,
+    /// 提案数（有 entry_proposed 的票）与成交分布
+    pub proposals: usize,
+    pub filled: usize,
+    pub touched: usize,
+    pub missed: usize,
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +136,9 @@ pub struct WeeklyReport {
     pub no_base_price: usize,
     /// 市场基准样本不足的交易日数
     pub thin_market_days: usize,
+    /// 识别 1% 边际所需样本量（按当前 alpha 标准差估）
+    pub need_n_d1: usize,
+    pub need_n_d3: usize,
     pub errors: Vec<String>,
 }
 
@@ -213,9 +256,10 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
 
     let mut closes: HashMap<(String, String), f64> = HashMap::new();
     let mut opens: HashMap<(String, String), f64> = HashMap::new();
+    let mut lows: HashMap<(String, String), f64> = HashMap::new();
     let mut by_date: HashMap<String, HashMap<String, f64>> = HashMap::new();
     for row in diesel::sql_query(
-        "SELECT code, date, close, open FROM stock_daily \
+        "SELECT code, date, close, open, low FROM stock_daily \
           WHERE close > 0 AND date >= ?1 AND date <= ?2",
     )
     .bind::<Text, _>(start_text.clone())
@@ -227,11 +271,35 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
         if let Some(open) = row.open {
             opens.insert((row.code.clone(), row.date.clone()), open);
         }
+        if let Some(low) = row.low {
+            lows.insert((row.code.clone(), row.date.clone()), low);
+        }
         by_date
             .entry(row.date.clone())
             .or_default()
             .insert(row.code.clone(), row.close);
     }
+
+    // 0.15-1：全市场等权日收益（beta 与 alpha 的市场组合）。
+    #[derive(QueryableByName)]
+    struct MarketRow {
+        #[diesel(sql_type = Text)]
+        date: String,
+        #[diesel(sql_type = Double)]
+        avg: f64,
+    }
+    let market_series: HashMap<String, f64> = diesel::sql_query(
+        "SELECT date, AVG(pct_chg) AS avg FROM stock_daily \
+          WHERE pct_chg IS NOT NULL AND date >= date(?1, '-150 day') AND date <= ?2 \
+          GROUP BY date",
+    )
+    .bind::<Text, _>(start_text.clone())
+    .bind::<Text, _>(last_needed.clone())
+    .load::<MarketRow>(&mut conn)
+    .map_err(|error| format!("市场等权序列查询失败: {error}"))?
+    .into_iter()
+    .map(|row| (row.date, row.avg))
+    .collect();
 
     let mut report = WeeklyReport {
         week_start: start_text,
@@ -302,6 +370,34 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
             _ => None,
         };
 
+        // 0.15-1：60 日 beta；alpha = 个股收益 − beta × 市场同期收益。
+        let beta = beta_of(&mut conn, &ticket.code, &ticket.open_date, &market_series);
+        let market_window = |periods: usize| -> Option<f64> {
+            let mut acc = 1.0;
+            for step in 1..=periods {
+                let date = calendar.get(start_index + step)?;
+                let ret = market_series.get(date)?;
+                acc *= 1.0 + ret / 100.0;
+            }
+            Some((acc - 1.0) * 100.0)
+        };
+        let alpha_d1 = match (d1, beta, market_window(1)) {
+            (Some(stock), Some(beta), Some(market)) => Some(stock - beta * market),
+            _ => None,
+        };
+        let alpha_d3 = match (d3, beta, market_window(3)) {
+            (Some(stock), Some(beta), Some(market)) => Some(stock - beta * market),
+            _ => None,
+        };
+        // 0.15-2：提案区间是否在次日可成交。
+        let fill = fill_status(
+            &mut conn,
+            ticket.id,
+            &ticket.code,
+            &calendar,
+            &lows,
+        );
+
         report.rows.push(WeeklyRow {
             code: ticket.code.clone(),
             name: resolve_name(&mut conn, &ticket.code).unwrap_or_default(),
@@ -311,6 +407,10 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
             d1,
             d3,
             excess_d1,
+            beta,
+            alpha_d1,
+            alpha_d3,
+            fill,
         });
     }
 
@@ -331,17 +431,39 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
         let d1: Vec<f64> = rows.iter().filter_map(|row| row.d1).collect();
         if let Some((n, win_rate, mean, median)) = summarize(&d1) {
             let excess: Vec<f64> = rows.iter().filter_map(|row| row.excess_d1).collect();
+            let alpha_d1: Vec<f64> = rows.iter().filter_map(|row| row.alpha_d1).collect();
+            let alpha_d3: Vec<f64> = rows.iter().filter_map(|row| row.alpha_d3).collect();
+            let alpha_mean = |values: &[f64]| {
+                if values.is_empty() {
+                    None
+                } else {
+                    Some(values.iter().sum::<f64>() / values.len() as f64)
+                }
+            };
             report.stats.push(SourceStat {
                 label,
                 n,
                 win_rate,
                 mean,
                 median,
-                excess: if excess.is_empty() {
-                    None
-                } else {
-                    Some(excess.iter().sum::<f64>() / excess.len() as f64)
-                },
+                excess: alpha_mean(&excess),
+                alpha_d1: alpha_mean(&alpha_d1),
+                alpha_d1_ci: bootstrap_ci(&alpha_d1),
+                alpha_d3: alpha_mean(&alpha_d3),
+                alpha_d3_ci: bootstrap_ci(&alpha_d3),
+                proposals: rows.iter().filter(|row| row.fill.is_some()).count(),
+                filled: rows
+                    .iter()
+                    .filter(|row| row.fill == Some(FillStatus::Filled))
+                    .count(),
+                touched: rows
+                    .iter()
+                    .filter(|row| row.fill == Some(FillStatus::Touched))
+                    .count(),
+                missed: rows
+                    .iter()
+                    .filter(|row| row.fill == Some(FillStatus::Missed))
+                    .count(),
             });
         }
     }
@@ -350,6 +472,12 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
             .partial_cmp(&a.mean)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // 0.15-1：识别 1% 边际所需样本量（双侧 5%、80% 功效，近似 7.85·σ²/δ²）。
+    let alpha_d1_all: Vec<f64> = report.rows.iter().filter_map(|row| row.alpha_d1).collect();
+    let alpha_d3_all: Vec<f64> = report.rows.iter().filter_map(|row| row.alpha_d3).collect();
+    report.need_n_d1 = need_n(&alpha_d1_all);
+    report.need_n_d3 = need_n(&alpha_d3_all);
 
     let mut losers: Vec<WeeklyRow> = report
         .rows
@@ -362,6 +490,136 @@ pub fn build(db: &DatabaseManager, week_end: &str) -> Result<WeeklyReport, Strin
     report.losers = losers;
 
     Ok(report)
+}
+
+/// 60 日 beta：个股日收益对全市场等权日收益回归的斜率。样本不足 30 天返回 None。
+fn beta_of(
+    conn: &mut diesel::SqliteConnection,
+    code: &str,
+    open_date: &str,
+    market: &HashMap<String, f64>,
+) -> Option<f64> {
+    #[derive(QueryableByName)]
+    struct PctRow {
+        #[diesel(sql_type = Text)]
+        date: String,
+        #[diesel(sql_type = Double)]
+        pct_chg: f64,
+    }
+    let rows: Vec<PctRow> = diesel::sql_query(
+        "SELECT date, pct_chg FROM stock_daily \
+          WHERE code = ?1 AND pct_chg IS NOT NULL AND date < ?2 \
+          ORDER BY date DESC LIMIT 60",
+    )
+    .bind::<Text, _>(code.to_owned())
+    .bind::<Text, _>(open_date.to_owned())
+    .load(conn)
+    .ok()?;
+    let pairs: Vec<(f64, f64)> = rows
+        .iter()
+        .filter_map(|row| market.get(&row.date).map(|mk| (*mk, row.pct_chg)))
+        .collect();
+    if pairs.len() < 30 {
+        return None;
+    }
+    let n = pairs.len() as f64;
+    let mx = pairs.iter().map(|(m, _)| *m).sum::<f64>() / n;
+    let my = pairs.iter().map(|(_, s)| *s).sum::<f64>() / n;
+    let cov = pairs
+        .iter()
+        .map(|(m, s)| (m - mx) * (s - my))
+        .sum::<f64>()
+        / n;
+    let var = pairs.iter().map(|(m, _)| (m - mx).powi(2)).sum::<f64>() / n;
+    if var <= f64::EPSILON {
+        return None;
+    }
+    Some(cov / var)
+}
+
+/// 提案区间（`12.08-12.32｜…`）在次日是否可成交。
+fn fill_status(
+    conn: &mut diesel::SqliteConnection,
+    ticket_id: i64,
+    code: &str,
+    calendar: &[String],
+    lows: &HashMap<(String, String), f64>,
+) -> Option<FillStatus> {
+    #[derive(QueryableByName)]
+    struct EventRow {
+        #[diesel(sql_type = Text)]
+        event_at: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        summary: Option<String>,
+    }
+    let event: EventRow = diesel::sql_query(
+        "SELECT event_at, summary FROM ticket_event \
+          WHERE ticket_id = ?1 AND event_kind = 'entry_proposed' \
+          ORDER BY event_at ASC LIMIT 1",
+    )
+    .bind::<BigInt, _>(ticket_id)
+    .get_result(conn)
+    .ok()?;
+    let (low, high) = parse_zone(event.summary.as_deref()?)?;
+    let index = calendar.iter().position(|date| date == &event.event_at)?;
+    let next = calendar.get(index + 1)?;
+    let day_low = lows.get(&(code.to_owned(), next.clone())).copied()?;
+    Some(if day_low <= low {
+        FillStatus::Filled
+    } else if day_low <= high {
+        FillStatus::Touched
+    } else {
+        FillStatus::Missed
+    })
+}
+
+/// 解析 `12.08-12.32｜…` 的区间；格式不符返回 None。
+pub(crate) fn parse_zone(summary: &str) -> Option<(f64, f64)> {
+    let head = summary.split('｜').next()?.trim();
+    let (low, high) = head.split_once('-')?;
+    let low: f64 = low.trim().parse().ok()?;
+    let high: f64 = high.trim().parse().ok()?;
+    if low > 0.0 && high >= low {
+        Some((low, high))
+    } else {
+        None
+    }
+}
+
+/// 确定性 bootstrap（xorshift 固定种子，2000 次）→ 均值 95% 区间。
+pub(crate) fn bootstrap_ci(values: &[f64]) -> Option<(f64, f64)> {
+    if values.len() < 5 {
+        return None;
+    }
+    const REPS: usize = 2000;
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut means = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut sum = 0.0;
+        for _ in 0..values.len() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let index = (seed as usize) % values.len();
+            sum += values[index];
+        }
+        means.push(sum / values.len() as f64);
+    }
+    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let low = means[(REPS as f64 * 0.025) as usize];
+    let high = means[((REPS as f64 * 0.975) as usize).min(REPS - 1)];
+    Some((low, high))
+}
+
+/// 识别 1% 边际所需样本量；样本 < 2 返回 0（未知）。
+pub(crate) fn need_n(values: &[f64]) -> usize {
+    if values.len() < 2 {
+        return 0;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    (7.85 * var / 1.0).ceil().max(1.0) as usize
 }
 
 impl WeeklyReport {
@@ -396,6 +654,22 @@ impl WeeklyReport {
                 "· {} n={} 胜率{:.0}% 均值{:+.2}% 中位{:+.2}% 超额{}\n",
                 stat.label, stat.n, stat.win_rate, stat.mean, stat.median, excess
             ));
+            let alpha = match (stat.alpha_d1, stat.alpha_d1_ci) {
+                (Some(mean), Some((low, high))) => {
+                    format!("alpha{mean:+.2}%[{low:+.1},{high:+.1}]")
+                }
+                (Some(mean), None) => format!("alpha{mean:+.2}%(n<5)"),
+                _ => "alpha 样本不足".to_string(),
+            };
+            let fill = if stat.proposals > 0 {
+                format!(
+                    "可成交{}/{}（半触及{} 未触及{}）",
+                    stat.filled, stat.proposals, stat.touched, stat.missed
+                )
+            } else {
+                "无提案".to_string()
+            };
+            out.push_str(&format!("    {alpha}｜{fill}\n"));
         }
 
         let emotion = self
@@ -425,6 +699,16 @@ impl WeeklyReport {
             }
         }
 
+        out.push_str(
+            "\n口径：alpha = 个股收益 − beta×全市场等权（60 日 beta）；[..] 为 bootstrap 95% 区间；\
+             可成交 = 次日最低价触及提案区间（触及下沿=可成交，只摸上半区=半触及）。\n",
+        );
+        if self.need_n_d1 > 0 {
+            out.push_str(&format!(
+                "样本量：D+1 n={}（识别 1% 边际约需 {}）；D+3 n={}（约需 {}）——未达标前不判定优劣。\n",
+                self.d1_n, self.need_n_d1, self.d3_n, self.need_n_d3
+            ));
+        }
         if self.thin_market_days > 0 {
             out.push_str(&format!(
                 "\n注：{} 个交易日全市场日线样本不足 {} 只，超额不给数。\n",
@@ -455,6 +739,32 @@ mod tests {
     #[test]
     fn summarize_empty_is_none() {
         assert!(summarize(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_zone_reads_range_prefix() {
+        assert_eq!(parse_zone("12.08-12.32｜回踩 ma10"), Some((12.08, 12.32)));
+        assert_eq!(parse_zone("没有区间"), None);
+        assert_eq!(parse_zone("13-12"), None);
+    }
+
+    #[test]
+    fn bootstrap_ci_is_deterministic_and_brackets_mean() {
+        let values = vec![-5.0, -2.0, 0.5, 1.5, 3.0, 8.0];
+        let first = bootstrap_ci(&values).unwrap();
+        let second = bootstrap_ci(&values).unwrap();
+        assert_eq!(first, second, "固定种子必须可复现");
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        assert!(first.0 <= mean && mean <= first.1);
+        assert!(bootstrap_ci(&[1.0, 2.0]).is_none(), "样本 <5 不给区间");
+    }
+
+    #[test]
+    fn need_n_grows_with_dispersion() {
+        let tight = need_n(&[0.9, 1.0, 1.1, 1.0, 0.95, 1.05]);
+        let wide = need_n(&[-10.0, 10.0, 0.0, 5.0, -5.0, 2.0]);
+        assert!(tight < wide, "波动越大需要的样本越多");
+        assert_eq!(need_n(&[1.0]), 0);
     }
 
     #[test]

@@ -40,6 +40,71 @@ pub fn create_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::
     .map(|_| ())
 }
 
+/// PIT 快照表（0.15-3，2026-10-24）：`board_member` 是每天覆盖的当前索引，
+/// 回看历史「这只票当时属于哪个板块」会用到今天的成分（前视）。这张表按交易日留版本。
+pub fn create_snapshot_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS board_member_snapshot (\
+         board_code TEXT NOT NULL,\
+         board_name TEXT NOT NULL,\
+         kind TEXT NOT NULL,\
+         instrument_code TEXT NOT NULL,\
+         trade_date TEXT NOT NULL,\
+         captured_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+         PRIMARY KEY (board_code, instrument_code, trade_date))",
+    )
+    .execute(conn)
+    .map(|_| ())
+}
+
+/// 把当前 `board_member` 全量快照到 `trade_date`（同日可重入：先删后插）。
+/// 返回写入行数。由 `build_from_ranking` 在每次重建后调用。
+pub fn snapshot_members(
+    conn: &mut SqliteConnection,
+    trade_date: &str,
+) -> Result<usize, String> {
+    create_snapshot_schema(conn).map_err(|error| format!("board_member_snapshot 建表失败: {error}"))?;
+    let date = trade_date.to_owned();
+    conn.transaction::<usize, diesel::result::Error, _>(|conn| {
+        diesel::sql_query("DELETE FROM board_member_snapshot WHERE trade_date = ?1")
+            .bind::<Text, _>(date.clone())
+            .execute(conn)?;
+        diesel::sql_query(
+            "INSERT INTO board_member_snapshot \
+             (board_code, board_name, kind, instrument_code, trade_date) \
+             SELECT board_code, board_name, kind, instrument_code, ?1 FROM board_member",
+        )
+        .bind::<Text, _>(date)
+        .execute(conn)
+    })
+    .map_err(|error| format!("PIT 快照写入失败: {error}"))
+}
+
+/// 某只票在 `as_of`（含当日）最近一份快照里所属的板块名（PIT 查询）。
+pub fn boards_as_of(
+    conn: &mut SqliteConnection,
+    code: &str,
+    as_of: &str,
+) -> Result<Vec<String>, String> {
+    #[derive(diesel::QueryableByName)]
+    struct BoardRow {
+        #[diesel(sql_type = Text)]
+        board_name: String,
+    }
+    create_snapshot_schema(conn).map_err(|error| format!("board_member_snapshot 建表失败: {error}"))?;
+    let rows: Vec<BoardRow> = diesel::sql_query(
+        "SELECT board_name FROM board_member_snapshot \
+          WHERE instrument_code = ?1 AND trade_date = (\
+                SELECT MAX(trade_date) FROM board_member_snapshot \
+                 WHERE instrument_code = ?1 AND trade_date <= ?2)",
+    )
+    .bind::<Text, _>(code.to_owned())
+    .bind::<Text, _>(as_of.to_owned())
+    .load(conn)
+    .map_err(|error| format!("PIT 成分查询失败: {error}"))?;
+    Ok(rows.into_iter().map(|row| row.board_name).collect())
+}
+
 fn kind_label(kind: BoardKind) -> &'static str {
     match kind {
         BoardKind::Industry => "industry",
@@ -210,17 +275,20 @@ pub struct RankingBuildReport {
     pub rows: usize,
     /// (板块名, 解析出的 board_code, 成分股数)
     pub per_board: Vec<(String, String, usize)>,
+    /// PIT 快照行数（0 表示快照失败，见 failures）
+    pub snapshot_rows: usize,
     pub failures: Vec<String>,
 }
 
 impl RankingBuildReport {
     pub fn log(&self) {
         log::info!(
-            "[板块成分] 榜单模式 boards={} ok={} failed={} rows={}",
+            "[板块成分] 榜单模式 boards={} ok={} failed={} rows={} pit_snapshot={}",
             self.boards_total,
             self.boards_ok,
             self.boards_failed,
-            self.rows
+            self.rows,
+            self.snapshot_rows
         );
         for (name, code, count) in &self.per_board {
             log::info!("[板块成分]   {name} → {code} {count} 只");
@@ -355,6 +423,12 @@ pub async fn build_from_ranking(
                 ));
             }
         }
+    }
+
+    // 0.15-3：留一份当日 PIT 快照（历史回看不再用今天的成分）。
+    match snapshot_members(&mut conn, trade_date) {
+        Ok(rows) => report.snapshot_rows = rows,
+        Err(error) => report.failures.push(error),
     }
 
     Ok(report)

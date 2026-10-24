@@ -1096,9 +1096,9 @@ capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧�
   ③P3.1 的新闻监控已经在用 `news_items.code`，不受 AI 断供影响。
   真正该做的是查 AI 评估为什么停（另立排查项），不是再加一条读同一份窄数据的链。
 
-### 0.15 方法论加固（未开工，2026-10-24 专家视角分析）
+### 0.15 方法论加固（2026-10-24 落地，代码 + 单测通过；实测数字待补）
 
-方案条目之外、但会让现有结论站不住的三件事，按优先级：
+方案条目之外、但会让现有结论站不住的三件事，已按优先级全部落地：
 
 1. **统计口径升级（周报）**：现在用「减等权市场」算超额、只给均值/胜率。实测：
    轮动 D+1 t=1.25、D+3 t=−0.67（均不显著）；D+3 原始 −2.04% 经 60 日 beta 调整后
@@ -1109,6 +1109,24 @@ capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧�
    「可成交 n / 提案 n」，并按触及子集重算。
 3. **PIT（point-in-time）**：`board_ranking_daily` 有 trade_date，但 `board_member` **没有日期列**，
    每天覆盖 —— 回看历史「所属板块」用的是今天的成分，属前视。需要每日快照或 snapshot_date。
+
+实施（2026-10-24 晚）：
+
+- **1+2 周报（`monitor/ticket_weekly_report.rs`）**：
+  - `beta_of`（60 日日收益对全市场等权回归，<30 天返回 None）；
+  - `alpha_d1/alpha_d3 = 个股收益 − beta × 市场同期收益`；
+  - `bootstrap_ci`（xorshift 固定种子 2000 次，95% 区间；n<5 不给）；
+  - `need_n` = 7.85·σ²/1%（识别 1% 边际所需样本量）；
+  - `fill_status`：解析 `entry_proposed` 摘要里的区间（`12.08-12.32｜…`），
+    与次日最低价比 → 可成交 / 半触及 / 未触及；按来源统计「可成交 n/提案 n」；
+  - 正文每个来源多一行 `alpha[a,b]｜可成交x/y`，页脚加口径与样本量提示。
+- **3 PIT（`monitor/board_member.rs`）**：新增 `board_member_snapshot`（PK board_code+instrument_code+trade_date），
+  `build_from_ranking` 每次重建后按当日快照（先删后插，同日可重入）；
+  另给 `boards_as_of(code, date)` 做 PIT 查询（取 ≤ 该日的最近一份快照）。
+  日志新增 `pit_snapshot=` 字段。
+- 验证：`cargo check --lib --bin monitor` 0 error；`cargo test --lib ticket_weekly_report` **6 passed**
+  （新增 parse_zone / bootstrap 确定性 / need_n 单调 3 个）。
+- 待补：用 10-23 实数据跑一次新周报，把 alpha/CI/可成交 的真实数字贴回来（当前 CLI 跑在审计链上，约 25 分钟）。
 
 后续（成本模型、多重检验校正、杀死规则、生存分析定持有期）写在分析记录里，暂不排期。
 
