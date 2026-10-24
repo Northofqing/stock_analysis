@@ -1024,17 +1024,21 @@ SQL 级改动在现网只读库上逐条验证：`event_exists_same_day` 查询�
 **2.1 09:25 板块热度（拓 1.1，并入 1.3 同一条消息）— 已完成（2026-10-23）**：竞价 rows 按 board_member 聚合，
 输出 top5「板块名 + 竞价均涨幅 + 竞价量比中位」；不足 5 个按实际。
 
-**2.2 thesis 存档与理由失效（拓 1.3）**：open_ticket 时写 `kind='thesis'`
-（板块/催化/来源）；每日 **15:50** 核对板块是否仍在 top10（board_ranking_daily 前一交易日），
-不在且连续 2 日 → `kind='thesis_invalidated'`；eviction 增第三规则（理由失效出池）。
+**2.2 thesis 存档与理由失效 — 已完成（2026-10-24，operator 选 B：并进 C 规则）**：
+`open_ticket` 写 `kind='thesis'`（note 截断 160 字，同日同摘要幂等）；失效**不新增第三处判据**，
+并进明日计划的 C 规则——票所属板块全部退出当日 top10 时写 `kind='thesis_invalidated'`
+（只标注、不改 stage；出池仍归 `ticket_eviction`）。落点：
+`database/ticket_lifecycle.rs`（open_ticket + `mark_thesis_invalidated`）、
+`monitor/buy_zone_dispatch.rs`（C 规则 drop 处调用）。与原文偏差：原文 15:50 独立作业、
+连续 2 日判定、第三规则出池，全部取消（与 C 规则/2.8 重复）。
 
 **2.3 资金流选票入口（拓 7）— 已完成（2026-10-23）**：观察池新增 `collect_money_flow_boards`——读
 `board_ranking_daily rank_fid='f62'` 前一日 top10 → 成分股取涨幅前 3，source='money_flow'；
 日志 `mf_candidates=N`；10-21 前无 f62 数据则跳过（不补造）。
 
-**2.4 新闻降级（P3.1 配套）**：`news_ai_assessment` 连续 N 日无新增时，
-post_close_news_review 与盘中 scan 新闻规则改用 `entity_linker` 对 news_items 近 5 日匹配
-→ `kind='news_mention'`，news_dedup 去重。
+**2.4 新闻降级 — 已撤销（2026-10-24，探针结论）**：`news_items` 是**按票拉取**的存储
+（7 天 6,394 条但只有 55 个不同 code），`entity_linker` 在这 55 只上匹配不增加覆盖；
+真正堵的是 AI 评估段（最后一条 2026-10-14 06:50），已另立排查项，不再用 2.4 兜底。
 
 **2.5 概念扩展（拓 2.3）— 已完成（2026-10-24）**：P3.3 关联票 = board_member ∪ concept_peers；日志带来源分布。
 
@@ -1115,7 +1119,7 @@ capability（见 grpc_source.rs STATIC_OPENING_CAPABILITY_FAMILIES），Mac 侧�
   （`live_pct_overrides_daily_and_missing_stays_none`）。**未验真实流量**：
   14:50 的板块榜与行情批次要等下个交易日（2026-10-26）才第一次跑。
 
-### 批 3 预算层（Q3=30%）— 未开工（见 3.4）
+### 批 3 预算层（Q3=30%）— **已完成（2026-10-24，口径 C）**
 
 **3.1 周预算状态**：本周已用 = 本周新增持仓成本（快照 `position_opened` 对应
 quantity × snapshot cost_price 求和）；预算 = 总资产（user_account_summary，缺则
@@ -1126,7 +1130,16 @@ quantity × snapshot cost_price 求和）；预算 = 总资产（user_account_su
 **3.3 排序花钱**：候选按 priority 分数降序，逐票标「建议顺序 / 占用预算 / 剩余预算」；
 超预算标「排队」——**不拦截**。
 
-**3.4 状态（2026-10-23）：未开工。** 前置是一件没定的事：本周新增仓位的权威口径。
+**3.4 状态（2026-10-24）：3.1/3.2/3.3 已完成，口径 C（两源取 max）。**
+
+- 3.1 `monitor/weekly_budget.rs`：`used = max(快照差分, 台账买入)`；
+  快照差分 = 本周初快照 → 当前快照逐票 `max(0, 数量差) × 成本价`；
+  台账 = 本周 `trades.direction='buy'` ∪ `stock_position.buy_date` 本周，两本台账取较大者；
+  预算 = 最近账户总资产 × 30%。无总资产/无快照时返回 Err，正文只写「不可用」，不猜数。
+- 3.2 板块集中度：单板块本周新增上限 = 总资产 × 15%；超限的候选标
+  「⏸ 板块集中度高/超预算·排队」并挪到候选末尾（只标注与排序，不挡买入）。
+- 3.3 排序花钱：先按 priority 分数排序，再逐票标「占用预算 X（本周剩余 Y）」。
+- 待验证：真实「本周已用」要等下周一后有一笔买入 + 快照才能对上账；当前快照是 10-22 23:35。
 方案写「快照 `position_opened` 对应 quantity × 快照 cost_price」，但 `position_opened`
 事件只在相邻两份快照的差量里产生，跨周的第一份快照没有基线；用
 `trade_ledger` 的推断买入又是另一套口径（BR-215 允许它缺）。两个口径对不上时
@@ -1158,8 +1171,11 @@ quantity × snapshot cost_price 求和）；预算 = 总资产（user_account_su
 
 ### 批 5 探源
 
-**5.1 商品行情源（拓 2.2）— 探源完成，源可用（2026-10-24）**：探新浪/东财商品接口可用性；可用则
-chain_relation_candidate 商品名→价格日更；不可用则关闭该项并记录。
+**5.1 商品行情源 — 已完成（2026-10-24）**：`monitor/commodity_price.rs` +
+`commodity_price_daily(code, trade_date)` / `commodity_symbol_map` 两张表；
+16:10 日更（新浪 `hq.sinajs.cn`，GBK + Referer，内盘取字段 8、外盘取字段 1）；
+空报价（动力煤 `nf_ZC0`）不写行、日志记「无源」，不补 0。9 个品种：
+螺纹钢/铁矿石/铜/铝/焦炭/黄金/纽约黄金/纽约原油/动力煤。
 
 **5.2 成交偏差（拓 3.2）— 脚本完成，样本待数据（2026-10-24）**：先做离线分析（entry_proposed 区间 vs 快照 cost_price
 偏差分布），口径确认后再上报表。

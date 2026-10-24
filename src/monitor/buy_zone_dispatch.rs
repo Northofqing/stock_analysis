@@ -389,6 +389,16 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
     parts.push(String::new());
     parts.push(render_board_header(&mut conn, as_of));
 
+    // 批 3.1（2026-10-24）：本周预算。口径 C：快照差分 / 台账买入取较大者。
+    // 拿不到总资产时只报「不可用」，不按预算排序、不猜数（BR-222）。
+    let budget = crate::monitor::weekly_budget::load(db, as_of).ok();
+    match &budget {
+        Some(state) => parts.push(state.summary_line()),
+        None => parts.push(
+            "💰 本周预算：不可用（缺少账户总资产或持仓快照），本轮不按预算排队".to_string(),
+        ),
+    }
+
     // ---- 持仓段 ----
     if holdings.is_empty() {
         parts.push(String::new());
@@ -508,6 +518,16 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
                     .map(|boards| boards.iter().any(|board| active_set.contains(board)))
                     .unwrap_or(true);
                 if !still_active {
+                    // 2.2：把「理由失效」记进票的事件流（只标注，不改 stage）。
+                    // C 规则是唯一触发点，避免第三条判据。
+                    if let Some(boards) = sectors.get(code) {
+                        let _ = crate::database::ticket_lifecycle::mark_thesis_invalidated(
+                            &mut conn,
+                            code,
+                            as_of,
+                            boards,
+                        );
+                    }
                     dropped.push(code.clone());
                     continue;
                 }
@@ -589,7 +609,47 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
         if priority_used {
             parts.push("按优先级分数排序（①最强），仓位另列。".to_string());
         }
-        for (index, row) in rows.iter().enumerate() {
+
+        // 批 3.2/3.3（2026-10-24）：预算与板块集中度。
+        // 逐票算占用 = 建议仓位 × 总资产；超「本周剩余」或「板块上限（总资产 15%）」
+        // 的票标排队并挪到后面 —— 只标注与排序，不挡买入。
+        let mut budget_state: std::collections::HashMap<String, (f64, bool, f64)> =
+            std::collections::HashMap::new();
+        if let Some(state) = &budget {
+            let mut remaining = state.remaining();
+            let mut board_extra: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            for row in &rows {
+                let cost = row.advice.suggested_pct / 100.0 * state.total_assets;
+                let board = sectors.get(&row.code).and_then(|boards| boards.first());
+                let board_used = board
+                    .map(|name| {
+                        state.board_used(name) + board_extra.get(name).copied().unwrap_or(0.0)
+                    })
+                    .unwrap_or(0.0);
+                let over_budget = cost > remaining;
+                let over_board = board
+                    .map(|_| board_used + cost > state.board_cap())
+                    .unwrap_or(false);
+                let queued = over_budget || over_board;
+                if !queued {
+                    remaining -= cost;
+                    if let Some(name) = board {
+                        *board_extra.entry(name.clone()).or_insert(0.0) += cost;
+                    }
+                }
+                budget_state.insert(row.code.clone(), (cost, queued, remaining));
+            }
+        }
+        let ordered: Vec<&PlanRow> = rows
+            .iter()
+            .filter(|row| !budget_state.get(&row.code).map(|state| state.1).unwrap_or(false))
+            .chain(
+                rows.iter()
+                    .filter(|row| budget_state.get(&row.code).map(|state| state.1).unwrap_or(false)),
+            )
+            .collect();
+        for (index, row) in ordered.into_iter().enumerate() {
             parts.push(String::new());
             let board = sectors
                 .get(&row.code)
@@ -610,6 +670,17 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
             parts.push(format!("{marker} {}{}{score_text}", row.label, board));
             if let Some(flag) = risk_flags.get(&row.code) {
                 parts.push(format!("  ⚠ 有雷：{flag}（标注，不挡买入）"));
+            }
+            if let Some((cost, queued, remaining)) = budget_state.get(&row.code) {
+                if *queued {
+                    parts.push(format!(
+                        "  ⏸ 板块集中度高/超预算·排队（本票占用 {cost:.0}，本周剩余 {remaining:.0}）"
+                    ));
+                } else {
+                    parts.push(format!(
+                        "  占用预算 {cost:.0}（本周剩余 {remaining:.0}）"
+                    ));
+                }
             }
             // 去掉第一行（重复的 label + 收盘），其余照旧。
             let body = row.render();

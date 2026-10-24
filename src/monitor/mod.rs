@@ -72,6 +72,8 @@ pub mod ticket_weekly_report; // 2026-10-24: 选股周报 (source × D+1/D+3 胜
 pub mod ticket_watch_pool; // 2026-10-17: 观察池生成 (新闻催化; 板块轮动待接写入方)
 pub mod trade_ledger; // 交易流水: 手工录入 + 快照差分推断 (2026-10-19)
 pub mod trading_fact_snapshot; // 2026-10-17: op 67 价格带每日落库 (快照日有值, 错过永久丢)
+pub mod commodity_price; // 2026-10-24: 产业链商品价格日更（5.1，新浪 hq.sinajs.cn）
 pub mod watch_pool_intraday; // 2026-10-24: 14:50 盘中选票（实时涨幅 + 当日实时板块榜）
+pub mod weekly_budget; // 2026-10-24: 周预算/板块集中度（批 3.1/3.2/3.3）
 pub mod watch_pool_monitor; // 2026-10-18: 观察池定向监控 (30s 异动扫描)
 pub mod watch_pool_perf; // 2026-10-20: 观察池选股表现 (N 日收益/胜率)

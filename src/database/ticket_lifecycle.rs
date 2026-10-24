@@ -168,12 +168,71 @@ pub fn open_ticket(
         #[diesel(sql_type = BigInt)]
         id: i64,
     }
-    diesel::sql_query("SELECT id FROM ticket_lifecycle WHERE code = ? AND open_date = ? LIMIT 1")
-        .bind::<Text, _>(code)
-        .bind::<Text, _>(open_date)
-        .get_result::<Id>(conn)
-        .map(|row| row.id)
-        .map_err(|e| format!("ticket id lookup failed ({code} {open_date}): {e}"))
+    let ticket_id = diesel::sql_query(
+        "SELECT id FROM ticket_lifecycle WHERE code = ? AND open_date = ? LIMIT 1",
+    )
+    .bind::<Text, _>(code)
+    .bind::<Text, _>(open_date)
+    .get_result::<Id>(conn)
+    .map(|row| row.id)
+    .map_err(|e| format!("ticket id lookup failed ({code} {open_date}): {e}"))?;
+
+    // 2.2（2026-10-24）：开票即把「为什么开这张票」写进事件流（kind='thesis'）。
+    // note 里已经是板块/催化/来源的可读摘要；截断到 160 字符避免把整段 note 复制一遍。
+    if let Some(text) = note.map(str::trim).filter(|text| !text.is_empty()) {
+        let summary: String = text.chars().take(160).collect();
+        let already =
+            event_exists_same_day(conn, ticket_id, "thesis", open_date, &summary).unwrap_or(false);
+        if !already {
+            let _ = append_event(
+                conn,
+                ticket_id,
+                open_date,
+                "thesis",
+                None,
+                None,
+                Some(&summary),
+            );
+        }
+    }
+    Ok(ticket_id)
+}
+
+/// 2.2（2026-10-24）：理由失效。
+///
+/// 只由明日计划的 C 规则触发（「所属板块全部退出当日 top10」），不新增第三条判据；
+/// **只写事件、不改 stage** —— 出池仍归 `ticket_eviction`，避免两处同时改状态。
+/// 同票同日的失效只记一次；返回 true 表示本次真的写入了。
+pub fn mark_thesis_invalidated(
+    conn: &mut SqliteConnection,
+    code: &str,
+    as_of: &str,
+    boards: &[String],
+) -> Result<bool, String> {
+    let Some(ticket) = find_active_ticket(conn, code)? else {
+        return Ok(false);
+    };
+    let names = boards
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("/");
+    let summary = format!("理由失效：所属板块 {names} 全部退出今日 top10（C 规则）");
+    if event_exists_same_day(conn, ticket.id, "thesis_invalidated", as_of, &summary).unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    append_event(
+        conn,
+        ticket.id,
+        as_of,
+        "thesis_invalidated",
+        None,
+        None,
+        Some(&summary),
+    )?;
+    Ok(true)
 }
 
 /// 更新 stage（只在 ticket 仍活跃时生效）。

@@ -13349,6 +13349,43 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 商品价格（5.1，2026-10-24）：16:10 日更。
+                    // 源是新浪 hq.sinajs.cn（GBK，需 Referer）；无合约品种（动力煤）不写行、
+                    // 日志记「无源」，不补 0。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(16, 10, 0).unwrap()
+                    {
+                        static COMMODITY_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = COMMODITY_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text =
+                                    advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::commodity_price::refresh(
+                                    &db, &date_text,
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        report.log();
+                                        *COMMODITY_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => {
+                                        log::warn!("[商品价格] 失败，下轮重试: {error}")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 日线+均线（P2 数据基础）：与 trading-authority 门解耦,
                     // 直接用 HistoricalBars 拉最近 30 个交易日、自算 ma5/ma10/ma20/量比。
                     // 代价：这是"自算的第二套口径"，authority 通了若数值不一致需要对齐。
