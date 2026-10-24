@@ -1144,15 +1144,17 @@ quantity × snapshot cost_price 求和）；预算 = 总资产（user_account_su
 
 **4.4 归档**：周报同时写 `data/perf_log/<date>_weekly.txt`。
 
-**4.5 实施记录（2026-10-23，4.1/4.2 完成，4.3/4.4 未做）**
+**4.5 实施记录（4.1~4.4 全部完成）**
 
 - 4.1 已完成：`watch_pool_perf::render` 基准价按 source 分——`p01_preopen` 取
   `open_date` 开盘价（09:00 开票、当日可买），其余取收盘价；来源扩到
   `board_rotation / news_catalyst / p01_preopen / money_flow / holding`。
 - 4.2 已完成：批次汇总每个窗口多一列「D+N 市场」= 同日全市场等权收益 + 样本数；
   样本 < 800 标「不可信」（当前日线覆盖只有几十只，这一列会如实显示不可信）。
-- 未做：4.3 入口归因周报（周五 17:00）与 4.4 归档 —— 依赖 4.1/4.2 的产出先跑满一周，
-  且要新增周日历判断（节假日顺延），排在下一批。
+- 4.3/4.4 已完成（`feba9a345`，2026-10-24）：`ticket_weekly_report` 周五 17:00 推送 +
+  归档 `data/perf_log/<date>_weekly.txt`（归档文件兼判重 marker）；同日修
+  `no_base_price`（无基准价的票计入分母并单列，`b4d761aae`）。
+  10-23 终版实测见 0.11（41 只、D+1 全可算、超额列出真数）。
 
 ### 批 5 探源
 
