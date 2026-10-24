@@ -145,6 +145,8 @@ pub struct AuctionPriceReport {
     pub quoted: Vec<PriceLine>,
     pub skipped_high: Vec<PriceLine>,
     pub no_price: usize,
+    /// 情绪高潮期被压掉的连板票（2026-10-24）
+    pub skipped_phase: Vec<PriceLine>,
     pub errors: Vec<String>,
     pub board_heat: Vec<BoardHeat>,
 }
@@ -152,10 +154,11 @@ pub struct AuctionPriceReport {
 impl AuctionPriceReport {
     pub fn summary_line(&self) -> String {
         format!(
-            "[竞价买价] emotion={} quoted={} skipped_high={} no_price={} errors={}",
+            "[竞价买价] emotion={} quoted={} skipped_high={} skipped_phase={} no_price={} errors={}",
             self.emotion,
             self.quoted.len(),
             self.skipped_high.len(),
+            self.skipped_phase.len(),
             self.no_price,
             self.errors.len()
         )
@@ -177,6 +180,19 @@ impl AuctionPriceReport {
         }
         for line in &self.skipped_high {
             out.push_str(&format!("\n{}\n", line.render()));
+        }
+        if !self.skipped_phase.is_empty() {
+            out.push_str(&format!(
+                "\n情绪高潮 · 连板≥{} 不追（{} 只）\n",
+                crate::monitor::market_regime::EMOTION_STREAK,
+                self.skipped_phase.len()
+            ));
+            for line in &self.skipped_phase {
+                out.push_str(&format!(
+                    "· {} {} 竞价{:+.2}%\n",
+                    line.code, line.name, line.auction_pct
+                ));
+            }
         }
         if self.no_price > 0 {
             out.push_str(&format!(
@@ -307,6 +323,24 @@ pub fn build(
             report.no_price += 1;
             continue;
         };
+        // 2026-10-24：情绪高潮期不给连板 ≥4 的票定价 —— 文章说的「情绪高潮不追高」，
+        // 我们这边就用市场级情绪档来压，而不是逐票拍脑袋。
+        let streak = crate::monitor::market_regime::streak_on(&mut conn, as_of, &row.code);
+        let phase = crate::monitor::market_regime::phase_on(&mut conn, as_of);
+        let line_for_skip = || PriceLine {
+            code: row.code.clone(),
+            name: row.name.clone(),
+            auction_price,
+            auction_pct,
+            price: None,
+            tier: Tier::SkipHigh,
+        };
+        if streak >= crate::monitor::market_regime::EMOTION_STREAK
+            && phase == Some(crate::monitor::market_regime::MarketPhase::Climax)
+        {
+            report.skipped_phase.push(line_for_skip());
+            continue;
+        }
         let tier = tier_for(auction_pct);
         let price = quote_price(auction_price, tier);
         let line = PriceLine {

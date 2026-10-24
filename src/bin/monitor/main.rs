@@ -12311,6 +12311,44 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 市场情绪周期（2026-10-24，情绪—逻辑框架）：15:35。
+                    // 落涨停池快照 + 五档阶段（冰点/修复/发酵/高潮/退潮），供两处使用：
+                    // 情绪高潮期压掉连板 ≥4 的高位追价、冰点期放宽（见 ticket_auction_price /
+                    // ticket_entry_proposal）。阈值预注册在 market_regime 顶部，不按周调。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 35, 0).unwrap()
+                    {
+                        static MARKET_REGIME_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                            std::sync::Mutex::new(None);
+                        let already = MARKET_REGIME_LAST
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .map(|d| d == advice_report_date)
+                            .unwrap_or(false);
+                        if !already {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                let date_text =
+                                    advice_report_date.format("%Y-%m-%d").to_string();
+                                match stock_analysis::monitor::market_regime::capture(
+                                    &db, &date_text,
+                                )
+                                .await
+                                {
+                                    Ok(snapshot) => {
+                                        log::info!("{}", snapshot.summary_line());
+                                        *MARKET_REGIME_LAST
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) =
+                                            Some(advice_report_date);
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[情绪周期] 失败，下一轮重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
                     // 分型重算（批 1.1，2026-10-23）：15:37，持仓变化之后、淘汰之前。
                     //
                     // 为什么是 15:37 而不是方案原文的 15:42：15:38 的淘汰规则要用当日分型

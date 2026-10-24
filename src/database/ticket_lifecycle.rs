@@ -198,6 +198,37 @@ pub fn open_ticket(
     Ok(ticket_id)
 }
 
+/// 0.17（2026-10-24）：逻辑档案最小版。
+///
+/// 只记三样：一句话逻辑 / 证伪条件 / 兑现节点。写 `kind='logic'` 事件，
+/// 同日同摘要幂等。**不做强度打分**——没有同类事件的历史分布做校准，打出来的分只是自我说服。
+pub fn record_logic(
+    conn: &mut SqliteConnection,
+    code: &str,
+    as_of: &str,
+    logic: &str,
+    falsify: &str,
+    due: Option<&str>,
+) -> Result<i64, String> {
+    let Some(ticket) = find_active_ticket(conn, code)? else {
+        return Err(format!("{code} 没有活跃 ticket，先开票再记逻辑"));
+    };
+    let summary = match due.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(due) => format!(
+            "逻辑：{}｜证伪：{}｜兑现：{}",
+            logic.trim(),
+            falsify.trim(),
+            due
+        ),
+        None => format!("逻辑：{}｜证伪：{}", logic.trim(), falsify.trim()),
+    };
+    let summary: String = summary.chars().take(200).collect();
+    if !event_exists_same_day(conn, ticket.id, "logic", as_of, &summary).unwrap_or(false) {
+        append_event(conn, ticket.id, as_of, "logic", None, None, Some(&summary))?;
+    }
+    Ok(ticket.id)
+}
+
 /// 2.2（2026-10-24）：理由失效。
 ///
 /// 只由明日计划的 C 规则触发（「所属板块全部退出当日 top10」），不新增第三条判据；
@@ -212,14 +243,10 @@ pub fn mark_thesis_invalidated(
     let Some(ticket) = find_active_ticket(conn, code)? else {
         return Ok(false);
     };
-    let names = boards
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("/");
+    let names = boards.iter().take(3).cloned().collect::<Vec<_>>().join("/");
     let summary = format!("理由失效：所属板块 {names} 全部退出今日 top10（C 规则）");
-    if event_exists_same_day(conn, ticket.id, "thesis_invalidated", as_of, &summary).unwrap_or(false)
+    if event_exists_same_day(conn, ticket.id, "thesis_invalidated", as_of, &summary)
+        .unwrap_or(false)
     {
         return Ok(false);
     }

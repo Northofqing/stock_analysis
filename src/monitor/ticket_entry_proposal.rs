@@ -44,6 +44,8 @@ pub struct ProposalReport {
     pub skipped_overheat: Vec<String>,
     pub skipped_at_support: Vec<String>,
     pub skipped_no_data: Vec<String>,
+    /// 连板 ≥4 的情绪段票：不给 ma 回踩价（2026-10-24）
+    pub skipped_emotion_phase: Vec<String>,
     pub skipped_duplicate: usize,
     pub errors: Vec<String>,
 }
@@ -51,12 +53,13 @@ pub struct ProposalReport {
 impl ProposalReport {
     pub fn summary_line(&self) -> String {
         format!(
-            "[入场参考] scanned={} proposed={} overheated={} at_support={} no_data={} duplicate={} errors={}",
+            "[入场参考] scanned={} proposed={} overheated={} at_support={} no_data={} emotion_phase={} duplicate={} errors={}",
             self.scanned,
             self.proposed.len(),
             self.skipped_overheat.len(),
             self.skipped_at_support.len(),
             self.skipped_no_data.len(),
+            self.skipped_emotion_phase.len(),
             self.skipped_duplicate,
             self.errors.len()
         )
@@ -83,10 +86,7 @@ fn already_proposed_today(
 /// 给所有 `observing` 的票算一次入场参考。
 ///
 /// `as_of` 必须是交易日（`YYYY-MM-DD`），盘后调度传当天日期。
-pub fn propose_for_observing(
-    db: &DatabaseManager,
-    as_of: &str,
-) -> Result<ProposalReport, String> {
+pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<ProposalReport, String> {
     // 先校验日期格式，避免把非法值带进 SQL 的 date() 比较
     NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
         .map_err(|error| format!("as_of 非法 ({as_of}): {error}"))?;
@@ -115,6 +115,16 @@ pub fn propose_for_observing(
                 continue;
             }
         };
+
+        // 2026-10-24（情绪—逻辑框架）：连板 ≥4 属情绪段，不给 ma 回踩价。
+        // 依据：涨停次日触及 ma10 仅 15.4%，连板越高越不回踩 —— 给回踩价等于给不成交的价。
+        let streak = crate::monitor::market_regime::streak_on(&mut conn, as_of, code);
+        if streak >= crate::monitor::market_regime::EMOTION_STREAK {
+            report
+                .skipped_emotion_phase
+                .push(format!("{code}（{streak} 板）"));
+            continue;
+        }
 
         let zone = match buy_zone::compute(&mut conn, code, as_of) {
             Ok(Some(zone)) => zone,
