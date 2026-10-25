@@ -17,6 +17,10 @@ name = "lhb_query"
 path = "src/bin/lhb_query.rs"
 
 [[bin]]
+name = "holding_earnings_report"
+path = "src/bin/holding_earnings_report.rs"
+
+[[bin]]
 name = "external_bars_import"
 path = "src/bin/external_bars_import.rs"
 

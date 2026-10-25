@@ -13424,6 +13424,138 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 持仓财报（2026-10-25）：披露当晚 20:30 / 22:30 两轮。
+                    // 覆盖 持仓 ∪ 虚拟仓位；只推“今天有新披露”的票；建议带具体比例。
+                    if calendar::is_trading_day(advice_report_date) {
+                        let slot: u8 = if now_time
+                            >= chrono::NaiveTime::from_hms_opt(22, 30, 0).unwrap()
+                        {
+                            2
+                        } else if now_time
+                            >= chrono::NaiveTime::from_hms_opt(20, 30, 0).unwrap()
+                        {
+                            1
+                        } else {
+                            0
+                        };
+                        if slot > 0 {
+                            static EARNINGS_SLOT: std::sync::Mutex<Option<(chrono::NaiveDate, u8)>> =
+                                std::sync::Mutex::new(None);
+                            let already = EARNINGS_SLOT
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .map(|(date, done)| date == advice_report_date && done >= slot)
+                                .unwrap_or(false);
+                            if !already {
+                                if let Some(db) = stock_analysis::database::DatabaseManager::try_get()
+                                {
+                                    let date_text =
+                                        advice_report_date.format("%Y-%m-%d").to_string();
+                                    let codes = match db.get_conn() {
+                                        Ok(mut conn) => {
+                                            stock_analysis::monitor::holding_earnings::ensure_schema(
+                                                &mut conn,
+                                            )
+                                            .ok();
+                                            stock_analysis::monitor::holding_earnings::covered_codes(
+                                                &mut conn,
+                                            )
+                                        }
+                                        Err(error) => {
+                                            log::warn!("[持仓财报] 取连接失败: {error}");
+                                            Vec::new()
+                                        }
+                                    };
+                                    if codes.is_empty() {
+                                        log::info!("[持仓财报] 无覆盖代码（快照/虚拟仓位皆空）");
+                                    } else {
+                                        let (written, errors) =
+                                            match stock_analysis::monitor::holding_earnings::sync(
+                                                &db, &codes,
+                                            )
+                                            .await
+                                            {
+                                                Ok(result) => result,
+                                                Err(error) => (0, vec![error]),
+                                            };
+                                        if !errors.is_empty() {
+                                            log::warn!(
+                                                "[持仓财报] 同步失败 {} 项: {:?}",
+                                                errors.len(),
+                                                errors
+                                            );
+                                        }
+                                        let mut parts: Vec<String> = Vec::new();
+                                        if let Ok(mut conn) = db.get_conn() {
+                                            let virtual_tags =
+                                                stock_analysis::monitor::holding_earnings::virtual_codes(
+                                                    &mut conn,
+                                                );
+                                            let mut announced_today = 0usize;
+                                            for code in &codes {
+                                                let Some(period) = stock_analysis::monitor::holding_earnings::latest_income_period(&mut conn, code) else {
+                                                    continue;
+                                                };
+                                                let announced = stock_analysis::monitor::holding_earnings::announced_on(&mut conn, code, &period);
+                                                if announced.as_deref() != Some(date_text.as_str()) {
+                                                    continue;
+                                                }
+                                                announced_today += 1;
+                                                let Some(metrics) = stock_analysis::monitor::holding_earnings::compute(&mut conn, code, &period) else {
+                                                    continue;
+                                                };
+                                                let advice = stock_analysis::monitor::holding_earnings::advise(&metrics);
+                                                let is_virtual = virtual_tags.iter().any(|c| c == code);
+                                                let rendered = stock_analysis::monitor::holding_earnings::render(&metrics, &advice, is_virtual);
+                                                if let Err(error) = stock_analysis::monitor::holding_earnings::record_report(
+                                                    &mut conn, &metrics, &advice, &rendered, false,
+                                                ) {
+                                                    log::warn!("[持仓财报] 落库失败 {code}: {error}");
+                                                }
+                                                parts.push(rendered);
+                                            }
+                                            log::info!(
+                                                "[持仓财报] synced_rows={written} announced_today={announced_today} covered={}",
+                                                codes.len()
+                                            );
+                                        }
+                                        if parts.is_empty() {
+                                            log::info!("[持仓财报] 今晚无新披露，不推送");
+                                        } else {
+                                            let text = format!(
+                                                "【持仓财报 {date_text}】\n\n{}\n\n建议只针对持仓比例，不自动交易；T+1 才能执行。",
+                                                parts.join("\n\n")
+                                            );
+                                            if crate::notify::push_wechat(&text).await {
+                                                if let Ok(mut conn) = db.get_conn() {
+                                                    for code in &codes {
+                                                        if let Some(period) = stock_analysis::monitor::holding_earnings::latest_income_period(&mut conn, code) {
+                                                            if stock_analysis::monitor::holding_earnings::announced_on(&mut conn, code, &period).as_deref() == Some(date_text.as_str()) {
+                                                                if let Some(metrics) = stock_analysis::monitor::holding_earnings::compute(&mut conn, code, &period) {
+                                                                    let advice = stock_analysis::monitor::holding_earnings::advise(&metrics);
+                                                                    let _ = stock_analysis::monitor::holding_earnings::record_report(
+                                                                        &mut conn, &metrics, &advice, "", true,
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                log::info!("[持仓财报] 已推送 {} 只", parts.len());
+                                                *EARNINGS_SLOT
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    Some((advice_report_date, slot));
+                                            } else {
+                                                log::warn!("[持仓财报] 推送失败，下一轮重试");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 日线+均线（P2 数据基础）：与 trading-authority 门解耦,
                     // 直接用 HistoricalBars 拉最近 30 个交易日、自算 ma5/ma10/ma20/量比。
                     // 代价：这是"自算的第二套口径"，authority 通了若数值不一致需要对齐。
