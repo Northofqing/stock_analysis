@@ -22,6 +22,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -84,6 +85,19 @@ def fetch(code: str, start: str, end: str) -> dict:
     return {"records": records, "batch_id": response.get("batchId"), "provider": response.get("selectedProvider")}
 
 
+def fetch_with_retry(code: str, start: str, end: str, retries: int = 3) -> dict:
+    """桥在建连高峰会偶发 no_verified_batch / 身份缺失，重试三次即可覆盖绝大多数。"""
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return fetch(code, start, end)
+        except Exception as error:  # noqa: BLE001
+            last = error
+            time.sleep(0.6 * (attempt + 1))
+    assert last is not None
+    raise last
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
@@ -91,6 +105,7 @@ def main() -> int:
     ap.add_argument("--end", default="2026-10-23")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--codes-file", help="只同步这些代码（失败清单 json: [{code,error}] 或纯文本每行一个）")
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db, timeout=120)
@@ -106,7 +121,14 @@ def main() -> int:
             import time as _time
             _time.sleep(5)
 
-    codes = [row[0] for row in conn.execute("SELECT DISTINCT code FROM stock_daily ORDER BY code")]
+    if args.codes_file:
+        raw = open(args.codes_file, encoding="utf-8").read().strip()
+        if raw.startswith("["):
+            codes = sorted({item["code"] for item in json.loads(raw)})
+        else:
+            codes = sorted({line.strip() for line in raw.splitlines() if line.strip()})
+    else:
+        codes = [row[0] for row in conn.execute("SELECT DISTINCT code FROM stock_daily ORDER BY code")]
     if args.limit:
         codes = codes[: args.limit]
     total = len(codes)
@@ -114,6 +136,7 @@ def main() -> int:
 
     started = datetime.now()
     done = errors = rows_written = 0
+    failures: list[dict[str, str]] = []
     pending: list[tuple] = []
 
     def flush() -> None:
@@ -135,7 +158,7 @@ def main() -> int:
         pending.clear()
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(fetch, code, args.start, args.end): code for code in codes}
+        futures = {pool.submit(fetch_with_retry, code, args.start, args.end): code for code in codes}
         for future in as_completed(futures):
             code = futures[future]
             done += 1
@@ -143,6 +166,7 @@ def main() -> int:
                 result = future.result()
             except Exception as error:  # noqa: BLE001
                 errors += 1
+                failures.append({"code": code, "error": str(error)[:300]})
                 if errors <= 10:
                     print(f"[公司行动] {code}: {error}", file=sys.stderr)
                 continue
@@ -169,6 +193,11 @@ def main() -> int:
     flush()
 
     elapsed = (datetime.now() - started).total_seconds()
+    if failures:
+        failed_path = f"data/audit/corporate_actions_failed_{datetime.now():%Y%m%d}.json"
+        with open(failed_path, "w", encoding="utf-8") as handle:
+            json.dump(failures, handle, ensure_ascii=False, indent=2)
+        print(f"[公司行动] 失败明细 {failed_path}（{len(failures)} 只）")
     print(f"[公司行动] 完成 codes={done} rows={rows_written} errors={errors} elapsed={elapsed:.1f}s")
     return 0 if errors == 0 else 2
 
