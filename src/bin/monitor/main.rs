@@ -13387,6 +13387,50 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                         }
                     }
 
+                    // 盘前行情探针（2026-10-25）：09:10 一次，把实时行情可用性推给 operator。
+                    // 背景：10-23 价格类推送（09:25 竞价/持仓建议/T0）因 provider 全灭全停，
+                    // operator 需要一个明确的「今天能不能推」的信号，而不是等没收到才发现。
+                    if calendar::is_trading_day(advice_report_date)
+                        && now_time >= chrono::NaiveTime::from_hms_opt(9, 10, 0).unwrap()
+                    {
+                        let marker = format!(
+                            "data/preopen_probe/{}",
+                            advice_report_date.format("%Y-%m-%d")
+                        );
+                        if !std::path::Path::new(&marker).exists() {
+                            let codes = vec![
+                                "000001".to_string(),
+                                "600519".to_string(),
+                                "002131".to_string(),
+                                "600396".to_string(),
+                            ];
+                            let probe = tokio::task::spawn_blocking(move || {
+                                stock_analysis::data_gateway::market_data::MarketDataGateway::new()
+                                    .required_realtime_quotes(&codes)
+                                    .map(|quotes| format!("{quotes:?}"))
+                            })
+                            .await;
+                            let text = match probe {
+                                Ok(Ok(detail)) => format!(
+                                    "【09:10 行情探针】OK\n{} 只样本全部拿到完整报价\n样本：000001 / 600519 / 002131 / 600396\n→ 09:25 竞价与价格类推送按计划\n（内部：{}）",
+                                    "4",
+                                    detail.chars().take(160).collect::<String>()
+                                ),
+                                Ok(Err(error)) => format!(
+                                    "【09:10 行情探针】失败\n{error}\n→ 今天价格类推送（09:25 竞价 / 持仓建议 / T0）预计不可用，系统按降级运行"
+                                ),
+                                Err(error) => format!("【09:10 行情探针】任务失败: {error}"),
+                            };
+                            if crate::notify::push_wechat(&text).await {
+                                let _ = std::fs::create_dir_all("data/preopen_probe");
+                                let _ = std::fs::write(&marker, "pushed\n");
+                                log::info!("[盘前探针] 已推送并写 marker={marker}");
+                            } else {
+                                log::warn!("[盘前探针] 推送失败，下一轮重试");
+                            }
+                        }
+                    }
+
                     // 商品价格（5.1，2026-10-24）：16:10 日更。
                     // 源是新浪 hq.sinajs.cn（GBK，需 Referer）；无合约品种（动力煤）不写行、
                     // 日志记「无源」，不补 0。
