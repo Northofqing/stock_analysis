@@ -412,7 +412,9 @@ fn classify_current_equity(
             EquityShareClass::B,
             EquitySegment::ShanghaiB,
         ),
-        "000" | "001" | "002" | "003" => (
+        // 2026-10-25：302 是深市主板新号段（数据合同里 302132 属有效代码），
+        // 原来不在白名单，生命周期查询直接 invalid_request。
+        "000" | "001" | "002" | "003" | "302" => (
             Exchange::Shenzhen,
             EquityShareClass::A,
             EquitySegment::ShenzhenMainA,
