@@ -75,7 +75,13 @@ impl LhbReport {
 
 /// 解析一段 ReviewLhb 正文。非个股行（标题/分隔线）忽略。
 pub fn parse_render(text: &str) -> Vec<LhbRow> {
-    let header = regex::Regex::new(r"^\s*\d+\.\s*(?:SZ|SH)(\d{6})\s+排名净买\s+(\S+)").unwrap();
+    // 2026-10-26：渲染模板从「排名净买」改为「股票名 净买额」，
+    // 旧正则完全不匹配 → 龙虎榜自 07-12 起一直解析 0 行。
+    // 两种形状都接受：`1. SZ000559 探路者 3.74亿 | ...` 与 `1. SZ000559 排名净买 3.74亿 | ...`
+    let header = regex::Regex::new(
+        r"^\s*\d+\.\s*(?:SZ|SH)(\d{6})\s+(?:\S+\s+)?(-?\d+(?:\.\d+)?(?:亿|万))\s*\|",
+    )
+    .unwrap();
     let seat = regex::Regex::new(r"^\s*(买[1-9])\s+(.+?)\s*\|\s*([^|]+)").unwrap();
 
     let mut rows: Vec<LhbRow> = Vec::new();
@@ -306,5 +312,21 @@ mod tests {
     fn empty_text_yields_nothing() {
         assert!(parse_render("").is_empty());
         assert!(parse_render("🐉 龙虎榜净买前五\n数据源: eastmoney-web").is_empty());
+    }
+
+    // 2026-10-26：模板改为「代码 股票名 净买额 | ...」，旧正则 0 行。
+    const SAMPLE_V2: &str = "🐉 龙虎榜净买前五（2026-10-26 21:00）\n\
+数据源: eastmoney-web | 源日期: 2026-10-26\n\
+1. SZ000559 探路者 3.74亿 | 净买额 2 笔\n\
+   买1 深股通专用 | 2.51亿 | 净=1.26亿\n\
+   买2 机构专用 | 9467.28万 | 净=9467.28万\n";
+
+    #[test]
+    fn parses_current_template_with_stock_name() {
+        let rows = parse_render(SAMPLE_V2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].code, "000559");
+        assert_eq!(rows[0].net_buy, "3.74亿");
+        assert_eq!(rows[0].top_seats.len(), 2);
     }
 }

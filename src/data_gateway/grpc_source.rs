@@ -3871,14 +3871,15 @@ impl GrpcSource {
                 ),
             ));
         }
+        // 2026-10-26：外部侧按页预算返回（batch_id 里带 pages/total），单日可达 1000+ 条，
+        // limit 必然被打满。此前一律 fail-closed → 公告类链路长期全灭。
+        // 现按「有界前缀」接纳：保留完整批次证据，只显式告警覆盖率未验证，
+        // 由消费方标注可能不全（与 convert 层 complete=false 的处理口径一致）。
         if external && batch.records().len() == limit as usize {
-            return Err(GatewayError::invalid_evidence(
-                "MarketAnnouncements",
-                Some(batch.evidence().provider),
-                format!(
-                    "external market announcement coverage unverified: response saturated requested limit {limit}"
-                ),
-            ));
+            log::warn!(
+                "[BR-161] MarketAnnouncements 外部批次数达到请求上限 {limit}，覆盖率未验证；按有界前缀接纳 batch_id={}",
+                q.batch_id
+            );
         }
         Ok(batch)
     }
@@ -7103,7 +7104,7 @@ mod tests {
     }
 
     #[test]
-    fn br161_saturated_external_market_announcements_fail_closed() {
+    fn br161_saturated_external_market_announcements_accept_bounded_prefix() {
         let _env = test_grpc_env_guard();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap();
         let response = |provenance| QueryResult {
@@ -7143,9 +7144,8 @@ mod tests {
                 "grpc-mtls:magic-market.local".to_string(),
             ),
         ))]);
-        let error = block_on(external.market_announcements_async(date, 1)).unwrap_err();
-        assert_eq!(error.reason_code(), "invalid_evidence");
-        assert!(error.message().contains("coverage unverified"));
+        let saturated = block_on(external.market_announcements_async(date, 1)).unwrap();
+        assert_eq!(saturated.records().len(), 1);
 
         std::env::remove_var("GRPC_MARKET_CLIENT_BUNDLE");
         reset_bridge();

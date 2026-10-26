@@ -3125,9 +3125,23 @@ fn compute_account_mode_metrics_blocking() -> Result<AccountModeMetricsBatch, St
     // 的净盈亏推导 (评估 #1: 逐笔成本喂费率口径 ledger, 引擎 NetMetrics);
     // 账本重建或闭环仓位净值不可用 → Err (账户指标与常规 paper 风控上下文不完整).
     let as_of = observed_at.date_naive();
-    let report =
+    let report = if std::env::var_os(stock_analysis::trading::paper_ledger_runtime::BINDING_ENV)
+        .is_some()
+    {
+        // 2026-10-26：绑定账本时 raw replay 会被 BR-251 拒绝（PaperScopeRequired），
+        // 必须走显式 epoch scope 的 verified effective fills 路径。
+        let db = stock_analysis::database::DatabaseManager::try_get()
+            .ok_or_else(|| "BR-103 paper database unavailable".to_string())?;
+        let effective = stock_analysis::performance::economic_position::query_effective_fills_through_from_database_typed(
+            db, as_of,
+        )
+        .map_err(|error| format!("BR-103 paper scope replay unavailable: {error}"))?;
+        stock_analysis::performance::economic_position::report_from_effective(&effective)
+            .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?
+    } else {
         stock_analysis::performance::economic_position::compute_economic_position_report(as_of)
-            .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?;
+            .map_err(|error| format!("BR-103 paper ledger anchor unavailable: {error}"))?
+    };
     // An unresolved original price in an open lifecycle also invalidates the
     // anchor, even when every previously closed lifecycle has usable net PnL.
     require_account_mode_net_summary(&report.net_summary)?;
@@ -4519,6 +4533,16 @@ fn install_mode_owned_core_database(test_mode: bool) -> Result<std::path::PathBu
         ))
     };
     initialized.map_err(|error| format!("initialize mode-owned core database: {error}"))?;
+    // 情绪周期表由 15:35 捕获任务首次创建；启动时也补建一次，避免 09:25
+    // 的高位门因为“表不存在”而只能看到查询失败。表为空时 streak/phase
+    // 仍然是未知，调用方必须保留这个语义。
+    if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+        let mut conn = db
+            .get_conn()
+            .map_err(|error| format!("open market_regime schema connection: {error}"))?;
+        stock_analysis::monitor::market_regime::ensure_schema(&mut conn)
+            .map_err(|error| format!("ensure market_regime schema: {error}"))?;
+    }
     Ok(database_path)
 }
 
@@ -5658,6 +5682,45 @@ async fn tdx_lday_daily_sync(date_text: &str) -> bool {
     }
 }
 
+/// P6 二层归因：必须等全市场日线落库后再算，否则 market_pct 只有几十只票。
+/// 用独立 marker，日线已成功但归因失败时下一轮仍会重试，不把 P6 的失败
+/// 伪装成“日线任务已完成”。
+fn refresh_attribution_benchmark_if_needed(date_text: &str) {
+    let marker = std::path::Path::new("data/attribution_benchmark").join(date_text);
+    if marker.exists() {
+        return;
+    }
+    let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+        log::warn!("[归因基准] 数据库不可用, 本轮跳过 date={date_text}");
+        return;
+    };
+    match stock_analysis::monitor::attribution_benchmark::build(&db, date_text) {
+        Ok(result) => {
+            log::info!(
+                "[归因基准] date={} rows={} with_benchmark={} sample_size={} accepted={}",
+                result.trade_date,
+                result.rows,
+                result.with_benchmark,
+                result.sample_size,
+                result.benchmark_accepted
+            );
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(error) = std::fs::write(
+                &marker,
+                format!(
+                    "rows={} with_benchmark={} sample_size={} accepted={}",
+                    result.rows, result.with_benchmark, result.sample_size, result.benchmark_accepted
+                ),
+            ) {
+                log::warn!("[归因基准] marker 写入失败（下一轮会重试）: {error}");
+            }
+        }
+        Err(error) => log::warn!("[归因基准] 失败，下一轮重试 date={date_text}: {error}"),
+    }
+}
+
 async fn full_universe_bars_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
@@ -5672,6 +5735,7 @@ async fn full_universe_bars_loop() {
         let date_text = today.format("%Y-%m-%d").to_string();
         let marker = std::path::Path::new("data/daily_bars_full").join(&date_text);
         if marker.exists() {
+            refresh_attribution_benchmark_if_needed(&date_text);
             continue;
         }
         // 2026-10-24：先走通达信盘后文件。脚本自己校验「文件最新日期 >= 今天」
@@ -5685,6 +5749,7 @@ async fn full_universe_bars_loop() {
             if let Err(error) = std::fs::write(&marker, "tdx_lday") {
                 log::warn!("[日线全量] marker 写入失败（重启会重放）: {error}");
             }
+            refresh_attribution_benchmark_if_needed(&date_text);
             continue;
         }
         log::warn!("[日线全量] 通达信盘后文件不可用，退回 provider 路径 date={date_text}");
@@ -5754,6 +5819,7 @@ async fn full_universe_bars_loop() {
                 if let Err(error) = std::fs::write(&marker, coverage.to_string()) {
                     log::warn!("[日线全量] marker 写入失败（重启会重放）: {error}");
                 }
+                refresh_attribution_benchmark_if_needed(&date_text);
             }
             Err(error) => log::warn!("[日线全量] 失败, 保留重试 date={date_text}: {error}"),
         }
@@ -14918,6 +14984,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                 scanner.dq_summary(),
                 prediction_summary
             );
+
+            // 盘后不能立刻回到外层 loop：`while !is_market_active()` 在
+            // session=盘后 时直接 break，外层会无间隔重入，导致每秒重复
+            // “进入交易时段”并把日志刷成 GB 级。盘后调度都有日期 marker，
+            // 这里睡 5 分钟再检查即可；下一交易日开盘前会自然恢复。
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
 
             // 收盘后继续循环，等待下一个交易日
         }
