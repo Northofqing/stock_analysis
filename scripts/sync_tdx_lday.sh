@@ -108,5 +108,11 @@ log "当日覆盖 $TARGET = ${COVERAGE} 只（门槛 ${COVERAGE_MIN}）"
 if [ "${COVERAGE:-0}" -lt "$COVERAGE_MIN" ]; then
   exit 23
 fi
+# 2026-10-26：导入后必须立刻回补当日 MA，否则新一天的 ma5/10/20 全为 NULL
+# （10-26 实测 5,162/5,217 行为空，因为 15:55 的 MA 任务早于盘后导入）。
+if [ -f "$ROOT/scripts/backfill_daily_ma.py" ]; then
+  log "回补当日均线"
+  python3 "$ROOT/scripts/backfill_daily_ma.py" --db "$DB" 2>&1 | sed 's/^/[tdx-sync] /' | tail -3
+fi
 log "完成"
 exit 0

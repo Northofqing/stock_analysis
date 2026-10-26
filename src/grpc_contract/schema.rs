@@ -51,7 +51,7 @@ const SCHEMAS: &[OpSchema] = &[
     },
     OpSchema {
         operation: Operation::MarketAnnouncements,
-        schema_name: "news.market_announcements",
+        schema_name: "magic.market.market_announcements.request",
         schema_version: 1,
     },
     OpSchema {
