@@ -5582,6 +5582,33 @@ fn log_startup_profile(
 /// 「营业部/席位/净买」，所以不需要新 op，只需要把归档读出来匹配活跃情绪票。
 /// 21:00 推送、21:40 起跑留 40 分钟余量；当日没有 LHB 推送（decisions=0）不写 marker，
 /// 5 分钟后重试。
+/// 调 scripts/sync_lhb_daily.py（东方财富 LHB 明细直写 lhb_daily）。
+/// 失败只记录，不阻塞后续 ReviewLhb 文本补充。
+fn run_lhb_direct_sync(date_text: &str) -> Result<String, String> {
+    let output = std::process::Command::new("python3")
+        .arg("scripts/sync_lhb_daily.py")
+        .arg("--db")
+        .arg("data/stock_analysis.db")
+        .arg("--date")
+        .arg(date_text)
+        .output()
+        .map_err(|error| format!("spawn failed: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "exit={:?} {}",
+            output.status.code(),
+            stderr.trim().lines().last().unwrap_or("")
+        ));
+    }
+    Ok(stdout
+        .lines()
+        .last()
+        .unwrap_or("")
+        .to_string())
+}
+
 async fn lhb_sync_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
@@ -5597,6 +5624,12 @@ async fn lhb_sync_loop() {
         let marker = std::path::Path::new("data/lhb_sync").join(&date_text);
         if marker.exists() {
             continue;
+        }
+        // 2026-10-26：先走东方财富直连日更（lhb_daily 唯一可用源）。
+        // 旧的 ReviewLhb 文本解析保留作补充，但它依赖当日有新投递。
+        match run_lhb_direct_sync(&date_text) {
+            Ok(written) => log::info!("[龙虎榜] 直连日更完成 date={date_text} rows={written}"),
+            Err(error) => log::warn!("[龙虎榜] 直连日更失败 date={date_text}: {error}"),
         }
         let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
             continue;
