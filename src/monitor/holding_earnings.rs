@@ -223,6 +223,8 @@ pub fn virtual_codes(conn: &mut diesel::SqliteConnection) -> Vec<String> {
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {
     pub code: String,
+    /// 股票名称；库里查不到就是 None，不编造（BR-222）。
+    pub name: Option<String>,
     pub report_period: String,
     pub announced_on: Option<String>,
     pub rev_single: Option<f64>,
@@ -334,6 +336,7 @@ pub fn compute(conn: &mut diesel::SqliteConnection, code: &str, period: &str) ->
     }
     let mut metrics = Metrics {
         code: code.to_string(),
+        name: crate::monitor::buy_zone::resolve_name(conn, code),
         report_period: period.to_string(),
         ..Default::default()
     };
@@ -507,7 +510,11 @@ pub fn render(metrics: &Metrics, advice: &Advice, virtual_position: bool) -> Str
         },
         None => metrics.report_period.clone(),
     };
-    let mut out = format!("{tag}{} {period}", metrics.code);
+    let label = match metrics.name.as_deref() {
+        Some(name) if !name.is_empty() => format!("{} {}", metrics.code, name),
+        _ => metrics.code.clone(),
+    };
+    let mut out = format!("{tag}{label} {period}");
     out.push_str(&format!(
         "\n  单季营收 {} ｜ 归母净利 {} ｜ 毛利率 {}（环比 {}）",
         fmt(metrics.rev_yoy, "%"),

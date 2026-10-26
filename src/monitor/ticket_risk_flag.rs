@@ -179,7 +179,9 @@ pub fn scan(db: &DatabaseManager, as_of: &str) -> Result<RiskReport, String> {
                 hits.push(RiskHit {
                     ticket_id: ticket.id,
                     code: ticket.code.clone(),
-                    name: ticket.code.clone(),
+                    // 2026-10-26：原来直接写 code，推送里就只剩数字。
+                    name: crate::monitor::buy_zone::resolve_name(&mut conn, &ticket.code)
+                        .unwrap_or_else(|| ticket.code.clone()),
                     keyword: (*keyword).to_string(),
                     snippet,
                 });
