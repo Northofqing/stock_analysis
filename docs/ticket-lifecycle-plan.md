@@ -2823,5 +2823,18 @@ git diff --check
 - 板块 alpha 结论；
 - 策略普遍性结论。
 
-**当前状态：本计划是待实施计划，不是已完成记录；源码、数据库、调度和推送均未
-按本计划改动。**
+#### 11.11.9 实施状态（2026-10-27 回写）
+
+- WP0–WP3 已实施并提交：
+  - `fab398a98`：运行时缺陷基线；
+  - `804af9fdf`：DecisionContext、EntryPolicy、`ticket_decision`、提案 shadow、触发双跑；
+  - `1e06d10a4`：EntryMode 仅 P01 情绪票走 AuctionReference；
+  - `a754f93c9`：本计划与架构文档。
+- 2026-10-27 已部署 shadow：`TICKET_DECISION_SHADOW=1`、
+  `TICKET_ENTRY_POLICY=shadow`；`ticket_decision` 表存在，部署后 0 行，
+  说明还没有新的提案运行。
+- WP3.5/WP4 正在实施：行情 coverage、源健康、`entry_expired`、
+  `entry_superseded`、提案状态投影、重复活跃票 dry-run。没有改推送模板，
+  没有清理重复票，没有切 `new`。
+- WP5–WP8 仍未实施；`data/auction_raw`、完整 PIT 对照和真实成交数据仍缺失，
+  相关结论继续标 `UNKNOWN`。
