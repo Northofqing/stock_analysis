@@ -84,6 +84,7 @@ def check_p11(main, days, log_lines):
     board_cand = 0
     ok_days = 0
     empty_rounds = 0
+    source_unavailable = 0
     for line in log_lines:
         # 兼容两种历史格式：带 board_candidates 的新格式 / 不带它的旧格式
         m = re.search(
@@ -99,6 +100,13 @@ def check_p11(main, days, log_lines):
         opened_here = int(m.group(7))
         board_cand += candidates
         opened += opened_here
+        # 2026-10-27：日志新增三个健康字段；旧日志没有时保持 None。
+        if re.search(r"news_health=(?:unavailable|stale|conflict)", line):
+            source_unavailable += 1
+        if re.search(r"board_health=(?:unavailable|stale|conflict)", line):
+            source_unavailable += 1
+        if re.search(r"mf_health=(?:unavailable|stale|conflict)", line):
+            source_unavailable += 1
         if candidates > 0 or opened_here > 0 or int(m.group(2)) > 0:
             ok_days += 1
         elif m.group(4) is not None:
@@ -108,16 +116,25 @@ def check_p11(main, days, log_lines):
         f"日志累计 board_candidates={board_cand} opened={opened} "
         f"news_candidates={news_cand} 有产出的轮次={ok_days}"
     )
+    if source_unavailable:
+        r.detail += f" | 来源不可用记录 {source_unavailable} 条"
     if ok_days > 0:
         r.status = OK
         if opened == 0:
             r.detail += " | opened=0 属正常（选中的票已在库，走 appended 补事件）"
     elif empty_rounds > 0:
-        r.status = FAIL
-        r.detail += (
-            f" | {empty_rounds} 轮 board_candidates=0，观察池真空转"
-            "（查 BoardFlows / 东财 BK 成分股 / news_ai_assessment）"
-        )
+        if source_unavailable > 0:
+            r.status = PARTIAL
+            r.detail += (
+                f" | {empty_rounds} 轮无候选，但存在来源不可用；"
+                "不能判定为观察池空转"
+            )
+        else:
+            r.status = FAIL
+            r.detail += (
+                f" | {empty_rounds} 轮 board_candidates=0，观察池真空转"
+                "（查 BoardFlows / 东财 BK 成分股 / news_ai_assessment）"
+            )
     else:
         r.status = FAIL
         r.detail += " | 日志里没有观察池轮次（调度未触发或日志已被轮转）"
@@ -238,12 +255,49 @@ def check_p2(main, days):
 
 
 def check_p33(log_lines):
-    """P3.3 同板块异动：看失败 vs 成功的比例。"""
+    """P3.3 同板块异动：失败 vs 成功必须同时可见，不能只数失败文本。"""
     r = Result("P3.3", "同板块关联票")
     fail = sum(1 for l in log_lines if "关联票查询失败" in l)
-    r.detail = f"最近日志里「关联票查询失败」{fail} 次"
+    coverage_rounds = 0
+    requested = accepted = rejected = 0
+    unavailable = 0
+    for line in log_lines:
+        m = re.search(
+            r"\[观察池\]\[coverage\] scope=watch_peer(?:_failed)? "
+            r"requested=(\d+) accepted=(\d+) missing=(\d+) rejected=(\d+).*?health=(\w+)",
+            line,
+        )
+        if not m:
+            continue
+        coverage_rounds += 1
+        requested += int(m.group(1))
+        accepted += int(m.group(2))
+        rejected += int(m.group(4))
+        if m.group(5) in ("unavailable", "stale", "conflict"):
+            unavailable += 1
+    if coverage_rounds:
+        r.detail = (
+            f"coverage 轮次={coverage_rounds} requested={requested} accepted={accepted} "
+            f"rejected={rejected} unavailable={unavailable}"
+        )
+        if requested == 0:
+            r.status = SKIP
+            r.detail += " | 没有关联票候选（不是行情失败）"
+        elif accepted > 0:
+            r.status = OK
+            if rejected or unavailable:
+                r.detail += " | 有成功也有缺口，按覆盖率为准"
+        elif unavailable:
+            r.status = PARTIAL
+            r.detail += " | 关联票行情源不可用；不是“没有关联票”"
+        else:
+            r.status = PARTIAL
+            r.detail += " | 有请求但无接受记录，需查 coverage"
+        return r
+
+    # 兼容旧日志：没有 coverage 结构时仍看失败/命中，但明确标为旧口径。
+    r.detail = f"旧口径：最近日志里「关联票查询失败」{fail} 次"
     if fail == 0:
-        # 没有任何失败也可能是因为规则没启用
         hit = sum(1 for l in log_lines if "同板块" in l and "关联票查询失败" not in l)
         r.detail += f" | 「同板块」上报 {hit} 次"
         r.status = OK if hit > 0 else SKIP
@@ -436,16 +490,19 @@ def check_batch1(main, log_lines):
 
     r = Result("批1.5", "价格失效")
     invalidated = main.execute(
-        "SELECT COUNT(*) FROM ticket_event WHERE event_kind='entry_invalidated'"
+        "SELECT COUNT(*) FROM ticket_event WHERE event_kind IN ('entry_invalidated','entry_expired')"
     ).fetchone()[0]
     expiry = sum(1 for line in log_lines if "[价格失效] 时效检查" in line)
-    r.detail = f"entry_invalidated 事件 {invalidated} 条；[价格失效] 时效检查 {expiry} 行"
+    r.detail = (
+        f"entry_invalidated/entry_expired 事件 {invalidated} 条；"
+        f"[价格失效] 时效检查 {expiry} 行"
+    )
     if expiry == 0:
         r.status = FAIL
         r.detail += " | 15:42 时效检查没有日志"
     elif invalidated == 0:
         r.status = PARTIAL
-        r.detail += " | 无失效（票都还在价格窗口内）"
+        r.detail += " | 无失效/到期（票都还在价格窗口内）"
     else:
         r.status = OK
     out.append(r)

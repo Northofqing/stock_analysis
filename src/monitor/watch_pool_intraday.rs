@@ -14,7 +14,8 @@ use crate::data_gateway::GatewayBatch;
 use crate::data_gateway::market_data::RealtimeMarketQuote;
 use crate::database::DatabaseManager;
 use crate::monitor::{
-    board_member, board_ranking_snapshot, ticket_entry_proposal, ticket_watch_pool,
+    board_member, board_ranking_snapshot, quote_coverage::QuoteCoverage, ticket_entry_proposal,
+    ticket_watch_pool,
 };
 use diesel::sql_types::{Integer, Nullable, Text};
 use diesel::RunQueryDsl as _;
@@ -33,6 +34,7 @@ pub struct IntradayReport {
     pub boards: usize,
     pub member_codes: usize,
     pub quoted: usize,
+    pub quote_coverage: QuoteCoverage,
     pub candidates: usize,
     pub opened: usize,
     pub picks: Vec<(String, String)>,
@@ -41,13 +43,14 @@ pub struct IntradayReport {
 impl IntradayReport {
     pub fn summary_line(&self) -> String {
         format!(
-            "[盘中选票] 板块 {} 个 / 成分 {} 只 / 有行情 {} 只 / 候选 {} / 新开 {} / 推送 {} 只",
+            "[盘中选票] 板块 {} 个 / 成分 {} 只 / 有行情 {} 只 / 候选 {} / 新开 {} / 推送 {} 只 / {}",
             self.boards,
             self.member_codes,
             self.quoted,
             self.candidates,
             self.opened,
-            self.picks.len()
+            self.picks.len(),
+            self.quote_coverage.summary()
         )
     }
 }
@@ -69,8 +72,8 @@ pub async fn run(db: &DatabaseManager, date: &str) -> Result<IntradayReport, Str
 
     // 4) top 板块成分股 → 实时涨幅。
     let codes = member_codes(db, date)?;
-    let pct_by_code = fetch_pct_map(&codes).await;
-    let quoted = pct_by_code.len();
+    let (pct_by_code, quote_coverage) = fetch_pct_map(&codes).await;
+    let quoted = quote_coverage.accepted;
 
     // 5) 用实时涨幅建池（source=board_rotation_pm）。
     let live = ticket_watch_pool::LiveSnapshot {
@@ -104,6 +107,7 @@ pub async fn run(db: &DatabaseManager, date: &str) -> Result<IntradayReport, Str
         boards: board_report.f3_count,
         member_codes: codes.len(),
         quoted,
+        quote_coverage,
         candidates: report.candidates,
         opened: report.opened,
         picks,
@@ -193,24 +197,40 @@ fn normalized_unique_codes(codes: &[String]) -> Vec<String> {
 }
 
 /// 批量拉实时涨幅；单批失败只记录，不影响其它批次。
-async fn fetch_pct_map(codes: &[String]) -> HashMap<String, f64> {
+async fn fetch_pct_map(codes: &[String]) -> (HashMap<String, f64>, QuoteCoverage) {
     let mut map = HashMap::new();
+    let mut coverage = QuoteCoverage::default();
     let codes = normalized_unique_codes(codes);
     if codes.is_empty() {
-        return map;
+        coverage.log("intraday");
+        return (map, coverage);
     }
     let Ok(bridge) = grpc_source::bridge_for("RealtimeQuotes") else {
         log::warn!("[盘中选票] 行情桥不可用，本轮不选票");
-        return map;
+        let failed = QuoteCoverage::failed(&codes);
+        failed.log("intraday");
+        return (map, failed);
     };
     for chunk in codes.chunks(QUOTE_CHUNK) {
         let quotes: Vec<RealtimeMarketQuote> = match bridge.realtime_quotes_async(chunk).await {
-            Ok(GatewayBatch::Available { records, .. }) => records,
-            Ok(GatewayBatch::VerifiedEmpty(_)) => Vec::new(),
+            Ok(GatewayBatch::Available { records, .. }) => {
+                coverage.merge(QuoteCoverage::observed(chunk, &records));
+                records
+            }
+            Ok(GatewayBatch::VerifiedEmpty(_)) => {
+                coverage.merge(QuoteCoverage::observed(chunk, &[]));
+                Vec::new()
+            }
             Err(error) if error.reason_code() == "no_last_traded_price" => {
-                bridge.realtime_quotes_with_isolation(chunk).await.quotes
+                let isolated = bridge.realtime_quotes_with_isolation(chunk).await;
+                let mut batch = QuoteCoverage::observed(chunk, &isolated.quotes);
+                batch.rejected = isolated.isolated;
+                batch.batches = isolated.requests;
+                coverage.merge(batch);
+                isolated.quotes
             }
             Err(error) => {
+                coverage.merge(QuoteCoverage::failed(chunk));
                 log::warn!(
                     "[盘中选票] 行情批次失败（{} 只）: {error}",
                     chunk.len()
@@ -222,7 +242,8 @@ async fn fetch_pct_map(codes: &[String]) -> HashMap<String, f64> {
             map.insert(quote.code, quote.change_percent);
         }
     }
-    map
+    coverage.log("intraday");
+    (map, coverage)
 }
 
 fn tickets_for_source(

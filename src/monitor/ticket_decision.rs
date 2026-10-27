@@ -495,6 +495,124 @@ pub fn update_proposal_status(
     Ok(changed > 0)
 }
 
+/// 由 `ticket_event` 事件推出的提案状态。事件是事实，`ticket_decision` 只是投影。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalProjection {
+    pub ticket_id: i64,
+    pub code: String,
+    pub decision_id: Option<String>,
+    pub status: Option<ProposalStatus>,
+    pub latest_event_kind: Option<String>,
+    pub latest_event_at: Option<String>,
+}
+
+/// 读取一张票最新一次提案生命周期事件，映射成状态；不回写历史。
+pub fn latest_proposal_status(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+) -> Result<Option<ProposalStatus>, String> {
+    #[derive(QueryableByName)]
+    struct EventRow {
+        #[diesel(sql_type = Text)]
+        event_kind: String,
+    }
+    let event: Option<EventRow> = diesel::sql_query(
+        "SELECT event_kind FROM ticket_event \
+         WHERE ticket_id = ?1 \
+           AND event_kind IN ('entry_proposed','entry_triggered','entry_invalidated',\
+                              'entry_expired','entry_superseded') \
+         ORDER BY event_at DESC, id DESC LIMIT 1",
+    )
+    .bind::<BigInt, _>(ticket_id)
+    .get_result::<EventRow>(conn)
+    .optional()
+    .map_err(|error| format!("提案事件查询失败: {error}"))?;
+    Ok(event.and_then(|row| match row.event_kind.as_str() {
+        "entry_proposed" => Some(ProposalStatus::Open),
+        "entry_triggered" => Some(ProposalStatus::Triggered),
+        "entry_invalidated" => Some(ProposalStatus::Invalidated),
+        "entry_expired" => Some(ProposalStatus::Expired),
+        "entry_superseded" => Some(ProposalStatus::Superseded),
+        _ => None,
+    }))
+}
+
+/// 列出所有活跃 `entry_proposed` 票及其事件投影，供审计/验收使用。
+pub fn list_active_proposals(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ProposalProjection>, String> {
+    #[derive(QueryableByName)]
+    struct TicketRow {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+        #[diesel(sql_type = Text)]
+        code: String,
+    }
+    let tickets: Vec<TicketRow> = diesel::sql_query(
+        "SELECT id, code FROM ticket_lifecycle \
+         WHERE close_date IS NULL AND stage = 'entry_proposed' \
+         ORDER BY code, id",
+    )
+    .load(conn)
+    .map_err(|error| format!("活跃提案查询失败: {error}"))?;
+
+    let mut out = Vec::with_capacity(tickets.len());
+    for ticket in tickets {
+        #[derive(QueryableByName)]
+        struct EventRow {
+            #[diesel(sql_type = Text)]
+            event_kind: String,
+            #[diesel(sql_type = Nullable<Text>)]
+            event_at: Option<String>,
+        }
+        let event: Option<EventRow> = diesel::sql_query(
+            "SELECT event_kind, event_at FROM ticket_event \
+             WHERE ticket_id = ?1 \
+               AND event_kind IN ('entry_proposed','entry_triggered','entry_invalidated',\
+                                  'entry_expired','entry_superseded') \
+             ORDER BY event_at DESC, id DESC LIMIT 1",
+        )
+        .bind::<BigInt, _>(ticket.id)
+        .get_result::<EventRow>(conn)
+        .optional()
+        .map_err(|error| format!("提案事件查询失败: {error}"))?;
+        let latest_event_kind = event.as_ref().map(|row| row.event_kind.clone());
+        let status = latest_event_kind.as_deref().and_then(|kind| match kind {
+            "entry_proposed" => Some(ProposalStatus::Open),
+            "entry_triggered" => Some(ProposalStatus::Triggered),
+            "entry_invalidated" => Some(ProposalStatus::Invalidated),
+            "entry_expired" => Some(ProposalStatus::Expired),
+            "entry_superseded" => Some(ProposalStatus::Superseded),
+            _ => None,
+        });
+        let decision_id: Option<String> = {
+            #[derive(QueryableByName)]
+            struct DecisionRow {
+                #[diesel(sql_type = Text)]
+                decision_id: String,
+            }
+            diesel::sql_query(
+                "SELECT decision_id FROM ticket_decision \
+                 WHERE ticket_id = ?1 ORDER BY as_of DESC, updated_at DESC, decision_id DESC LIMIT 1",
+            )
+            .bind::<BigInt, _>(ticket.id)
+            .get_result::<DecisionRow>(conn)
+            .optional()
+            .map_err(|error| format!("提案上下文查询失败: {error}"))?
+            .map(|row| row.decision_id)
+        };
+        out.push(ProposalProjection {
+            ticket_id: ticket.id,
+            code: ticket.code,
+            decision_id,
+            status,
+            latest_event_kind,
+            latest_event_at: event.and_then(|row| row.event_at),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,5 +807,65 @@ mod tests {
         assert!(latest_open_proposal(&mut conn, 1)
             .expect("query after status")
             .is_none());
+    }
+
+    #[test]
+    fn event_projection_distinguishes_expired_and_superseded() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        ticket_lifecycle::create_schema(&mut conn).expect("ticket schema");
+        diesel::sql_query(
+            "INSERT INTO ticket_lifecycle (id, code, open_date, stage, source) \
+             VALUES (1, '001216', '2026-10-26', 'entry_proposed', 'p01_preopen')",
+        )
+        .execute(&mut conn)
+        .expect("ticket");
+        ticket_lifecycle::append_event(
+            &mut conn,
+            1,
+            "2026-10-26 15:40:00",
+            "entry_proposed",
+            None,
+            Some("td-old"),
+            Some("初始提案"),
+        )
+        .expect("proposal event");
+        assert_eq!(
+            latest_proposal_status(&mut conn, 1).expect("projection"),
+            Some(ProposalStatus::Open)
+        );
+
+        ticket_lifecycle::append_event(
+            &mut conn,
+            1,
+            "2026-10-27 15:42:00",
+            "entry_expired",
+            None,
+            Some("td-old"),
+            Some("到期"),
+        )
+        .expect("expired event");
+        assert_eq!(
+            latest_proposal_status(&mut conn, 1).expect("projection"),
+            Some(ProposalStatus::Expired)
+        );
+
+        ticket_lifecycle::append_event(
+            &mut conn,
+            1,
+            "2026-10-27 15:43:00",
+            "entry_superseded",
+            None,
+            Some("td-old"),
+            Some("被新提案取代"),
+        )
+        .expect("superseded event");
+        let active = list_active_proposals(&mut conn).expect("active projections");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].ticket_id, 1);
+        assert_eq!(active[0].status, Some(ProposalStatus::Superseded));
+        assert_eq!(
+            active[0].latest_event_kind.as_deref(),
+            Some("entry_superseded")
+        );
     }
 }

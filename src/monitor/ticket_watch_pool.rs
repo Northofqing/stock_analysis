@@ -21,6 +21,7 @@
 
 use crate::database::ticket_lifecycle;
 use crate::database::DatabaseManager;
+use crate::monitor::ticket_decision::SourceHealth;
 use diesel::{QueryableByName, RunQueryDsl};
 
 /// 默认回看天数（新闻催化）。
@@ -63,6 +64,10 @@ pub struct WatchPoolReport {
     pub mf_candidates: usize,
     /// 资金流路新增（不与其他两路重合）的票数
     pub mf_added: usize,
+    /// 三条来源各自的健康状态；未执行/失败时必须显式标记。
+    pub news_health: Option<SourceHealth>,
+    pub board_health: Option<SourceHealth>,
+    pub mf_health: Option<SourceHealth>,
     /// 合并后总候选数
     pub candidates: usize,
     pub opened: usize,
@@ -77,7 +82,7 @@ impl WatchPoolReport {
         log::info!(
             "[观察池] news_scanned={} news_candidates={} boards={} board_candidates={} board_added={} \
              mf_boards={} mf_candidates={} mf_added={} total={} opened={} appended={} \
-             skipped_invalid={} dry_run={}",
+             skipped_invalid={} dry_run={} news_health={} board_health={} mf_health={}",
             self.scanned_rows,
             self.news_candidates,
             self.board_scanned_rows,
@@ -90,7 +95,10 @@ impl WatchPoolReport {
             self.opened,
             self.appended,
             self.skipped_invalid_code,
-            self.dry_run
+            self.dry_run,
+            health_label(self.news_health),
+            health_label(self.board_health),
+            health_label(self.mf_health)
         );
         for error in &self.errors {
             log::warn!("[观察池] {error}");
@@ -111,6 +119,10 @@ fn source_label(source: &str) -> &'static str {
         "holding" => "持仓",
         _ => "新闻",
     }
+}
+
+fn health_label(health: Option<SourceHealth>) -> &'static str {
+    health.unwrap_or(SourceHealth::Unavailable).as_str()
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -580,11 +592,18 @@ pub fn build_watch_pool(
     live: Option<&LiveSnapshot>,
 ) -> Result<WatchPoolReport, String> {
     let lookback = lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS);
-    let (scanned_rows, mut candidates) = collect_news_catalysts(db, business_date, lookback)?;
+    let mut source_errors: Vec<String> = Vec::new();
+    let (scanned_rows, mut candidates, news_health) = match collect_news_catalysts(db, business_date, lookback) {
+        Ok((rows, candidates)) => (rows, candidates, SourceHealth::Available),
+        Err(error) => {
+            source_errors.push(format!("新闻来源不可用: {error}"));
+            (0, Vec::new(), SourceHealth::Unavailable)
+        }
+    };
     let news_count = candidates.len();
 
     // 第二路：板块轮动（board_ranking_daily top N → board_member 成分股）。
-    let (board_scanned, board_candidates) = collect_board_rotation(
+    let (board_scanned, board_candidates, board_health) = match collect_board_rotation(
         db,
         business_date,
         BOARD_TOP_N,
@@ -593,7 +612,13 @@ pub fn build_watch_pool(
         leader_codes,
         eastmoney_members,
         live,
-    )?;
+    ) {
+        Ok((rows, candidates)) => (rows, candidates, SourceHealth::Available),
+        Err(error) => {
+            source_errors.push(format!("板块轮动来源不可用: {error}"));
+            (0, Vec::new(), SourceHealth::Unavailable)
+        }
+    };
     let board_count_raw = board_candidates.len();
     let mut board_added = 0usize;
     for candidate in board_candidates {
@@ -616,7 +641,7 @@ pub fn build_watch_pool(
 
     // 第三路：资金流（f62 前一交易日主力净流入榜）。与板块路同一套成分/排序口径，
     // 只是榜不同 —— 两条榜可能选到同一只票，合并进同一条 note（hits 累加）。
-    let (mf_scanned, mf_candidates) = collect_money_flow_boards(
+    let (mf_scanned, mf_candidates, mf_health) = match collect_money_flow_boards(
         db,
         business_date,
         BOARD_TOP_N,
@@ -625,7 +650,13 @@ pub fn build_watch_pool(
         leader_codes,
         eastmoney_members,
         live,
-    )?;
+    ) {
+        Ok((rows, candidates)) => (rows, candidates, SourceHealth::Available),
+        Err(error) => {
+            source_errors.push(format!("资金流来源不可用: {error}"));
+            (0, Vec::new(), SourceHealth::Unavailable)
+        }
+    };
     let mf_count_raw = mf_candidates.len();
     let mut mf_added = 0usize;
     for candidate in mf_candidates {
@@ -655,7 +686,11 @@ pub fn build_watch_pool(
         mf_scanned_rows: mf_scanned,
         mf_candidates: mf_count_raw,
         mf_added,
+        news_health: Some(news_health),
+        board_health: Some(board_health),
+        mf_health: Some(mf_health),
         dry_run,
+        errors: source_errors,
         ..Default::default()
     };
 
@@ -759,5 +794,13 @@ mod tests {
         // 盘后口径：只用日线
         assert_eq!(effective_pct(None, "000001", Some(2.0)), Some(2.0));
         assert_eq!(effective_pct(None, "000001", None), None);
+    }
+
+    #[test]
+    fn missing_health_is_unavailable_not_silent_success() {
+        assert_eq!(health_label(None), "unavailable");
+        assert_eq!(health_label(Some(SourceHealth::Available)), "available");
+        assert_eq!(health_label(Some(SourceHealth::Partial)), "partial");
+        assert_eq!(health_label(Some(SourceHealth::Unavailable)), "unavailable");
     }
 }

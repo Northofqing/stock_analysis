@@ -26,6 +26,7 @@ use diesel::sql_types::{BigInt, Integer, Text};
 
 use crate::data_gateway::GatewayBatch;
 use crate::database::DatabaseManager;
+use crate::monitor::quote_coverage::QuoteCoverage;
 
 /// 日内涨跌幅阈值（%）
 pub const DAY_CHANGE_THRESHOLD: f64 = 3.0;
@@ -128,8 +129,20 @@ pub async fn scan(
     // 即使价格没动也要报——这正是「新闻驱动」和「纯价格异动」的区别。
     // 已通知过的新闻用 news_dedup 记住，避免 30 秒一轮反复刷屏。
     let news_hits = match load_fresh_news(db, &codes) {
-        Ok(hits) => hits,
+        Ok(hits) => {
+            log::info!(
+                "[观察池][P3.1] health=available rows={} watch_codes={}",
+                hits.len(),
+                codes.len()
+            );
+            hits
+        }
         Err(error) => {
+            log::warn!(
+                "[观察池][P3.1] health=unavailable watch_codes={} error={}",
+                codes.len(),
+                error
+            );
             log::warn!("[观察池] 新闻查询失败, 本轮只跑价格规则: {}", error);
             Vec::new()
         }
@@ -148,13 +161,23 @@ pub async fn scan(
     let bridge = crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes")
         .map_err(|error| error.to_string())?;
     let quotes = match bridge.realtime_quotes_async(&codes).await {
-        Ok(GatewayBatch::Available { records, .. }) => records,
-        Ok(GatewayBatch::VerifiedEmpty(_)) => return Ok(Vec::new()),
+        Ok(GatewayBatch::Available { records, .. }) => {
+            QuoteCoverage::observed(&codes, &records).log("watch_main");
+            records
+        }
+        Ok(GatewayBatch::VerifiedEmpty(_)) => {
+            QuoteCoverage::observed(&codes, &[]).log("watch_main");
+            return Ok(Vec::new());
+        }
         // 整批被「当日无最新成交价」拒绝（停牌 / 未开盘 / 一字板封死）。
         // 这条是业务态不是故障，二分隔离出坏票，好票继续参与异动判断；
         // 坏票本轮直接丢，不造价格（BR-222）。
         Err(error) if error.reason_code() == "no_last_traded_price" => {
             let isolated = bridge.realtime_quotes_with_isolation(&codes).await;
+            let mut coverage = QuoteCoverage::observed(&codes, &isolated.quotes);
+            coverage.rejected = isolated.isolated.clone();
+            coverage.batches = isolated.requests;
+            coverage.log("watch_main_isolated");
             log::warn!(
                 "[观察池] RealtimeQuotes 被 no_last_traded_price 拒绝, 二分隔离后 \
                  取到 {} 只 / 隔离 {} 只 / 请求 {} 次{}",
@@ -172,7 +195,10 @@ pub async fn scan(
             }
             isolated.quotes
         }
-        Err(error) => return Err(format!("行情拉取失败: {error}")),
+        Err(error) => {
+            QuoteCoverage::failed(&codes).log("watch_main_failed");
+            return Err(format!("行情拉取失败: {error}"));
+        }
     };
 
     let mut news_by_code: HashMap<String, Vec<(i64, String)>> = HashMap::new();
@@ -307,6 +333,13 @@ async fn load_peer_alerts(
         }
     }
 
+    log::info!(
+        "[观察池][P3.3] board_member_rows={} watch_codes={} matched_watch={}",
+        members.len(),
+        codes.len(),
+        boards_of.len()
+    );
+
     let mut candidates: Vec<String> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     for boards in boards_of.values() {
@@ -354,19 +387,30 @@ async fn load_peer_alerts(
     }
 
     if candidates.is_empty() {
+        QuoteCoverage::default().log("watch_peer");
         return Ok(HashMap::new());
     }
     let candidates = normalized_unique_codes(candidates);
     if candidates.is_empty() {
+        QuoteCoverage::default().log("watch_peer");
         return Ok(HashMap::new());
     }
 
     let bridge = crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes")
         .map_err(|error| error.to_string())?;
     let quotes = match bridge.realtime_quotes_async(&candidates).await {
-        Ok(GatewayBatch::Available { records, .. }) => records,
-        Ok(GatewayBatch::VerifiedEmpty(_)) => return Ok(HashMap::new()),
-        Err(error) => return Err(format!("关联票行情拉取失败: {error}")),
+        Ok(GatewayBatch::Available { records, .. }) => {
+            QuoteCoverage::observed(&candidates, &records).log("watch_peer");
+            records
+        }
+        Ok(GatewayBatch::VerifiedEmpty(_)) => {
+            QuoteCoverage::observed(&candidates, &[]).log("watch_peer");
+            return Ok(HashMap::new());
+        }
+        Err(error) => {
+            QuoteCoverage::failed(&candidates).log("watch_peer_failed");
+            return Err(format!("关联票行情拉取失败: {error}"));
+        }
     };
     let by_code: HashMap<&str, &crate::data_gateway::RealtimeMarketQuote> = quotes
         .iter()

@@ -6,7 +6,7 @@
 //!    且当日涨幅 < 6% → 记 `ticket_event(kind='entry_triggered')` + `candidate_trigger_selection`，
 //!    并推一条「突破确认」。1 票/日只推一次（`(trigger_date, code)` 主键天然幂等）。
 //! 2. **价格失效（1.5）**：现价跌破放弃价 → `kind='entry_invalidated'`；
-//!    时效到期（趋势型 > 3 个交易日、情绪型跨日未触发）同样失效。
+//!    时效到期（趋势型 > 3 个交易日、情绪型跨日未触发）→ `kind='entry_expired'`。
 //!    **只作废价格，不淘汰票** —— stage 不动，淘汰仍归 `ticket_eviction`。
 //!
 //! ## 为什么缓存
@@ -254,9 +254,9 @@ fn prev_high_before(
     Ok(row.and_then(|row| row.high))
 }
 
-/// 最近一次入场参考之后是否已经记过价格失效。
+/// 最近一次入场参考之后是否已经关闭（失效/到期/被新提案取代）。
 ///
-/// `entry_invalidated` 只作废这一次价格窗口，不淘汰票；但旧实现把它当成
+/// `entry_invalidated` 只作废这一次价格窗口，不淘汰票；旧实现把它当成
 /// 纯日志：warm 仍把票放进缓存，价格回升后还能再触发，expiry 也会每天重复写。
 /// 新 proposal 事件会把窗口重新打开，所以比较的是「最近一次 proposal」。
 fn invalidated_after_latest_proposal(
@@ -270,7 +270,8 @@ fn invalidated_after_latest_proposal(
     }
     let row: CountRow = diesel::sql_query(
         "SELECT COUNT(*) AS n FROM ticket_event i \
-          WHERE i.ticket_id = ?1 AND i.event_kind = 'entry_invalidated' \
+          WHERE i.ticket_id = ?1 \
+            AND i.event_kind IN ('entry_invalidated','entry_expired','entry_superseded') \
             AND i.event_at >= COALESCE((\
                   SELECT MAX(p.event_at) FROM ticket_event p \
                    WHERE p.ticket_id = ?1 AND p.event_kind = 'entry_proposed'\
@@ -770,6 +771,16 @@ pub fn invalidate_expired(db: &DatabaseManager, as_of: &str) -> Result<ExpiryRep
         if proposed_date >= as_of.to_string() {
             continue; // 今天刚给的参考，跨日才谈失效
         }
+        match ticket_decision::latest_proposal_status(&mut conn, ticket.id) {
+            Ok(Some(ProposalStatus::Open)) | Ok(None) => {}
+            Ok(Some(_)) => continue, // 已触发/失效/到期/被取代，不重复写
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("{} 状态投影失败: {error}", ticket.code));
+                continue;
+            }
+        }
         let regime =
             match ticket_regime::resolve(&mut conn, ticket.id, &ticket.code, &ticket.source, as_of)
             {
@@ -800,11 +811,12 @@ pub fn invalidate_expired(db: &DatabaseManager, as_of: &str) -> Result<ExpiryRep
             "{}入场参考 {proposed_date} 起已 {elapsed} 个交易日未触发（上限 {limit}）",
             regime.label()
         );
-        // 同日重跑（重启补跑）不重复记
+        // 同日重跑（重启补跑）不重复记。到期是独立事件，不能再伪装成
+        // entry_invalidated；旧历史事件保留不动。
         match ticket_lifecycle::event_exists_same_day(
             &mut conn,
             ticket.id,
-            "entry_invalidated",
+            "entry_expired",
             as_of,
             &reason,
         ) {
@@ -815,19 +827,43 @@ pub fn invalidate_expired(db: &DatabaseManager, as_of: &str) -> Result<ExpiryRep
                 continue;
             }
         }
-        match ticket_lifecycle::append_event(
-            &mut conn,
-            ticket.id,
-            as_of,
-            "entry_invalidated",
-            None,
-            None,
-            Some(&reason),
-        ) {
+        let decision_id = match ticket_decision::latest_open_proposal(&mut conn, ticket.id) {
+            Ok(Some(context)) => Some(context.decision_id),
+            Ok(None) => None,
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("{} 提案上下文查询失败: {error}", ticket.code));
+                continue;
+            }
+        };
+        let result = conn.transaction::<(), RecordTxError, _>(|conn| {
+            ticket_lifecycle::append_event(
+                conn,
+                ticket.id,
+                as_of,
+                "entry_expired",
+                None,
+                decision_id.as_deref(),
+                Some(&reason),
+            )?;
+            if let Some(decision_id) = decision_id.as_deref() {
+                let changed =
+                    ticket_decision::update_proposal_status(conn, decision_id, ProposalStatus::Expired)?;
+                if !changed {
+                    return Err(format!(
+                        "entry_expired 已记账但 ticket_decision 不存在: {decision_id}"
+                    )
+                    .into());
+                }
+            }
+            Ok(())
+        });
+        match result {
             Ok(()) => report.invalidated.push((ticket.code.clone(), reason)),
             Err(error) => report
                 .errors
-                .push(format!("{} 记事件失败: {error}", ticket.code)),
+                .push(format!("{} 记到期事件失败: {error}", ticket.code)),
         }
     }
 
@@ -996,5 +1032,45 @@ mod tests {
             invalidated_after_latest_proposal(&mut conn, 1).unwrap(),
             false
         );
+    }
+
+    #[test]
+    fn expiry_and_supersede_also_close_the_current_window() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        diesel::sql_query(
+            "CREATE TABLE ticket_event (\
+               id INTEGER PRIMARY KEY AUTOINCREMENT,\
+               ticket_id INTEGER NOT NULL,\
+               event_kind TEXT NOT NULL,\
+               event_at TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .expect("ticket_event schema");
+        for (kind, at) in [
+            ("entry_proposed", "2026-10-20 15:40:00"),
+            ("entry_expired", "2026-10-21 15:42:00"),
+        ] {
+            diesel::sql_query(
+                "INSERT INTO ticket_event (ticket_id, event_kind, event_at) VALUES (1, ?1, ?2)",
+            )
+            .bind::<Text, _>(kind)
+            .bind::<Text, _>(at)
+            .execute(&mut conn)
+            .expect("insert event");
+        }
+        assert!(invalidated_after_latest_proposal(&mut conn, 1).unwrap());
+        diesel::sql_query(
+            "INSERT INTO ticket_event (ticket_id, event_kind, event_at) \
+             VALUES (1, 'entry_proposed', '2026-10-22 15:40:00')",
+        )
+        .execute(&mut conn)
+        .expect("new proposal reopens window");
+        diesel::sql_query(
+            "INSERT INTO ticket_event (ticket_id, event_kind, event_at) \
+             VALUES (1, 'entry_superseded', '2026-10-23 15:40:00')",
+        )
+        .execute(&mut conn)
+        .expect("supersede closes window");
+        assert!(invalidated_after_latest_proposal(&mut conn, 1).unwrap());
     }
 }

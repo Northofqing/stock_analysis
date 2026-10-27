@@ -26,7 +26,7 @@ use crate::database::ticket_lifecycle;
 use crate::database::DatabaseManager;
 use crate::monitor::buy_zone;
 use crate::monitor::ticket_decision::{
-    self, DecisionContext, EntryMode, EvidenceGrade, SourceHealth, SourceStatus,
+    self, DecisionContext, EntryMode, EvidenceGrade, ProposalStatus, SourceHealth, SourceStatus,
 };
 use crate::monitor::ticket_regime::{self, Regime};
 
@@ -52,13 +52,14 @@ pub struct ProposalReport {
     /// 连板 ≥4 的情绪段票：不给 ma 回踩价（2026-10-24）
     pub skipped_emotion_phase: Vec<String>,
     pub skipped_duplicate: usize,
+    pub superseded: usize,
     pub errors: Vec<String>,
 }
 
 impl ProposalReport {
     pub fn summary_line(&self) -> String {
         format!(
-            "[入场参考] scanned={} proposed={} overheated={} at_support={} no_data={} emotion_phase={} duplicate={} errors={}",
+            "[入场参考] scanned={} proposed={} overheated={} at_support={} no_data={} emotion_phase={} duplicate={} superseded={} errors={}",
             self.scanned,
             self.proposed.len(),
             self.skipped_overheat.len(),
@@ -66,6 +67,7 @@ impl ProposalReport {
             self.skipped_no_data.len(),
             self.skipped_emotion_phase.len(),
             self.skipped_duplicate,
+            self.superseded,
             self.errors.len()
         )
     }
@@ -76,6 +78,40 @@ fn decision_shadow_enabled() -> bool {
     std::env::var("TICKET_DECISION_SHADOW")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+/// 新提案落库后，把上一张仍为 Open 的提案收口为 Superseded。
+/// 事件保留旧 decision_id，便于审计时看到替换链。
+fn supersede_previous(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    as_of: &str,
+    previous: &DecisionContext,
+    new_decision_id: &str,
+) -> Result<(), String> {
+    let summary = format!("被新提案 {new_decision_id} 取代");
+    ticket_lifecycle::append_event(
+        conn,
+        ticket_id,
+        as_of,
+        "entry_superseded",
+        None,
+        Some(&previous.decision_id),
+        Some(&summary),
+    )
+    .map_err(|error| format!("entry_superseded 落库失败: {error}"))?;
+    let changed = ticket_decision::update_proposal_status(
+        conn,
+        &previous.decision_id,
+        ProposalStatus::Superseded,
+    )?;
+    if !changed {
+        return Err(format!(
+            "entry_superseded 已记账但 ticket_decision 不存在: {}",
+            previous.decision_id
+        ));
+    }
+    Ok(())
 }
 
 fn latest_source_date(
@@ -290,7 +326,11 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             match ticket_regime::resolve(&mut conn, ticket.id, code, &ticket.source, as_of) {
                 Ok(decision) => (
                     decision.regime.as_str().to_owned(),
-                    ticket_decision::entry_mode_for(decision.regime, zone.trend, &ticket.source),
+                    ticket_decision::entry_mode_for(
+                        decision.regime,
+                        zone.trend,
+                        &ticket.source,
+                    ),
                     valid_until_for(as_of, decision.regime),
                 ),
                 Err(error) => {
@@ -298,6 +338,20 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
                     ("unknown".to_owned(), EntryMode::Unknown, None)
                 }
             };
+
+        let previous_context = if shadow {
+            match ticket_decision::latest_open_proposal(&mut conn, ticket.id) {
+                Ok(context) => context,
+                Err(error) => {
+                    report
+                        .errors
+                        .push(format!("{code} 旧提案查询失败: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut context = DecisionContext::new(
             ticket.id,
@@ -317,17 +371,37 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
         context.source_health = source_health.clone();
         context.evidence_grade = EvidenceGrade::L1;
         context.missing_fields.push("volume_ratio".to_owned());
+        context.supersedes = previous_context
+            .as_ref()
+            .map(|previous| previous.decision_id.clone());
         context.seal();
 
         if shadow {
             match ticket_decision::persist_proposal(&db, &context) {
-                Ok(()) => log::info!(
-                    "[入场参考][shadow] code={} decision_id={} mode={} low={low:.2} high={high:.2} valid_until={:?}",
-                    code,
-                    context.decision_id,
-                    context.entry_mode.as_str(),
-                    context.valid_until
-                ),
+                Ok(()) => {
+                    log::info!(
+                        "[入场参考][shadow] code={} decision_id={} mode={} low={low:.2} high={high:.2} valid_until={:?}",
+                        code,
+                        context.decision_id,
+                        context.entry_mode.as_str(),
+                        context.valid_until
+                    );
+                    if let Some(previous) = previous_context {
+                        if let Err(error) = supersede_previous(
+                            &mut conn,
+                            ticket.id,
+                            as_of,
+                            &previous,
+                            &context.decision_id,
+                        ) {
+                            report
+                                .errors
+                                .push(format!("{code} 旧提案收口失败: {error}"));
+                        } else {
+                            report.superseded += 1;
+                        }
+                    }
+                }
                 Err(error) => report
                     .errors
                     .push(format!("{code} shadow context 写入失败: {error}")),
