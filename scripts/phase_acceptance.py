@@ -230,14 +230,36 @@ def check_p13(main, days):
 
 
 def check_p2(main, days):
-    """P2 可买价：ticket_event 要有 entry_proposed。"""
+    """P2 可买价：不仅要产出 entry_proposed，还要看是否进入触发/执行。"""
     r = Result("P2", "可买价/entry_proposed")
     if not table_exists(main, "ticket_event"):
         r.detail = "ticket_event 缺失"
         r.status = FAIL
         return r
+    dates = [
+        row[0]
+        for row in main.execute(
+            "SELECT DISTINCT substr(event_at, 1, 10) FROM ticket_event "
+            "WHERE event_at IS NOT NULL AND length(event_at) >= 10 "
+            "ORDER BY 1 DESC LIMIT ?",
+            (days,),
+        ).fetchall()
+    ]
+    cutoff = min(dates) if dates else "0000-00-00"
     ev = main.execute(
-        "SELECT COUNT(*) FROM ticket_event WHERE event_kind='entry_proposed'"
+        "SELECT COUNT(*) FROM ticket_event "
+        "WHERE event_kind='entry_proposed' AND substr(event_at,1,10) >= ?",
+        (cutoff,),
+    ).fetchone()[0]
+    trig = main.execute(
+        "SELECT COUNT(*) FROM ticket_event "
+        "WHERE event_kind='entry_triggered' AND substr(event_at,1,10) >= ?",
+        (cutoff,),
+    ).fetchone()[0]
+    invalidated = main.execute(
+        "SELECT COUNT(*) FROM ticket_event "
+        "WHERE event_kind='entry_invalidated' AND substr(event_at,1,10) >= ?",
+        (cutoff,),
     ).fetchone()[0]
     st = main.execute(
         "SELECT COUNT(*) FROM ticket_lifecycle WHERE stage='entry_proposed'"
@@ -245,10 +267,21 @@ def check_p2(main, days):
     obs = main.execute(
         "SELECT COUNT(*) FROM ticket_lifecycle WHERE stage='observing' AND close_date IS NULL"
     ).fetchone()[0]
-    r.detail = f"entry_proposed 事件={ev} 状态={st} | 仍停在 observing={obs}"
+    decisions = 0
+    if table_exists(main, "ticket_decision"):
+        decisions = main.execute(
+            "SELECT COUNT(*) FROM ticket_decision WHERE as_of >= ?", (cutoff,)
+        ).fetchone()[0]
+    r.detail = (
+        f"窗口 {cutoff}~最新 entry_proposed={ev} 触发={trig} 失效={invalidated} "
+        f"| 活跃状态={st} decision={decisions} | 仍停在 observing={obs}"
+    )
     if ev == 0 and st == 0:
         r.status = FAIL
         r.detail += " | 从未产出过买入区间"
+    elif trig == 0:
+        r.status = PARTIAL
+        r.detail += " | 有提案但窗口内 0 触发；不能算漏斗打通"
     else:
         r.status = OK
     return r

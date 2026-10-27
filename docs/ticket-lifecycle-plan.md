@@ -2839,5 +2839,14 @@ git diff --check
   - 没有改推送模板，没有清理重复票，没有切 `new`。
 - 2026-10-27 18:34 重启后 `ticket_decision` 仍为 0 行；这是部署后还没有新的提案，
   不是 shadow 失败。第一次真实校验看下一交易日 15:40。
-- WP5–WP8 仍未实施；`data/auction_raw`、完整 PIT 对照和真实成交数据仍缺失，
-  相关结论继续标 `UNKNOWN`。
+- WP6 已落第一版只读证据包（2026-10-27）：
+  - `scripts/ticket_audit.py`：按票/日期导出 ticket、事件、decision、日线、regime、
+    基准、投递决策和命中的 `push_log`，生成 `gaps.json`/`timeline.jsonl`/`manifest.sha256`；
+  - `scripts/ticket_audit_eval.py`：只按证据包内数据计算 T+1/T+3/T+5、MFE/MAE；
+    无 DecisionContext 或成交证据时固定 `INCONCLUSIVE`；
+  - `scripts/ticket_evidence_audit.py`：独立校验 manifest 与 JSON 可解析性；
+  - 001216/2026-10-26 实跑：1 张 ticket、8 条事件、0 条 decision、4 个证据缺口，
+    T+1 已观测为 -9.996%，但入场参考价仍为 `UNKNOWN`；
+  - 证据包路径：运行根 `data/ticket_evidence/001216/2026-10-26`。
+- WP5、WP7、WP8 仍未实施：模板文案/OutputContract、验收漏斗、`new` 切换未做；
+  `data/auction_raw`、完整 PIT 对照和真实成交数据仍缺失，相关结论继续标 `UNKNOWN`。

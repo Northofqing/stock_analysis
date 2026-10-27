@@ -396,21 +396,52 @@ async fn load_peer_alerts(
         return Ok(HashMap::new());
     }
 
-    let bridge = crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes")
-        .map_err(|error| error.to_string())?;
-    let quotes = match bridge.realtime_quotes_async(&candidates).await {
-        Ok(GatewayBatch::Available { records, .. }) => {
-            QuoteCoverage::observed(&candidates, &records).log("watch_peer");
-            records
-        }
-        Ok(GatewayBatch::VerifiedEmpty(_)) => {
-            QuoteCoverage::observed(&candidates, &[]).log("watch_peer");
-            return Ok(HashMap::new());
-        }
+    let bridge = match crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes") {
+        Ok(bridge) => bridge,
         Err(error) => {
+            // 桥接器构造失败也要留下 coverage；否则验收只能看到旧的
+            // “关联票查询失败”，无法区分源不可用和真的没有候选。
             QuoteCoverage::failed(&candidates).log("watch_peer_failed");
             return Err(format!("关联票行情拉取失败: {error}"));
         }
+    };
+    let quotes = {
+        // provider 对一批里某些代码会整批返回 internal（常见于停牌/退市/
+        // 板块成分里的陈旧代码）。不能因为一个坏代码把整组关联票丢掉：
+        // 失败批次二分，直到隔离出单只坏票；coverage 记录每个子批次。
+        let mut queue: std::collections::VecDeque<Vec<String>> =
+            std::collections::VecDeque::new();
+        queue.push_back(candidates.clone());
+        let mut coverage = QuoteCoverage::default();
+        let mut records = Vec::new();
+        let mut last_error: Option<String> = None;
+        while let Some(batch) = queue.pop_front() {
+            match bridge.realtime_quotes_async(&batch).await {
+                Ok(GatewayBatch::Available { records: got, .. }) => {
+                    coverage.merge(QuoteCoverage::observed(&batch, &got));
+                    records.extend(got);
+                }
+                Ok(GatewayBatch::VerifiedEmpty(_)) => {
+                    coverage.merge(QuoteCoverage::observed(&batch, &[]));
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    if batch.len() > 1 {
+                        let mid = batch.len() / 2;
+                        queue.push_front(batch[mid..].to_vec());
+                        queue.push_front(batch[..mid].to_vec());
+                    } else {
+                        coverage.merge(QuoteCoverage::failed(&batch));
+                    }
+                }
+            }
+        }
+        coverage.log("watch_peer");
+        if records.is_empty() && coverage.failed_batches > 0 && coverage.accepted == 0 {
+            let detail = last_error.unwrap_or_else(|| "all batches failed".to_owned());
+            return Err(format!("关联票行情拉取失败: {detail}"));
+        }
+        records
     };
     let by_code: HashMap<&str, &crate::data_gateway::RealtimeMarketQuote> = quotes
         .iter()
