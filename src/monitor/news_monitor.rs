@@ -532,10 +532,26 @@ pub fn refresh_concept_index_blocking(
     our_codes: &std::collections::HashSet<String>,
 ) -> Result<std::collections::HashMap<String, Vec<String>>, String> {
     let gateway = crate::data_gateway::BoardDataGateway::production_tdx();
+    // 2026-10-27：桥的连接池偶发 attestation 失败会让单只票在 35s 后被取消，
+    // 而索引是「全体成功才安装」，一次瞬时取消就废掉整轮。
+    // 这里对单只票重试一次（800ms 退避），仍失败才按原语义拒绝整批。
     build_concept_index_from_memberships(our_codes, |code| {
-        gateway
-            .memberships_blocking(code)
-            .map_err(|error| format!("code={code} memberships Gateway 失败: {error}"))
+        let mut attempt = 0u8;
+        loop {
+            match gateway.memberships_blocking(code) {
+                Ok(batch) => return Ok(batch),
+                Err(error) => {
+                    let message = format!("code={code} memberships Gateway 失败: {error}");
+                    if attempt == 0 {
+                        attempt = 1;
+                        log::warn!("[BR-188] {message}；800ms 后重试一次");
+                        std::thread::sleep(std::time::Duration::from_millis(800));
+                    } else {
+                        return Err(message);
+                    }
+                }
+            }
+        }
     })
 }
 
