@@ -2833,8 +2833,11 @@ git diff --check
 - 2026-10-27 已部署 shadow：`TICKET_DECISION_SHADOW=1`、
   `TICKET_ENTRY_POLICY=shadow`；`ticket_decision` 表存在，部署后 0 行，
   说明还没有新的提案运行。
-- WP3.5/WP4 正在实施：行情 coverage、源健康、`entry_expired`、
-  `entry_superseded`、提案状态投影、重复活跃票 dry-run。没有改推送模板，
-  没有清理重复票，没有切 `new`。
+- WP3.5/WP4 已实施、测试并部署（`6c80b6e86`、`eb502877f`）：
+  - 行情 coverage 与 `news/board/mf` 三源健康；
+  - `entry_expired`、`entry_superseded`、提案状态投影、重复活跃票只读 dry-run。
+  - 没有改推送模板，没有清理重复票，没有切 `new`。
+- 2026-10-27 18:34 重启后 `ticket_decision` 仍为 0 行；这是部署后还没有新的提案，
+  不是 shadow 失败。第一次真实校验看下一交易日 15:40。
 - WP5–WP8 仍未实施；`data/auction_raw`、完整 PIT 对照和真实成交数据仍缺失，
   相关结论继续标 `UNKNOWN`。
