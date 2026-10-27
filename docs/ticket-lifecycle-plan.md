@@ -2845,8 +2845,15 @@ git diff --check
   - `scripts/ticket_audit_eval.py`：只按证据包内数据计算 T+1/T+3/T+5、MFE/MAE；
     无 DecisionContext 或成交证据时固定 `INCONCLUSIVE`；
   - `scripts/ticket_evidence_audit.py`：独立校验 manifest 与 JSON 可解析性；
+  - `scripts/ticket_control_group.py`：按 as_of 日线和 `board_member` 生成 PIT 对照；
+    001216 无板块成分映射，只能退回同交易所+同涨跌幅带，状态为 `WEAK`，不当作合格对照；
   - 001216/2026-10-26 实跑：1 张 ticket、8 条事件、0 条 decision、4 个证据缺口，
-    T+1 已观测为 -9.996%，但入场参考价仍为 `UNKNOWN`；
+    T+1 已观测为 -9.996%，但入场参考价仍为 `UNKNOWN`；对照组 37 只但状态 `WEAK`；
   - 证据包路径：运行根 `data/ticket_evidence/001216/2026-10-26`。
+- 2026-10-27 追加修复并部署（`a9f67db3a` 之后的运行根 release）：
+  - 同板块关联票行情批次失败时二分隔离坏代码，避免一个陈旧成分让整组 P3.3 空转；
+  - `phase_acceptance.py` 的 P2 改为漏斗口径，窗口内 0 触发时标 `PARTIAL`，不再只因历史
+    `entry_proposed` 存在就判达标；
+  - P3.3 的真实源错误仍需下一交易日观察；重启后当前无盘中轮次，不能提前宣称修复。
 - WP5、WP7、WP8 仍未实施：模板文案/OutputContract、验收漏斗、`new` 切换未做；
   `data/auction_raw`、完整 PIT 对照和真实成交数据仍缺失，相关结论继续标 `UNKNOWN`。

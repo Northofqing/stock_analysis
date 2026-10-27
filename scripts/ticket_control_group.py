@@ -58,6 +58,19 @@ def main() -> int:
             }
         else:
             board = board_of(args.code)
+            board_rows = con.execute(
+                "SELECT DISTINCT board_code FROM board_member WHERE instrument_code=?",
+                (args.code,),
+            ).fetchall()
+            board_codes = {row["board_code"] for row in board_rows}
+            member_set: set[str] = set()
+            if board_codes:
+                placeholders = ",".join("?" for _ in board_codes)
+                member_rows = con.execute(
+                    f"SELECT instrument_code FROM board_member WHERE board_code IN ({placeholders})",
+                    tuple(board_codes),
+                ).fetchall()
+                member_set = {row["instrument_code"] for row in member_rows}
             rows = con.execute(
                 "SELECT code, date, close, pct_chg FROM stock_daily "
                 "WHERE date=? AND code<>? AND close IS NOT NULL AND pct_chg IS NOT NULL",
@@ -71,10 +84,14 @@ def main() -> int:
                 }
                 for row in rows
                 if board_of(row["code"]) == board
+                and (not member_set or row["code"] in member_set)
                 and abs(row["pct_chg"] - target["pct_chg"]) <= args.pct_band
             ]
             candidates.sort(key=lambda item: (abs(item["pct_chg"] - target["pct_chg"]), item["code"]))
-            status = "OK" if len(candidates) >= args.min_samples else "INSUFFICIENT"
+            if not board_codes:
+                status = "WEAK" if len(candidates) >= args.min_samples else "INSUFFICIENT"
+            else:
+                status = "OK" if len(candidates) >= args.min_samples else "INSUFFICIENT"
             result = {
                 "status": status,
                 "code": args.code,
@@ -86,9 +103,11 @@ def main() -> int:
                 },
                 "method": {
                     "board": board,
+                    "board_source": "board_member" if board_codes else "exchange_prefix_fallback",
+                    "board_codes": sorted(board_codes),
                     "pct_band": args.pct_band,
                     "min_samples": args.min_samples,
-                    "source": "stock_daily as_of",
+                    "source": "stock_daily as_of + board_member",
                     "future_data_used": False,
                 },
                 "candidate_count": len(candidates),
@@ -97,7 +116,7 @@ def main() -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         print(json.dumps({"status": result["status"], "candidate_count": result.get("candidate_count", 0)}, ensure_ascii=False))
-        return 0 if result["status"] in {"OK", "INSUFFICIENT"} else 1
+        return 0 if result["status"] in {"OK", "WEAK", "INSUFFICIENT"} else 1
     finally:
         con.close()
 
