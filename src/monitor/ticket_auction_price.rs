@@ -36,6 +36,15 @@ pub const MAX_AUCTION_PCT: f64 = 6.0;
 /// 板块热度取前几名。
 const BOARD_HEAT_TOP: usize = 5;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputKind {
+    /// WP5 目标语义：只输出参考价，不声称可执行/可成交。
+    #[default]
+    ReferencePrice,
+    /// 旧文案；仅用于 shadow 期保持推送不变。
+    LegacyAction,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     /// 高开过多，不给价
@@ -55,6 +64,16 @@ impl Tier {
             Tier::Light => "轻仓",
             Tier::EnsureFill => "保成交",
             Tier::Bargain => "低开博弈区",
+        }
+    }
+
+    /// WP5 的参考语义：保留分档信息，但不把档位写成下单动作。
+    pub fn reference_label(self) -> &'static str {
+        match self {
+            Tier::SkipHigh => "高开过多不追",
+            Tier::Light => "轻仓参考",
+            Tier::EnsureFill => "中间区间参考",
+            Tier::Bargain => "低开参考",
         }
     }
 }
@@ -92,12 +111,40 @@ pub struct PriceLine {
     /// 给出来的价（含上浮），`None` = 不给
     pub price: Option<f64>,
     pub tier: Tier,
+    /// 默认只输出参考价；旧文案要显式降级。
+    pub output_kind: OutputKind,
 }
 
 impl PriceLine {
     pub fn render(&self) -> String {
-        match self.price {
-            Some(price) => format!(
+        let kind = if crate::monitor::output_contract::reference_language_enabled() {
+            self.output_kind
+        } else {
+            OutputKind::LegacyAction
+        };
+        self.render_as(kind)
+    }
+
+    pub fn render_as(&self, kind: OutputKind) -> String {
+        match (kind, self.price) {
+            (OutputKind::ReferencePrice, Some(price)) => format!(
+                "{} {} 竞价 {:.2}（{:+.2}%）→ 竞价参考价 {:.2}〔{}〕",
+                self.code,
+                self.name,
+                self.auction_price,
+                self.auction_pct,
+                price,
+                self.tier.reference_label()
+            ),
+            (OutputKind::ReferencePrice, None) => format!(
+                "{} {} 竞价 {:.2}（{:+.2}%）→ 不给参考价〔{}〕",
+                self.code,
+                self.name,
+                self.auction_price,
+                self.auction_pct,
+                self.tier.reference_label()
+            ),
+            (OutputKind::LegacyAction, Some(price)) => format!(
                 "{} {} 竞价 {:.2}（{:+.2}%）→ 买价 {:.2}〔{}〕",
                 self.code,
                 self.name,
@@ -106,7 +153,7 @@ impl PriceLine {
                 price,
                 self.tier.label()
             ),
-            None => format!(
+            (OutputKind::LegacyAction, None) => format!(
                 "{} {} 竞价 {:.2}（{:+.2}%）→ 不给价〔{}〕",
                 self.code,
                 self.name,
@@ -153,8 +200,14 @@ pub struct AuctionPriceReport {
 
 impl AuctionPriceReport {
     pub fn summary_line(&self) -> String {
+        let label = if crate::monitor::output_contract::reference_language_enabled() {
+            "竞价参考价"
+        } else {
+            "竞价买价"
+        };
         format!(
-            "[竞价买价] emotion={} quoted={} skipped_high={} skipped_phase={} no_price={} errors={}",
+            "[{}] emotion={} quoted={} skipped_high={} skipped_phase={} no_price={} errors={}",
+            label,
             self.emotion,
             self.quoted.len(),
             self.skipped_high.len(),
@@ -169,8 +222,13 @@ impl AuctionPriceReport {
         if self.emotion == 0 {
             return None;
         }
+        let reference = crate::monitor::output_contract::reference_language_enabled();
         let mut out = String::new();
-        out.push_str(&format!("【{as_of} 09:25 竞价买价】\n"));
+        if reference {
+            out.push_str(&format!("【{as_of} 09:25 竞价参考价】\n"));
+        } else {
+            out.push_str(&format!("【{as_of} 09:25 竞价买价】\n"));
+        }
         out.push_str(&format!(
             "情绪型 {} 只（趋势型走 ma 回踩，见明日计划）\n",
             self.emotion
@@ -195,9 +253,10 @@ impl AuctionPriceReport {
             }
         }
         if self.no_price > 0 {
+            let no_price_label = if reference { "不给参考价" } else { "不给价" };
             out.push_str(&format!(
-                "\n{} 只竞价价缺失（停牌/未撮合），不给价\n",
-                self.no_price
+                "\n{} 只竞价价缺失（停牌/未撮合），{}\n",
+                self.no_price, no_price_label
             ));
         }
         if !self.board_heat.is_empty() {
@@ -206,7 +265,11 @@ impl AuctionPriceReport {
                 out.push_str(&format!("· {}\n", heat.render()));
             }
         }
-        out.push_str("\n⚠ 竞价买入当日 T+1 不可卖。给的是参考价，不是成交承诺。");
+        if reference {
+            out.push_str("\n⚠ 参考价，不是下单指令；未核验成交，T+1 不可卖。");
+        } else {
+            out.push_str("\n⚠ 竞价买入当日 T+1 不可卖。给的是参考价，不是成交承诺。");
+        }
         Some(out)
     }
 }
@@ -341,6 +404,7 @@ pub fn build(
             auction_pct,
             price: None,
             tier: Tier::SkipHigh,
+            output_kind: OutputKind::ReferencePrice,
         };
         if streak.is_some_and(|value| value >= crate::monitor::market_regime::EMOTION_STREAK)
             && phase == Some(crate::monitor::market_regime::MarketPhase::Climax)
@@ -357,6 +421,7 @@ pub fn build(
             auction_pct,
             price,
             tier,
+            output_kind: OutputKind::ReferencePrice,
         };
         match tier {
             Tier::SkipHigh => report.skipped_high.push(line),
@@ -406,6 +471,7 @@ mod tests {
                 auction_pct: 3.0,
                 price: Some(10.0),
                 tier: Tier::Light,
+                output_kind: OutputKind::ReferencePrice,
             }],
             ..Default::default()
         };
@@ -413,6 +479,25 @@ mod tests {
         assert!(text.contains("T+1 不可卖"));
         assert!(text.contains("002696"));
         assert!(text.contains("轻仓"));
+    }
+
+    #[test]
+    fn reference_output_never_claims_buy_or_fill() {
+        let line = PriceLine {
+            code: "001216".to_string(),
+            name: "华瓷股份".to_string(),
+            auction_price: 22.78,
+            auction_pct: -5.41,
+            price: Some(22.78),
+            tier: Tier::Bargain,
+            output_kind: OutputKind::ReferencePrice,
+        };
+        let text = line.render_as(OutputKind::ReferencePrice);
+        assert!(text.contains("竞价参考价"));
+        assert!(!text.contains("买价"));
+        assert!(!text.contains("保成交"));
+        assert!(!text.contains("保证成交"));
+        assert!(!text.contains("可执行"));
     }
 
     #[test]

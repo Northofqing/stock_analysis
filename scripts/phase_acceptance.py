@@ -85,6 +85,11 @@ def check_p11(main, days, log_lines):
     ok_days = 0
     empty_rounds = 0
     source_unavailable = 0
+    source_health: dict[str, dict[str, int]] = {
+        "news": {},
+        "board": {},
+        "mf": {},
+    }
     for line in log_lines:
         # 兼容两种历史格式：带 board_candidates 的新格式 / 不带它的旧格式
         m = re.search(
@@ -100,7 +105,11 @@ def check_p11(main, days, log_lines):
         opened_here = int(m.group(7))
         board_cand += candidates
         opened += opened_here
-        # 2026-10-27：日志新增三个健康字段；旧日志没有时保持 None。
+        # 2026-10-27：日志新增三个健康字段；逐源累计，防止 board 正常掩盖 news/mf 断供。
+        for source in ("news", "board", "mf"):
+            match = re.search(rf"{source}_health=(\w+)", line)
+            if match:
+                source_health[source][match.group(1)] = source_health[source].get(match.group(1), 0) + 1
         if re.search(r"news_health=(?:unavailable|stale|conflict)", line):
             source_unavailable += 1
         if re.search(r"board_health=(?:unavailable|stale|conflict)", line):
@@ -112,14 +121,26 @@ def check_p11(main, days, log_lines):
         elif m.group(4) is not None:
             empty_rounds += 1
 
+    health_text = "; ".join(
+        f"{source}={source_health[source]}" for source in ("news", "board", "mf")
+    )
     r.detail = (
         f"日志累计 board_candidates={board_cand} opened={opened} "
-        f"news_candidates={news_cand} 有产出的轮次={ok_days}"
+        f"news_candidates={news_cand} 有产出的轮次={ok_days} | {health_text}"
     )
     if source_unavailable:
         r.detail += f" | 来源不可用记录 {source_unavailable} 条"
+    unavailable_sources = [
+        source
+        for source in ("news", "board", "mf")
+        if any(key in {"unavailable", "stale", "conflict"} for key in source_health[source])
+    ]
     if ok_days > 0:
-        r.status = OK
+        if unavailable_sources:
+            r.status = PARTIAL
+            r.detail += f" | 有产出但来源不可用: {','.join(unavailable_sources)}；不能算三源齐全"
+        else:
+            r.status = OK
         if opened == 0:
             r.detail += " | opened=0 属正常（选中的票已在库，走 appended 补事件）"
     elif empty_rounds > 0:
@@ -261,6 +282,23 @@ def check_p2(main, days):
         "WHERE event_kind='entry_invalidated' AND substr(event_at,1,10) >= ?",
         (cutoff,),
     ).fetchone()[0]
+    expired = main.execute(
+        "SELECT COUNT(*) FROM ticket_event "
+        "WHERE event_kind='entry_expired' AND substr(event_at,1,10) >= ?",
+        (cutoff,),
+    ).fetchone()[0]
+    superseded = main.execute(
+        "SELECT COUNT(*) FROM ticket_event "
+        "WHERE event_kind='entry_superseded' AND substr(event_at,1,10) >= ?",
+        (cutoff,),
+    ).fetchone()[0]
+    evaluated = 0
+    if table_exists(main, "advice_outcome_tracking"):
+        evaluated = main.execute(
+            "SELECT COUNT(*) FROM advice_outcome_tracking "
+            "WHERE business_date >= ? AND (outcome_filled_at IS NOT NULL OR outcome_pct IS NOT NULL)",
+            (cutoff,),
+        ).fetchone()[0]
     st = main.execute(
         "SELECT COUNT(*) FROM ticket_lifecycle WHERE stage='entry_proposed'"
     ).fetchone()[0]
@@ -272,9 +310,12 @@ def check_p2(main, days):
         decisions = main.execute(
             "SELECT COUNT(*) FROM ticket_decision WHERE as_of >= ?", (cutoff,)
         ).fetchone()[0]
+    trigger_rate = (trig / ev * 100.0) if ev else 0.0
     r.detail = (
-        f"窗口 {cutoff}~最新 entry_proposed={ev} 触发={trig} 失效={invalidated} "
-        f"| 活跃状态={st} decision={decisions} | 仍停在 observing={obs}"
+        f"窗口 {cutoff}~最新 proposal={ev} open={st} triggered={trig} "
+        f"invalidated={invalidated} expired={expired} superseded={superseded} "
+        f"evaluated={evaluated} trigger_rate={trigger_rate:.1f}% "
+        f"decision={decisions} observing={obs}"
     )
     if ev == 0 and st == 0:
         r.status = FAIL
@@ -282,6 +323,9 @@ def check_p2(main, days):
     elif trig == 0:
         r.status = PARTIAL
         r.detail += " | 有提案但窗口内 0 触发；不能算漏斗打通"
+    elif evaluated == 0:
+        r.status = PARTIAL
+        r.detail += " | 有触发但 0 个已评估结果；不能算闭环"
     else:
         r.status = OK
     return r

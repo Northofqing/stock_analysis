@@ -418,6 +418,11 @@ impl P01InputBinding {
                         .expect("valid TEST_CODE published time")
                         .with_timezone(&Utc),
                 }],
+                recommend_price: None,
+                streak: None,
+                sealed_amount: None,
+                turnover: None,
+                break_count: None,
             }],
             limit_pools: P01LimitPoolsBinding {
                 request_kind: "Upper",

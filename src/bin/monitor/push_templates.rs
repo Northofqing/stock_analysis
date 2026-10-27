@@ -1619,9 +1619,14 @@ pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) ->
         }
     }
     out.push_str(&format!(
-        "\n理由: {}\n辅助建议, 非下单指令",
+        "\n理由: {}",
         params.reasons.join("; "),
     ));
+    out.push_str(if stock_analysis::monitor::output_contract::reference_language_enabled() {
+        "\n风险参考线，不是成交承诺；辅助建议, 非下单指令"
+    } else {
+        "\n辅助建议, 非下单指令"
+    });
     out
 }
 
@@ -1645,8 +1650,13 @@ pub struct HoldingPlanParams<'a> {
 /// T-04 持仓紧急风险
 /// v12 §14.1 T-04 HoldingEvent 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_holding_event(banner: &BannerCtx, p: HoldingEventParams<'_>) -> String {
+    let footer = if stock_analysis::monitor::output_contract::reference_language_enabled() {
+        "风险参考线，不是成交承诺；辅助建议, 非下单指令"
+    } else {
+        "辅助建议, 非下单指令"
+    };
     format!(
-        "{}\n🚨 持仓风险 {}({})（{}）\n触发: {}\n现价{}（{:+.1}%） 距止损{:+.1}%\n建议: {}\n可用股数: {}\n辅助建议, 非下单指令",
+        "{}\n🚨 持仓风险 {}({})（{}）\n触发: {}\n现价{}（{:+.1}%） 距止损{:+.1}%\n建议: {}\n可用股数: {}\n{}",
         banner.render(),
         p.name,
         p.code,
@@ -1657,6 +1667,7 @@ pub fn render_holding_event(banner: &BannerCtx, p: HoldingEventParams<'_>) -> St
         p.gap_pct,
         p.action,
         p.avail,
+        footer,
     )
 }
 
@@ -1817,8 +1828,14 @@ impl EvidenceQuality {
 
 /// v12 §14.1 T-07 CandidateTriggered 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_candidate_triggered(banner: &BannerCtx, p: CandidateTriggeredParams<'_>) -> String {
+    let reference = stock_analysis::monitor::output_contract::reference_language_enabled();
+    let range_label = if reference {
+        "触发参考区间"
+    } else {
+        "低吸参考"
+    };
     let mut out = format!(
-        "{}\n📋 候选触发 {}({})（{}）\n等级{} | 状态: Triggered | 主题: {}\n现价{} 已触发: {}\n低吸参考: {}~{} | 止损{} | 仓位上限{}%",
+        "{}\n📋 候选触发 {}({})（{}）\n等级{} | 状态: Triggered | 主题: {}\n现价{} 已触发: {}\n{}: {}~{} | 止损{} | 仓位上限{}%",
         banner.render(),
         p.name,
         p.code,
@@ -1827,6 +1844,7 @@ pub fn render_candidate_triggered(banner: &BannerCtx, p: CandidateTriggeredParam
         p.topic,
         fmt_price(p.price),
         p.trigger_desc,
+        range_label,
         fmt_price(p.lo),
         fmt_price(p.hi),
         fmt_price(p.stop),
@@ -1855,7 +1873,11 @@ pub fn render_candidate_triggered(banner: &BannerCtx, p: CandidateTriggeredParam
             out.push_str(&format!("\n· {}", nb));
         }
     }
-    out.push_str("\n需人工确认, 非自动买入");
+    if reference {
+        out.push_str("\n参考区间，未核验成交；需人工确认, 非自动买入");
+    } else {
+        out.push_str("\n需人工确认, 非自动买入");
+    }
     out
 }
 
@@ -2825,16 +2847,19 @@ pub struct WatchItem<'a> {
 
 /// v12 §14.2 R-07 TomorrowWatch 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_tomorrow_watch(date: &str, items: &[WatchItem<'_>]) -> String {
+    let reference = stock_analysis::monitor::output_contract::reference_language_enabled();
+    let range_label = if reference { "参考区间" } else { "低吸" };
     let mut out = format!("📌 明日观察池（{}）", date);
     for (i, it) in items.iter().enumerate() {
         out.push_str(&format!(
-            "\n{}. {}({}) [{}] 来源: {}\n   触发{} | 低吸{}~{} | 止损{}\n   理由: {}",
+            "\n{}. {}({}) [{}] 来源: {}\n   触发{} | {}{}~{} | 止损{}\n   理由: {}",
             i + 1,
             it.name,
             it.code,
             it.topic,
             it.source,
             it.trigger,
+            range_label,
             fmt_price(it.lo),
             fmt_price(it.hi),
             fmt_price(it.stop),
@@ -2842,7 +2867,14 @@ pub fn render_tomorrow_watch(date: &str, items: &[WatchItem<'_>]) -> String {
         ));
         out.push_str("\n─────");
     }
-    out.push_str(&format!("\n共{}只 | 明日竞价后按 T-11 复核", items.len(),));
+    if reference {
+        out.push_str(&format!(
+            "\n共{}只 | 参考区间，未核验成交；明日竞价后按 T-11 复核",
+            items.len(),
+        ));
+    } else {
+        out.push_str(&format!("\n共{}只 | 明日竞价后按 T-11 复核", items.len(),));
+    }
     out
 }
 

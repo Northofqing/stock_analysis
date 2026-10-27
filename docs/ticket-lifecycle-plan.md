@@ -2857,3 +2857,19 @@ git diff --check
   - P3.3 的真实源错误仍需下一交易日观察；重启后当前无盘中轮次，不能提前宣称修复。
 - WP5、WP7、WP8 仍未实施：模板文案/OutputContract、验收漏斗、`new` 切换未做；
   `data/auction_raw`、完整 PIT 对照和真实成交数据仍缺失，相关结论继续标 `UNKNOWN`。
+- 2026-10-27 晚继续落地（`a9f67db3a` 之后）：
+  - WP6 Rust 版 `src/monitor/ticket_evidence.rs` + `src/bin/ticket_audit.rs` 已实现，
+    实跑 001216/2026-10-26：1 ticket、8 事件、0 decision、4 gaps；Rust 包
+    `data/ticket_evidence/001216/2026-10-26-rust` 通过独立 manifest 校验；
+  - WP5 代码已落地但默认不启用：`output_contract.rs` + `TICKET_OUTPUT_CONTRACT=1`
+    才切换“竞价参考价/触发参考区间/风险参考线”语义；默认仍保持旧推送，
+    避免在 shadow 样本不足时改变用户可见文案；
+  - P2 验收增加 proposal/open/triggered/invalidated/expired/superseded/evaluated
+    与 trigger_rate；P1.1 增加三源健康明细；
+  - 新增只读巡检 `scripts/ticket_ops_check.py`，并创建本地 cron
+    `ticket-ops-check`（工作日 09:35/15:45，输出运行根 `data/ops_check/`）。
+- 仍未完成：
+  - WP5 激活（等 5 日 shadow 或 operator 明确豁免）；
+  - WP6 fixture 回归、原始竞价/逐笔证据、完整 PIT 对照；
+  - WP7 P6 `board_pct` 仍 0/9766，P1.1 news/mf 仍 0；P3.3 需下一交易日验证；
+  - WP8 `TICKET_ENTRY_POLICY=new` 未切换，`ticket_decision` 仍 0 行。

@@ -61,6 +61,8 @@ pub mod signal_state;
 pub mod quote_coverage; // 2026-10-27: WP3.5 行情覆盖率与源健康
 pub mod ticket_auction_price; // 2026-10-23: 情绪票 09:25 竞价买价 + 板块热度 (批 1.3/2.1)
 pub mod ticket_decision; // 2026-10-27: DecisionContext + EntryPolicy + ticket_decision 投影
+pub mod ticket_evidence; // 2026-10-27: WP6 只读证据包/缺口
+pub mod output_contract; // 2026-10-27: WP5 参考价输出合同开关
 pub mod ticket_entry_proposal; // 2026-10-21: P2 入场参考 (observing → entry_proposed，复用 buy_zone)
 pub mod ticket_entry_trigger; // 2026-10-23: 盘中突破确认 + 价格失效 (批 1.4/1.5)
 pub mod ticket_event_sync; // 2026-10-17: 投递记账 (Delivered → ticket_event; 观察池/持仓才建票)
