@@ -327,6 +327,13 @@ pub fn build(
         // 我们这边就用市场级情绪档来压，而不是逐票拍脑袋。
         let streak = crate::monitor::market_regime::streak_on(&mut conn, as_of, &row.code);
         let phase = crate::monitor::market_regime::phase_on(&mut conn, as_of);
+        if streak.is_none() {
+            log::debug!(
+                "[竞价买价] {} 高位状态未核实（无 <= {} 的涨停池快照）",
+                row.code,
+                as_of
+            );
+        }
         let line_for_skip = || PriceLine {
             code: row.code.clone(),
             name: row.name.clone(),
@@ -335,7 +342,7 @@ pub fn build(
             price: None,
             tier: Tier::SkipHigh,
         };
-        if streak >= crate::monitor::market_regime::EMOTION_STREAK
+        if streak.is_some_and(|value| value >= crate::monitor::market_regime::EMOTION_STREAK)
             && phase == Some(crate::monitor::market_regime::MarketPhase::Climax)
         {
             report.skipped_phase.push(line_for_skip());

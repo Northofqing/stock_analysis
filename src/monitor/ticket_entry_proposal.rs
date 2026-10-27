@@ -119,10 +119,10 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
         // 2026-10-24（情绪—逻辑框架）：连板 ≥4 属情绪段，不给 ma 回踩价。
         // 依据：涨停次日触及 ma10 仅 15.4%，连板越高越不回踩 —— 给回踩价等于给不成交的价。
         let streak = crate::monitor::market_regime::streak_on(&mut conn, as_of, code);
-        if streak >= crate::monitor::market_regime::EMOTION_STREAK {
+        if streak.is_some_and(|value| value >= crate::monitor::market_regime::EMOTION_STREAK) {
             report
                 .skipped_emotion_phase
-                .push(format!("{code}（{streak} 板）"));
+                .push(format!("{code}（{} 板）", streak.unwrap_or(0)));
             continue;
         }
 

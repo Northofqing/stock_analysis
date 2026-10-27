@@ -481,10 +481,49 @@ def check_batch1(main, log_lines):
     return out
 
 
+def read_log_window(latest_day, max_lines, max_bytes):
+    """读日志窗口。
+
+    旧实现固定取尾部 2 万行，2026-10-26 3.0GB 日志下只能覆盖 17 点后的
+    BuildIdentity 噪音，把当天 09:25/15:45 的产出误判成“调度没跑”。
+    这里优先按最近交易日日期锚定起点；找不到锚点才退回尾部行数模式。
+    """
+    if not os.path.exists(STDERR_LOG):
+        return [], "日志不存在"
+    size = os.path.getsize(STDERR_LOG)
+    start = max(0, size - max_bytes)
+    note = f"尾部 {max_bytes // (1024 * 1024)}MB"
+    anchored = False
+    if latest_day:
+        marker = latest_day.encode()
+        try:
+            import mmap
+
+            with open(STDERR_LOG, "rb") as f:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    idx = mm.find(marker)
+                    if idx >= 0:
+                        start = mm.rfind(b"\n", 0, idx) + 1
+                        anchored = True
+                        note = f"从 {latest_day} 日期锚点 byte={start}"
+                        if size - start > max_bytes:
+                            note += f"（截断 {max_bytes // (1024 * 1024)}MB）"
+        except (OSError, ValueError) as error:
+            note = f"日期锚点失败({error})，尾部 {max_bytes // (1024 * 1024)}MB"
+    with open(STDERR_LOG, "rb") as f:
+        f.seek(start)
+        raw = f.read(max_bytes)
+    lines = raw.decode("utf-8", "replace").splitlines()
+    if not anchored:
+        lines = lines[-max_lines:]
+    return lines, note
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=5)
     ap.add_argument("--log-tail", type=int, default=20000)
+    ap.add_argument("--log-window-mb", type=int, default=512)
     args = ap.parse_args()
 
     for p in (MAIN_DB, DELIVERY_DB):
@@ -495,12 +534,12 @@ def main():
     main_db = ro(MAIN_DB)
     delivery_db = ro(DELIVERY_DB)
 
-    log_lines = []
-    if os.path.exists(STDERR_LOG):
-        with open(STDERR_LOG, "r", errors="replace") as f:
-            # 取尾部 N 行
-            from collections import deque
-            log_lines = list(deque(f, maxlen=args.log_tail))
+    days = trading_days(main_db, args.days)
+    log_lines, log_note = read_log_window(
+        days[0] if days else None,
+        args.log_tail,
+        max(1, args.log_window_mb) * 1024 * 1024,
+    )
 
     checks = [
         check_p11(main_db, args.days, log_lines),
@@ -515,7 +554,7 @@ def main():
     ]
     checks.extend(check_batch1(main_db, log_lines))
 
-    print(f"=== ticket 阶段验收（{datetime.now():%Y-%m-%d %H:%M}，日志 {len(log_lines)} 行）===\n")
+    print(f"=== ticket 阶段验收（{datetime.now():%Y-%m-%d %H:%M}，日志 {len(log_lines)} 行，窗口 {log_note}）===\n")
     for c in checks:
         print(c)
 

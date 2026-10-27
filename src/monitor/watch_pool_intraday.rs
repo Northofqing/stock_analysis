@@ -176,9 +176,26 @@ fn member_codes(db: &DatabaseManager, date: &str) -> Result<Vec<String>, String>
     Ok(rows.into_iter().map(|row| row.instrument_code).collect())
 }
 
+/// 行情桥要求 code 非空、无首尾空白且不重复；整批里只要有一只违规就全批失败。
+fn normalized_unique_codes(codes: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    codes
+        .iter()
+        .filter_map(|code| {
+            let code = code.trim();
+            if code.is_empty() || !seen.insert(code.to_owned()) {
+                None
+            } else {
+                Some(code.to_owned())
+            }
+        })
+        .collect()
+}
+
 /// 批量拉实时涨幅；单批失败只记录，不影响其它批次。
 async fn fetch_pct_map(codes: &[String]) -> HashMap<String, f64> {
     let mut map = HashMap::new();
+    let codes = normalized_unique_codes(codes);
     if codes.is_empty() {
         return map;
     }
@@ -262,4 +279,20 @@ pub fn render_push(db: &DatabaseManager, report: &IntradayReport) -> String {
     text.push_str("口径：盘中按实时涨幅选；15:40 盘后还会再选一次（来源 board_rotation_pm / board_rotation 分开记账）。\n");
     text.push_str("假设执行、非真实收益。");
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_codes_are_trimmed_unique_and_non_empty() {
+        let got = normalized_unique_codes(&[
+            " 600396 ".to_string(),
+            "600396".to_string(),
+            "".to_string(),
+            "001216".to_string(),
+        ]);
+        assert_eq!(got, vec!["600396".to_string(), "001216".to_string()]);
+    }
 }

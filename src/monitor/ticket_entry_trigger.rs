@@ -22,7 +22,7 @@
 //! - 「所属板块退出 top10」这一条失效条件**没有实现**：`board_member` 只覆盖采集成功的板块，
 //!   「表里没有」≠「不属于」，用它作废价格会误杀；明日计划已有 C 规则做同样的过滤。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Double, Nullable, Text};
@@ -81,7 +81,18 @@ impl TriggerCache {
     }
 
     pub fn codes(&self) -> Vec<String> {
-        self.targets.iter().map(|item| item.code.clone()).collect()
+        let mut seen = HashSet::new();
+        self.targets
+            .iter()
+            .filter_map(|item| {
+                let code = item.code.trim();
+                if code.is_empty() || !seen.insert(code.to_owned()) {
+                    None
+                } else {
+                    Some(code.to_owned())
+                }
+            })
+            .collect()
     }
 }
 
@@ -155,6 +166,34 @@ fn prev_high_before(
     Ok(row.and_then(|row| row.high))
 }
 
+/// 最近一次入场参考之后是否已经记过价格失效。
+///
+/// `entry_invalidated` 只作废这一次价格窗口，不淘汰票；但旧实现把它当成
+/// 纯日志：warm 仍把票放进缓存，价格回升后还能再触发，expiry 也会每天重复写。
+/// 新 proposal 事件会把窗口重新打开，所以比较的是「最近一次 proposal」。
+fn invalidated_after_latest_proposal(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+) -> Result<bool, String> {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let row: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM ticket_event i \
+          WHERE i.ticket_id = ?1 AND i.event_kind = 'entry_invalidated' \
+            AND i.event_at >= COALESCE((\
+                  SELECT MAX(p.event_at) FROM ticket_event p \
+                   WHERE p.ticket_id = ?1 AND p.event_kind = 'entry_proposed'\
+                ), '')",
+    )
+    .bind::<BigInt, _>(ticket_id)
+    .get_result(conn)
+    .map_err(|error| format!("入场失效事件查询失败: {error}"))?;
+    Ok(row.n > 0)
+}
+
 /// 预热当日判据：`entry_proposed` 的票 → 昨高 + buy_zone 区间 + 分型。
 pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
     chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
@@ -173,7 +212,8 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
     let tickets: Vec<TicketRow> = diesel::sql_query(
         "SELECT id, code, source FROM ticket_lifecycle \
-          WHERE close_date IS NULL AND stage = 'entry_proposed' ORDER BY code",
+          WHERE close_date IS NULL AND stage = 'entry_proposed' \
+          ORDER BY code, open_date DESC, id DESC",
     )
     .load(&mut conn)
     .map_err(|error| format!("entry_proposed 票查询失败: {error}"))?;
@@ -182,44 +222,55 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
         as_of: as_of.to_string(),
         ..Default::default()
     };
+    let mut seen_codes = HashSet::new();
 
     for ticket in tickets {
-        let Some(prev_high) = prev_high_before(&mut conn, &ticket.code, as_of)? else {
-            cache.skipped.push(format!("{} 无昨高", ticket.code));
+        let code = ticket.code.trim().to_owned();
+        if code.is_empty() || !seen_codes.insert(code.clone()) {
+            cache
+                .skipped
+                .push(format!("{} 重复/空活跃票", ticket.code));
+            continue;
+        }
+        if invalidated_after_latest_proposal(&mut conn, ticket.id)? {
+            cache.skipped.push(format!("{code} 已有失效价格窗口"));
+            continue;
+        }
+        let Some(prev_high) = prev_high_before(&mut conn, &code, as_of)? else {
+            cache.skipped.push(format!("{code} 无昨高"));
             continue;
         };
-        let zone = match buy_zone::compute(&mut conn, &ticket.code, as_of) {
+        let zone = match buy_zone::compute(&mut conn, &code, as_of) {
             Ok(Some(zone)) => zone,
             Ok(None) => {
-                cache.skipped.push(format!("{} 无日线", ticket.code));
+                cache.skipped.push(format!("{code} 无日线"));
                 continue;
             }
             Err(error) => {
                 cache
                     .skipped
-                    .push(format!("{} 买点失败: {error}", ticket.code));
+                    .push(format!("{code} 买点失败: {error}"));
                 continue;
             }
         };
         let (Some(entry_low), Some(entry_high)) = (zone.entry_low, zone.entry_high) else {
-            cache.skipped.push(format!("{} 无入场区间", ticket.code));
+            cache.skipped.push(format!("{code} 无入场区间"));
             continue;
         };
-        let regime =
-            match ticket_regime::resolve(&mut conn, ticket.id, &ticket.code, &ticket.source, as_of)
-            {
-                Ok(decision) => decision.regime,
-                Err(error) => {
-                    cache
-                        .skipped
-                        .push(format!("{} 分型失败: {error}", ticket.code));
-                    continue;
-                }
-            };
+        let regime = match ticket_regime::resolve(&mut conn, ticket.id, &code, &ticket.source, as_of)
+        {
+            Ok(decision) => decision.regime,
+            Err(error) => {
+                cache
+                    .skipped
+                    .push(format!("{code} 分型失败: {error}"));
+                continue;
+            }
+        };
         cache.targets.push(TriggerTarget {
             ticket_id: ticket.id,
-            name: zone.name.clone().unwrap_or_else(|| ticket.code.clone()),
-            code: ticket.code,
+            name: zone.name.clone().unwrap_or_else(|| code.clone()),
+            code,
             prev_high,
             entry_low,
             entry_high,
@@ -441,11 +492,18 @@ pub fn invalidate_expired(db: &DatabaseManager, as_of: &str) -> Result<ExpiryRep
         let Some(proposed_at) = proposed_at else {
             continue;
         };
+        match invalidated_after_latest_proposal(&mut conn, ticket.id) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                report.errors.push(format!("{} {error}", ticket.code));
+                continue;
+            }
+        }
         let proposed_date: String = proposed_at.chars().take(10).collect();
         if proposed_date >= as_of.to_string() {
             continue; // 今天刚给的参考，跨日才谈失效
         }
-
         let regime =
             match ticket_regime::resolve(&mut conn, ticket.id, &ticket.code, &ticket.source, as_of)
             {
@@ -574,5 +632,56 @@ mod tests {
         assert!(text.contains("突破确认"));
         assert!(text.contains("情绪型"));
         assert!(text.contains("002696"));
+    }
+
+    #[test]
+    fn trigger_codes_are_unique_and_trimmed() {
+        let mut cache = TriggerCache::default();
+        cache.targets.push(target(10.0, Some(9.0)));
+        let mut duplicate = target(11.0, Some(9.5));
+        duplicate.ticket_id = 2;
+        duplicate.code = " 002696 ".to_string();
+        cache.targets.push(duplicate);
+        assert_eq!(cache.codes(), vec!["002696".to_string()]);
+    }
+
+    #[test]
+    fn invalidation_only_closes_the_current_proposal() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        diesel::sql_query(
+            "CREATE TABLE ticket_event (\
+               id INTEGER PRIMARY KEY AUTOINCREMENT,\
+               ticket_id INTEGER NOT NULL,\
+               event_kind TEXT NOT NULL,\
+               event_at TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .expect("ticket_event schema");
+        for (kind, at) in [
+            ("entry_proposed", "2026-10-20 15:40:00"),
+            ("entry_invalidated", "2026-10-21 09:31:00"),
+        ] {
+            diesel::sql_query(
+                "INSERT INTO ticket_event (ticket_id, event_kind, event_at) VALUES (1, ?1, ?2)",
+            )
+            .bind::<Text, _>(kind)
+            .bind::<Text, _>(at)
+            .execute(&mut conn)
+            .expect("insert event");
+        }
+        assert_eq!(
+            invalidated_after_latest_proposal(&mut conn, 1).unwrap(),
+            true
+        );
+
+        diesel::sql_query(
+            "INSERT INTO ticket_event (ticket_id, event_kind, event_at) VALUES (1, 'entry_proposed', '2026-10-22 15:40:00')",
+        )
+        .execute(&mut conn)
+        .expect("insert refreshed proposal");
+        assert_eq!(
+            invalidated_after_latest_proposal(&mut conn, 1).unwrap(),
+            false
+        );
     }
 }

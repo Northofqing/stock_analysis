@@ -332,28 +332,33 @@ pub fn phase_on(conn: &mut diesel::SqliteConnection, date: &str) -> Option<Marke
     row.and_then(|row| MarketPhase::parse(&row.phase))
 }
 
-/// 某票在某日的连板高度（读不到按 0 处理——不把未知当高位）。
-pub fn streak_on(conn: &mut diesel::SqliteConnection, date: &str, code: &str) -> u32 {
+/// 某票在指定日期可用的最新涨停池高度。
+///
+/// 09:25 时当日 15:35 的快照还不存在，因此不能只查 `trade_date = date`；
+/// 取 `<= date` 的最近一份快照，并返回 `None` 表示“未知”，调用方不得把它当成 0。
+pub fn streak_on(conn: &mut diesel::SqliteConnection, date: &str, code: &str) -> Option<u32> {
     #[derive(diesel::QueryableByName)]
     struct StreakRow {
         #[diesel(sql_type = Nullable<Integer>)]
         streak: Option<i32>,
     }
     let row: Option<StreakRow> = diesel::sql_query(
-        "SELECT streak FROM limit_up_pool_daily WHERE trade_date = ?1 AND code = ?2",
+        "SELECT streak FROM limit_up_pool_daily \
+          WHERE trade_date <= ?1 AND code = ?2 \
+          ORDER BY trade_date DESC LIMIT 1",
     )
-    .bind::<Text, _>(date.to_owned())
-    .bind::<Text, _>(code.to_owned())
+    .bind::<Text, _>(date)
+    .bind::<Text, _>(code)
     .get_result(conn)
     .ok();
     row.and_then(|row| row.streak)
         .map(|value| value.max(0) as u32)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::SqliteConnection;
 
     #[test]
     fn ice_when_limit_up_thin() {
@@ -382,5 +387,31 @@ mod tests {
     fn small_prev_pool_does_not_trigger_ebb() {
         // 昨日只有 10 只涨停，今天 5 只：不按「缩量 60%」判退潮（小样本不判）
         assert_eq!(classify(5, 1, Some(-3.0), 10), MarketPhase::Ice);
+    }
+
+    #[test]
+    fn streak_uses_latest_snapshot_before_as_of() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        ensure_schema(&mut conn).expect("market regime schema");
+        diesel::sql_query(
+            "INSERT INTO limit_up_pool_daily (trade_date, code, streak) VALUES (?1, ?2, ?3)",
+        )
+        .bind::<Text, _>("2026-10-23")
+        .bind::<Text, _>("001216")
+        .bind::<Integer, _>(4)
+        .execute(&mut conn)
+        .expect("insert prior snapshot");
+        diesel::sql_query(
+            "INSERT INTO limit_up_pool_daily (trade_date, code, streak) VALUES (?1, ?2, ?3)",
+        )
+        .bind::<Text, _>("2026-10-26")
+        .bind::<Text, _>("001216")
+        .bind::<Integer, _>(1)
+        .execute(&mut conn)
+        .expect("insert same-day snapshot");
+
+        assert_eq!(streak_on(&mut conn, "2026-10-26", "001216"), Some(1));
+        assert_eq!(streak_on(&mut conn, "2026-10-25", "001216"), Some(4));
+        assert_eq!(streak_on(&mut conn, "2026-10-22", "001216"), None);
     }
 }

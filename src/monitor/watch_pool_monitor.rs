@@ -90,6 +90,23 @@ fn watch_codes(conn: &mut SqliteConnection) -> Result<Vec<String>, String> {
     Ok(codes)
 }
 
+/// 行情请求要求「非空且唯一」，而 ticket/板块/概念三个来源可能有重复或空白。
+/// 在发请求前统一清理，避免整批被 invalid_request 拒绝。
+fn normalized_unique_codes(codes: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    codes
+        .into_iter()
+        .filter_map(|code| {
+            let code = code.trim();
+            if code.is_empty() || !seen.insert(code.to_owned()) {
+                None
+            } else {
+                Some(code.to_owned())
+            }
+        })
+        .collect()
+}
+
 /// 扫描一轮。返回本轮触发的异动。
 ///
 /// `last_prices` 是上一轮的观测价（调用方维护），用于判断盘中急变。
@@ -102,6 +119,7 @@ pub async fn scan(
         let mut conn = db.get_conn().map_err(|e| e.to_string())?;
         watch_codes(&mut conn)?
     };
+    let codes = normalized_unique_codes(codes);
     if codes.is_empty() {
         return Ok(Vec::new());
     }
@@ -338,6 +356,10 @@ async fn load_peer_alerts(
     if candidates.is_empty() {
         return Ok(HashMap::new());
     }
+    let candidates = normalized_unique_codes(candidates);
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
 
     let bridge = crate::data_gateway::grpc_source::bridge_for("RealtimeQuotes")
         .map_err(|error| error.to_string())?;
@@ -532,5 +554,18 @@ mod tests {
         assert!(text.contains("600703"));
         assert!(text.contains("三安光电"));
         assert!(text.contains("-3.50%"));
+    }
+
+    #[test]
+    fn normalized_codes_trim_and_dedupe() {
+        let got = normalized_unique_codes(vec![
+            "001216".to_string(),
+            " 001216 ".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+            "600396".to_string(),
+            "600396".to_string(),
+        ]);
+        assert_eq!(got, vec!["001216".to_string(), "600396".to_string()]);
     }
 }
