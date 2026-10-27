@@ -15,6 +15,7 @@
 - 2026-10-23：批 0 入库（eddb6d49e）；批 1 分型体系全部落地 + 批 2 七项接线 + 批 4.1/4.2 口径修正（621ea15cf，见「1.7 实施记录」）。
 - 2026-10-24：批 2 补 2.5 概念扩展、2.6 龙虎榜归档接线；批 5 两项探源出结论（5.1 商品源可用、5.2 提案零成交）；2.4 探针证明降级不成立。
 - 2026-10-24（下午）：日线改走**通达信盘后文件**（`tdx_day_import`），6,187,698 行进库、覆盖 5,229 只、2021-08 起（0.11）；桥内补齐 Tencent 7 字段并重启（见 0.12）。
+- 2026-10-26：华瓷股份(001216)案例触发“机制归因不等于判断正确”评审；新增第十一节专家级证据与验证方案（P0 高位门/streak 口径、原始证据包、独立复核、预先登记结果）。
 
 ## 调整记录
 
@@ -1340,3 +1341,1487 @@ entry_proposed 事件 37 条（10-21 33 条 / 10-22 4 条）
 
 **不是对端问题的（明确排除）**：个股新闻断供（news_items 每日 570~690 条在进，
 AI 评估 Mac 侧断）、公告通道未接线（Mac 侧）、竞价 op 61/涨停池已通。
+
+## 十一、专家级证据与验证方案（2026-10-26 新增）
+
+> 本节回答的不是“系统为什么给出这个数”，而是“凭什么相信这个数”。
+> 前者是代码路径归因，后者需要原始素材、独立复算和样本外结果。两者不能互相代替。
+> 状态：待实施；不改变现有选股规则、不自动交易、不新增 schema 列。
+
+### 11.1 触发案例：华瓷股份(001216)
+
+2026-10-26 09:25 的推送原文：
+
+```text
+001216 华瓷股份 竞价 26.60（-5.41%）→ 买价 26.60〔低开博弈区〕
+```
+
+同一交易日可核对的事实：
+
+| 时间 | 事实 | 证据 |
+|---|---|---|
+| 09:00 | P01 推送 3 只“样本观察”，华瓷为第 3 只；分类“MLCC粉体+氧化锆微珠+日用陶瓷” | `data/push_log/2026-10-26/` 当日归档；`ticket_lifecycle` #69 |
+| 09:25 | 竞价买价任务 `emotion=15 quoted=14 skipped_high=1 skipped_phase=0` | stderr `[竞价买价]` 行 |
+| 09:39 | 另一条盘中信号链：`共振=-96 建议=回避/卖出` | stderr `[信号融合]` 行 |
+| 09:45 | HoldingPlan 给“加仓观察”，现价 25.31，成本 26.61，500 股，浮亏约 -4.9% | `durable_delivery` 当日 HoldingPlan 归档 |
+| 09:25 时只读查库 | `limit_up_pool_daily` / `market_regime_daily` 两张表不存在 | 运行根 `stock_analysis.db` `sqlite_master` |
+| 台账 | ticket #69 note 写 `streak=4`、推荐价 28.12 | `ticket_lifecycle` / `ticket_event` |
+| 原始日线 | 10/19 +10.00%、10/20 -5.76%、10/21 +10.00%、10/22 +1.43%、10/23 +10.02% | `stock_daily` |
+
+注：`market_regime` 两表是 2026-10-24 才加入的盘后表，10/26 09:25 前还没有经历过一个交易日的 15:35 写入；
+10/26 15:35 之后已首次写入（1 行市场阶段、55 行涨停池），表不存在不等于代码没上线；
+但 `streak_on` 只查当天行，09:25 的结构问题仍然成立。
+
+最后一行说明：**上游字段 `streak=4` 不能直接当作“四连板”事实**，必须先核对源字段口径。
+本次现有证据只能达到下文 L1（系统日志 + 台账 + 已接纳行情），没有达到 L2/L3，
+因此不能回答“财报不佳是否应改变这个买价”。
+
+### 11.2 目标与边界
+
+目标：
+
+1. 每一个带价格的 ticket 决策都有可追溯的证据包，覆盖“选入理由、定价依据、风险/基本面、持仓上下文”四层。
+2. 证据缺失必须显式写“缺失/未核实”，不能用 0、空串或“系统默认”代替。
+3. 原始行情、原始涨停池字段、公告/财报原文、账户快照至少各有一条独立来源；单靠推送正文不算。
+4. 每一条可执行价格都能被独立脚本从原始素材重算，且结果可归档、可复核。
+5. 推荐效果用预先登记的样本外结果衡量，不用单个案例证明规则正确。
+
+不做：
+
+- 不把财报打分塞进选股排序（沿用 8.5 拓 6：财报只做排雷/归因，不进选票打分）。
+- 不自动调参、不自动交易、不根据单日结果关闭规则。
+- 不因缺少数据而编造财务数字、资金流、竞价盘口或关联公司。
+- 不新增 `ticket_lifecycle` 列；新增状态优先用 `ticket_event` 或文件归档（铁律 26）。
+
+### 11.3 证据分级（本方案统一口径）
+
+| 等级 | 内容 | 能证明什么 | 不能证明什么 |
+|---|---|---|---|
+| L0 | 推送正文、系统摘要 | 系统当时这样说了 | 数据是否真实、判断是否正确 |
+| L1 | L0 + 原始行情/涨停池 batch id、source binding、确定性回放 | 系统当时看到了什么、如何算出该价 | 财报是否真实、外部世界是否认同 |
+| L2 | L1 + 公司公告/财报原文/完整新闻原文 | 公司披露了什么、信息来源是什么 | 两家数据源是否一致、规则是否有效 |
+| L3 | L2 + 第二独立来源逐字段核对 | 关键事实不是单一供应商错误 | 未来收益是否为正 |
+| L4 | L3 + 预先登记的样本外结果（含成本、可成交率、对照组） | 规则在历史样本外是否有稳定优势 | 未来一定盈利、单票一定正确 |
+
+华瓷本次：**L1**。L2 未做，L3 未做，L4 未做。
+`market_regime` 高位门未生效的排查结论属于 L1 机制证据，不等于“财报差的票不能买”。
+
+### 11.4 工作项与落点
+
+| 编号 | 优先级 | 工作项 | 主要落点 | 产出 |
+|---|---|---|---|---|
+| 6.1 | P0 | 09:25 高位门修复与 streak 口径 | `market_regime.rs`、`ticket_auction_price.rs`、`main.rs` | 可解释的高位门，不再静默按 0 处理 |
+| 6.2 | P0 | 原始字段语义探针 | `grpc_bundle_probe` / 新 `limit_pool_probe` | `streak` 等字段的数据字典 |
+| 6.3 | P1 | ticket 证据包 | 新 `ticket_evidence.rs`、`ticket_event`、文件归档 | 每次决策的 L1 JSON + 摘要 |
+| 6.4 | P1 | 持仓上下文 | `portfolio` / 快照 / 竞价输出 | “新买/加仓”与仓位风险可见 |
+| 6.5 | P1 | 公告原文接线 | `EventCalendarGateway::market_announcements` | 公告标题/日期/链接/来源哈希 |
+| 6.6 | P1 | 结构化财务事实 | `CompanyDataGateway::financial_statements` | 原始报表行、报告期、公告日 |
+| 6.7 | P1 | 原始竞价归档 | `auction_watch` / `auction_watch_loop` | 每日可重放的竞价原始行 |
+| 6.8 | P2 | 条件收益与样本外评估 | 新 `scripts/ticket_expert_eval.py` | 含成本、对照组、置信区间的报告 |
+| 6.9 | P2 | 独立审计脚本 | 新 `scripts/ticket_evidence_audit.py` | 每日 PASS/PARTIAL/FAIL |
+| 6.10 | P1 | 输出语义与冲突披露 | `ticket_auction_price` / `p01` / HoldingPlan 渲染 | 不再把“参考价”写成“买价” |
+
+#### 6.1 P0：09:25 高位门修复与 streak 口径
+
+**已确认的机制问题**
+
+`ticket_auction_price::build` 的高位过滤：
+
+```text
+streak >= EMOTION_STREAK && phase == Some(Climax) -> skipped_phase
+```
+
+但 `streak_on(as_of=today)` 只查 `limit_up_pool_daily.trade_date = today`，而该表由
+15:35 的盘后任务写入；09:25 时当日行必然不存在。只读查库时该表本身也不存在。
+`streak_on` / `phase_on` 查询失败返回 `0` / `None`，于是本次 `skipped_phase=0`，
+并不是“系统判断它不属于高位”。
+
+**动作**
+
+1. `market_regime::ensure_schema` 在 monitor 启动时也执行一次；不允许只在 15:35 首次建表。
+2. `streak_on` 改为取 `trade_date <= as_of ORDER BY trade_date DESC LIMIT 1`，返回
+   `Option<u32>`；无数据返回 `None`，不再把未知压成 0。
+3. `ticket_auction_price` 分别记录 `streak`、`streak_source_date`、`phase`、
+   `phase_source_date`；未知时在正文/证据包写“高位状态未核实”，不得写成“已检查”。
+4. 保留现有语义：只有 `phase == Climax` 且 `streak >= 4` 才跳过；其他阶段继续给价。
+   是否“未知即不报价”是产品决策，见 11.6 D4；默认先只标注，不拦截。
+5. P01 的 `streak` 台账字段仍保留，但必须先经 6.2 探针确认语义后才能展示为“连板”。
+
+**验证**
+
+- `cargo test --lib market_regime`、`cargo test --lib ticket_auction_price`：
+  无当日行、有前一日行时取前值；无表时返回 None；Climax + 4 板跳过；非 Climax 不跳过。
+- 连续 3 个交易日日志出现 `streak_source_date=`、`phase_source_date=`、`skipped_phase=`，
+  且每次跳过都能回指到一条已知日期的快照。
+- 华瓷案例回放：至少输出“streak 来源/是否未知”，不能再出现无法解释的 `skipped_phase=0`。
+
+**做不到**
+
+只修“读取时点”和“未知标记”，不修上游 `streak` 的口径；不保证高位门从此一定拦截，
+因为是否拦截还取决于市场阶段是否被判定为高潮。
+
+#### 6.2 P0：原始字段语义探针
+
+**目的**：把 `LimitPools` 原始响应中的 `streak / price / sealed_amount / break_count /
+first_seal_at / board_name` 与 `stock_daily` 原始日线逐票对照，确认“连板”的确切含义。
+
+**动作**
+
+1. 扩展 `src/bin/grpc_bundle_probe.rs` 或新增 `src/bin/limit_pool_probe.rs`：
+   对指定交易日、指定 code 打印原始 `LimitPoolEntry` 全字段 + 该票最近 10 根日线。
+2. 对 2026-10-23 的 3 只 P01 head 做逐票核对，至少包括 001216、603278、002724。
+3. 把结论写入 `docs/data-dictionary/limit-pool-fields.md`（新建；若无该目录则写入
+   `docs/data-dictionary.md`）：字段名、源类型、样例、是否等于连续涨停、缺失含义。
+4. 在未确认前，所有用户可见文案把 `streak` 写成“涨停池高度字段”，不写“四连板”。
+
+**实测起点**
+
+001216 的 `streak=4` 与 10/19~10/23 原始日线不一致（中间有 -5.76% 和 +1.43% 两根），
+因此上游极可能是“近 N 日涨停次数/区间高度”而不是连续涨停。这个判断必须先由原始响应确认，
+不能只看台账就定案。
+
+**验收**
+
+- 探针输出保存到 `data/ticket_evidence/probes/<date>-limit-pool.json`；
+- 每个 P01 head 都有“原始 streak / 日线重算值 / 差异原因”三列；
+- 数据字典里不再有“连板”歧义词；文末写明未核对的字段。
+
+#### 6.3 P1：每次决策的 ticket 证据包
+
+**设计**
+
+新增 `src/monitor/ticket_evidence.rs`，不新增数据库列。每次关键决策写两份：
+
+1. `ticket_event(kind='evidence_bundle')`，summary 只放
+   `path|sha256|level=L1|missing=...`，便于按 ticket 检索；
+2. 文件 `data/ticket_evidence/<date>/<code>-<occurrence>.json`，保存完整证据。
+
+证据包最小字段：
+
+```json
+{
+  "schema_version": "ticket-evidence-v1",
+  "business_date": "2026-10-26",
+  "code": "001216",
+  "ticket_id": 69,
+  "captured_at": "...",
+  "level": "L1",
+  "selection": {
+    "source": "p01_preopen",
+    "concept": "MLCC粉体+氧化锆微珠+日用陶瓷",
+    "limit_pool_batch_id": "...",
+    "streak_raw": 4,
+    "recommend_price_raw": 28.12,
+    "news": [{"title": "...", "source_name": "...", "published_at": "...", "canonical_url": null}]
+  },
+  "pricing": {
+    "auction_batch_id": "...",
+    "auction_source_at": "...",
+    "auction_price": 26.60,
+    "auction_pct": -5.41,
+    "tier": "bargain",
+    "quoted_price": 26.60,
+    "streak": null,
+    "streak_source_date": null,
+    "phase": null,
+    "phase_source_date": null
+  },
+  "portfolio": {
+    "position_quantity": 500,
+    "cost_price": 26.61,
+    "market_value": null,
+    "weight_pct": null,
+    "source": "user_confirmed_snapshot"
+  },
+  "fundamentals": {
+    "status": "unavailable",
+    "reason": "financial_statements_not_fetched"
+  },
+  "missing": ["official_filing", "independent_financial_source", "raw_auction_depth"],
+  "source_hashes": {}
+}
+```
+
+**接入点**
+
+- P01 开票后：`p01.rs::record_p01_tickets`；
+- 09:25 竞价买价：`ticket_auction_price::build` 返回前或 `auction_watch_loop` 推送前；
+- 盘中/持仓动作：后续接入 HoldingPlan 的 source binding，先做 P01 + 09:25 两条。
+- 所有字段必须带 `source` / `observed_at` / `batch_id` / `sha256`（有则填，无则 `null` 并进 missing）。
+
+**验收**
+
+- 任取一个 ticket，能从 `/data/ticket_evidence/<date>/` 还原当时的选入、定价、持仓、缺失项；
+- `sha256` 与文件内容一致；重放脚本能算出同一个 `quoted_price`；
+- 一条证据缺失一定在 `missing` 中出现，不允许空值静默通过。
+
+#### 6.4 P1：持仓上下文（先看账户，再看买价）
+
+**原因**：华瓷案例中，09:45 快照已有 500 股、成本 26.61；26.60 不是“新买一只票”，
+而是对已浮亏仓位继续加仓。只给单票买价，等于隐藏了真实风险。
+
+**动作**
+
+1. 读取已确认快照/当前持仓（`portfolio::load_positions()` 及 `user_position_snapshot`），
+   在证据包里写 `position_quantity / cost_price / pnl_pct / weight_pct / available_quantity`。
+2. 09:25 推送增加一行：
+   `持仓：已有 500 股，成本 26.61，浮亏 -4.9%（本次为加仓观察，不是新买入）`；
+   无持仓时明确写 `持仓：无`，不能省略。
+3. 读取 `weekly_budget` 的剩余预算和单板块集中度，写入证据包；正文只标“预算占用/排队”，
+   不硬拦截（沿用 D3）。
+4. 找不到确认快照时写 `portfolio.status=unavailable` 并说明原因，不用成本 0 或数量 0 代替。
+
+**验收**
+
+- 用华瓷 10/26 快照做 fixture，输出必须含 `已有 500 股/成本 26.61`；
+- 无持仓的票不得出现“加仓”字样；
+- 金额、数量、成本与快照逐字段相等。
+
+#### 6.5 P1：公告原文接线（L2 的第一步）
+
+现有 `EventCalendarGateway::market_announcements(date, limit)` 已经返回
+`EventAnnouncement { announcement_id, code, category, title, published_at, canonical_url }`，
+但当前只服务新闻告警，不写 ticket 证据包。该通道是 CNINFO 聚合，不是交易所原文全文。
+
+**动作**
+
+1. 每日对活跃 ticket 的 code 过滤 `EventAnnouncement`，把命中项写
+   `ticket_event(kind='filing')` + 证据包 `filings[]`。
+2. 使用 `canonical_url` 直接回链原文；不把标题改写成“利好/利空”。
+3. 若公告通道失败，写 `filings.status=unavailable` 和 reason；F10 关键词只作为
+   `risk_flag` 的过渡来源，不冒充公告原文。
+4. 对“财报差”的判断，必须优先读原文/结构化报表；聚合标题只能作为线索。
+
+**验收**
+
+- 连续 3 个交易日活跃票的公告覆盖数、命中数、失败原因均可见；
+- 一条已知公告能用 `announcement_id + canonical_url` 回查；
+- 不在证据包中出现无来源的“重大利好/利空”结论。
+
+**做不到**
+
+`MarketAnnouncements` 是当日全市场分页，limit 有上限；不能保证覆盖所有历史公告。
+历史公告全文需要另建下载/解析链，先列为后续项，不在本批承诺。
+
+#### 6.6 P1：结构化财务事实（只做证据，不做选股打分）
+
+现有 `CompanyDataGateway::financial_statements(codes, kind)` 走
+`FinancialStatements`，返回 `FinancialStatement { report_period, announced_on, lines, evidence }`；
+原始行有 `key / source_label / value / unit`，缺失保持 `None`（BR-222）。
+
+**动作**
+
+1. 对 P01/持仓活跃票拉取资产负债表、利润表、现金流量表；证据包只存原始行和报告期，
+   不在拉取层做“好坏”结论。
+2. 新增 CLI（建议 `src/bin/ticket_fundamentals.rs`）生成一份规范化摘要：
+   - 报告期、公告日、币种、数据源、batch id；
+   - 营收/净利润/经营现金流、应收、存货、负债等**实际存在的行**；
+   - `missing_lines[]` 与 `unavailable_reason`。
+3. 只计算源数据足够且定义明确的指标：营收同比、净利润同比、OCF/净利润、应收/营收、
+   存货周转、资产负债率、毛利率；任一输入缺失则整项标 `unavailable`，不插值。
+4. 第二独立来源（Wind/Choice/券商导出或另一供应商）先做探源；当前
+   `FINANCIAL_STATEMENT_PROVIDER_ORDER` 只有 Sina，不能自称“双源核对”。
+
+**验收**
+
+- 华瓷能取到 2026 三季报或明确写 `report_not_available`；
+- 每个数字带 `report_period + announced_on + source + batch_id`；
+- 同一指标在第二个来源出现差异时，输出两值、差异和以哪个为准的理由，禁止静默取平均。
+
+#### 6.7 P1：原始竞价归档（为以后独立复算）
+
+现在的 09:25 推送只保存渲染正文；`AuctionRow` 没有 batch id / source_at / observed_at，
+事后无法从原始行重算 26.60。
+
+**动作**
+
+1. 扩展 `AuctionRow` 或在 `auction_watch::observe` 内保留 `GatewayBatch` 的 evidence；
+2. 每日 09:25 成功后写 `data/auction_raw/<date>.json`，每行至少：
+   `code / name / auction_price / auction_pct / auction_volume_ratio / provider /
+   source_at / observed_at / batch_id`；
+3. 写文件成功再写 `data/auction_price/<date>` marker；失败重试，不能只写 marker；
+4. 回放工具读取原始文件，重新执行 `tier_for` / `quote_price`，必须得到同一价格。
+
+**验收**
+
+- 华瓷 10/26 原始文件存在，回放得到 26.60 / Bargain；
+- `source_at` 与推送中 09:25 的竞价时刻一致；
+- 连续 3 个交易日原始文件行数等于当日 active+持仓报价数（缺失单独计数）。
+
+**边界**
+
+op 61 提供的是竞价终态报价，不是完整逐笔/盘口深度；无法据此验证成交概率和撤单，
+只能验证“系统拿到的竞价价是什么”。完整盘口需要新的数据源，见 11.6。
+
+#### 6.8 P2：条件收益与样本外评估
+
+**目的**：回答“财报差的低开情绪票是否更差”“26.60 这类价位是否有正期望”，
+而不是用华瓷一只票的涨跌下结论。
+
+**预先登记（必须先写后跑）**
+
+新建 `data/research/ticket_expert/2026-10-26-preregistration.json`，至少写：
+
+- 研究问题与方向（例如“财务质量差的低开组 D+1 均值更低”）；
+- 样本定义：涨停次日、竞价/开盘低开 >2%、剔除停牌/ST/无法成交；
+- 分组：财务质量（OCF/净利润、净利润同比、应计项）、是否有底仓、streak 口径、市场阶段；
+- 主要指标：D+1/D+3 收盘收益、相对行业/市场超额、最大回撤、可成交率；
+- 成本：双边 0.2% 作为基准，另做 0.1%/0.3% 敏感性；
+- 样本切分：按时间前 60% 训练、后 40% 验证，或 walk-forward；
+- 最小样本量与“不结论”阈值；
+- 文件 sha256 与生成时间。
+
+**脚本**
+
+`scripts/ticket_expert_eval.py`（只读 `stock_analysis.db` + 证据包）：
+1. 用 `stock_daily` 原始日线构造事件样本，严格按公告日/交易日做 PIT；
+2. 同一交易日、同行业或同市值组做对照；
+3. 输出均值、中位数、胜率、bootstrap 95% CI、可成交率、最大回撤；
+4. 按财务质量分组做交互检验，报告样本量；n 不足时只写“样本不足，不结论”；
+5. 结果写 `data/research/ticket_expert/<date>-report.json` + Markdown 摘要。
+
+**验收**
+
+- 预登记文件先于结果文件存在且 hash 可查；
+- 报告中每个结论都有 n、区间、成本假设和对照组；
+- 样本外区间不参与调参；如果规则是在全样本上选的，明确标“探索性，不是验证”。
+
+**边界**
+
+历史竞价数据此前没有落库，6.7 只能从上线日起积累；在积累足够前，历史回测用
+开盘价近似竞价价，报告必须标注“近似，不是真实竞价成交”。
+
+#### 6.9 P2：独立审计与第三方可复现
+
+新增 `scripts/ticket_evidence_audit.py`，只读运行，不写生产库。检查项：
+
+1. 每个 P01/09:25/HoldingPlan 决策是否都有证据包；
+2. 每份证据包是否有 `source/batch_id/observed_at/sha256`，是否存在未来时间；
+3. 用原始竞价文件重算 `quoted_price`，与推送正文一致；
+4. 原始涨停池字段与数据字典一致；`streak` 语义未确认时标 `UNVERIFIED`；
+5. 结构化财务事实是否能回链到报告期/公告日；第二来源缺失时标 `SINGLE_SOURCE`；
+6. 记录冲突：同一票同日出现“加仓”与“回避/卖出”时必须列出，不得只保留一条。
+
+输出 `data/audit/ticket_evidence/<date>.json`，状态 `PASS / PARTIAL / FAIL`，
+并打印每个失败项的修复入口。第三方只需数据库只读副本 + `data/ticket_evidence` +
+`data/auction_raw` + 脚本即可复算。
+
+**验收**
+
+- 连续 3 个交易日 `PARTIAL/FAIL` 项有明确原因，不允许“没检查”；
+- 任何 `PASS` 必须能从原始文件复算出同一结论；
+- 审计脚本不依赖主进程内部状态。
+
+#### 6.10 P1：输出语义与冲突披露
+
+现有文案把所有档位都叫“买价”，但实际含义不同：
+
+- 09:00 P01 是“样本观察”，不是推荐买入；
+- 09:25 是情绪型竞价参考，不是成交承诺；
+- 09:45 HoldingPlan 是持仓动作建议，不是新买入。
+
+**动作**
+
+1. `ticket_auction_price::PriceLine::render` 把“买价”改为：
+   `竞价参考价`；无原始行情/证据包时写 `参考价（证据不足）`，不写“买价”。
+2. 有底仓时前缀 `持仓加仓参考`；无底仓才可写 `新买入参考`。
+3. 同日出现 `signal_fusion` 负分或 `risk_flag` 时，证据包和正文加一行：
+   `⚠ 冲突/风险：...`，不能静默省略。
+4. P01 标题保持“样本观察”，不改成“推荐”；如果未来要升级为推荐，必须先达到 L2+
+   并由 operator 拍板，不能在代码里偷偷改词。
+
+**验收**
+
+- 华瓷回放正文出现“竞价参考价 26.60 / 低开博弈区 / 已有 500 股 / 高位状态未核实”；
+- 无证据时不得出现“买价/建议买入”；
+- render 单测覆盖“有底仓/无底仓/冲突/证据不足”四种情况。
+
+#### 6.10.1 现有模板内容审计矩阵（2026-10-27 补）
+
+6.10 原来只覆盖竞价 `PriceLine` 和 P01 标题，**没有系统覆盖所有用户可见模板**。
+这会出现证据包写“参考价（证据不足）”、正文仍写“买价/低吸/建议买入”的矛盾。
+现有模板必须纳入同一套输出语义，至少覆盖：
+
+| 模板/入口 | 当前内容特征 | 必须改/验收 |
+|---|---|---|
+| `push_templates::render_bound_preopen_news_hot`（09:00 P01） | “盘前热点 … 只样本观察”，带依据前一交易日、来源新闻 | 保持“样本观察”，不得出现“推荐/买入”；补证据来源/缺失标记 |
+| `ticket_auction_price::PriceLine::render` + `AuctionPriceReport::render`（09:25） | “买价”“09:25 竞价买价”，末尾有 T+1 提示 | 改为“竞价参考价”；无原始行情/证据包写“参考价（证据不足）”；有底仓写“持仓加仓参考” |
+| `push_templates::render_candidate_triggered` / `render_candidate_invalidated`（突破确认） | “低吸参考”“止损”“需人工确认”，已带证据质量行 | 把“低吸参考”改成“参考区间（未核验成交）”；输出证据包状态和失效原因，不把触发写成成交 |
+| `push_templates::render_tomorrow_watch`（R-07 明日观察池） | “触发 / 低吸 lo~hi / 止损”，来源和理由 | 改为“参考区间 / 失效价”；标来源与证据等级；无证据不得写“低吸” |
+| `push_templates::render_holding_plan` / `render_holding_event`（持仓） | “成本参考价位 / 止损线 / 可用股数”，已有“非下单指令” | 明确“参考价”，补持仓上下文和行情证据状态；无可用行情时不写确定价位 |
+| `buy_zone_dispatch` 明日计划正文（非 `push_templates`） | “买点 / 止损 / 仓位建议”，持仓段只给加仓/止损 | 同样按“参考价/参考区间”口径；与证据包字段对账，不只改模板函数 |
+| `push_templates::render_auction_volume`（盘中竞价热点） | “观察池今日… 辅助建议，非下单指令” | 不含个股买价；保留“非下单指令”，不得新增“买价”字样 |
+
+**模板验收（不是只看 render 编译通过）：**
+
+1. 每个模板至少四组正文断言：正常 / 无原始证据 / 有底仓 / 冲突或风险；
+2. 禁止词表：证据不足时不得出现 `买价`、`建议买入`、`低吸`、`保证成交`；
+3. 必现词表：`参考价`或`参考区间`、`证据不足`/`未核验成交`、`非下单指令`；
+   09:25 竞价正文必须保留 `T+1 不可卖`；
+4. 用 `data/push_log/` 或 `delivery_decisions` 的 `rendered_content` 与同一 ticket
+   证据包逐字段对账；正文与证据包不一致时审计判 `FAIL`，不能只看日志“已推送”；
+5. 新增模板或新增输出字段时，必须先补本矩阵和对应四态用例，否则不允许上线。
+
+### 11.5 交付顺序与验收门
+
+| 阶段 | 内容 | 依赖 | 完成判据 |
+|---|---|---|---|
+| A（下一交易日开盘前，若批准部署） | 6.1 + 6.2 | 无 | 09:25 日志能解释 streak/phase 来源；原始字段探针有结果 |
+| B（A 后 2~3 个交易日） | 6.3 + 6.4 + 6.7 + 6.10 | A | P01/09:25 证据包覆盖 100%；原始竞价可回放；有底仓显示正确 |
+| C（数据源探通后） | 6.5 + 6.6 | 公告/财报网关可用 | 公告可回链；财务事实有报告期与来源；缺数据显式标注 |
+| D（积累 2~4 周样本后） | 6.8 + 6.9 | B/C + 原始样本 | 预登记在前；报告含 n/CI/成本/对照；审计可独立复算 |
+
+阶段 A/B 不依赖外部供应商，可先做；C 受 `MarketAnnouncements` 分页和
+`FinancialStatements` 单源限制；D 不能提前宣称完成。
+
+### 11.6 待拍板与外部依赖
+
+**D4：streak/phase 未知时是否给价**
+
+- A（建议，先采用）：继续给“参考价”，但在正文和证据包明确“高位状态未核实”；
+- B：P01 情绪票在高位状态未知时不报价，安全性更高，但会减少可见机会；
+- C：仅对 streak 已知≥4 且 phase 未知的票不报价，折中。
+
+建议先 A，积累 2 周后按审计数据决定是否升级为 B/C。不能在未知时静默当作 0。
+
+**D5：财报证据的角色**
+
+- 建议保持现有决策：财报只做排雷/归因，不进选票打分；但必须把“财报未审”写进证据包，
+  不能把“没有财报输入”包装成“财报没问题”。
+
+**外部依赖**
+
+1. 第二独立财务来源（Wind/Choice/券商导出或另一供应商）：当前 `FinancialStatements`
+   只固定 Sina，单源不能自称交叉核对。
+2. 竞价逐笔/盘口：op 61 只有终态报价，若要做成交概率和撤单分析，需要新数据源；
+   没有之前只能验证“看到的价”，不能验证“一定买得到”。
+3. 公告全文：`MarketAnnouncements` 是分页元数据，历史全文下载/解析另立任务；
+   在此之前 L2 只能做到“公告标题/链接”，不能做全文抽取。
+4. PIT 板块成员：`board_member_snapshot` 代码 2026-10-24 才加入，10/26 15:45 首次生成
+   （3,457 行，trade_date=2026-10-26）；此前历史没有快照，仍不可回看。
+
+### 11.7 本次证据边界（必须随结论一起写）
+
+- 已核对：推送归档、ticket 台账、生产日志、运行根同版源码、已接纳行情、当前库表状态。
+- 已推断但未完成原文核对：`streak=4` 的真实口径；华瓷“财报不大行”的具体项目与幅度。
+- 未核对：华瓷三季报/年报原文、审计意见、公告全文、第二家财务数据源、逐笔竞价/盘口。
+- 因此本次结论只能写到“26.60 是竞价规则产物，且高位门本次没有被证明生效”，
+  不能写到“财报差所以该跌”或“规则长期无效”。
+
+### 11.8 重写后的研究题目与可开发性边界（2026-10-27 回写）
+
+> 目标是“更深”，不是“更大”：不新增阶段、不扩推送、不先做全市场平台，
+> 先把一只票从原始证据到可执行性与可证伪结论做成一条可复核的纵向切片。
+
+**题目：单票生命周期决策审计——从原始证据到可执行性与可证伪结论**
+
+给定一只最近被系统推荐过买入价的 A 股（首选 001216），以推荐日 T 为基准，回答五个问题：
+
+1. **为什么是这只票**：逐层还原“全市场候选 → 观察池 → ticket → 入场提案”，
+   每个门槛的真实输入、阈值、默认值、失败语义；区分规则选择与数据恰好可得。
+2. **为什么是这个价格**：价格由哪条代码路径生成、依赖哪些原始行情/竞价/日线；
+   关键数据缺失时系统如何降级；它是参考价还是可成交价。
+3. **这个价格能执行吗**：按 A 股规则重建集合竞价、涨跌停、T+1、整手、费用、
+   滑点、流动性、排队/成交概率；给出参考价 vs 可成交价 vs 成交概率。
+   没有校准数据时只能写 `UNKNOWN`，不得编概率。
+4. **结果由什么解释**：把 T+1/T+3/T+5 拆成市场、板块、风格、个股 alpha，
+   再拆成选股、择时、仓位、执行；给出 MFE/MAE、未触发机会成本、止损后走势。
+5. **下次还会这样吗**：用同期条件相近但未被选中的票做对照组；给出样本量、
+   置信区间、预注册证伪条件、样本外/前瞻验证或明确“样本不足”。
+
+**交付物**（按顺序）：
+
+- A. 一页决策 memo：结论、三条最强证据、三条反证、未知项。
+- B. 单票原始证据包：原始行情/竞价、公告/财报原文、新闻原文、系统原始 payload、
+  规则版本/构建哈希、投递回执、账户/成交记录；每项带 source、时间、hash。
+- C. 时间轴：signal → candidate → ticket → price → push → human action →
+  fill/no-fill → outcome → attribution，标“当时已知/事后已知”。
+- D. 规则与门槛审计表：claim｜代码/参数｜输入｜默认值｜失败分支｜证据｜反证｜置信度。
+- E. 可执行性报告：参考价、可成交价、成交概率（或 UNKNOWN）、成本、容量、不能成交原因。
+- F. 归因报告：市场/板块/风格/alpha、选股/择时/仓位/执行、路径指标。
+- G. 对照与证伪报告：对照组、样本量/功效、预注册条件、样本外结果、推翻条件。
+- H. 独立复核记录：第二人/独立脚本复现、哈希、差异清单。
+
+**硬约束**：
+
+- 不新增功能/表/推送，不改选股规则、不调参、不自动交易。
+- 不拿单票证明普遍性；不拿系统日志当原始证据；不拿 AI 摘要当财报原文。
+- 数据拿不到就标 `UNKNOWN` 并说明阻断哪个结论；禁止补 0/补价格/补映射。
+- 先做纵向证据链，不做横向功能扩张；先能证伪，再谈优化。
+
+**验收门**：
+
+- 每个结论可追到原始材料/代码行/时间戳；
+- 独立复核能从证据包重算出同一结果；
+- 必须同时列出支持证据与反证；
+- 最后给出“保留/修改/停用”的明确建议；证据不足时写“不能判定”及所需样本量。
+
+**当前判断：这是研究/验收题目，不是可直接开发的施工图。**
+
+直接交给开发会缺四类东西：
+
+1. **文件级落点**：未定模块、函数、表、调度点、幂等键、失败重试和回滚。
+2. **数据现实**：现有 `ticket_lifecycle` / `ticket_event` / `delivery_decisions` /
+   `stock_daily` / `board_member` / `market_regime_daily` /
+   `attribution_benchmark_daily` / `push_log` 可支撑 L1 证据包；
+   但原始竞价委托/逐笔/盘口、公告与财报全文、第二独立财务源、真实成交/排队数据
+   仍缺失，不能承诺“专家级原始素材”全部可得。
+3. **对照组口径**：同期未选中票从哪张表、哪个时点、哪些字段匹配，样本量和检验
+   方法尚未写成可执行查询；当前库主要保留最终入池票，淘汰/候选快照是否完整待证。
+4. **执行概率校准**：涨跌停/T+1/整手/费用可规则化，成交概率需要原始竞价/成交数据；
+   没有校准时只能输出“可执行性未知”，不能输出概率结论。
+
+**要变成施工图，第一条纵向切片至少应补：**
+
+- `src/monitor/ticket_evidence.rs`：证据包索引与缺口标注，只读现有库/原始归档；
+- `src/bin/ticket_audit.rs`：`--code --as-of --out` 生成时间轴、门槛审计、hash manifest；
+- `scripts/ticket_audit_eval.py`：MFE/MAE、T+N、市场/板块/风格分解；
+- `scripts/ticket_control_group.py`：PIT 全市场候选、匹配对照组、样本量与置信区间；
+- `scripts/ticket_evidence_audit.py`：独立重算 + hash 校验；
+- `data/ticket_evidence/<code>/<date>/{raw/,timeline.jsonl,manifest.sha256}`；
+- 盘后 15:45 后生成，文件 marker 判重；失败保留 partial 包，下一轮重试；不推送。
+
+**可执行验收命令（目标形态，尚未实现）：**
+
+```bash
+cargo test --lib monitor::ticket_evidence::tests
+cargo run --release --bin ticket_audit -- --code 001216 --as-of 2026-10-26 --out data/ticket_evidence/001216/2026-10-26
+python3 scripts/ticket_audit_eval.py --pack data/ticket_evidence/001216/2026-10-26
+python3 scripts/ticket_evidence_audit.py --pack data/ticket_evidence/001216/2026-10-26
+```
+
+以上命令、文件级工作项和数据缺口补齐前，不应把 11.8 标为“已完成”，
+也不应对外宣称“可开发落地”。
+
+### 11.9 支撑架构：DecisionContext + EntryPolicy + 状态投影 + 输出合同（2026-10-27 补）
+
+本节回答“11.8 的审计题目用什么架构执行”，不是另起一个功能扩张方案。
+架构只做四件事：把同一决策的输入收敛、把触发语义按模式分派、把提案状态投影成
+可查询对象、把输出语义变成类型合同。目标不是更多模块，而是让 11.8 的每个结论
+能被重放和证伪。
+
+#### 11.9.1 定位
+
+- 11.8 是研究/审计题目：问为什么、能否执行、如何证伪。
+- 11.9 是审计仪器：提供可复现的输入、状态、规则分派和输出。
+- 本阶段不新增选股规则、不新增推送渠道、不自动交易；新结构先 shadow，只写
+  审计包，不改变现有用户可见推送。
+
+#### 11.9.2 目标数据流
+
+```text
+原始证据归档（raw + hash）
+  -> PIT 视图 / 数据合同（source_at、observed_at、source_health）
+  -> 候选与 ticket（现有 P01、观察池、持仓）
+  -> 提案（DecisionContext：entry_mode、price_window、valid_until）
+  -> EntryPolicy（pullback / breakout / auction）-> Decision
+  -> 提案状态投影（open / triggered / invalidated / expired）
+  -> OutputContract（ReferencePrice / ExecutablePrice / NoPrice）
+  -> 现有 push / delivery audit
+  -> ticket_evidence 包 + audit 脚本
+```
+
+#### 11.9.3 DecisionContext
+
+同一张票的提案、触发、渲染、审计必须消费同一个上下文对象。最小字段：
+
+| 组 | 字段 |
+|---|---|
+| 身份 | `decision_id`、`ticket_id`、`code`、`proposal_id`、`supersedes` |
+| 时间 | `as_of`、`valid_from`、`valid_until`、`source_at`、`observed_at` |
+| 选择 | `source`、`regime`、`entry_mode`、`candidate_rank` |
+| 价格 | `price_low`、`price_high`、`abandon`、`prev_high`、`auction_ref` |
+| 确认 | `confirmation`（量比/报价/突破条件） |
+| 数据 | `source_health`、`data_mode`、`evidence_grade`、`missing_fields` |
+| 仓位 | `held_qty`、`cost`、`available`、`risk_budget` |
+| 规则 | `rule_version`、`commit`、`config_hash` |
+| 证据 | `evidence_refs`（原始文件/表/行/哈希） |
+
+`entry_mode` 必须是枚举，不能继续使用 `zone.trigger` 自由文本：
+
+- `Pullback`：回踩型；
+- `Breakout`：突破型；
+- `AuctionReference`：竞价参考型；
+- `Unknown`：无法判定，只能输出参考或 `NoDecision`。
+
+#### 11.9.4 EntryPolicy
+
+`ticket_entry_trigger::judge` 改为纯函数：
+
+```text
+evaluate(context, quote) -> Triggered | Invalidated | Expired | NoDecision
+```
+
+按 `entry_mode` 分派：
+
+- `Pullback`：价格进入 `price_low..price_high` 且确认条件成立；跌破 `abandon`
+  失效；不再要求 `price >= prev_high`。
+- `Breakout`：`price >= prev_high` 且涨幅未超过上限；跌破 `abandon` 失效。
+- `AuctionReference`：竞价参考价加盘中确认；没有原始竞价或成交证据时输出
+  `NoDecision`/`ReferenceOnly`，不能伪造触发。
+- `Unknown`：不触发，只记录缺口。
+
+现有 `TriggerTarget` 已带 `entry_low`/`entry_high`，但 `judge` 尚未消费；
+这是当前 77 条提案、0 条触发、20 条趋势型到期的直接结构原因之一。
+
+#### 11.9.5 提案状态投影
+
+ticket stage 与 proposal state 分开：
+
+```text
+ticket:   observing -> entry_proposed -> holding -> closed
+proposal: open -> triggered | invalidated | expired
+```
+
+- `entry_invalidated` 关闭当前 proposal，不改变 ticket stage；
+- 需要重新提案时写 `supersedes`，不能复用旧 proposal；
+- 所有消费方只读投影，不各自解释 `ticket_event` 文本；
+- 短期内若不能改 schema，可从 `ticket_event` 投影到内存/JSON 缓存；长期应有
+  一个显式投影表/视图，否则消费者会再次漂移。
+
+#### 11.9.6 OutputContract
+
+输出必须分类型，模板不能自由拼“买价”：
+
+- `ReferencePrice`：参考价/参考区间，必须带证据状态；
+- `ExecutablePrice`：有行情/成交证据的可执行价，必须带执行条件；
+- `NoPrice`：证据不足，不给价格。
+
+禁止词与必现词按 6.10.1 执行；四态正文断言、`push_log` /
+`delivery_decisions.rendered_content` 与同一 ticket 证据包对账，缺失即 FAIL。
+
+#### 11.9.7 文件级落点（目标形态，尚未实现）
+
+- `src/monitor/ticket_entry_proposal.rs`：产生 `DecisionContext` 和 `entry_mode`；
+- `src/monitor/ticket_entry_trigger.rs`：按 `EntryPolicy` 分派，消费价格窗口；
+- 新增 `src/monitor/ticket_decision.rs`：上下文类型、枚举、校验；
+- 新增 `src/monitor/ticket_proposal_state.rs`：提案状态投影/查询；
+- `src/monitor/ticket_auction_price.rs`、`src/bin/monitor/push_templates.rs`：
+  按 `OutputKind` 渲染，禁止硬编码“买价/低吸”；
+- `src/monitor/ticket_evidence.rs`、`src/bin/ticket_audit.rs`：证据包与审计入口；
+- `scripts/ticket_audit_eval.py`、`scripts/ticket_control_group.py`、
+  `scripts/ticket_evidence_audit.py`：评估、对照、独立复核；
+- `data/ticket_evidence/<code>/<date>/{raw/,timeline.jsonl,manifest.sha256}`。
+
+#### 11.9.8 不变量
+
+1. 提案、触发、渲染、审计只消费同一份 context；禁止各自查库重算。
+2. `Unknown` 不得降级成 0；缺失数据必须显式进入 `missing_fields`。
+3. proposal 失效只关闭 proposal，不把 ticket 留在 `entry_proposed`。
+4. 参考价不得渲染成可执行价；模板测试必须覆盖禁止词。
+5. 每个 decision 必须带 `evidence_refs`、`rule_version` 和可复算哈希。
+6. `EntryPolicy` 必须是纯函数，便于单测、回放和 shadow 对比。
+7. 先 shadow、再切换；任何阶段不得自动下单。
+
+#### 11.9.9 落地顺序与验收
+
+1. **Shadow**：新 context/policy 与旧逻辑并行，只写审计日志，不改变推送；
+   对比触发率、失效原因、漏触发和模板文案差异。
+2. **提案状态**：上线只读投影，清理重复活跃票和僵尸提案；先做数据迁移，
+   再让消费方切换。
+3. **输出合同**：先改模板和四态测试，再切换用户可见文案；不允许“文案先上、
+   证据后补”。
+4. **证据包**：盘后生成 001216 的纵向切片，跑
+   `ticket_audit`、`ticket_audit_eval.py`、`ticket_control_group.py`、
+   `ticket_evidence_audit.py`；数据缺失项必须出现在报告里。
+
+验收指标至少包括：提案→触发转化率、失效/到期原因分布、来源覆盖率、模板
+禁止词命中数、证据包重算哈希一致率；不以“有事件行”代替“决策成立”。
+
+#### 11.9.10 非目标
+
+- 不做全量 CQRS/事件溯源；
+- 不做通用规则引擎；
+- 不让 LLM 决定价格或触发；
+- 不新增推送渠道、选股规则或自动交易；
+- 不把“架构更完整”当作继续扩功能的理由。
+
+本节是 11.8 的执行层。若 11.8 的审计题目没有先跑通，11.9 不应被标为“已落地”。
+
+### 11.10 更深入版架构题目：单票决策内核的最小可证伪架构（2026-10-27 回写）
+
+#### 11.10.1 为什么在 11.9 之后再写一版
+
+11.9 是组件视图：DecisionContext、EntryPolicy、状态投影、OutputContract。
+它回答了“东西放哪里”，但没有回答“凭什么说这个架构是对的”。如果只按 11.9
+继续加模块，最后会得到一个更大的系统，而不是一个更可信的决策内核。
+
+本节把架构题目改成“证明义务视图”，判断标准不再是组件数量，而是：
+
+- 关键不变量是否被类型、属性测试或模型检查证明；
+- 同一份原始输入能否重放出同一个 `DecisionRecord`；
+- proposal、trigger、render、audit 四个消费者是否对同一 context 解释一致；
+- 数据缺失时是否只能降级为 `NoDecision`/`ReferenceOnly`，不会补 0、补价、补映射；
+- 独立复核者能否不依赖生产库、只看证据包重算出同一结论。
+
+当前数据说明这不是抽象问题：截至 2026-10-27 15:09，77 条 `entry_proposed`、
+0 条 `entry_triggered`、20 条趋势型到期；62 张活跃提案停在 `entry_proposed`；新闻和资金流入口
+`news_candidates=0`、`mf_candidates=0`；P6 的 `board_pct` 仍为 0。它们分别对应
+触发语义、提案生命周期、来源健康和归因边界四类架构缺陷。
+
+#### 11.10.2 顶尖架构专家会做、但通常没被要求的事
+
+1. 先定义质量属性，而不是先画组件
+   对这套系统，优先级应是可审计性、确定性、失效安全、可演化；不是吞吐、
+   低延迟或“功能齐全”。每个组件必须说明它保护哪个质量属性，否则就是多余复杂度。
+
+2. 把业务语义写成不变量
+   例如“未知不能变成 0”“参考价不能渲染成可执行价”“一个提案只能有一个当前
+   状态”“同一决策的所有消费者必须读同一份上下文”。不变量要能被测试或模型检查
+   证明，不能只写在文档里。
+
+3. 显式建模三种时间
+   `source_at`（数据源时间）、`observed_at`（系统看到的时间）、
+   `valid_from/valid_until`（决策有效时间）。还要处理迟到数据、修订、重述、
+   停牌、除权。很多“当时看起来正确”的结论，都是时间建模错了。
+
+4. 把缺失、冲突、过期当作一等公民
+   不是 `Option::None -> 0`，而是 `Unknown / Partial / Conflict / Stale` 四种
+   状态，并规定每种状态下允许输出什么。数据不可用时应该降级为 `NoDecision`
+   或 `ReferenceOnly`，不是继续算。
+
+5. 把决策内核和 I/O、UI、LLM 彻底分开
+   内核是纯函数：`decide(context, quote, rules) -> Decision`。不查库、不发推送、
+   不写日志、不调模型。这样才可以重放、单测、形式化验证和独立实现。
+
+6. 为失败而设计
+   数据源超时、返回空、字段缺失、批次部分失败、重复 code、乱序、旧进程日志
+   混入——这些不是异常，是常态。架构必须规定每种失败的降级路径和用户可见结果，
+   不能靠“正常情况下没问题”。
+
+7. 设计可重放和可独立实现
+   每次决策记录完整输入、规则版本、构建哈希、随机种子、数据快照哈希。另一个人
+   用另一套实现，能从同一份原始包算出同一个 `DecisionRecord`。这比“代码看起来
+   对”强得多。
+
+8. 给每个组件写证明义务
+   例如：状态机必须证明“invalidated 的提案不会再触发”；context 必须证明
+   “缺失字段不会变成 0”；renderer 必须证明“没有执行证据时不会出现买价”。
+   没有证明义务的组件，应该删掉，而不是保留。
+
+9. 设计契约测试和模式演化
+   提案、触发、渲染、审计是四个消费者；它们必须通过同一组 contract tests。
+   字段新增/改名/语义变化要有版本和迁移，不然今天修好的语义，下一次改动又漂移。
+
+10. 设计运营闭环
+    shadow、canary、feature flag、回滚、漏斗指标、来源覆盖率、模板禁词命中、
+    重放一致率。架构不是上线即结束，而是能观察自己是否在退化。
+
+11. 记录“没有决策”和人的决策
+    不触发、不成交、主动放弃、用户不执行，都是决策样本。只记录成功交易，架构
+    就会系统性高估自己。
+
+12. 写 ADR 和非目标
+    明确为什么不做全量 CQRS、不做通用规则引擎、不让 LLM 定价。非目标和目标
+    一样重要，否则架构会不断被“顺便加一个功能”撑大。
+
+#### 11.10.3 他们会从哪些最原始的素材入手
+
+不是先看 `ticket_event`、`attribution_benchmark_daily` 或看板，而是回到产生这些
+数据的输入。
+
+1. 代码与数据的真实结构
+   实际 schema、索引、查询计划、迁移历史、字段 null 分布、重复 key、行数变化；
+   不是文档里“应该有”的表。
+
+2. 原始 provider 交互
+   gRPC/HTTP 请求和响应、request_id、batch_id、重试、超时、空响应、错误码、
+   `source_at/observed_at`。失败响应和“没有数据”本身也是证据。
+
+3. 系统运行痕迹
+   原始日志（带进程 ID、启动时间、构建版本）、事件流、投递回执、
+   `delivery_decisions`、`push_log`、配置快照、activation 文件、feature flag、
+   git commit、构建哈希。
+
+4. 决策链的完整候选集
+   全市场候选、评分、排名、淘汰原因、未入池票、观察池但未提案、提案但未触发、
+   触发但未成交。不能只留最终入池的票。
+
+5. 人的动作
+   券商对账单、订单/成交回报、改价/撤单、用户笔记、执行/不执行的原因。系统
+   建议和实际动作的差异是架构最重要的反馈。
+
+6. 异常与事故
+   失败批次、重复票、旧进程残留、日志爆炸、数据源断供、误报/漏报、回滚记录、
+   事故复盘。这些比“正常样本”更能暴露架构缺陷。
+
+7. 市场与公司原始层
+   集合竞价、逐笔/盘口、未复权日线、涨跌停/停牌/除权、板块成分历史；
+   公告/财报 PDF/XBRL、新闻原文及发布时间。用于验证决策的外部真实性，不用
+   派生指标替代。
+
+8. 测试与证明材料
+   属性测试、模型检查、回放结果、shadow 差异、独立复算报告。架构的“原始素材”
+   也包括证明本身。
+
+当前项目的现实边界：`ticket_lifecycle`、`ticket_event`、`delivery_decisions`、
+`stock_daily`、`market_regime_daily` 可以支撑 L1 审计；但 `data/auction_raw/`
+不存在，原始竞价委托/逐笔/盘口缺失；公告/财报全文、第二独立财务源、真实成交/
+排队数据仍缺失；`board_member_snapshot` 到 2026-10-26 才首次生成 3,457 行。
+缺失就写 `UNKNOWN`，不能用派生表补。
+
+#### 11.10.4 他们会使用的具体方法和工具
+
+1. 类型驱动设计
+   用 newtype 区分 `Code`、`Price`、`Quantity`、`AsOf`、`Confidence`、
+   `ReferencePrice`、`ExecutablePrice`；让非法状态在类型上不可表达。Rust 的
+   enum/newtype 适合这一层。
+
+2. 状态机 + 属性测试 + 模型检查
+   状态机定义 ticket/proposal/decision 的合法转移；用 `proptest` 做属性测试；
+   关键生命周期用 TLA+/Alloy 检查“失效后不能再触发”“triggered 不能回到 open”
+   等不变量。
+
+3. Functional core / imperative shell
+   决策内核纯函数；数据库、行情、推送、日志都放在 adapter 层。这样内核可以脱离
+   生产环境重放。
+
+4. 确定性回放
+   录制原始输入 + 规则版本 + 构建哈希；同一输入必须产生 byte-identical 的
+   `DecisionRecord`。这是比“单元测试通过”更强的证明。
+
+5. 数据合同与契约测试
+   JSON Schema/Protobuf 定义 context、quote、decision、output；producer/consumer
+   双方跑 contract tests；schema 变更有版本和迁移。
+
+6. 双时态 / PIT 数据层
+   `source_at`、`observed_at`、`valid_time` 分离；as-of join；原始层不可变 +
+   hash manifest；curated 层可重建。
+
+7. Shadow / 差分测试
+   新旧决策内核并行，只记录不推送；比较触发率、失效原因、漏触发、文案差异。
+   差分测试比“我觉得这样对”可靠。
+
+8. 失效模式分析
+   FMEA/red team：列出 stale、missing、conflict、duplicate、partial、
+   out-of-order 六类故障，逐项规定检测、降级、告警和回滚。
+
+9. 可观测性与漏斗
+   proposal→trigger→fill 转化率、来源覆盖率、unknown 比例、模板禁词命中、
+   重放一致率、shadow 差异率；不以事件行数验收。
+
+10. 外部因果/统计方法
+    PIT 对照、匹配/DiD/合成控制/RD、bootstrap、FDR、功效分析、样本外。
+    用于验证决策结果，不用于替代架构证明。
+
+**核心证明义务表**
+
+| 不变量 | 证明方式 | 当前状态 |
+|---|---|---|
+| 未知不得变成 0 | 属性测试 + 缺失字段用例 | 未实现 |
+| 一个决策只有一份 context | 类型系统 + contract tests | 未实现 |
+| invalidated 提案不能再触发 | 状态机 + 模型检查 | 未实现 |
+| 参考价不得渲染成可执行价 | renderer 四态测试 + 禁词检查 | 未实现 |
+| 同一输入重放出同一结果 | 确定性回放 + hash 对比 | 未实现 |
+| 来源不可用时不得继续产出可执行价 | adapter health gate + 契约测试 | 未实现 |
+| 四个消费者解释一致 | producer/consumer contract tests | 未实现 |
+| 独立复核不依赖生产库 | 证据包 + 独立脚本 | 未实现 |
+
+#### 11.10.5 除了你我，还有什么能证明结果是正确的
+
+1. 模型检查器/属性测试
+   证明状态机不变量在所有合法输入下成立；不是“跑过几个例子”。
+
+2. 独立实现/独立复算
+   另一个人或另一套代码从同一份原始包重放出同一个 `DecisionRecord`；哈希一致。
+
+3. 契约测试
+   proposal、trigger、render、audit 四个消费者对同一 context 的输出一致；
+   没有“提案说回踩、触发看突破”。
+
+4. 外部原始数据
+   交易所/公告/财报/独立数据商交叉核对；券商成交回报验证执行价格和成交概率。
+
+5. Shadow / Canary / 生产审计
+   新旧内核并行差异、线上灰度和回滚记录；证明它在真实数据分布下没有退化。
+
+6. 红队/独立架构评审
+   专门找“未知变 0”“参考价变买价”“失效提案仍触发”的反例；ADR 评审记录取舍。
+
+7. 签名证据链
+   原始包、决策记录、规则版本、构建哈希、投递回执可追溯、不可篡改；审计者
+   不需要相信我们的日志。
+
+8. 市场本身
+   只能证明“这套决策在样本外是否有经济价值”，不能单独证明架构正确；架构
+   正确性和策略盈利能力是两条证明线。
+
+#### 11.10.6 重写后的题目
+
+**题目：单票决策内核的最小可证伪架构**
+**副题：在信息不完整、规则多模式、提案会失效的条件下，保证同一个决策可重放、
+可解释、可执行、可证伪**
+
+定位：不是“再做一个平台”，而是把现有 ticket 链路收敛成一个**纯决策内核 +
+三个边界**；以 001216（2026-10-26）为唯一纵向切片，先证明架构，不扩功能。
+
+核心问题：
+
+1. **一个决策的最小规范对象是什么？**
+   哪些字段是身份、时间、价格、证据、状态、规则版本？哪些状态在类型上必须
+   不可表达？
+
+2. **时间与缺失如何建模？**
+   `source_at / observed_at / valid_time` 如何进入 context？
+   `Unknown / Partial / Conflict / Stale` 分别允许什么输出？
+
+3. **触发语义如何唯一？**
+   Pullback、Breakout、AuctionReference 如何分派？为什么同一份 context 不会在
+   proposal 和 trigger 里得到两种解释？
+
+4. **提案生命周期如何与 ticket 分离？**
+   open / triggered / invalidated / expired 如何转移？失效后为什么不会再触发？
+   重新提案如何 `supersedes`？
+
+5. **输出如何不越权？**
+   ReferencePrice / ExecutablePrice / NoPrice 的边界是什么？没有成交证据时，
+   模板为什么不可能输出“买价”？
+
+6. **架构如何被证明？**
+   哪些不变量用属性测试/模型检查证明？哪些用独立复算、shadow、外部数据证明？
+   哪些只能标 `UNKNOWN`？
+
+交付物：
+
+A. `DecisionModel.md`：领域模型、类型、状态机、不变量、时序图、ADR。
+B. 纯决策内核参考实现：`decide(context, quote, rules) -> Decision`，无 I/O。
+C. 三个边界：Evidence/PIT adapter、DecisionRecord/投影、OutputContract renderer。
+D. `DecisionRecord` 追加日志与当前状态投影；支持 `supersedes`。
+E. 001216 证据包：raw、timeline、manifest、缺口清单。
+F. 回放/属性测试/模型检查/差分测试报告。
+G. Shadow 对比报告：旧逻辑 vs 新内核，差异分类。
+H. 独立复核记录与最终裁决：保留/修改/停用架构。
+
+硬约束：
+
+- 只做一个票、一个决策类型、一条价格路径；
+- 不新增选股规则、推送渠道、自动交易；
+- 不把 LLM 放进决策内核；
+- 不追求全量 CQRS/事件溯源/通用规则引擎；
+- 每个组件必须有证明义务，没有就删掉；
+- 数据缺失标 `UNKNOWN`，不得补 0/补价格/补映射；
+- 不以“组件数量/代码行数”衡量深度，以不变量覆盖率和重放一致率衡量。
+
+验收门：
+
+- 非法状态在类型上不可表达；
+- 关键不变量通过属性测试/模型检查；
+- 同一原始输入重放出 byte-identical 的 `DecisionRecord`；
+- proposal/trigger/render/audit 四个消费者对同一 context 解释一致；
+- 未知/缺失场景只能输出 `NoDecision`/`ReferenceOnly`；
+- shadow 差异逐条分类，不能只报总数；
+- 独立复核者能从证据包复算，不依赖我们的数据库；
+- 最终给出“保留/修改/停用”的明确结论；证据不足写“不能判定”。
+
+**架构深度度量**
+
+| 维度 | 度量 | 通过标准 |
+|---|---|---|
+| 不变量覆盖 | 已证明的关键不变量 / 全部关键不变量 | 100% 有测试或模型检查 |
+| 重放确定性 | 同一输入的 `DecisionRecord` 哈希 | 100% 一致 |
+| 消费者一致性 | proposal/trigger/render/audit 的契约测试 | 无分歧 |
+| 未知处理 | 缺失字段产生可执行价的比例 | 0 |
+| 来源健康 | 不可用来源仍产出可执行价的比例 | 0 |
+| 模板语义 | 禁止词命中数 | 0 |
+| Shadow 差异 | 差异条数及分类 | 全部解释/归因 |
+| 独立复核 | 不依赖生产库可复算的比例 | 100% |
+
+#### 11.10.7 与 11.9、11.8 的关系
+
+- 11.8 是研究/审计题目：问“这只票的决策链是否成立”。
+- 11.9 是目标组件：DecisionContext、EntryPolicy、状态投影、OutputContract。
+- 11.10 是架构题目与证明标准：规定 11.9 的每个组件必须证明什么。
+
+三者不是互相替代：
+
+1. 先按 11.10 写 DecisionModel、ADR 和证明义务；
+2. 再按 11.9 落组件；
+3. 最后用 11.8 的证据包和审计脚本验证。
+
+如果 11.9 的某个组件无法对应 11.10 的证明义务，应删除该组件，而不是为它
+补一个理由。若 11.9 与 11.10 冲突，以 11.10 的题目和验收门为准。
+
+#### 11.10.8 架构图（目标形态）
+
+以下图只表达“一个决策内核 + 三个边界 + 证明闭环”，不增加新模块。所有节点均为
+目标形态，当前尚未实现。
+
+##### 11.10.8.1 组件与边界
+
+```mermaid
+flowchart LR
+  subgraph EV["Evidence boundary"]
+    RAW["raw provider payloads<br/>exchange / filings / news / logs"]
+    PIT["PIT adapters<br/>source_at / observed_at / valid_time"]
+    SNAP["snapshot + hash manifest"]
+    HEALTH["SourceHealth<br/>available / partial / stale / conflict"]
+  end
+
+  subgraph KERNEL["Decision kernel (pure, no I/O)"]
+    RULES["RuleSet<br/>version · commit · config hash"]
+    POS["Position and capacity context"]
+    CTX["DecisionContext<br/>identity · time · mode · price · evidence"]
+    POLICY["EntryPolicy<br/>Pullback / Breakout / AuctionReference"]
+    DEC["Decision<br/>Triggered / Invalidated / Expired / NoDecision"]
+  end
+
+  subgraph STATE["State boundary"]
+    LOG["DecisionRecord log<br/>append-only + hash"]
+    PROJ["Proposal projection<br/>open / triggered / invalidated / expired"]
+  end
+
+  subgraph OUT["Output boundary"]
+    OC["OutputContract<br/>ReferencePrice / ExecutablePrice / NoPrice"]
+    PUSH["existing push + delivery audit"]
+  end
+
+  RAW --> PIT --> CTX
+  SNAP --> CTX
+  HEALTH --> CTX
+  RULES --> CTX
+  POS --> CTX
+  CTX --> POLICY --> DEC
+  DEC --> LOG --> PROJ
+  DEC --> OC --> PUSH
+  PROJ -. "current proposal / supersedes" .-> CTX
+  LOG -. "evidence refs" .-> SNAP
+```
+
+读法：
+
+- 实线是运行期数据流；虚线是回读/证据引用，不参与决策计算。
+- 决策内核不能直接读数据库、发推送、写日志或调用 LLM；这些都在边界层完成。
+- `SourceHealth` 是 context 的必需输入；`stale/conflict` 必须导致降级，不是跳过。
+- `Decision` 是唯一写入口；`DecisionRecord` 是唯一事实来源，`Proposal projection`
+  只是读模型。
+
+##### 11.10.8.2 ticket 与 proposal 的双状态
+
+```mermaid
+flowchart LR
+  subgraph T["ticket stage"]
+    OBS["observing"] --> EP["entry_proposed"] --> HOLD["holding"] --> CLOSED["closed"]
+  end
+
+  subgraph P["proposal state (separate)"]
+    OPEN["open"] --> TRIG["triggered"]
+    OPEN --> INV["invalidated"]
+    OPEN --> EXP["expired"]
+    TRIG --> FILL["filled / not_filled"]
+  end
+
+  EP -. "opens" .-> OPEN
+  INV -. "closes proposal; ticket unchanged" .-> EP
+  EXP -. "re-propose with supersedes" .-> OPEN
+  TRIG -. "fill evidence" .-> HOLD
+  FILL -. "close" .-> CLOSED
+```
+
+关键点：`entry_invalidated` 只关闭当前 proposal，不允许 ticket 长期停在
+`entry_proposed`；重新提案必须通过 `supersedes` 建立新的 proposal，不能复用旧窗口。
+
+##### 11.10.8.3 单票决策时序
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant E as Evidence/PIT
+  participant P as Proposal
+  participant K as Decision kernel
+  participant S as Proposal projection
+  participant O as OutputContract
+  participant D as Delivery/Audit
+
+  E->>P: candidate + source health + as_of
+  P->>K: DecisionContext(mode, window, valid_until)
+  K->>K: pure evaluate
+  alt evidence sufficient
+    K-->>S: Triggered / Invalidated / Expired
+    K-->>O: Decision
+    O-->>D: ReferencePrice / ExecutablePrice
+  else missing / stale / conflict
+    K-->>S: NoDecision
+    K-->>O: NoDecision
+    O-->>D: 参考信息，无价格
+  end
+  D-->>E: receipt + evidence refs + hash
+```
+
+时序图强调：缺失/过期/冲突不是异常分支，而是正常分支；`NoDecision` 必须能被
+投递、审计和统计，不能静默消失。
+
+##### 11.10.8.4 证明闭环
+
+```mermaid
+flowchart TB
+  RAW["raw evidence + manifest.sha256"] --> REPLAY["deterministic replay"]
+  RULES["DecisionRecord + rule version + build hash"] --> REPLAY
+  REPLAY --> HASH{"same hash?"}
+  HASH -- no --> FAIL["FAIL: stop / investigate"]
+  HASH -- yes --> SHADOW["shadow diff old vs new"]
+  SHADOW --> AUDIT["independent audit / red team"]
+  AUDIT --> VERDICT["keep / change / retire"]
+  FAIL --> VERDICT
+```
+
+这张图是 11.10 的核心：架构是否正确，不由“组件画得全不全”证明，而由
+`原始证据 -> 重放 -> 哈希一致 -> shadow/独立审计 -> 裁决` 证明。
+
+**当前状态：11.10 是架构研究/验收题目，不是施工图；所有组件、图和证明义务均未实现，
+不得标为“已完成”或“已落地”。**
+
+### 11.11 整改实施计划：从现有 ticket 链路到最小决策内核（2026-10-27 制定）
+
+#### 11.11.1 交付物与边界
+
+完成后你会收到：
+
+1. 一个可重放的 `DecisionContext` / `DecisionRecord` 链路；
+2. 001216（2026-10-26）的原始证据包、时间轴和缺口清单；
+3. 旧触发逻辑 vs 新 `EntryPolicy` 的 shadow 对比报告；
+4. 一份“保留 / 修改 / 停用”的架构裁决；
+5. 明确的未验证项和所需数据。
+
+你用它决定：是否切换触发策略、是否继续投入、以及下一条数据/功能是否值得做。
+
+本计划只实现 11.10 的最小闭环，不做：
+
+- 不新增选股规则、不新增推送渠道、不自动交易；
+- 不做全量 CQRS/事件溯源、不做通用规则引擎、不让 LLM 定价；
+- 不重写全部 7 个模板，只先统一与 P2/P3 直接相关的输出；
+- 不补造原始竞价、公告全文、第二财务源和成交概率。
+
+#### 11.11.2 当前基线（2026-10-27 实测）
+
+| 项 | 当前值 | 含义 |
+|---|---|---|
+| 活跃 ticket | `entry_proposed=62`、`holding=6`、`observing=5` | 62 张提案没有触发确认 |
+| `entry_proposed` 事件 | 77 | 提案产出存在（10/27 14:50 又新增 15 条） |
+| `entry_triggered` 事件 | 0 | 触发链路没有成功样本 |
+| `entry_invalidated` 事件 | 23 | 失效/到期在写，但不改 stage |
+| 重复活跃 code | `002696`、`002724`、`603278` 各 2 张 | 历史数据卫生问题 |
+| 工作区 | 7 个源码/脚本文件 + 本文档未提交 | 没有可回滚的架构基线 |
+
+这些数字只用于确定整改顺序；不代表策略有效或无效。
+
+#### 11.11.3 实施原则
+
+1. **先基线，后改行为**：未提交的修复先按业务线入库；没有干净基线不做 schema/行为切换。
+2. **先 shadow，后切换**：新内核先只写审计日志，不改变推送；差异分类后再开。
+3. **一个纵向切片**：先 001216 + 一条价格路径，不先做全市场。
+4. **加表不加列**：优先新增 `ticket_decision`，不改 `ticket_lifecycle` / `ticket_event`
+   既有列；所有 schema 变更在数据库副本上先跑。
+5. **每个组件有证明义务**：没有测试、没有验收指标、没有回滚点的组件不进入生产。
+6. **未知不补 0**：数据缺失一律 `UNKNOWN`/`NoDecision`，不补价格、映射、成交概率。
+
+#### 11.11.4 工作包与顺序
+
+**WP0：基线、备份与开关**
+
+- 目的：让后续改动可比较、可回滚。
+- 动作：
+  1. `git status --short`、`git diff --check`，把当前 7 个源码/脚本修复按业务线提交；
+     本文档单独提交，不混入行为改动。
+  2. 对主库和投递库做一致性备份：
+     `sqlite3 <db> ".backup '<backup-path>'"`，再跑 `PRAGMA integrity_check;`。
+  3. 固定本次基线：记录 `git rev-parse HEAD`、运行中 binary mtime、schema 表清单、
+     当前验收输出。
+- 落点：`data/backups/`、`data/ticket_evidence/_baseline/`（不入库）。
+- 验收：备份可打开、`integrity_check=ok`、`cargo check --lib --bin monitor`、`git diff --check`。
+- 不做：不在这一步改触发逻辑、不重启 monitor。
+
+**WP1：DecisionContext、EntryPolicy、ticket_decision 表**
+
+- 新文件 `src/monitor/ticket_decision.rs`：
+  - `EntryMode { Pullback, Breakout, AuctionReference, Unknown }`
+  - `ProposalStatus { Open, Triggered, Invalidated, Expired, Superseded }`
+  - `Decision { Triggered, Invalidated, Expired, NoDecision }`
+  - `OutputKind { ReferencePrice, ExecutablePrice, NoPrice }`
+  - `SourceHealth { Available, Partial, Unavailable, Stale, Conflict }`
+  - `EvidenceGrade { L0, L1, L2, L3, L4 }`
+  - `DecisionContext { decision_id, ticket_id, code, as_of, source, regime,
+    entry_mode, price_low/high, trigger_level, abandon, confirmation,
+    valid_from/until, source_health, data_mode, evidence_grade,
+    missing_fields, position, capacity, rule_version, evidence_refs }`
+  - `EntryPolicy::evaluate(&DecisionContext, &QuoteView) -> Decision`，纯函数、无 I/O。
+  - `decision_id = sha256(canonical_context_json)`，同一上下文幂等。
+- 修改 `src/database/ticket_lifecycle.rs`：
+  - 在 `create_schema` 新增 `ticket_decision` 表（不改既有列）：
+    `decision_id TEXT PRIMARY KEY`、`ticket_id`、`code`、`as_of`、`proposal_id`、
+    `supersedes`、`entry_mode`、`price_low/high`、`trigger_level`、`abandon`、
+    `proposal_status`、`valid_from/until`、`source`、`source_health`、
+    `evidence_grade`、`context_json`、`rule_version`、`created_at/updated_at`。
+  - 索引：`(ticket_id, as_of)`、`(code, proposal_status)`。
+  - API：`insert_decision`、`latest_open_proposal`、`update_proposal_status`；
+    `ticket_event` 继续 append-only，`occurrence_identity=decision_id` 关联。
+- 修改 `src/monitor/mod.rs`：注册 `ticket_decision`。
+- 测试：纯函数覆盖 Pullback/Breakout/AuctionReference/Unknown；缺失行情返回
+  `NoDecision`；同一 context 生成同一 `decision_id`；`serde_json` 往返一致。
+- 验收命令：
+  `cargo test --lib monitor::ticket_decision::tests`
+  `cargo test --lib database::ticket_lifecycle`
+- 风险：新增表在启动时创建；先在主库副本上验证 `CREATE TABLE IF NOT EXISTS` 与
+  旧表共存，不在生产库直接试。
+
+**WP2：提案写入 context（shadow）**
+
+- 修改 `src/monitor/ticket_entry_proposal.rs`：
+  - 在 `buy_zone::compute` 后生成 `DecisionContext`；`entry_mode` 映射：
+    - `Trend::Bullish` → `Pullback`，使用 `entry_low..entry_high`；
+    - `Trend::Bearish | Tangled` → `Breakout`，`trigger_level=ma5`；ma5 缺失 → `Unknown`；
+    - `Regime::Emotion` 且 `source=p01_preopen` → `AuctionReference`：15:40 只建
+      观察 context，`auction_ref=None`；09:25 由 `ticket_auction_price` 写入竞价
+      参考价，输出 `ReferencePrice`，没有原始竞价/成交证据时不做可执行触发；
+    - 无法判定 → `Unknown`，输出参考或 `NoDecision`，不得猜触发方式。
+  - `confirmation` 明确写 `price_only`；实时行情没有量比字段，
+    `missing_fields` 记录 `volume_ratio`，不得声称量能确认已执行。
+  - `source_health` 由调用方传入的快照填充；首版至少区分
+    `daily_bars / quotes / news / board` 四源，缺失写 `Unavailable`/`Partial`。
+  - 新 context 以 `TICKET_DECISION_SHADOW=1` 写入 + 日志；旧 stage/事件行为不变。
+- 修改 `src/bin/monitor/main.rs`：调用提案函数时传入 source health 快照；
+  不改变推送。
+- 测试：`entry_mode` 映射、`Unknown` 不触发、缺失字段进入 `missing_fields`；
+  旧 `entry_proposed` 事件仍按原路径写入。
+- 验收：shadow 日志出现 `decision_id`、`entry_mode`、`source_health`；
+  用户可见推送内容零变化；`cargo test --lib monitor::ticket_entry_proposal::tests`。
+
+**WP3：触发改为 EntryPolicy（双跑 + 灰度开关）**
+
+- 修改 `src/monitor/ticket_entry_trigger.rs`：
+  - `TriggerTarget` 增加 `decision_id`、`entry_mode`、`trigger_level`、`valid_until`、
+    `source_health`、`evidence_grade`。
+  - `warm` 优先读 `ticket_decision.latest_open_proposal`；旧 proposal 没有 context
+    时标记 `legacy_context_missing`，不猜 mode，不参与新策略触发。
+  - `judge` 改为 `EntryPolicy::evaluate`：
+    - `Pullback`：`price` 进入 `price_low..price_high` → `Triggered`；
+      跌破 `abandon` → `Invalidated`；其他 `NoDecision`。
+    - `Breakout`：`price >= trigger_level` 且涨幅 `< 6%` → `Triggered`；
+      跌破 `abandon` → `Invalidated`。
+    - `AuctionReference`：没有原始竞价/成交证据 → `NoDecision`，只输出参考。
+    - `Unknown`：不触发，只记录缺口。
+  - `evaluate` 改用 `RealtimeQuoteCoverage`，保留 accepted/missing/rejected：
+    部分缺失不静默跳过；整批不可用返回错误并记录 `SourceHealth::Unavailable`。
+  - `record` 在同一事务内写 `ticket_decision` 状态 + `ticket_event`；
+    失败回滚，不允许“事件写了、状态没写”。
+  - 开关：`TICKET_ENTRY_POLICY=legacy|shadow|new`；默认 `legacy`，shadow 只记录
+    差异，`new` 才改变用户可见触发。
+- 修改测试：现有 `breaks_prev_high_triggers...` 拆成 `pullback_range...` 和
+  `breakout_prev_high...`；新增 `pullback_does_not_wait_for_prev_high`、
+  `unknown_mode_never_triggers`、`partial_quote_is_not_success`。
+- 验收：
+  `cargo test --lib monitor::ticket_entry_trigger::tests`
+  shadow 对比：同一批票旧/新决策条数、漏触发、误触发、失效原因；
+  在生产仍为 `legacy` 时，推送零变化。
+
+**WP3.5：源健康与 P3.3（并行，不阻塞内核）**
+
+- 修改 `src/monitor/watch_pool_monitor.rs` / `src/monitor/watch_pool_intraday.rs`：
+  - 关联票和盘中报价改用 `RealtimeQuoteCoverage` 的 accepted/missing/rejected，
+    记录 `attempt / success / failure / coverage`；不能再只数失败文本。
+  - 批量请求前保持 trim、去空、去重；部分缺失不整批失败，整批不可用才报错。
+- 修改 `src/monitor/ticket_watch_pool.rs` / `src/bin/monitor/main.rs`：
+  - 新闻、资金流、板块三条入口分别写 `SourceHealth`；某源 `Unavailable` 时
+    输出“该源不可用”，不要把它算成“今天没有候选”。
+  - 观察池汇总日志增加 `news_health=... mf_health=... board_health=...`。
+- 修改 `scripts/phase_acceptance.py`：P3.3 只有在 `success > 0` 或显式
+  `source_unavailable` 时才允许非 FAIL；P1.1 分源报告，不允许板块单腿掩盖新闻/资金流。
+- 验收：P3.3 的失败计数与成功计数同时出现；P1.1 每个来源都有健康状态；
+  用户可见推送不因 shadow 改变。
+- 边界：`board_member` 覆盖率不足和 `board_member_snapshot` 只有 2026-10-26
+  起，不能用它做历史 PIT；这条仍标 `UNKNOWN`。
+
+**WP4：proposal 状态投影与历史数据清理**
+
+- 修改 `src/monitor/ticket_entry_trigger.rs`：
+  - 到期写新事件 `entry_expired`，不再把到期伪装成 `entry_invalidated`；
+  - 重新提案写 `entry_superseded`，建立新 `decision_id`；
+  - 投影规则：最新 `entry_proposed` → Open；后续 `entry_triggered` → Triggered；
+    `entry_invalidated` → Invalidated；`entry_expired` → Expired；
+    新 proposal → 旧 proposal Superseded。
+- 修改 `src/database/ticket_lifecycle.rs`：提供 `latest_proposal_status` /
+  `list_active_proposals`；只读投影，不回写历史事件。
+- 新增 `src/bin/ticket_dedupe.rs`：
+  - `--dry-run` 列出重复活跃 code、ticket id、stage、最新事件；
+  - `--apply` 只关闭较旧 ticket（`close_date` + `stage='exited'` + `duplicate_closed`
+    事件），不删除行；
+  - 先处理 `002696`/`002724`/`603278`，需 operator 明确批准后执行。
+- 清理完成后再评估是否加“同 code 仅一张活跃 ticket”的部分唯一索引；
+  现有重复未清理前不要加。
+- 验收：重复查询返回 0；`ticket_decision` 当前状态与事件一致；
+  `cargo test --lib monitor::ticket_entry_trigger::tests`。
+
+**WP5：OutputContract 与模板**
+
+- 修改 `src/monitor/ticket_auction_price.rs`：
+  - `PriceLine` 增加 `OutputKind`；默认 `ReferencePrice`；
+  - 文案 `买价` → `竞价参考价`；标题 `09:25 竞价买价` → `09:25 竞价参考价`；
+  - 保留 `T+1 不可卖`，并增加“未核验成交/非下单指令”；
+  - 09:25 把 `auction_price/auction_pct/tier` 写回对应的 `ticket_decision`
+    （`AuctionReference`），作为参考价证据；没有原始竞价/成交数据时仍只写参考，
+    不伪造可执行价或成交概率。
+- 修改 `src/bin/monitor/push_templates.rs`：
+  - `render_candidate_triggered`：`低吸参考` → `触发参考区间`；
+  - `render_tomorrow_watch`：`低吸` → `参考区间`；
+  - `render_holding_plan` / `render_holding_event`：保留风险阈值，但标明
+    “风险参考线，不是成交承诺”；
+  - 逐项按 6.10.1 的禁止词/必现词检查，不一次重写全部模板。
+- 测试：
+  - 每个模板四态：正常 / 无原始证据 / 有底仓 / 冲突或风险；
+  - 证据不足时不得出现“买价、建议买入、低吸、保证成交”；
+  - 必须出现“参考价/参考区间、证据不足/未核验成交、非下单指令”。
+- 验收：`cargo test --bin monitor push_templates`；更新旧断言，不保留与新语义冲突的测试。
+
+**WP6：单票证据包与审计 CLI**
+
+- 新文件 `src/monitor/ticket_evidence.rs`：
+  - 只读索引：`ticket_lifecycle`、`ticket_event`、`ticket_decision`、
+    `delivery_decisions`、`push_log`、`stock_daily`、`market_regime_daily`、
+    `attribution_benchmark_daily`、`advice_outcome_tracking`；
+  - `EvidenceGap { field, source, blocked_conclusion }`；
+  - 不做写入，不调用 `DatabaseManager` 的迁移路径。
+- 新文件 `src/bin/ticket_audit.rs`：
+  - `--db`、`--delivery-db`、`--code`、`--as-of`、`--out` 必填；
+  - 使用 SQLite read-only（`mode=ro`）打开，避免污染生产；
+  - 输出：`raw/`（SQL 查询结果 JSON + 源表/rowid/hash）、`timeline.jsonl`、
+    `gaps.json`、`manifest.sha256`、`memo.md` 骨架；
+  - 不把整库复制进证据包，不把派生表当原始证据。
+- 新增脚本：
+  - `scripts/ticket_audit_eval.py`：MFE/MAE、T+1/T+3/T+5、可成交/未成交、
+    市场/板块/风格分解；缺数据写 `UNKNOWN`；
+  - `scripts/ticket_control_group.py`：PIT 候选与匹配；当前候选全集不足时输出
+    `BLOCKED`，不拿最终入池票冒充对照；
+  - `scripts/ticket_evidence_audit.py`：只读证据包，重算哈希和关键字段，出
+    PASS/PARTIAL/FAIL。
+- 新增 `tests/fixtures/ticket_evidence/` 小样本；真实包写运行根
+  `data/ticket_evidence/001216/2026-10-26/`，不入库。
+- 验收：
+  `cargo test --lib monitor::ticket_evidence::tests`
+  `cargo run --release --bin ticket_audit -- --db <db> --delivery-db <delivery> \
+   --code 001216 --as-of 2026-10-26 --out <out>`
+  `python3 scripts/ticket_evidence_audit.py --pack <out>`
+  `python3 -m py_compile scripts/ticket_audit_eval.py scripts/ticket_control_group.py scripts/ticket_evidence_audit.py`
+
+**WP7：验收指标改造（与 WP6 同步）**
+
+- 修改 `scripts/phase_acceptance.py`：
+  - P2 从“有 entry_proposed”改为漏斗：
+    `proposal / open / triggered / invalidated / expired / evaluated`，
+    并单列 `trigger_rate`；0 触发在有评估的情况下不得直接判 OK；
+  - P3.3 统计 `attempt / success / failure / coverage`，不再只数失败文本；
+  - P1.1 分源：`news_candidates`、`mf_candidates`、`board_candidates` 各自报
+    可用/不可用，单一来源不能掩盖另外两源断供；
+  - P6 区分 `market_pct` 与 `board_pct`：`board_pct=0` 时标 `PARTIAL/UNKNOWN`，
+    不把“市场等权超额”写成 alpha。
+- 验收：`python3 scripts/phase_acceptance.py --days 5`，输出必须能解释每个 0。
+
+**WP8：部署、shadow 与回滚**
+
+- 顺序：
+  1. 主仓 `cargo test` 限定目标 + `cargo check --lib --bin monitor`；
+  2. `cargo build --release --bin monitor`；
+  3. 同步改动源文件到运行根，`diff -rq` 确认无遗漏；
+  4. 运行根 release 构建；
+  5. `launchctl kickstart -k gui/$(id -u)/com.stockanalysis.monitor`；
+  6. 验证 `bound root mode=production path=<运行根>`、migrations、shadow 日志；
+     不把 PID/“启动成功”当行为验证。
+- 灰度：
+  - 第 1 阶段 `TICKET_DECISION_SHADOW=1` + `TICKET_ENTRY_POLICY=legacy`，只记录；
+  - 第 2 阶段 `TICKET_ENTRY_POLICY=shadow`，比较差异；
+  - 第 3 阶段只对 001216 或一个来源开 `new`；
+  - 观察至少 5 个交易日、覆盖一次失效/到期，再讨论全量。
+- 回滚：
+  - `TICKET_ENTRY_POLICY=legacy` 立即回旧触发；
+  - `TICKET_DECISION_SHADOW=0` 停止新表写入；
+  - 保留旧 binary 和备份；新表可保留，不删历史。
+- 上线后验收：
+  - 用户可见推送在 shadow 阶段零变化；
+  - `ticket_decision` 有 `decision_id`/`rule_version`/`context_json`；
+  - `entry_triggered` 与 `entry_expired` 能区分；
+  - 重放同一输入哈希一致；
+  - 没有 `NoDecision` 被当成成功。
+
+#### 11.11.5 文件级落点汇总
+
+| 文件 | 动作 | 依赖 |
+|---|---|---|
+| `src/monitor/ticket_decision.rs` | 新增类型、纯 `EntryPolicy`、测试 | WP1 |
+| `src/database/ticket_lifecycle.rs` | 新增 `ticket_decision` 表/API；不改旧列 | WP1 |
+| `src/monitor/ticket_entry_proposal.rs` | 生成 context、entry_mode、source health | WP2 |
+| `src/monitor/ticket_entry_trigger.rs` | 按策略分派、quote coverage、状态事务 | WP3/WP4 |
+| `src/monitor/watch_pool_monitor.rs` | 关联票 coverage / 成功失败计数 | WP3.5 |
+| `src/monitor/watch_pool_intraday.rs` | 盘中报价 coverage / source health | WP3.5 |
+| `src/monitor/ticket_watch_pool.rs` | 新闻/资金流来源健康标记 | WP3.5 |
+| `src/monitor/mod.rs` | 注册新模块 | WP1 |
+| `src/monitor/ticket_auction_price.rs` | OutputKind、参考价文案 | WP5 |
+| `src/bin/monitor/push_templates.rs` | 模板语义与四态测试 | WP5 |
+| `src/bin/monitor/main.rs` | 调度、shadow 开关、source health 注入 | WP2/WP8 |
+| `src/monitor/ticket_evidence.rs` | 只读证据索引/缺口 | WP6 |
+| `src/bin/ticket_audit.rs` | 单票审计 CLI | WP6 |
+| `src/bin/ticket_dedupe.rs` | 重复活跃票 dry-run/apply | WP4 |
+| `scripts/ticket_audit_eval.py` | 路径/收益/成交评估 | WP6 |
+| `scripts/ticket_control_group.py` | PIT 对照；不足则 BLOCKED | WP6 |
+| `scripts/ticket_evidence_audit.py` | 独立重算/hash 校验 | WP6 |
+| `scripts/phase_acceptance.py` | 漏斗/来源/归因验收 | WP7 |
+| `tests/fixtures/ticket_evidence/` | 小样本回归 | WP6 |
+
+#### 11.11.6 验收命令（目标形态）
+
+```bash
+cargo check --lib --bin monitor
+cargo test --lib monitor::ticket_decision::tests
+cargo test --lib monitor::ticket_entry_trigger::tests
+cargo test --lib monitor::ticket_entry_proposal::tests
+cargo test --bin monitor push_templates
+cargo run --release --bin ticket_audit -- \
+  --db /Users/zhangzhen/.local/share/stock-analysis-runtime/data/stock_analysis.db \
+  --delivery-db /Users/zhangzhen/.local/share/stock-analysis-runtime/data/durable_delivery.sqlite3 \
+  --code 001216 --as-of 2026-10-26 \
+  --out data/ticket_evidence/001216/2026-10-26
+python3 scripts/ticket_audit_eval.py --pack data/ticket_evidence/001216/2026-10-26
+python3 scripts/ticket_control_group.py --pack data/ticket_evidence/001216/2026-10-26
+python3 scripts/ticket_evidence_audit.py --pack data/ticket_evidence/001216/2026-10-26
+python3 scripts/phase_acceptance.py --days 5
+git diff --check
+```
+
+当前这些命令中的新文件和新表尚未实现，不能把命令写进文档就当成可执行验收。
+
+#### 11.11.7 需要拍板的事项
+
+1. **是否允许新增 `ticket_decision` 表**
+   推荐：允许。只加表、不改旧表列；代价是一次 schema 变更和数据库副本验证。
+   备选：纯 `ticket_event` + JSON 投影；不改 schema，但没有约束、查询复杂、
+   容易出现消费者再次各自解释。
+
+2. **是否允许清理 3 组重复活跃 ticket**
+   推荐：先用 `ticket_dedupe --dry-run` 出清单，再关闭较旧票；不删除历史行。
+   代价：改变 6 张票的 stage，必须在备份后执行，并记录 `duplicate_closed` 事件。
+
+3. **EntryMode 的第一版口径**
+   推荐按本计划：Bullish→Pullback、Bearish/Tangled→Breakout、Emotion+竞价→
+   AuctionReference、其余 Unknown。Unknown 不给可执行价，不猜。
+   代价：短期内可能有更多 `NoDecision`/参考输出，但不再出现“回踩提案等昨高”。
+
+4. **第一期范围**
+   推荐只做 001216 + 一条价格路径 + shadow；不做全市场、不做 PIT 回填。
+   代价：不能马上得出策略结论，只能先证明决策链可重放。
+
+#### 11.11.8 明确不做与仍在阻塞的
+
+- 不做：全量 CQRS/事件溯源、通用规则引擎、LLM 定价、自动交易、新推送渠道。
+- 仍阻塞：
+  - 原始集合竞价委托/逐笔/盘口（`data/auction_raw/` 不存在）；
+  - 公告/财报全文、第二独立财务源；
+  - 真实成交/排队/滑点数据；
+  - 全市场候选与淘汰快照（对照组口径未成立）；
+  - `board_member_snapshot` 只有 2026-10-26 起，历史 PIT 不完整；
+  - P3.3 关联票成功/失败仍需按新覆盖率口径复验。
+
+这些缺口不阻止 WP1–WP6 的 shadow 和证据包，但会阻止：
+- 成交概率结论；
+- 财报因果结论；
+- 板块 alpha 结论；
+- 策略普遍性结论。
+
+**当前状态：本计划是待实施计划，不是已完成记录；源码、数据库、调度和推送均未
+按本计划改动。**
