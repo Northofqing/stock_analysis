@@ -290,7 +290,7 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             match ticket_regime::resolve(&mut conn, ticket.id, code, &ticket.source, as_of) {
                 Ok(decision) => (
                     decision.regime.as_str().to_owned(),
-                    ticket_decision::entry_mode_for(decision.regime, zone.trend),
+                    ticket_decision::entry_mode_for(decision.regime, zone.trend, &ticket.source),
                     valid_until_for(as_of, decision.regime),
                 ),
                 Err(error) => {

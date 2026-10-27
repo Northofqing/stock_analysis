@@ -297,7 +297,7 @@ fn legacy_shadow_context(
         as_of,
         source,
         regime.as_str(),
-        ticket_decision::entry_mode_for(regime, zone.trend),
+        ticket_decision::entry_mode_for(regime, zone.trend, source),
     );
     context.price_low = zone.entry_low;
     context.price_high = zone.entry_high;

@@ -379,15 +379,16 @@ pub fn output_kind_for(decision: Decision) -> OutputKind {
     }
 }
 
-/// 分型映射：情绪型统一走竞价参考，趋势型按均线形态分派。
-pub fn entry_mode_for(regime: Regime, trend: Trend) -> EntryMode {
-    match regime {
-        Regime::Emotion => EntryMode::AuctionReference,
-        Regime::Trend => match trend {
-            Trend::Bullish => EntryMode::Pullback,
-            Trend::Bearish | Trend::Tangled => EntryMode::Breakout,
-            Trend::Unknown => EntryMode::Unknown,
-        },
+/// 分型映射：P01 情绪型走竞价参考，其余按均线形态分派。
+pub fn entry_mode_for(regime: Regime, trend: Trend, source: &str) -> EntryMode {
+    // 只有 P01 情绪票在 09:25 有竞价参考；其他情绪来源没有竞价证据。
+    if regime == Regime::Emotion && source == "p01_preopen" {
+        return EntryMode::AuctionReference;
+    }
+    match trend {
+        Trend::Bullish => EntryMode::Pullback,
+        Trend::Bearish | Trend::Tangled => EntryMode::Breakout,
+        Trend::Unknown => EntryMode::Unknown,
     }
 }
 
@@ -647,19 +648,23 @@ mod tests {
     #[test]
     fn entry_mode_mapping_is_explicit() {
         assert_eq!(
-            entry_mode_for(Regime::Emotion, Trend::Bullish),
+            entry_mode_for(Regime::Emotion, Trend::Bullish, "p01_preopen"),
             EntryMode::AuctionReference
         );
         assert_eq!(
-            entry_mode_for(Regime::Trend, Trend::Bullish),
+            entry_mode_for(Regime::Emotion, Trend::Bullish, "holding"),
             EntryMode::Pullback
         );
         assert_eq!(
-            entry_mode_for(Regime::Trend, Trend::Tangled),
+            entry_mode_for(Regime::Trend, Trend::Bullish, "catalyst"),
+            EntryMode::Pullback
+        );
+        assert_eq!(
+            entry_mode_for(Regime::Trend, Trend::Tangled, "catalyst"),
             EntryMode::Breakout
         );
         assert_eq!(
-            entry_mode_for(Regime::Trend, Trend::Unknown),
+            entry_mode_for(Regime::Trend, Trend::Unknown, "catalyst"),
             EntryMode::Unknown
         );
     }
