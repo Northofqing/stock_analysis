@@ -409,8 +409,7 @@ async fn load_peer_alerts(
         // provider 对一批里某些代码会整批返回 internal（常见于停牌/退市/
         // 板块成分里的陈旧代码）。不能因为一个坏代码把整组关联票丢掉：
         // 失败批次二分，直到隔离出单只坏票；coverage 记录每个子批次。
-        let mut queue: std::collections::VecDeque<Vec<String>> =
-            std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<Vec<String>> = std::collections::VecDeque::new();
         queue.push_back(candidates.clone());
         let mut coverage = QuoteCoverage::default();
         let mut records = Vec::new();
