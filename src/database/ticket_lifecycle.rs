@@ -92,6 +92,46 @@ pub fn create_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::
     )
     .execute(conn)
     .ok();
+
+    // 2026-10-27: 决策上下文与提案投影。只新增表，不改 ticket_lifecycle /
+    // ticket_event 既有列；沿用 create_schema 的幂等建表，避免 schema 版本分叉。
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS ticket_decision (\
+         decision_id TEXT PRIMARY KEY,\
+         ticket_id INTEGER NOT NULL,\
+         code TEXT NOT NULL,\
+         as_of DATE NOT NULL,\
+         source TEXT NOT NULL,\
+         regime TEXT NOT NULL,\
+         entry_mode TEXT NOT NULL,\
+         price_low REAL,\
+         price_high REAL,\
+         trigger_level REAL,\
+         abandon REAL,\
+         proposal_status TEXT NOT NULL,\
+         valid_from TIMESTAMP,\
+         valid_until TIMESTAMP,\
+         source_health TEXT NOT NULL,\
+         evidence_grade TEXT NOT NULL,\
+         context_json TEXT NOT NULL,\
+         rule_version TEXT NOT NULL,\
+         supersedes TEXT,\
+         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .execute(conn)?;
+    diesel::sql_query(
+        "CREATE INDEX IF NOT EXISTS idx_ticket_decision_ticket \
+         ON ticket_decision(ticket_id, as_of)",
+    )
+    .execute(conn)
+    .ok();
+    diesel::sql_query(
+        "CREATE INDEX IF NOT EXISTS idx_ticket_decision_status \
+         ON ticket_decision(code, proposal_status)",
+    )
+    .execute(conn)
+    .ok();
     Ok(())
 }
 

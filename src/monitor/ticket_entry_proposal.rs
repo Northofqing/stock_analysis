@@ -18,12 +18,17 @@
 //! - 单票失败不影响其余票：错误进 `errors`，继续下一只。
 
 use chrono::NaiveDate;
-use diesel::sql_types::{BigInt, Text};
+use diesel::sql_types::{BigInt, Nullable, Text};
+use diesel::OptionalExtension;
 use diesel::{QueryableByName, RunQueryDsl, SqliteConnection};
 
 use crate::database::ticket_lifecycle;
 use crate::database::DatabaseManager;
 use crate::monitor::buy_zone;
+use crate::monitor::ticket_decision::{
+    self, DecisionContext, EntryMode, EvidenceGrade, SourceHealth, SourceStatus,
+};
+use crate::monitor::ticket_regime::{self, Regime};
 
 #[derive(QueryableByName)]
 struct CodeRow {
@@ -66,6 +71,115 @@ impl ProposalReport {
     }
 }
 
+/// 仅 shadow 写 `ticket_decision`，默认不改变 proposal 的旧行为。
+fn decision_shadow_enabled() -> bool {
+    std::env::var("TICKET_DECISION_SHADOW")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn latest_source_date(
+    conn: &mut SqliteConnection,
+    sql: &str,
+    label: &str,
+) -> Result<Option<String>, String> {
+    #[derive(QueryableByName)]
+    struct DateRow {
+        #[diesel(sql_type = Nullable<Text>)]
+        d: Option<String>,
+    }
+    diesel::sql_query(sql)
+        .get_result::<DateRow>(conn)
+        .optional()
+        .map(|row| row.and_then(|row| row.d))
+        .map_err(|error| format!("{label} 日期查询失败: {error}"))
+}
+
+fn health_for_date(label: &str, date: Option<String>, as_of: &str) -> SourceStatus {
+    match date {
+        Some(date) if date == as_of => SourceStatus {
+            source: label.to_owned(),
+            health: SourceHealth::Available,
+            as_of: Some(date),
+            detail: None,
+        },
+        Some(date) => SourceStatus {
+            source: label.to_owned(),
+            health: SourceHealth::Stale,
+            as_of: Some(date),
+            detail: Some(format!("最新日期早于 {as_of}")),
+        },
+        None => SourceStatus {
+            source: label.to_owned(),
+            health: SourceHealth::Unavailable,
+            as_of: None,
+            detail: Some("未找到可用数据".to_owned()),
+        },
+    }
+}
+
+fn source_health_snapshot(conn: &mut SqliteConnection, as_of: &str) -> Vec<SourceStatus> {
+    let mut sources = Vec::with_capacity(4);
+    let daily = latest_source_date(conn, "SELECT MAX(date) AS d FROM stock_daily", "daily_bars");
+    sources.push(match daily {
+        Ok(date) => health_for_date("daily_bars", date, as_of),
+        Err(error) => SourceStatus {
+            source: "daily_bars".to_owned(),
+            health: SourceHealth::Unavailable,
+            as_of: None,
+            detail: Some(error),
+        },
+    });
+    let news = latest_source_date(
+        conn,
+        "SELECT MAX(substr(created_at, 1, 10)) AS d FROM news_ai_assessment",
+        "news",
+    );
+    sources.push(match news {
+        Ok(date) => health_for_date("news", date, as_of),
+        Err(error) => SourceStatus {
+            source: "news".to_owned(),
+            health: SourceHealth::Unavailable,
+            as_of: None,
+            detail: Some(error),
+        },
+    });
+    let board = latest_source_date(
+        conn,
+        "SELECT MAX(trade_date) AS d FROM board_ranking_daily",
+        "board",
+    );
+    sources.push(match board {
+        Ok(date) => health_for_date("board", date, as_of),
+        Err(error) => SourceStatus {
+            source: "board".to_owned(),
+            health: SourceHealth::Unavailable,
+            as_of: None,
+            detail: Some(error),
+        },
+    });
+    // proposal 阶段还没有盘中报价；这是事实，不伪装成已确认。
+    sources.push(SourceStatus {
+        source: "quotes".to_owned(),
+        health: SourceHealth::Partial,
+        as_of: Some(as_of.to_owned()),
+        detail: Some("proposal 阶段尚未评估实时报价".to_owned()),
+    });
+    sources
+}
+
+fn valid_until_for(as_of: &str, regime: Regime) -> Option<String> {
+    let mut date = NaiveDate::parse_from_str(as_of, "%Y-%m-%d").ok()?;
+    let limit = match regime {
+        Regime::Emotion => 1,
+        Regime::Trend => 3,
+    };
+    for _ in 0..limit {
+        date = crate::calendar::next_trading_day(date);
+    }
+    Some(date.format("%Y-%m-%d").to_string())
+}
+
 /// 当天是否已经给这只票推过入场参考。
 fn already_proposed_today(
     conn: &mut SqliteConnection,
@@ -100,6 +214,9 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
     .into_iter()
     .map(|row| row.code)
     .collect();
+
+    let source_health = source_health_snapshot(&mut conn, as_of);
+    let shadow = decision_shadow_enabled();
 
     let mut report = ProposalReport {
         scanned: observing.len(),
@@ -166,6 +283,54 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             Err(error) => {
                 report.errors.push(format!("{code} {error}"));
                 continue;
+            }
+        }
+
+        let (regime_label, entry_mode, valid_until) =
+            match ticket_regime::resolve(&mut conn, ticket.id, code, &ticket.source, as_of) {
+                Ok(decision) => (
+                    decision.regime.as_str().to_owned(),
+                    ticket_decision::entry_mode_for(decision.regime, zone.trend),
+                    valid_until_for(as_of, decision.regime),
+                ),
+                Err(error) => {
+                    report.errors.push(format!("{code} 分型失败: {error}"));
+                    ("unknown".to_owned(), EntryMode::Unknown, None)
+                }
+            };
+
+        let mut context = DecisionContext::new(
+            ticket.id,
+            code.clone(),
+            as_of,
+            ticket.source.clone(),
+            regime_label,
+            entry_mode,
+        );
+        context.price_low = Some(low);
+        context.price_high = Some(high);
+        context.trigger_level = zone.ma5;
+        context.abandon = zone.abandon;
+        context.confirmation = "price_only".to_owned();
+        context.valid_from = Some(as_of.to_owned());
+        context.valid_until = valid_until;
+        context.source_health = source_health.clone();
+        context.evidence_grade = EvidenceGrade::L1;
+        context.missing_fields.push("volume_ratio".to_owned());
+        context.seal();
+
+        if shadow {
+            match ticket_decision::persist_proposal(&db, &context) {
+                Ok(()) => log::info!(
+                    "[入场参考][shadow] code={} decision_id={} mode={} low={low:.2} high={high:.2} valid_until={:?}",
+                    code,
+                    context.decision_id,
+                    context.entry_mode.as_str(),
+                    context.valid_until
+                ),
+                Err(error) => report
+                    .errors
+                    .push(format!("{code} shadow context 写入失败: {error}")),
             }
         }
 

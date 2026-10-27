@@ -31,10 +31,34 @@ use crate::data_gateway::grpc_source;
 use crate::data_gateway::{GatewayBatch, RealtimeMarketQuote};
 use crate::database::{ticket_lifecycle, DatabaseManager};
 use crate::monitor::buy_zone;
+use crate::monitor::ticket_decision::{
+    self, Decision, DecisionContext, EntryMode, EntryPolicy, EvidenceGrade, ProposalStatus,
+    QuoteView, SourceStatus,
+};
 use crate::monitor::ticket_regime::{self, Regime};
 
 /// 触发确认的涨幅上限：涨幅超过它说明已经拉到高位，突破买点没有意义。
 const MAX_TRIGGER_CHANGE_PCT: f64 = 6.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerPolicyMode {
+    Legacy,
+    Shadow,
+    New,
+}
+
+fn trigger_policy_mode() -> TriggerPolicyMode {
+    match std::env::var("TICKET_ENTRY_POLICY")
+        .unwrap_or_else(|_| "legacy".to_owned())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "new" => TriggerPolicyMode::New,
+        "shadow" => TriggerPolicyMode::Shadow,
+        _ => TriggerPolicyMode::Legacy,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitAction {
@@ -64,6 +88,43 @@ pub struct TriggerTarget {
     pub entry_high: f64,
     pub abandon: Option<f64>,
     pub regime: Regime,
+    /// `None` = 旧提案还没有 context；只允许 legacy 路径使用。
+    pub context: Option<DecisionContext>,
+}
+
+impl TriggerTarget {
+    pub fn entry_mode(&self) -> EntryMode {
+        self.context
+            .as_ref()
+            .map(|context| context.entry_mode)
+            .unwrap_or(EntryMode::Unknown)
+    }
+
+    pub fn trigger_level(&self) -> Option<f64> {
+        self.context
+            .as_ref()
+            .and_then(|context| context.trigger_level)
+    }
+
+    pub fn decision_id(&self) -> Option<&str> {
+        self.context
+            .as_ref()
+            .map(|context| context.decision_id.as_str())
+    }
+
+    pub fn source_health(&self) -> &[SourceStatus] {
+        self.context
+            .as_ref()
+            .map(|context| context.source_health.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn evidence_grade(&self) -> EvidenceGrade {
+        self.context
+            .as_ref()
+            .map(|context| context.evidence_grade)
+            .unwrap_or(EvidenceGrade::L1)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -109,15 +170,42 @@ pub struct TriggerHit {
     pub abandon: Option<f64>,
     pub regime: Regime,
     pub action: HitAction,
+    pub decision_id: Option<String>,
+    pub entry_mode: EntryMode,
+    pub trigger_level: Option<f64>,
 }
 
 impl TriggerHit {
     pub fn basis(&self) -> String {
         match self.action {
-            HitAction::Triggered => format!(
-                "突破昨高 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
-                self.prev_high, self.price, self.change_pct, self.entry_low, self.entry_high
-            ),
+            HitAction::Triggered => match self.entry_mode {
+                EntryMode::Pullback => format!(
+                    "进入参考区间 {:.2}-{:.2}（现价 {:.2}，{:+.2}%）",
+                    self.entry_low, self.entry_high, self.price, self.change_pct
+                ),
+                EntryMode::Breakout => self.trigger_level.map_or_else(
+                    || {
+                        format!(
+                            "突破昨高 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            self.prev_high,
+                            self.price,
+                            self.change_pct,
+                            self.entry_low,
+                            self.entry_high
+                        )
+                    },
+                    |level| {
+                        format!(
+                            "站上触发位 {level:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            self.price, self.change_pct, self.entry_low, self.entry_high
+                        )
+                    },
+                ),
+                EntryMode::AuctionReference | EntryMode::Unknown => format!(
+                    "突破昨高 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                    self.prev_high, self.price, self.change_pct, self.entry_low, self.entry_high
+                ),
+            },
             HitAction::Invalidated => format!(
                 "跌破放弃价 {:.2}（现价 {:.2}）",
                 self.abandon.unwrap_or(0.0),
@@ -194,6 +282,35 @@ fn invalidated_after_latest_proposal(
     Ok(row.n > 0)
 }
 
+/// Shadow 模式下给旧 proposal 做只读重建：只用于比较，不写库、不参与 new 模式。
+fn legacy_shadow_context(
+    ticket_id: i64,
+    code: &str,
+    source: &str,
+    as_of: &str,
+    regime: Regime,
+    zone: &buy_zone::BuyZone,
+) -> DecisionContext {
+    let mut context = DecisionContext::new(
+        ticket_id,
+        code,
+        as_of,
+        source,
+        regime.as_str(),
+        ticket_decision::entry_mode_for(regime, zone.trend),
+    );
+    context.price_low = zone.entry_low;
+    context.price_high = zone.entry_high;
+    context.trigger_level = zone.ma5;
+    context.abandon = zone.abandon;
+    context.confirmation = "price_only".to_owned();
+    context.valid_from = Some(as_of.to_owned());
+    context.missing_fields.push("volume_ratio".to_owned());
+    context.missing_fields.push("legacy_backfill".to_owned());
+    context.seal();
+    context
+}
+
 /// 预热当日判据：`entry_proposed` 的票 → 昨高 + buy_zone 区间 + 分型。
 pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
     chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
@@ -223,13 +340,13 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
         ..Default::default()
     };
     let mut seen_codes = HashSet::new();
+    let policy_mode = trigger_policy_mode();
+    log::info!("[触发确认] policy_mode={policy_mode:?}");
 
     for ticket in tickets {
         let code = ticket.code.trim().to_owned();
         if code.is_empty() || !seen_codes.insert(code.clone()) {
-            cache
-                .skipped
-                .push(format!("{} 重复/空活跃票", ticket.code));
+            cache.skipped.push(format!("{} 重复/空活跃票", ticket.code));
             continue;
         }
         if invalidated_after_latest_proposal(&mut conn, ticket.id)? {
@@ -247,9 +364,7 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
                 continue;
             }
             Err(error) => {
-                cache
-                    .skipped
-                    .push(format!("{code} 买点失败: {error}"));
+                cache.skipped.push(format!("{code} 买点失败: {error}"));
                 continue;
             }
         };
@@ -257,33 +372,71 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
             cache.skipped.push(format!("{code} 无入场区间"));
             continue;
         };
-        let regime = match ticket_regime::resolve(&mut conn, ticket.id, &code, &ticket.source, as_of)
-        {
-            Ok(decision) => decision.regime,
-            Err(error) => {
-                cache
-                    .skipped
-                    .push(format!("{code} 分型失败: {error}"));
-                continue;
+        let regime =
+            match ticket_regime::resolve(&mut conn, ticket.id, &code, &ticket.source, as_of) {
+                Ok(decision) => decision.regime,
+                Err(error) => {
+                    cache.skipped.push(format!("{code} 分型失败: {error}"));
+                    continue;
+                }
+            };
+        let loaded_context = if policy_mode == TriggerPolicyMode::Legacy {
+            None
+        } else {
+            match ticket_decision::latest_open_proposal(&mut conn, ticket.id) {
+                Ok(context) => context,
+                Err(error) => {
+                    cache
+                        .skipped
+                        .push(format!("{code} decision context 查询失败: {error}"));
+                    None
+                }
             }
+        };
+        let context = match loaded_context {
+            Some(context) => Some(context),
+            None if policy_mode == TriggerPolicyMode::Shadow => Some(legacy_shadow_context(
+                ticket.id,
+                &code,
+                &ticket.source,
+                as_of,
+                regime,
+                &zone,
+            )),
+            None => None,
+        };
+        if context.is_none() && policy_mode == TriggerPolicyMode::New {
+            cache
+                .skipped
+                .push(format!("{code} legacy_context_missing（new 模式不猜触发）"));
+            continue;
+        }
+        let (target_entry_low, target_entry_high, target_abandon) = match &context {
+            Some(context) => (
+                context.price_low.unwrap_or(entry_low),
+                context.price_high.unwrap_or(entry_high),
+                context.abandon.or(zone.abandon),
+            ),
+            None => (entry_low, entry_high, zone.abandon),
         };
         cache.targets.push(TriggerTarget {
             ticket_id: ticket.id,
             name: zone.name.clone().unwrap_or_else(|| code.clone()),
             code,
             prev_high,
-            entry_low,
-            entry_high,
-            abandon: zone.abandon,
+            entry_low: target_entry_low,
+            entry_high: target_entry_high,
+            abandon: target_abandon,
             regime,
+            context,
         });
     }
 
     Ok(cache)
 }
 
-/// 判定一只票当前该触发还是失效（纯函数，便于回归）。
-fn judge(target: &TriggerTarget, price: f64, change_pct: f64) -> Option<HitAction> {
+/// 旧触发判据。保留为 legacy 开关的回归基线，不再作为默认新逻辑。
+fn judge_legacy(target: &TriggerTarget, price: f64, change_pct: f64) -> Option<HitAction> {
     if price <= 0.0 {
         return None;
     }
@@ -298,11 +451,35 @@ fn judge(target: &TriggerTarget, price: f64, change_pct: f64) -> Option<HitActio
     None
 }
 
+/// 旧测试和 legacy 路径使用的名字。
+fn judge(target: &TriggerTarget, price: f64, change_pct: f64) -> Option<HitAction> {
+    judge_legacy(target, price, change_pct)
+}
+
+/// 新策略结果 + 原因；没有 context 时返回 NoDecision 原因，不猜。
+fn judge_policy(
+    target: &TriggerTarget,
+    price: f64,
+    change_pct: f64,
+) -> (Option<HitAction>, &'static str) {
+    let Some(context) = target.context.as_ref() else {
+        return (None, "legacy_context_missing");
+    };
+    let outcome = EntryPolicy::evaluate(context, QuoteView { price, change_pct });
+    let action = match outcome.decision {
+        Decision::Triggered => Some(HitAction::Triggered),
+        Decision::Invalidated => Some(HitAction::Invalidated),
+        Decision::Expired | Decision::NoDecision => None,
+    };
+    (action, outcome.reason)
+}
+
 /// 拉一次行情并判定。行情不可用时返回错误（调用方记 warn、下一轮再试）。
 pub async fn evaluate(cache: &TriggerCache) -> Result<Vec<TriggerHit>, String> {
     if cache.is_empty() {
         return Ok(Vec::new());
     }
+    let policy_mode = trigger_policy_mode();
     let codes = cache.codes();
     let bridge = grpc_source::bridge_for("RealtimeQuotes").map_err(|error| error.to_string())?;
     let quotes: Vec<RealtimeMarketQuote> = match bridge.realtime_quotes_async(&codes).await {
@@ -323,7 +500,30 @@ pub async fn evaluate(cache: &TriggerCache) -> Result<Vec<TriggerHit>, String> {
         let Some(quote) = by_code.get(target.code.as_str()) else {
             continue;
         };
-        let Some(action) = judge(target, quote.price, quote.change_percent) else {
+        let legacy = judge_legacy(target, quote.price, quote.change_percent);
+        let (policy_action, policy_reason) =
+            judge_policy(target, quote.price, quote.change_percent);
+        let action = match policy_mode {
+            TriggerPolicyMode::Legacy => legacy,
+            TriggerPolicyMode::Shadow => {
+                if legacy != policy_action {
+                    log::info!(
+                        "[触发确认][shadow] code={} policy={:?} old={:?} new={:?} reason={} mode={} price={:.2} change={:.2}",
+                        target.code,
+                        policy_mode,
+                        legacy,
+                        policy_action,
+                        policy_reason,
+                        target.entry_mode().as_str(),
+                        quote.price,
+                        quote.change_percent
+                    );
+                }
+                legacy
+            }
+            TriggerPolicyMode::New => policy_action,
+        };
+        let Some(action) = action else {
             continue;
         };
         hits.push(TriggerHit {
@@ -338,6 +538,9 @@ pub async fn evaluate(cache: &TriggerCache) -> Result<Vec<TriggerHit>, String> {
             abandon: target.abandon,
             regime: target.regime,
             action,
+            decision_id: target.decision_id().map(str::to_owned),
+            entry_mode: target.entry_mode(),
+            trigger_level: target.trigger_level(),
         });
     }
     Ok(hits)
@@ -350,6 +553,35 @@ pub enum RecordOutcome {
     /// 当日已经记过（不推送）
     Duplicate,
 }
+
+#[derive(Debug)]
+enum RecordTxError {
+    Db(diesel::result::Error),
+    Message(String),
+}
+
+impl From<diesel::result::Error> for RecordTxError {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl From<String> for RecordTxError {
+    fn from(error: String) -> Self {
+        Self::Message(error)
+    }
+}
+
+impl std::fmt::Display for RecordTxError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Db(error) => write!(formatter, "{error}"),
+            Self::Message(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for RecordTxError {}
 
 /// 把一次命中写进库。同日同票同动作只记一次。
 pub fn record(
@@ -365,15 +597,32 @@ pub fn record(
             }
             let basis = hit.basis();
             db.record_candidate_trigger(as_of, &hit.code, &hit.name, &basis)?;
-            ticket_lifecycle::append_event(
-                &mut conn,
-                hit.ticket_id,
-                as_of,
-                "entry_triggered",
-                None,
-                None,
-                Some(&basis),
-            )?;
+            conn.transaction::<(), RecordTxError, _>(|conn| {
+                ticket_lifecycle::append_event(
+                    conn,
+                    hit.ticket_id,
+                    as_of,
+                    "entry_triggered",
+                    None,
+                    hit.decision_id.as_deref(),
+                    Some(&basis),
+                )?;
+                if let Some(decision_id) = hit.decision_id.as_deref() {
+                    let changed = ticket_decision::update_proposal_status(
+                        conn,
+                        decision_id,
+                        ProposalStatus::Triggered,
+                    )?;
+                    if !changed {
+                        return Err(format!(
+                            "entry_triggered 已记账但 ticket_decision 不存在: {decision_id}"
+                        )
+                        .into());
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
             Ok(RecordOutcome::Recorded)
         }
         HitAction::Invalidated => {
@@ -388,15 +637,32 @@ pub fn record(
             )? {
                 return Ok(RecordOutcome::Duplicate);
             }
-            ticket_lifecycle::append_event(
-                &mut conn,
-                hit.ticket_id,
-                as_of,
-                "entry_invalidated",
-                None,
-                None,
-                Some(&summary),
-            )?;
+            conn.transaction::<(), RecordTxError, _>(|conn| {
+                ticket_lifecycle::append_event(
+                    conn,
+                    hit.ticket_id,
+                    as_of,
+                    "entry_invalidated",
+                    None,
+                    hit.decision_id.as_deref(),
+                    Some(&summary),
+                )?;
+                if let Some(decision_id) = hit.decision_id.as_deref() {
+                    let changed = ticket_decision::update_proposal_status(
+                        conn,
+                        decision_id,
+                        ProposalStatus::Invalidated,
+                    )?;
+                    if !changed {
+                        return Err(format!(
+                            "entry_invalidated 已记账但 ticket_decision 不存在: {decision_id}"
+                        )
+                        .into());
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
             Ok(RecordOutcome::Recorded)
         }
     }
@@ -582,11 +848,55 @@ mod tests {
             entry_high: 10.5,
             abandon,
             regime: Regime::Emotion,
+            context: None,
         }
     }
 
     fn quote(price: f64, change: f64) -> (f64, f64) {
         (price, change)
+    }
+
+    fn policy_target(mode: EntryMode, prev_high: f64) -> TriggerTarget {
+        let mut base = target(prev_high, Some(9.0));
+        let mut context =
+            DecisionContext::new(1, "002696", "2026-10-27", "board_rotation", "trend", mode);
+        context.price_low = Some(10.0);
+        context.price_high = Some(10.5);
+        context.trigger_level = Some(10.8);
+        context.abandon = Some(9.0);
+        context.seal();
+        base.context = Some(context);
+        base
+    }
+
+    #[test]
+    fn pullback_policy_uses_range_not_prev_high() {
+        let target = policy_target(EntryMode::Pullback, 11.0);
+        let (price, change) = quote(10.2, 3.0);
+        assert_eq!(judge_legacy(&target, price, change), None);
+        assert_eq!(
+            judge_policy(&target, price, change).0,
+            Some(HitAction::Triggered)
+        );
+    }
+
+    #[test]
+    fn breakout_policy_uses_trigger_level_not_prev_high() {
+        let target = policy_target(EntryMode::Breakout, 11.0);
+        let (price, change) = quote(10.9, 3.0);
+        assert_eq!(judge_legacy(&target, price, change), None);
+        assert_eq!(
+            judge_policy(&target, price, change).0,
+            Some(HitAction::Triggered)
+        );
+    }
+
+    #[test]
+    fn policy_without_context_is_no_decision() {
+        let target = target(10.3, Some(9.0));
+        let outcome = judge_policy(&target, 11.0, 3.0);
+        assert_eq!(outcome.0, None);
+        assert_eq!(outcome.1, "legacy_context_missing");
     }
 
     #[test]
@@ -627,6 +937,9 @@ mod tests {
             abandon: Some(9.0),
             regime: Regime::Emotion,
             action: HitAction::Triggered,
+            decision_id: None,
+            entry_mode: EntryMode::Unknown,
+            trigger_level: None,
         };
         let text = hit.render();
         assert!(text.contains("突破确认"));
