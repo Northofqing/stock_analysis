@@ -22,7 +22,7 @@
 use crate::database::ticket_lifecycle;
 use crate::database::DatabaseManager;
 use crate::monitor::ticket_decision::SourceHealth;
-use diesel::{QueryableByName, RunQueryDsl};
+use diesel::{OptionalExtension, QueryableByName, RunQueryDsl};
 
 /// 默认回看天数（新闻催化）。
 const DEFAULT_LOOKBACK_DAYS: i64 = 5;
@@ -157,6 +157,29 @@ pub fn collect_news_catalysts(
     }
 
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    // 先看新闻评估源本身是否还在更新；否则「窗口内 0 条」会被误读成
+    // 「今天没有催化」，而不是新闻管线已停。
+    #[derive(QueryableByName)]
+    struct LatestRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        latest: Option<String>,
+    }
+    let latest: Option<String> = diesel::sql_query(
+        "SELECT MAX(substr(created_at, 1, 10)) AS latest FROM news_ai_assessment",
+    )
+    .get_result::<LatestRow>(&mut *conn)
+    .optional()
+    .map_err(|e| format!("news freshness query failed: {e}"))?
+    .and_then(|row| row.latest);
+    if latest
+        .as_deref()
+        .is_none_or(|date| date < since_text.as_str())
+    {
+        return Err(format!(
+            "news_ai_assessment 最新 {:?} 早于窗口起点 {since_text}（来源陈旧）",
+            latest
+        ));
+    }
     // 按时间倒序，第一次见到某只票即为"最新催化"。
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT target_code, impact, core_logic, created_at FROM news_ai_assessment \
