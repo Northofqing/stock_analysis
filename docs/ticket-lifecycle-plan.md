@@ -2932,6 +2932,18 @@ git diff --check
     不再把现价放进幂等键；
   - 已产生的重复事件保留未删，等待人工确认后再做数据清理；
     P2 的当前 `triggered` 计数含这些重复，不能当作独立样本数。
+  - `ticket_entry_trigger` 测试补到 13 个（含去重回归）。
+- 2026-10-28 15:40 观察池未生成：
+  - 15:25 重启后 `startup_health_check status=degraded`；
+  - 到 16:40 `data/watch_pool/2026-10-28` 仍不存在，`ticket_decision`
+    仍 0 行，`stock_daily` 的 2026-10-28 也仍没有全市场行；
+  - 期间 monitor 长时间 100% CPU，`sample` 显示热点在
+    `database::news_ai::global_critical::validate_rows`：每条新闻候选都重扫
+    26,992 行不可变链；
+  - 已提交 `e204d40d5`，按链头 `MAX(seq)+record_hash` 缓存校验结果，
+    append 后主动失效；`database::news_ai::global_critical::tests` 1/1 通过；
+    运行根 release 已编译，但未重启，当前 PID 4955 仍是旧二进制；
+  - 因此 WP8 shadow 样本仍只有 0 个 `ticket_decision`，不能推进切 `new`。
 - 2026-10-28 新闻源陈旧检测：
   - `news_ai_assessment` 最新只到 2026-10-14，观察池不再把它当成
     “窗口内 0 条催化”，而是显式报新闻来源不可用；
