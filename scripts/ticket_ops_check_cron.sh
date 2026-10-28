@@ -5,8 +5,9 @@ R=/Users/zhangzhen/.local/share/stock-analysis-runtime
 REPO=/Users/zhangzhen/Desktop/Quant/stock_analysis
 OUT="$R/data/ops_check/$(date +%F-%H%M).json"
 mkdir -p "$R/data/ops_check"
-exec python3 "$REPO/scripts/ticket_ops_check.py" \
+python3 "$REPO/scripts/ticket_ops_check.py" \
   --db "$R/data/stock_analysis.db" \
   --delivery-db "$R/data/durable_delivery.sqlite3" \
   --log "$R/logs/monitor-launchd.stderr.log" \
   --out "$OUT"
+cp "$OUT" "$R/data/ops_check/latest.json"

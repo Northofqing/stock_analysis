@@ -18,6 +18,7 @@ import argparse
 import json
 import re
 import sqlite3
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -88,7 +89,11 @@ def main() -> int:
             size = handle.tell()
             handle.seek(max(0, size - 8_000_000))
             text = handle.read().decode("utf-8", errors="ignore")
-        for line in text.splitlines():
+        # 只看当前进程启动后的日志；否则重启前的失败会被当成“现在还在失败”。
+        anchor = text.rfind("[monitor] bound root")
+        current = text[anchor:] if anchor >= 0 else text
+        last = deque(maxlen=5)
+        for line in current.splitlines():
             match = re.search(
                 r"\[观察池\]\[coverage\].*scope=(\S+).*health=(\w+)", line
             )
@@ -98,8 +103,8 @@ def main() -> int:
             health = match.group(2).lower()
             if health in ("available", "partial", "unavailable"):
                 coverage[health] += 1
-            if len(coverage["last"]) < 5:
-                coverage["last"].append({"scope": match.group(1), "health": health})
+            last.append({"scope": match.group(1), "health": health})
+        coverage["last"] = list(last)
         report["last_log_line"] = text.splitlines()[-1][:300] if text.splitlines() else ""
     report["coverage"] = coverage
     report["log_path"] = str(log_path)
