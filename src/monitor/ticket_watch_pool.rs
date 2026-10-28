@@ -537,6 +537,16 @@ pub fn collect_money_flow_boards(
     let Some(prev) = prev else {
         return Ok((0, Vec::new()));
     };
+    // f62 必须正好是上一交易日：10/23 的榜不能冒充 10/28 的资金流。
+    // 数据缺口应显式报 source unavailable，而不是静默用旧榜。
+    let business_day = chrono::NaiveDate::parse_from_str(business_date, "%Y-%m-%d")
+        .map_err(|e| format!("业务日期非法 {business_date}: {e}"))?;
+    let expected = crate::calendar::prev_trading_day(business_day).to_string();
+    if prev != expected {
+        return Err(format!(
+            "f62 榜最新 {prev}，需要上一交易日 {expected}（陈旧，不能当当日资金流）"
+        ));
+    }
     collect_board_picks(
         db,
         &prev,
