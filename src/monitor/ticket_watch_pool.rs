@@ -502,6 +502,13 @@ pub fn collect_board_rotation(
     )
 }
 
+/// f62 资金流榜要求的上一交易日；解析失败显式报错，不静默回退。
+fn previous_trading_day_text(business_date: &str) -> Result<String, String> {
+    let business_day = chrono::NaiveDate::parse_from_str(business_date, "%Y-%m-%d")
+        .map_err(|e| format!("业务日期非法 {business_date}: {e}"))?;
+    Ok(crate::calendar::prev_trading_day(business_day).to_string())
+}
+
 /// 资金流路（批 2.3 / 拓 7）：`f62` 主力净流入榜 top N → 成分股 → 每板块前 M。
 ///
 /// 取**当日**榜（`board_ranking_daily` 15:30 已写），取不到再退最近一日：
@@ -539,9 +546,7 @@ pub fn collect_money_flow_boards(
     };
     // f62 必须正好是上一交易日：10/23 的榜不能冒充 10/28 的资金流。
     // 数据缺口应显式报 source unavailable，而不是静默用旧榜。
-    let business_day = chrono::NaiveDate::parse_from_str(business_date, "%Y-%m-%d")
-        .map_err(|e| format!("业务日期非法 {business_date}: {e}"))?;
-    let expected = crate::calendar::prev_trading_day(business_day).to_string();
+    let expected = previous_trading_day_text(business_date)?;
     if prev != expected {
         return Err(format!(
             "f62 榜最新 {prev}，需要上一交易日 {expected}（陈旧，不能当当日资金流）"
@@ -812,5 +817,14 @@ mod tests {
         assert_eq!(health_label(Some(SourceHealth::Available)), "available");
         assert_eq!(health_label(Some(SourceHealth::Partial)), "partial");
         assert_eq!(health_label(Some(SourceHealth::Unavailable)), "unavailable");
+    }
+
+    #[test]
+    fn f62_requires_exact_previous_trading_day() {
+        assert_eq!(
+            previous_trading_day_text("2026-10-28").unwrap(),
+            "2026-10-27"
+        );
+        assert!(previous_trading_day_text("not-a-date").is_err());
     }
 }
