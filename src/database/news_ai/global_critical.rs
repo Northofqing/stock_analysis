@@ -77,14 +77,78 @@ fn validate_rows(values: &[Row]) -> NewsAiAssessmentAuditResult<Vec<GlobalCritic
     }
     Ok(complete)
 }
+
+/// 全链校验是 O(行数) 的 JSON 规范化 + 哈希；新闻批次里每一条候选都会调用
+/// `has_base`，27k 行的表会把 CPU 拉满并让主循环的其他定时任务饿死。校验结果
+/// 只依赖不可变的链头；缓存到链头变化（append 会主动失效）为止。
+#[cfg(not(test))]
+type ValidatedGlobalRows = std::sync::Arc<Vec<GlobalCriticalEvidence>>;
+
+#[cfg(not(test))]
+static VALIDATED_GLOBAL_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(i64, String, ValidatedGlobalRows)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+fn validated_rows(conn: &mut SqliteConnection) -> NewsAiAssessmentAuditResult<ValidatedGlobalRows> {
+    #[derive(QueryableByName)]
+    struct Stamp {
+        #[diesel(sql_type = BigInt)]
+        seq: i64,
+        #[diesel(sql_type = Nullable<Text>)]
+        record_hash: Option<String>,
+    }
+    let stamp: Stamp = diesel::sql_query(
+        "SELECT COALESCE(MAX(seq),0) AS seq, \
+                (SELECT record_hash FROM news_ai_global_critical_v1 ORDER BY seq DESC LIMIT 1) AS record_hash",
+    )
+    .get_result(conn)
+    .map_err(NewsAiAssessmentAuditError::from)?;
+    let cache = VALIDATED_GLOBAL_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((seq, hash, values)) = guard.as_ref() {
+            if *seq == stamp.seq && *hash == stamp.record_hash.clone().unwrap_or_default() {
+                return Ok(std::sync::Arc::clone(values));
+            }
+        }
+    }
+    let values = std::sync::Arc::new(validate_rows(&rows(conn)?)?);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((
+            stamp.seq,
+            stamp.record_hash.unwrap_or_default(),
+            std::sync::Arc::clone(&values),
+        ));
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+fn validated_rows(
+    conn: &mut SqliteConnection,
+) -> NewsAiAssessmentAuditResult<std::sync::Arc<Vec<GlobalCriticalEvidence>>> {
+    Ok(std::sync::Arc::new(validate_rows(&rows(conn)?)?))
+}
+
+#[cfg(not(test))]
+fn invalidate_validated_global_cache() {
+    if let Some(cache) = VALIDATED_GLOBAL_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
+#[cfg(test)]
+fn invalidate_validated_global_cache() {}
 pub(super) fn has_equity_base(
     conn: &mut SqliteConnection,
     fact: &AdmittedNewsFact,
 ) -> NewsAiAssessmentAuditResult<bool> {
     let expected = NewsBaseIdentity::from_fact(fact).map_err(|e| audit(e.to_string()))?;
-    let values = validate_rows(&rows(conn)?)?;
+    let values = validated_rows(conn)?;
     let mut found = false;
-    for value in values {
+    for value in values.iter() {
         let actual = value.news_base().map_err(|e| audit(e.to_string()))?;
         found |= actual == expected || actual.same_text_revision(&expected);
     }
@@ -124,7 +188,7 @@ pub(super) fn has_base(
         // Identical text across purposes is conservative even across source items.
         found |= actual == expected || actual.same_text_revision(&expected);
     }
-    for value in validate_rows(&rows(conn)?)? {
+    for value in validated_rows(conn)?.iter() {
         let actual = value.news_base().map_err(|e| audit(e.to_string()))?;
         // Same-purpose key keeps provider+item+revision, never profile/version.
         found |= actual == expected;
@@ -135,7 +199,7 @@ pub(super) fn append(
     conn: &mut SqliteConnection,
     result: GlobalCriticalModelResult,
 ) -> NewsAiAssessmentAuditResult<AuditedGlobalCriticalNews> {
-    conn.immediate_transaction::<_,NewsAiAssessmentAuditError,_>(|conn| {
+    let appended = conn.immediate_transaction::<_, NewsAiAssessmentAuditError, _>(|conn| {
         let evidence=result.evidence;let fact=evidence.fact().map_err(|e|audit(e.to_string()))?;
         if has_base(conn,&fact)? { return Err(audit("global source appeared after pre-call barrier; no capability")); }
         let before=rows(conn)?;validate_rows(&before)?;
@@ -150,7 +214,11 @@ pub(super) fn append(
         if after.len()!=before.len()+1 || actual.seq!=seq || actual.assessment_id!=id || actual.evidence_json!=body || actual.evidence_sha256!=digest || actual.previous_hash!=previous || actual.record_hash!=record { return Err(audit("global exact full readback differs")); }
         // Diesel only returns this token after the real transaction COMMIT succeeds.
         AuditedGlobalCriticalNews::mint(evidence,&actual.evidence_sha256).map_err(|e|audit(e.to_string()))
-    })
+    });
+    if appended.is_ok() {
+        invalidate_validated_global_cache();
+    }
+    appended
 }
 impl DatabaseManager {
     pub fn has_audited_global_news_base(
