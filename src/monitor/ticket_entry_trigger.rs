@@ -486,10 +486,24 @@ pub async fn evaluate(cache: &TriggerCache) -> Result<Vec<TriggerHit>, String> {
     let quotes: Vec<RealtimeMarketQuote> = match bridge.realtime_quotes_async(&codes).await {
         Ok(GatewayBatch::Available { records, .. }) => records,
         Ok(GatewayBatch::VerifiedEmpty(_)) => Vec::new(),
-        Err(error) if error.reason_code() == "no_last_traded_price" => {
-            bridge.realtime_quotes_with_isolation(&codes).await.quotes
+        Err(error) => {
+            // provider 对整批（含个别停牌/陈旧代码）可能回 no_verified_batch；
+            // 触发确认不能因为一只坏票或批次上限整组不跑。二分隔离后继续；
+            // 只有全部代码都被隔离时才报错。
+            let reason = error.reason_code().to_owned();
+            let isolated = bridge.realtime_quotes_with_isolation(&codes).await;
+            log::warn!(
+                "[触发确认] RealtimeQuotes 被 {} 拒绝, 二分隔离后取到 {} 只 / 隔离 {} 只 / 请求 {} 次",
+                reason,
+                isolated.quotes.len(),
+                isolated.isolated.len(),
+                isolated.requests
+            );
+            if isolated.quotes.is_empty() {
+                return Err(format!("行情拉取失败: {error}"));
+            }
+            isolated.quotes
         }
-        Err(error) => return Err(format!("行情拉取失败: {error}")),
     };
     let by_code: HashMap<&str, &RealtimeMarketQuote> = quotes
         .iter()
