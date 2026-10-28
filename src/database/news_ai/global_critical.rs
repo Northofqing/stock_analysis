@@ -94,12 +94,13 @@ fn validated_rows(conn: &mut SqliteConnection) -> NewsAiAssessmentAuditResult<Va
     #[derive(QueryableByName)]
     struct Stamp {
         #[diesel(sql_type = BigInt)]
+        #[diesel(column_name = "max_seq")]
         seq: i64,
         #[diesel(sql_type = Nullable<Text>)]
         record_hash: Option<String>,
     }
     let stamp: Stamp = diesel::sql_query(
-        "SELECT COALESCE(MAX(seq),0) AS seq, \
+        "SELECT COALESCE((SELECT seq FROM news_ai_global_critical_v1 ORDER BY seq DESC LIMIT 1),0) AS max_seq, \
                 (SELECT record_hash FROM news_ai_global_critical_v1 ORDER BY seq DESC LIMIT 1) AS record_hash",
     )
     .get_result(conn)
