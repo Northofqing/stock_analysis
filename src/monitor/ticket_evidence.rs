@@ -620,4 +620,129 @@ mod tests {
         );
         assert!(gaps.is_empty(), "unexpected gaps: {gaps:?}");
     }
+
+    #[test]
+    fn evidence_pack_reads_fixture_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main_path = dir.path().join("main.db");
+        let delivery_path = dir.path().join("delivery.db");
+        fs::create_dir(dir.path().join("auction_raw")).expect("auction dir");
+        fs::create_dir(dir.path().join("push_log")).expect("push dir");
+        fs::write(
+            dir.path().join("push_log").join("2026-10-26.txt"),
+            "001216 华瓷股份 买入区间",
+        )
+        .expect("push file");
+
+        let main = Connection::open(&main_path).expect("main db");
+        main.execute_batch(
+            "CREATE TABLE ticket_lifecycle (
+                id INTEGER PRIMARY KEY, code TEXT, open_date TEXT, close_date TEXT,
+                stage TEXT, source TEXT, note TEXT, created_at TEXT, updated_at TEXT);
+             CREATE TABLE ticket_event (
+                id INTEGER PRIMARY KEY, ticket_id INTEGER, event_at TEXT, event_kind TEXT,
+                push_kind TEXT, occurrence_identity TEXT, summary TEXT, created_at TEXT);
+             CREATE TABLE ticket_decision (
+                decision_id TEXT, ticket_id INTEGER, code TEXT, as_of TEXT, source TEXT,
+                regime TEXT, entry_mode TEXT, proposal_status TEXT, price_low REAL,
+                price_high REAL, trigger_level REAL, abandon REAL, valid_from TEXT,
+                valid_until TEXT, evidence_grade TEXT, source_health TEXT,
+                context_json TEXT, rule_version TEXT, supersedes TEXT,
+                created_at TEXT, updated_at TEXT);
+             CREATE TABLE stock_daily (
+                code TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL,
+                volume REAL, amount REAL, pct_chg REAL, ma5 REAL, ma10 REAL, ma20 REAL,
+                data_source TEXT);
+             CREATE TABLE market_regime_daily (
+                trade_date TEXT, limit_up_count INTEGER, max_streak INTEGER,
+                broken_count INTEGER, limit_down_count INTEGER, prev_pool_count INTEGER,
+                prev_premium REAL, phase TEXT, captured_at TEXT);
+             CREATE TABLE attribution_benchmark_daily (
+                trade_date TEXT, code TEXT, stock_pct REAL, market_pct REAL,
+                board_pct REAL, excess_pct REAL, sample_size INTEGER, benchmark TEXT);
+             CREATE TABLE advice_outcome_tracking (
+                id INTEGER PRIMARY KEY, occurrence_identity TEXT, business_date TEXT, push_kind TEXT, code TEXT,
+                pushed_at TEXT, executed TEXT, execution_source TEXT, outcome_pct REAL,
+                expected_price REAL, change_t1 REAL, change_t3 REAL, change_t5 REAL,
+                mfe REAL, mae REAL, note TEXT);",
+        )
+        .expect("main schema");
+        main.execute(
+            "INSERT INTO ticket_lifecycle VALUES
+             (1, '001216', '2026-10-26', NULL, 'entry_proposed', 'holding', '', NULL, NULL)",
+            [],
+        )
+        .expect("ticket");
+        main.execute(
+            "INSERT INTO ticket_event VALUES
+             (1, 1, '2026-10-26 15:40:00', 'entry_proposed', NULL, NULL, '区间 22.00-23.00', NULL)",
+            [],
+        )
+        .expect("event");
+        main.execute(
+            "INSERT INTO ticket_decision VALUES
+             ('d1', 1, '001216', '2026-10-26', 'holding', 'Bullish', 'Pullback',
+              'open', 22.0, 23.0, 22.5, NULL, '2026-10-26', NULL, 'L1',
+              'news=available', '{}', 'ticket_decision_v1', NULL, NULL, NULL)",
+            [],
+        )
+        .expect("decision");
+        main.execute(
+            "INSERT INTO stock_daily VALUES
+             ('001216', '2026-10-26', 22.0, 23.5, 21.8, 22.78, 1000, 20000, -10.0,
+              NULL, NULL, NULL, 'tdx_day')",
+            [],
+        )
+        .expect("daily");
+        drop(main);
+
+        let delivery = Connection::open(&delivery_path).expect("delivery db");
+        delivery
+            .execute_batch(
+                "CREATE TABLE delivery_decisions (
+                    decision_identity TEXT, business_date TEXT, push_kind TEXT,
+                    sub_kind TEXT, state TEXT, envelope_canonical BLOB,
+                    envelope_sha256 TEXT, created_at TEXT, updated_at TEXT);",
+            )
+            .expect("delivery schema");
+        delivery
+            .execute(
+                "INSERT INTO delivery_decisions VALUES
+                 ('d1', '2026-10-26', 'HoldingPlan', 'None', 'Delivered',
+                  X'454e', 'sha', '2026-10-26T15:40:00+08:00',
+                  '2026-10-26T15:40:00+08:00')",
+                [],
+            )
+            .expect("delivery");
+        drop(delivery);
+
+        let out = dir.path().join("out");
+        let summary = build_evidence_pack(&EvidenceRequest {
+            db: main_path,
+            delivery_db: delivery_path,
+            code: "001216".to_owned(),
+            as_of: "2026-10-26".to_owned(),
+            out: out.clone(),
+            push_log_root: dir.path().join("push_log"),
+        })
+        .expect("evidence pack");
+
+        assert_eq!(summary.tickets, 1);
+        assert_eq!(summary.events, 1);
+        assert_eq!(summary.decisions, 1);
+        assert_eq!(summary.gaps, 0);
+        assert_eq!(summary.push_log_files, 1);
+        for path in [
+            "raw/ticket_lifecycle.json",
+            "raw/ticket_event.jsonl",
+            "raw/ticket_decision.jsonl",
+            "raw/stock_daily.jsonl",
+            "gaps.json",
+            "timeline.jsonl",
+            "memo.md",
+            "manifest.sha256",
+        ] {
+            assert!(out.join(path).is_file(), "missing {path}");
+        }
+    }
 }
