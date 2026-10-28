@@ -2873,3 +2873,11 @@ git diff --check
   - WP6 fixture 回归、原始竞价/逐笔证据、完整 PIT 对照；
   - WP7 P6 `board_pct` 仍 0/9766，P1.1 news/mf 仍 0；P3.3 需下一交易日验证；
   - WP8 `TICKET_ENTRY_POLICY=new` 未切换，`ticket_decision` 仍 0 行。
+- 2026-10-28 09:30 盘中验证：
+  - P3.3 关联票 coverage 已恢复：8 轮 requested=400 accepted=398 rejected=2，
+    `unavailable=0`，验收从“未达标”升为“达标”；
+  - 主观察池 83 只 09:49:46 已恢复：`watch_main_isolated` requested=83
+    accepted=83 / 3 次请求；原先整批 `no_verified_batch` 失败已消失；
+  - 2026-10-27 全市场日线已补到 5,217 行（`tdx_day`），六只持仓收盘与券商价一致。
+- 当前仍不能算完成：P6 `board_pct` 仍全空；P1.1 news/mf 仍 0；
+  P2 仍 0 触发；WP5/WP8 激活门槛未过。

@@ -3563,15 +3563,17 @@ impl GrpcSource {
         Ok(batch)
     }
 
-    /// 整批 RealtimeQuotes 被 `no_last_traded_price` 拒绝时，二分隔离坏票后重试。
+    /// 整批 RealtimeQuotes 被拒绝时，二分隔离坏票后重试。
     ///
     /// 背景：provider 对「当日无最新成交价」的 instrument（停牌 / 未开盘 /
-    /// 一字板封死）会把整批请求判失败。这一条是业务态不是故障，不该让一只
+    /// 一字板封死）会把整批请求判失败；provider 对批次里个别陈旧/不可报价
+    /// 代码也可能整批返回 internal。这一条是业务态或单票错误，不该让一只
     /// 票拖垮整批行情。
     ///
     /// 策略：整批失败 → 对半拆 → 逐层拆到单票。复杂度 O(k·log n)，k 是坏票数；
     /// 全部坏票的极端情况退化成 O(n)。请求数上限 `MAX_BISECT_REQUESTS` 兜底，
-    /// 超限的 chunk 直接判为坏票。
+    /// 超限的 chunk 直接判为坏票。非 `no_last_traded_price` 的错误也拆分：
+    /// 否则一个 provider internal 会永久让 80 只观察票整组空转。
     ///
     /// 注意：不同子批的 `batch_id` 不同，**不能**把多批结果拼成一个
     /// `GatewayBatch`（那会伪造批次身份）。所以这里返回独立结构，由调用方
@@ -3610,8 +3612,8 @@ impl GrpcSource {
                     Err(_) => isolated.extend(chunk),
                 },
                 Err(error) => {
-                    let no_price = error.reason_code() == "no_last_traded_price";
-                    if no_price && chunk.len() > 1 {
+                    let _ = error;
+                    if chunk.len() > 1 {
                         let mid = chunk.len() / 2;
                         queue.push(chunk[..mid].to_vec());
                         queue.push(chunk[mid..].to_vec());

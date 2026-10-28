@@ -169,18 +169,18 @@ pub async fn scan(
             QuoteCoverage::observed(&codes, &[]).log("watch_main");
             return Ok(Vec::new());
         }
-        // 整批被「当日无最新成交价」拒绝（停牌 / 未开盘 / 一字板封死）。
-        // 这条是业务态不是故障，二分隔离出坏票，好票继续参与异动判断；
-        // 坏票本轮直接丢，不造价格（BR-222）。
-        Err(error) if error.reason_code() == "no_last_traded_price" => {
+        // 整批被拒绝（停牌/无最新价/provider internal 等）时，二分隔离出坏票，
+        // 好票继续参与异动判断；坏票本轮直接丢，不造价格（BR-222）。
+        Err(error) => {
+            let reason = error.reason_code().to_owned();
             let isolated = bridge.realtime_quotes_with_isolation(&codes).await;
             let mut coverage = QuoteCoverage::observed(&codes, &isolated.quotes);
             coverage.rejected = isolated.isolated.clone();
             coverage.batches = isolated.requests;
             coverage.log("watch_main_isolated");
             log::warn!(
-                "[观察池] RealtimeQuotes 被 no_last_traded_price 拒绝, 二分隔离后 \
-                 取到 {} 只 / 隔离 {} 只 / 请求 {} 次{}",
+                "[观察池] RealtimeQuotes 被 {} 拒绝, 二分隔离后取到 {} 只 / 隔离 {} 只 / 请求 {} 次{}",
+                reason,
                 isolated.quotes.len(),
                 isolated.isolated.len(),
                 isolated.requests,
@@ -194,10 +194,6 @@ pub async fn scan(
                 return Ok(Vec::new());
             }
             isolated.quotes
-        }
-        Err(error) => {
-            QuoteCoverage::failed(&codes).log("watch_main_failed");
-            return Err(format!("行情拉取失败: {error}"));
         }
     };
 
