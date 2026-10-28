@@ -1181,6 +1181,36 @@ mod tests {
     }
 
     #[test]
+    fn entry_triggered_dedupe_ignores_changing_price_basis() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        diesel::sql_query(
+            "CREATE TABLE ticket_event (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               ticket_id INTEGER NOT NULL,
+               event_kind TEXT NOT NULL,
+               event_at TEXT NOT NULL,
+               summary TEXT)",
+        )
+        .execute(&mut conn)
+        .expect("ticket_event schema");
+        for summary in [
+            "突破昨高 38.52（现价 40.16）",
+            "突破昨高 38.52（现价 39.90）",
+        ] {
+            diesel::sql_query(
+                "INSERT INTO ticket_event (ticket_id, event_kind, event_at, summary) \
+                 VALUES (1, 'entry_triggered', '2026-10-28', ?1)",
+            )
+            .bind::<Text, _>(summary)
+            .execute(&mut conn)
+            .expect("insert trigger");
+        }
+        assert!(entry_triggered_exists(&mut conn, 1, "2026-10-28").unwrap());
+        assert!(!entry_triggered_exists(&mut conn, 1, "2026-10-29").unwrap());
+        assert!(!entry_triggered_exists(&mut conn, 2, "2026-10-28").unwrap());
+    }
+
+    #[test]
     fn proposal_range_parses_stored_summary_and_rejects_garbage() {
         assert_eq!(
             parse_proposed_range("22.00-23.50｜回踩 ma10｜放弃 20.00"),
