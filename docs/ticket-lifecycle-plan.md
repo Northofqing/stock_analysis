@@ -2910,6 +2910,13 @@ git diff --check
     此前为 `标的=0 跳过=72`；
   - `buy_zone` 当日无区间时回退到最近一次 `entry_proposed` 事件里的
     `low-high` 原文区间，不补价；解析失败仍跳过，不猜。
+- 2026-10-28 触发记账修复：
+  - shadow 临时 context 不再带伪 `decision_id`；
+  - `entry_triggered` 事务成功后才写 `candidate_trigger_selection`，
+    事务失败不会留下孤儿候选；
+  - `ticket_entry_trigger` 12 个测试通过；运行根 release 构建 8m11s，
+    PID 89930，14:06:39 `startup_health_check status=ok`；尚无 14:05
+    之后的真实触发命中，P2 仍待观察。
 - 2026-10-28 新闻源陈旧检测：
   - `news_ai_assessment` 最新只到 2026-10-14，观察池不再把它当成
     “窗口内 0 条催化”，而是显式报新闻来源不可用；
