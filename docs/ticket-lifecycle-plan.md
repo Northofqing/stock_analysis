@@ -2944,6 +2944,15 @@ git diff --check
     append 后主动失效；`database::news_ai::global_critical::tests` 1/1 通过；
     运行根 release 已编译，但未重启，当前 PID 4955 仍是旧二进制；
   - 因此 WP8 shadow 样本仍只有 0 个 `ticket_decision`，不能推进切 `new`。
+- 2026-10-28 18:09 观察池补跑结果：
+  - 观察池生成 16 个候选、`opened=15 appended=1`，但
+    `[入场参考] scanned=20 proposed=0 overheated=2 no_data=16 emotion_phase=2`；
+  - 根因是 15:40 的提案轮次早于当日日线落库，`buy_zone` 没有当日 bar，
+    16 只票被判 `no_data`，此前的实现不会在 21:30 日线后重试；
+  - 已提交 `200a008ff`：`full_universe_bars_loop` 在日线成功/已有 marker
+    两条路径都调用 `retry_entry_proposals_after_daily`，按原有同日幂等重跑；
+  - 运行根 release 已重编译并重启，PID 28542；等待 21:30 日线落地后验证
+    是否产生第一批真实 `ticket_decision`。
 - 2026-10-28 新闻源陈旧检测：
   - `news_ai_assessment` 最新只到 2026-10-14，观察池不再把它当成
     “窗口内 0 条催化”，而是显式报新闻来源不可用；
