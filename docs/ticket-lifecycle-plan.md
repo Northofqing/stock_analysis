@@ -2905,6 +2905,15 @@ git diff --check
     不再只处理 `no_last_traded_price`；否则 `no_verified_batch` 会让触发确认/
     盘中选票整组停跑；
   - 运行根 release 已重启，等待 13:00 后盘中轮次验证。
+- 2026-10-28 触发区间回退：
+  - 13:27 重启后 `[触发确认] 预热日=2026-10-28 标的=45 跳过=27`，
+    此前为 `标的=0 跳过=72`；
+  - `buy_zone` 当日无区间时回退到最近一次 `entry_proposed` 事件里的
+    `low-high` 原文区间，不补价；解析失败仍跳过，不猜。
+- 2026-10-28 新闻源陈旧检测：
+  - `news_ai_assessment` 最新只到 2026-10-14，观察池不再把它当成
+    “窗口内 0 条催化”，而是显式报新闻来源不可用；
+  - 这会让 15:40 的 P1.1 从“静默 0”变成 PARTIAL，属于预期。
 - 2026-10-28 P6 时序修正：
   - `refresh_attribution_benchmark_if_needed` 在 `with_board=0` 时不写完成
     marker；15:40 板块成分建好后补跑一次 P6，避免 15:30 先写空 `board_pct`
