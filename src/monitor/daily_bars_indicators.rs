@@ -320,6 +320,101 @@ fn persist_bars_batch(
     Ok(())
 }
 
+/// 用 stock_daily 自身的历史收盘重算某交易日的 ma5/ma10/ma20 与量比。
+///
+/// TDX `.day` 导入只写 OHLCV，不写均线；15:40 的 buy_zone 依赖 ma5/ma10，
+/// 不补这一步会让所有 newly synced 的票在日线后仍被判 `no_data`。
+pub fn recompute_ma_for_date(
+    db: &DatabaseManager,
+    date_text: &str,
+) -> Result<usize, String> {
+    #[derive(diesel::QueryableByName)]
+    struct CodeRow {
+        #[diesel(sql_type = Text)]
+        code: String,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct BarRow {
+        #[diesel(sql_type = Double)]
+        close: f64,
+        #[diesel(sql_type = Nullable<Double>)]
+        volume: Option<f64>,
+    }
+    let mut conn = db.get_conn().map_err(|error| error.to_string())?;
+    let codes: Vec<CodeRow> = diesel::sql_query(
+        "SELECT DISTINCT code FROM stock_daily WHERE date = ?1 AND close IS NOT NULL",
+    )
+    .bind::<Text, _>(date_text)
+    .load(&mut conn)
+    .map_err(|error| format!("均线重算标的查询失败: {error}"))?;
+    conn.batch_execute("BEGIN IMMEDIATE")
+        .map_err(|error| format!("均线重算事务开启失败: {error}"))?;
+    let mut updated = 0usize;
+    for code in codes {
+        let bars: Vec<BarRow> = match diesel::sql_query(
+            "SELECT close, volume FROM stock_daily \
+             WHERE code = ?1 AND date <= ?2 AND close IS NOT NULL \
+             ORDER BY date DESC LIMIT 20",
+        )
+        .bind::<Text, _>(code.code.as_str())
+        .bind::<Text, _>(date_text)
+        .load(&mut conn)
+        {
+            Ok(bars) => bars,
+            Err(error) => {
+                let _ = conn.batch_execute("ROLLBACK");
+                return Err(format!("{} 均线历史查询失败: {error}", code.code));
+            }
+        };
+        if bars.len() < MA_SHORT {
+            continue;
+        }
+        let mut closes: Vec<f64> = bars.iter().map(|bar| bar.close).collect();
+        closes.reverse();
+        let current = closes.len() - 1;
+        let ma5 = window_mean(&closes, current, MA_SHORT);
+        let ma10 = window_mean(&closes, current, MA_MID);
+        let ma20 = window_mean(&closes, current, MA_LONG);
+        let volume_ratio = bars
+            .first()
+            .and_then(|bar| bar.volume)
+            .and_then(|volume| {
+                let volumes: Vec<f64> = bars
+                    .iter()
+                    .take(MA_SHORT)
+                    .filter_map(|bar| bar.volume)
+                    .collect();
+                if volumes.len() == MA_SHORT {
+                    let mean = volumes.iter().sum::<f64>() / MA_SHORT as f64;
+                    (mean > 0.0).then_some(volume / mean)
+                } else {
+                    None
+                }
+            });
+        let result = diesel::sql_query(
+            "UPDATE stock_daily SET ma5 = ?1, ma10 = ?2, ma20 = ?3, volume_ratio = ?4 \
+             WHERE code = ?5 AND date = ?6",
+        )
+        .bind::<Nullable<Double>, _>(ma5)
+        .bind::<Nullable<Double>, _>(ma10)
+        .bind::<Nullable<Double>, _>(ma20)
+        .bind::<Nullable<Double>, _>(volume_ratio)
+        .bind::<Text, _>(code.code.as_str())
+        .bind::<Text, _>(date_text)
+        .execute(&mut conn);
+        match result {
+            Ok(rows) => updated += rows,
+            Err(error) => {
+                let _ = conn.batch_execute("ROLLBACK");
+                return Err(format!("{} 均线写入失败: {error}", code.code));
+            }
+        }
+    }
+    conn.batch_execute("COMMIT")
+        .map_err(|error| format!("均线重算提交失败: {error}"))?;
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

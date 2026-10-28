@@ -5782,6 +5782,18 @@ fn retry_entry_proposals_after_daily(date_text: &str) {
     }
 }
 
+/// 日线之后补算 ma5/ma10/ma20；TDX 导入只写 OHLCV。
+fn recompute_ma_after_daily(date_text: &str) {
+    let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+        log::warn!("[日线均线] 重算跳过：数据库不可用 date={date_text}");
+        return;
+    };
+    match stock_analysis::monitor::daily_bars_indicators::recompute_ma_for_date(&db, date_text) {
+        Ok(rows) => log::info!("[日线均线] 重算完成 date={date_text} rows={rows}"),
+        Err(error) => log::warn!("[日线均线] 重算失败 date={date_text}: {error}"),
+    }
+}
+
 async fn full_universe_bars_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
@@ -5797,6 +5809,7 @@ async fn full_universe_bars_loop() {
         let marker = std::path::Path::new("data/daily_bars_full").join(&date_text);
         if marker.exists() {
             refresh_attribution_benchmark_if_needed(&date_text);
+            recompute_ma_after_daily(&date_text);
             retry_entry_proposals_after_daily(&date_text);
             continue;
         }
@@ -5812,6 +5825,7 @@ async fn full_universe_bars_loop() {
                 log::warn!("[日线全量] marker 写入失败（重启会重放）: {error}");
             }
             refresh_attribution_benchmark_if_needed(&date_text);
+            recompute_ma_after_daily(&date_text);
             retry_entry_proposals_after_daily(&date_text);
             continue;
         }
