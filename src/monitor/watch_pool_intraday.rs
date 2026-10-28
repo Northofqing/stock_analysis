@@ -25,8 +25,9 @@ use std::collections::{HashMap, HashSet};
 pub const INTRADAY_SOURCE: &str = "board_rotation_pm";
 /// note 里的口径标签。
 pub const INTRADAY_LABEL: &str = "盘中14:50";
-/// 行情批次大小（桥对单批 code 数有限制，100 是既有调用方在用的量级）。
-const QUOTE_CHUNK: usize = 100;
+/// 行情批次大小（桥对单批 code 数有限制；实测 50 只可成功，100 只整批
+/// 返回 no_verified_batch，随后二分隔离会放大到 64 次请求）。
+const QUOTE_CHUNK: usize = 50;
 /// 取当日榜 top 板块数，与 `BOARD_TOP_N` 对齐。
 const TOP_BOARDS: usize = 10;
 
