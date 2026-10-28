@@ -566,4 +566,58 @@ mod tests {
         let value = value_to_json(ValueRef::Blob(&[0x00, 0xff, 0x10]));
         assert_eq!(value, json!("00ff10"));
     }
+
+    fn row(value: serde_json::Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn gaps_name_every_missing_evidence_layer() {
+        let gaps = build_gaps(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Path::new("/definitely-missing-evidence-root"),
+            "2026-10-26",
+        );
+        let fields: Vec<&str> = gaps.iter().map(|gap| gap.field.as_str()).collect();
+        for expected in [
+            "ticket_decision",
+            "ticket_stage",
+            "entry_proposed_event",
+            "stock_daily_exact_date",
+            "auction_raw",
+            "HoldingPlan_delivery",
+        ] {
+            assert!(
+                fields.contains(&expected),
+                "missing gap {expected}: {fields:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaps_are_empty_when_all_layers_are_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("auction_raw")).expect("auction dir");
+        let tickets = vec![row(json!({"stage": "entry_proposed"}))];
+        let events = vec![row(json!({"event_kind": "entry_proposed"}))];
+        let decisions = vec![row(json!({"decision_id": "d1"}))];
+        let daily = vec![row(json!({"date": "2026-10-26"}))];
+        let deliveries = vec![row(
+            json!({"push_kind": "HoldingPlan", "state": "Delivered"}),
+        )];
+        let gaps = build_gaps(
+            &tickets,
+            &events,
+            &decisions,
+            &daily,
+            &deliveries,
+            dir.path(),
+            "2026-10-26",
+        );
+        assert!(gaps.is_empty(), "unexpected gaps: {gaps:?}");
+    }
 }
