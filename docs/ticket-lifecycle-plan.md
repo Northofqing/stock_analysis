@@ -2957,6 +2957,19 @@ git diff --check
     两条路径都调用 `retry_entry_proposals_after_daily`，按原有同日幂等重跑；
   - 运行根 release 已重编译并重启，PID 28542；等待 21:30 日线落地后验证
     是否产生第一批真实 `ticket_decision`。
+- 2026-10-28 21:55 首批 shadow 决策落库：
+  - `stock_daily` 2026-10-28 由 TDX 导入 5,217 行，但 `ma5/ma10/ma20`
+    全为 NULL；`[入场参考]` 仍是 `no_data=14`；
+  - 已提交 `aff7c3e31`：`daily_bars_indicators::recompute_ma_for_date`
+    用 stock_daily 自身历史收盘补算 MA/量比，并接到日线后/已有 marker 两条路径；
+  - 21:55 日志 `[日线均线] 重算完成 rows=5217`，随后
+    `scanned=20 proposed=10 overheated=8 no_data=0 emotion_phase=2`；
+  - `ticket_decision` 首次 10 行，`entry_proposed` 今日 10 条，active
+    `entry_proposed` 77；样例 source_health 为 daily_bars=available、
+    news=stale（10-14）、board=available、quotes=partial，
+    `confirmation=price_only`、`missing_fields=["volume_ratio"]`；
+  - `ticket_new_gate` 仍 `BLOCKED`：只有 2026-10-28 一个 decision 日期，
+    至少还需 4 个交易日样本。
 - 2026-10-28 新闻源陈旧检测：
   - `news_ai_assessment` 最新只到 2026-10-14，观察池不再把它当成
     “窗口内 0 条催化”，而是显式报新闻来源不可用；

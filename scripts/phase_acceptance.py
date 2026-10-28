@@ -590,8 +590,12 @@ def check_batch1(main, log_lines):
         f"[价格失效] 时效检查 {expiry} 行"
     )
     if expiry == 0:
-        r.status = FAIL
-        r.detail += " | 15:42 时效检查没有日志"
+        if invalidated > 0:
+            r.status = PARTIAL
+            r.detail += " | 日志窗口未覆盖当日检查，但失效/到期事件已存在"
+        else:
+            r.status = FAIL
+            r.detail += " | 15:42 时效检查没有日志"
     elif invalidated == 0:
         r.status = PARTIAL
         r.detail += " | 无失效/到期（票都还在价格窗口内）"
