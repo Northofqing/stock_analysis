@@ -273,6 +273,11 @@ def check_p2(main, days):
         (cutoff,),
     ).fetchone()[0]
     trig = main.execute(
+        "SELECT COUNT(DISTINCT ticket_id || '|' || substr(event_at,1,10)) FROM ticket_event "
+        "WHERE event_kind='entry_triggered' AND substr(event_at,1,10) >= ?",
+        (cutoff,),
+    ).fetchone()[0]
+    trigger_events = main.execute(
         "SELECT COUNT(*) FROM ticket_event "
         "WHERE event_kind='entry_triggered' AND substr(event_at,1,10) >= ?",
         (cutoff,),
@@ -313,6 +318,7 @@ def check_p2(main, days):
     trigger_rate = (trig / ev * 100.0) if ev else 0.0
     r.detail = (
         f"窗口 {cutoff}~最新 proposal={ev} open={st} triggered={trig} "
+        f"trigger_events={trigger_events} "
         f"invalidated={invalidated} expired={expired} superseded={superseded} "
         f"evaluated={evaluated} trigger_rate={trigger_rate:.1f}% "
         f"decision={decisions} observing={obs}"
@@ -553,10 +559,17 @@ def check_batch1(main, log_lines):
 
     r = Result("批1.4", "突破确认")
     triggered = main.execute(
+        "SELECT COUNT(DISTINCT ticket_id || '|' || substr(event_at,1,10)) "
+        "FROM ticket_event WHERE event_kind='entry_triggered'"
+    ).fetchone()[0]
+    trigger_events = main.execute(
         "SELECT COUNT(*) FROM ticket_event WHERE event_kind='entry_triggered'"
     ).fetchone()[0]
     warm = sum(1 for line in log_lines if "[触发确认] 预热" in line)
-    r.detail = f"entry_triggered 事件 {triggered} 条；[触发确认] 预热 {warm} 行"
+    r.detail = (
+        f"entry_triggered 去重 {triggered} 条 / 原始 {trigger_events} 条；"
+        f"[触发确认] 预热 {warm} 行"
+    )
     if warm == 0:
         r.status = FAIL
         r.detail += " | 预热未发生（entry_proposed 为空或调度未跑到）"
