@@ -312,6 +312,41 @@ fn legacy_shadow_context(
     context
 }
 
+/// 从 `entry_proposed` 事件摘要解析提案区间：
+/// `"22.00-23.00｜回踩 ma10｜放弃 20.00"` → `(22.0, 23.0)`。
+/// 只接受正数且 high >= low；解析失败返回 None，不猜。
+fn parse_proposed_range(summary: &str) -> Option<(f64, f64)> {
+    let first = summary.split('｜').next()?.trim();
+    let (low, high) = first.split_once('-')?;
+    let low: f64 = low.trim().parse().ok()?;
+    let high: f64 = high.trim().parse().ok()?;
+    (low > 0.0 && high >= low).then_some((low, high))
+}
+
+fn latest_proposed_range(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+) -> Result<Option<(f64, f64)>, String> {
+    #[derive(QueryableByName)]
+    struct SummaryRow {
+        #[diesel(sql_type = Nullable<Text>)]
+        summary: Option<String>,
+    }
+    let row: Option<SummaryRow> = diesel::sql_query(
+        "SELECT summary FROM ticket_event \
+         WHERE ticket_id = ?1 AND event_kind = 'entry_proposed' \
+         ORDER BY event_at DESC, id DESC LIMIT 1",
+    )
+    .bind::<BigInt, _>(ticket_id)
+    .get_result::<SummaryRow>(conn)
+    .optional()
+    .map_err(|error| format!("entry_proposed 摘要查询失败: {error}"))?;
+    Ok(row
+        .and_then(|row| row.summary)
+        .as_deref()
+        .and_then(parse_proposed_range))
+}
+
 /// 预热当日判据：`entry_proposed` 的票 → 昨高 + buy_zone 区间 + 分型。
 pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
     chrono::NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
@@ -369,9 +404,20 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
                 continue;
             }
         };
-        let (Some(entry_low), Some(entry_high)) = (zone.entry_low, zone.entry_high) else {
-            cache.skipped.push(format!("{code} 无入场区间"));
-            continue;
+        let (entry_low, entry_high) = match (zone.entry_low, zone.entry_high) {
+            (Some(low), Some(high)) if low > 0.0 && high >= low => (low, high),
+            _ => match latest_proposed_range(&mut conn, ticket.id)? {
+                Some((low, high)) => {
+                    log::debug!(
+                        "[触发确认] {code} 当日 buy_zone 无区间，回退提案原文区间 {low:.2}-{high:.2}"
+                    );
+                    (low, high)
+                }
+                None => {
+                    cache.skipped.push(format!("{code} 无入场区间"));
+                    continue;
+                }
+            },
         };
         let regime =
             match ticket_regime::resolve(&mut conn, ticket.id, &code, &ticket.source, as_of) {
@@ -1086,5 +1132,16 @@ mod tests {
         .execute(&mut conn)
         .expect("supersede closes window");
         assert!(invalidated_after_latest_proposal(&mut conn, 1).unwrap());
+    }
+
+    #[test]
+    fn proposal_range_parses_stored_summary_and_rejects_garbage() {
+        assert_eq!(
+            parse_proposed_range("22.00-23.50｜回踩 ma10｜放弃 20.00"),
+            Some((22.0, 23.5))
+        );
+        assert_eq!(parse_proposed_range("not-a-range"), None);
+        assert_eq!(parse_proposed_range("23.50-22.00"), None);
+        assert_eq!(parse_proposed_range("0-1"), None);
     }
 }
