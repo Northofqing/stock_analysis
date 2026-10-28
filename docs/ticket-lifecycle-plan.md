@@ -2871,13 +2871,20 @@ git diff --check
 - 仍未完成：
   - WP5 激活（等 5 日 shadow 或 operator 明确豁免）；
   - WP6 fixture 回归、原始竞价/逐笔证据、完整 PIT 对照；
-  - WP7 P6 `board_pct` 仍 0/9766，P1.1 news/mf 仍 0；P3.3 需下一交易日验证；
+  - WP7 P1.1 news/mf 仍 0；P3.3 已在 2026-10-28 验证（见下）；
   - WP8 `TICKET_ENTRY_POLICY=new` 未切换，`ticket_decision` 仍 0 行。
 - 2026-10-28 09:30 盘中验证：
-  - P3.3 关联票 coverage 已恢复：8 轮 requested=400 accepted=398 rejected=2，
+  - P3.3 关联票 coverage 已恢复：45 轮 requested=2250 accepted=2242 rejected=8，
     `unavailable=0`，验收从“未达标”升为“达标”；
   - 主观察池 83 只 09:49:46 已恢复：`watch_main_isolated` requested=83
     accepted=83 / 3 次请求；原先整批 `no_verified_batch` 失败已消失；
   - 2026-10-27 全市场日线已补到 5,217 行（`tdx_day`），六只持仓收盘与券商价一致。
-- 当前仍不能算完成：P6 `board_pct` 仍全空；P1.1 news/mf 仍 0；
-  P2 仍 0 触发；WP5/WP8 激活门槛未过。
+- 2026-10-28 P6 `board_pct` 落地：
+  - 口径改为**同交易日板块成分股的收盘等权涨幅**，成员数 < 5 的板块不参与；
+    不再用盘中 `board_ranking_daily.change_pct` 冒充收盘；
+  - 2026-10-26 2,204 只、2026-10-27 2,280 只有值；最近 5 日合计
+    board_pct 非空 4,484/14,166（31.7%），其余为成分快照缺失，保持 NULL；
+  - 整日写入改为单事务，避免 5k+ 行 autocommit 拖慢；
+  - `phase_acceptance.py --days 5` 当前为 **达标 10 / 部分 4 / 未达标 0**。
+- 当前仍不能算完成：P1.1 news/mf 仍 0；P2 仍 0 触发；
+  WP5/WP8 激活门槛未过；P6 只覆盖有成分快照的两天。

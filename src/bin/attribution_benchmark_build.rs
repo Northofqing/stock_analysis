@@ -56,10 +56,11 @@ fn main() {
         match attribution_benchmark::build(db, &trade_date) {
             Ok(result) => {
                 println!(
-                    "[归因] {} rows={} with_benchmark={} sample={} 基准={}",
+                    "[归因] {} rows={} with_benchmark={} with_board={} sample={} 基准={}",
                     result.trade_date,
                     result.rows,
                     result.with_benchmark,
+                    result.with_board,
                     result.sample_size,
                     if result.benchmark_accepted {
                         "采纳"

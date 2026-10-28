@@ -5730,10 +5730,11 @@ fn refresh_attribution_benchmark_if_needed(date_text: &str) {
     match stock_analysis::monitor::attribution_benchmark::build(&db, date_text) {
         Ok(result) => {
             log::info!(
-                "[归因基准] date={} rows={} with_benchmark={} sample_size={} accepted={}",
+                "[归因基准] date={} rows={} with_benchmark={} with_board={} sample_size={} accepted={}",
                 result.trade_date,
                 result.rows,
                 result.with_benchmark,
+                result.with_board,
                 result.sample_size,
                 result.benchmark_accepted
             );
@@ -5743,8 +5744,12 @@ fn refresh_attribution_benchmark_if_needed(date_text: &str) {
             if let Err(error) = std::fs::write(
                 &marker,
                 format!(
-                    "rows={} with_benchmark={} sample_size={} accepted={}",
-                    result.rows, result.with_benchmark, result.sample_size, result.benchmark_accepted
+                    "rows={} with_benchmark={} with_board={} sample_size={} accepted={}",
+                    result.rows,
+                    result.with_benchmark,
+                    result.with_board,
+                    result.sample_size,
+                    result.benchmark_accepted
                 ),
             ) {
                 log::warn!("[归因基准] marker 写入失败（下一轮会重试）: {error}");

@@ -466,6 +466,8 @@ def check_p6(main, days):
         f"{len(rows)} 天 / {total} 行（最新 {latest}）"
         f" market_pct 非空 {mkt}/{total} board_pct 非空 {brd}/{total}"
     )
+    if total:
+        r.detail += f"（board 覆盖 {100.0 * brd / total:.1f}%）"
     today = datetime.now().date()
     try:
         lag = (today - datetime.strptime(latest, "%Y-%m-%d").date()).days
