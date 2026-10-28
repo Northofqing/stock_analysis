@@ -110,6 +110,7 @@ impl TriggerTarget {
         self.context
             .as_ref()
             .map(|context| context.decision_id.as_str())
+            .filter(|decision_id| !decision_id.is_empty())
     }
 
     pub fn source_health(&self) -> &[SourceStatus] {
@@ -309,6 +310,9 @@ fn legacy_shadow_context(
     context.missing_fields.push("volume_ratio".to_owned());
     context.missing_fields.push("legacy_backfill".to_owned());
     context.seal();
+    // 这是 shadow 比较用的临时 context，没有写入 ticket_decision；
+    // 清空 decision_id，避免 record() 去更新一条不存在的决策行。
+    context.decision_id.clear();
     context
 }
 
@@ -993,6 +997,24 @@ mod tests {
         let outcome = judge_policy(&target, 11.0, 3.0);
         assert_eq!(outcome.0, None);
         assert_eq!(outcome.1, "legacy_context_missing");
+    }
+
+    #[test]
+    fn shadow_synthetic_context_does_not_claim_a_decision_row() {
+        let mut context = DecisionContext::new(
+            1,
+            "002696",
+            "2026-10-27",
+            "board_rotation",
+            "trend",
+            EntryMode::Breakout,
+        );
+        context.seal();
+        context.decision_id.clear();
+        let mut target = target(10.3, Some(9.0));
+        target.context = Some(context);
+        assert!(target.decision_id().is_none());
+        assert_eq!(target.entry_mode(), EntryMode::Breakout);
     }
 
     #[test]
