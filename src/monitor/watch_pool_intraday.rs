@@ -221,21 +221,23 @@ async fn fetch_pct_map(codes: &[String]) -> (HashMap<String, f64>, QuoteCoverage
                 coverage.merge(QuoteCoverage::observed(chunk, &[]));
                 Vec::new()
             }
-            Err(error) if error.reason_code() == "no_last_traded_price" => {
+            Err(error) => {
+                // 与主观察池/触发确认一致：整批失败先二分隔离，不能因一只坏票
+                // 或批次上限让整段盘中选票停跑。
+                let reason = error.reason_code().to_owned();
                 let isolated = bridge.realtime_quotes_with_isolation(chunk).await;
                 let mut batch = QuoteCoverage::observed(chunk, &isolated.quotes);
-                batch.rejected = isolated.isolated;
+                batch.rejected = isolated.isolated.clone();
                 batch.batches = isolated.requests;
                 coverage.merge(batch);
-                isolated.quotes
-            }
-            Err(error) => {
-                coverage.merge(QuoteCoverage::failed(chunk));
                 log::warn!(
-                    "[盘中选票] 行情批次失败（{} 只）: {error}",
-                    chunk.len()
+                    "[盘中选票] 行情批次被 {} 拒绝, 隔离后取到 {} 只 / 隔离 {} 只 / 请求 {} 次",
+                    reason,
+                    isolated.quotes.len(),
+                    isolated.isolated.len(),
+                    isolated.requests
                 );
-                Vec::new()
+                isolated.quotes
             }
         };
         for quote in quotes {
