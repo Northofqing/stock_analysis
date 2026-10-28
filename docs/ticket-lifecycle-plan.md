@@ -2919,6 +2919,8 @@ git diff --check
     之后的真实触发命中，P2 仍待观察。
 - 2026-10-28 触发实测（14:13）：
   - `001331`、`601598`、`601808` 三条 `entry_triggered` 成功记账；
+  - `data/push_log/2026-10-28/141358...` 等文件包含三条「⚡ 突破确认」正文，
+    说明事件不仅落库，也进入了推送日志；
   - P2 从 `triggered=0` 变为 `triggered=4`（今日 3 条 + 历史 1 条），
     `trigger_rate=7.4%`；batch1.4 从 PARTIAL 升为达标；
   - P2 仍标 PARTIAL，因为 `evaluated=0`，尚无 T+1 结果，不能算闭环。
