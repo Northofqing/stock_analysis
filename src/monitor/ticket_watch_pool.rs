@@ -511,9 +511,8 @@ fn previous_trading_day_text(business_date: &str) -> Result<String, String> {
 
 /// 资金流路（批 2.3 / 拓 7）：`f62` 主力净流入榜 top N → 成分股 → 每板块前 M。
 ///
-/// 取**当日**榜（`board_ranking_daily` 15:30 已写），取不到再退最近一日：
-/// 成分映射（`eastmoney_members`）是调用方按**当日**榜单 top 板块拉的 BK 成分，
-/// 用前一交易日的榜会拿名字对不上的成分表 —— 那样入口会永远选出 0 只。
+/// 取**当日**榜（`board_ranking_daily` 15:30 已写）；若最新 f62 不是上一交易日，
+/// 显式报 source unavailable，**不**拿旧榜当当日资金流。
 /// 10-21 之前 f62 无数据 → 返回 0，不补造。
 pub fn collect_money_flow_boards(
     db: &DatabaseManager,

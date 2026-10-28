@@ -2900,5 +2900,14 @@ git diff --check
   - `ticket_ops_check.py` 只解析当前 monitor 进程启动后的 coverage；
     11:57 结果为 available=8 / partial=2 / unavailable=0，仍因
     `ticket_decision` 无样本标 PARTIAL。
+- 2026-10-28 盘中行情隔离补齐：
+  - `ticket_entry_trigger` 与 `watch_pool_intraday` 也改为任意整批失败先二分隔离，
+    不再只处理 `no_last_traded_price`；否则 `no_verified_batch` 会让触发确认/
+    盘中选票整组停跑；
+  - 运行根 release 已重启，等待 13:00 后盘中轮次验证。
+- 2026-10-28 P6 时序修正：
+  - `refresh_attribution_benchmark_if_needed` 在 `with_board=0` 时不写完成
+    marker；15:40 板块成分建好后补跑一次 P6，避免 15:30 先写空 `board_pct`
+    后永久不再重算。
 - 当前仍不能算完成：P1.1 news/mf 仍 0；P2 仍 0 触发；
   WP5/WP8 激活门槛未过；P6 只覆盖有成分快照的两天。
