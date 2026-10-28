@@ -2943,6 +2943,10 @@ git diff --check
   - 已提交 `e204d40d5`，按链头 `MAX(seq)+record_hash` 缓存校验结果，
     append 后主动失效；`database::news_ai::global_critical::tests` 1/1 通过；
     运行根 release 已编译，但未重启，当前 PID 4955 仍是旧二进制；
+  - 后续实测发现缓存键查询的 `seq` 别名触发 SQLite “no such column: seq”，
+    且 append 后全量失效会让每个新候选重扫；已用 `b703e0ae9` 改标量查询、
+    `efed2e4da` 改 append 后增量更新缓存，BR-172 恢复 `failed=0`；
+    19:41 重启后 PID 41844，等待 21:30 日线。
   - 因此 WP8 shadow 样本仍只有 0 个 `ticket_decision`，不能推进切 `new`。
 - 2026-10-28 18:09 观察池补跑结果：
   - 观察池生成 16 个候选、`opened=15 appended=1`，但
