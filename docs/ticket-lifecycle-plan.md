@@ -2891,5 +2891,14 @@ git diff --check
     观察池不再把 10-23 榜当 10-28 资金流使用，改为显式报
     `mf_health=unavailable`，避免用旧榜造候选；
   - f62 没有备用源（新浪无主力净流入），未补造数据。
+- 2026-10-28 WP6 回归：
+  - `ticket_evidence` 新增 fixture 端到端测试：临时主库/投递库/推文目录
+    → 证据包文件、manifest、gaps 全部生成，5 个测试通过；
+  - 001216/2026-10-26 重新导出证据包 `2026-10-26-board` 通过 manifest 校验；
+    该票没有板块成分，`board_pct` 仍为 NULL，未补造。
+- 2026-10-28 自检：
+  - `ticket_ops_check.py` 只解析当前 monitor 进程启动后的 coverage；
+    11:57 结果为 available=8 / partial=2 / unavailable=0，仍因
+    `ticket_decision` 无样本标 PARTIAL。
 - 当前仍不能算完成：P1.1 news/mf 仍 0；P2 仍 0 触发；
   WP5/WP8 激活门槛未过；P6 只覆盖有成分快照的两天。
