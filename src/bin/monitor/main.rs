@@ -5766,6 +5766,22 @@ fn refresh_attribution_benchmark_if_needed(date_text: &str) {
     }
 }
 
+/// 全市场日线落库后，补跑一次「观察池 → 入场参考」。
+///
+/// 15:40 的观察池跑在当日日线之前，buy_zone 会因为没有当日 bar 把大量票记成
+/// no_data；只在 15:40 调一次 proposal 会让这些票永远进不了决策内核。
+/// 这里按同一套幂等（同日同票已有 entry_proposed 不再写）重试，不补价、不猜。
+fn retry_entry_proposals_after_daily(date_text: &str) {
+    let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+        log::warn!("[入场参考] 日线后重试跳过：数据库不可用 date={date_text}");
+        return;
+    };
+    match stock_analysis::monitor::ticket_entry_proposal::propose_for_observing(&db, date_text) {
+        Ok(report) => log::info!("[入场参考] 日线后重试 {}", report.summary_line()),
+        Err(error) => log::warn!("[入场参考] 日线后重试失败 date={date_text}: {error}"),
+    }
+}
+
 async fn full_universe_bars_loop() {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(300)).await;
@@ -5781,6 +5797,7 @@ async fn full_universe_bars_loop() {
         let marker = std::path::Path::new("data/daily_bars_full").join(&date_text);
         if marker.exists() {
             refresh_attribution_benchmark_if_needed(&date_text);
+            retry_entry_proposals_after_daily(&date_text);
             continue;
         }
         // 2026-10-24：先走通达信盘后文件。脚本自己校验「文件最新日期 >= 今天」
@@ -5795,6 +5812,7 @@ async fn full_universe_bars_loop() {
                 log::warn!("[日线全量] marker 写入失败（重启会重放）: {error}");
             }
             refresh_attribution_benchmark_if_needed(&date_text);
+            retry_entry_proposals_after_daily(&date_text);
             continue;
         }
         log::warn!("[日线全量] 通达信盘后文件不可用，退回 provider 路径 date={date_text}");
@@ -5865,6 +5883,7 @@ async fn full_universe_bars_loop() {
                     log::warn!("[日线全量] marker 写入失败（重启会重放）: {error}");
                 }
                 refresh_attribution_benchmark_if_needed(&date_text);
+                retry_entry_proposals_after_daily(&date_text);
             }
             Err(error) => log::warn!("[日线全量] 失败, 保留重试 date={date_text}: {error}"),
         }
