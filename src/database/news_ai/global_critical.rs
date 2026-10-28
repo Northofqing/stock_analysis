@@ -85,26 +85,33 @@ fn validate_rows(values: &[Row]) -> NewsAiAssessmentAuditResult<Vec<GlobalCritic
 type ValidatedGlobalRows = std::sync::Arc<Vec<GlobalCriticalEvidence>>;
 
 #[cfg(not(test))]
+#[derive(QueryableByName)]
+struct Stamp {
+    #[diesel(sql_type = BigInt)]
+    #[diesel(column_name = "max_seq")]
+    seq: i64,
+    #[diesel(sql_type = Nullable<Text>)]
+    record_hash: Option<String>,
+}
+
+#[cfg(not(test))]
+fn read_global_stamp(conn: &mut SqliteConnection) -> NewsAiAssessmentAuditResult<Stamp> {
+    diesel::sql_query(
+        "SELECT COALESCE((SELECT seq FROM news_ai_global_critical_v1 ORDER BY seq DESC LIMIT 1),0) AS max_seq, \
+                (SELECT record_hash FROM news_ai_global_critical_v1 ORDER BY seq DESC LIMIT 1) AS record_hash",
+    )
+    .get_result(conn)
+    .map_err(NewsAiAssessmentAuditError::from)
+}
+
+#[cfg(not(test))]
 static VALIDATED_GLOBAL_CACHE: std::sync::OnceLock<
     std::sync::Mutex<Option<(i64, String, ValidatedGlobalRows)>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(not(test))]
 fn validated_rows(conn: &mut SqliteConnection) -> NewsAiAssessmentAuditResult<ValidatedGlobalRows> {
-    #[derive(QueryableByName)]
-    struct Stamp {
-        #[diesel(sql_type = BigInt)]
-        #[diesel(column_name = "max_seq")]
-        seq: i64,
-        #[diesel(sql_type = Nullable<Text>)]
-        record_hash: Option<String>,
-    }
-    let stamp: Stamp = diesel::sql_query(
-        "SELECT COALESCE((SELECT seq FROM news_ai_global_critical_v1 ORDER BY seq DESC LIMIT 1),0) AS max_seq, \
-                (SELECT record_hash FROM news_ai_global_critical_v1 ORDER BY seq DESC LIMIT 1) AS record_hash",
-    )
-    .get_result(conn)
-    .map_err(NewsAiAssessmentAuditError::from)?;
+    let stamp = read_global_stamp(conn)?;
     let cache = VALIDATED_GLOBAL_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     if let Ok(guard) = cache.lock() {
         if let Some((seq, hash, values)) = guard.as_ref() {
@@ -132,16 +139,28 @@ fn validated_rows(
 }
 
 #[cfg(not(test))]
-fn invalidate_validated_global_cache() {
-    if let Some(cache) = VALIDATED_GLOBAL_CACHE.get() {
-        if let Ok(mut guard) = cache.lock() {
-            *guard = None;
-        }
-    }
+fn cache_appended_global(conn: &mut SqliteConnection, token: &AuditedGlobalCriticalNews) {
+    let Ok(stamp) = read_global_stamp(conn) else {
+        return;
+    };
+    let Some(cache) = VALIDATED_GLOBAL_CACHE.get() else {
+        return;
+    };
+    let Ok(mut guard) = cache.lock() else {
+        return;
+    };
+    let Some((seq, hash, values)) = guard.as_mut() else {
+        return;
+    };
+    let mut next = (**values).clone();
+    next.push(token.evidence().clone());
+    *seq = stamp.seq;
+    *hash = stamp.record_hash.unwrap_or_default();
+    *values = std::sync::Arc::new(next);
 }
 
 #[cfg(test)]
-fn invalidate_validated_global_cache() {}
+fn cache_appended_global(_conn: &mut SqliteConnection, _token: &AuditedGlobalCriticalNews) {}
 pub(super) fn has_equity_base(
     conn: &mut SqliteConnection,
     fact: &AdmittedNewsFact,
@@ -216,8 +235,8 @@ pub(super) fn append(
         // Diesel only returns this token after the real transaction COMMIT succeeds.
         AuditedGlobalCriticalNews::mint(evidence,&actual.evidence_sha256).map_err(|e|audit(e.to_string()))
     });
-    if appended.is_ok() {
-        invalidate_validated_global_cache();
+    if let Ok(token) = &appended {
+        cache_appended_global(conn, token);
     }
     appended
 }
