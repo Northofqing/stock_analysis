@@ -5738,6 +5738,13 @@ fn refresh_attribution_benchmark_if_needed(date_text: &str) {
                 result.sample_size,
                 result.benchmark_accepted
             );
+            if result.with_board == 0 {
+                log::warn!(
+                    "[归因基准] date={} 无 board_pct 覆盖（成分快照未就绪），不写完成 marker，稍后重试",
+                    result.trade_date
+                );
+                return;
+            }
             if let Some(parent) = marker.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -12557,7 +12564,12 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     )
                                     .await
                                     {
-                                        Ok(report) => report.log(),
+                                        Ok(report) => {
+                                            report.log();
+                                            // 15:30 的归因可能早于成分快照；15:40 建完成分后
+                                            // 再补一次，只有 with_board>0 才写完成 marker。
+                                            refresh_attribution_benchmark_if_needed(&date_text);
+                                        }
                                         Err(error) => log::warn!(
                                             "[板块成分] 榜单建表失败 date={date_text}: {error}"
                                         ),
