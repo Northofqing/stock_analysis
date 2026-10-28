@@ -648,6 +648,29 @@ impl std::fmt::Display for RecordTxError {
 
 impl std::error::Error for RecordTxError {}
 
+/// 某票当日是否已经记录过入场触发。事件是唯一事实，不能拿候选表的
+/// 精确 basis 做幂等键 —— 现价每轮变化会让同一票重复追加事件。
+fn entry_triggered_exists(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    as_of: &str,
+) -> Result<bool, String> {
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let row: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM ticket_event \
+         WHERE ticket_id = ?1 AND event_kind = 'entry_triggered' AND date(event_at) = date(?2)",
+    )
+    .bind::<BigInt, _>(ticket_id)
+    .bind::<Text, _>(as_of)
+    .get_result(conn)
+    .map_err(|error| format!("entry_triggered 去重查询失败: {error}"))?;
+    Ok(row.n > 0)
+}
+
 /// 把一次命中写进库。同日同票同动作只记一次。
 pub fn record(
     db: &DatabaseManager,
@@ -658,18 +681,7 @@ pub fn record(
     match hit.action {
         HitAction::Triggered => {
             let basis = hit.basis();
-            // 旧实现先写 candidate_trigger_selection，再开事务写事件；若事务
-            // 后来失败（例如 shadow 临时 context 没有 decision 行），候选行会
-            // 留下并让下一轮误判 Duplicate。只有事件已存在才算重复。
-            if db.latest_candidate_trigger(as_of, &hit.code)?.is_some()
-                && ticket_lifecycle::event_exists_same_day(
-                    &mut conn,
-                    hit.ticket_id,
-                    "entry_triggered",
-                    as_of,
-                    &basis,
-                )?
-            {
+            if entry_triggered_exists(&mut conn, hit.ticket_id, as_of)? {
                 return Ok(RecordOutcome::Duplicate);
             }
             conn.transaction::<(), RecordTxError, _>(|conn| {
