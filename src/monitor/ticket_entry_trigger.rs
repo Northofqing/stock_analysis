@@ -657,11 +657,21 @@ pub fn record(
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
     match hit.action {
         HitAction::Triggered => {
-            if db.latest_candidate_trigger(as_of, &hit.code)?.is_some() {
+            let basis = hit.basis();
+            // 旧实现先写 candidate_trigger_selection，再开事务写事件；若事务
+            // 后来失败（例如 shadow 临时 context 没有 decision 行），候选行会
+            // 留下并让下一轮误判 Duplicate。只有事件已存在才算重复。
+            if db.latest_candidate_trigger(as_of, &hit.code)?.is_some()
+                && ticket_lifecycle::event_exists_same_day(
+                    &mut conn,
+                    hit.ticket_id,
+                    "entry_triggered",
+                    as_of,
+                    &basis,
+                )?
+            {
                 return Ok(RecordOutcome::Duplicate);
             }
-            let basis = hit.basis();
-            db.record_candidate_trigger(as_of, &hit.code, &hit.name, &basis)?;
             conn.transaction::<(), RecordTxError, _>(|conn| {
                 ticket_lifecycle::append_event(
                     conn,
@@ -688,6 +698,8 @@ pub fn record(
                 Ok(())
             })
             .map_err(|error| error.to_string())?;
+            // 事件提交成功后再写候选行；这样失败的事务不会留下孤儿候选。
+            db.record_candidate_trigger(as_of, &hit.code, &hit.name, &basis)?;
             Ok(RecordOutcome::Recorded)
         }
         HitAction::Invalidated => {
