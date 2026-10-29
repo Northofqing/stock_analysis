@@ -25,6 +25,7 @@ use diesel::{QueryableByName, RunQueryDsl, SqliteConnection};
 use crate::database::ticket_lifecycle;
 use crate::database::DatabaseManager;
 use crate::monitor::buy_zone;
+use crate::monitor::selection_context::{self, ExtensionPolicy, SelectionContext};
 use crate::monitor::ticket_decision::{
     self, DecisionContext, EntryMode, EvidenceGrade, ProposalStatus, SourceHealth, SourceStatus,
 };
@@ -302,6 +303,17 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             continue;
         }
 
+        // 选股时点上下文：只记录“选之前走了多远”，不改变本函数的推进会/不推进会。
+        // 任一窗口不足时保留 None，后续 ExtensionPolicy 标 Unknown。
+        let (selection, selection_error) = match selection_context::load(&mut conn, code, as_of) {
+            Ok(selection) => (selection, None),
+            Err(error) => {
+                log::warn!("[入场参考][selection] code={code} 读取失败: {error}");
+                (SelectionContext::default(), Some(error))
+            }
+        };
+        let extension = ExtensionPolicy::evaluate(&selection);
+
         let (low, high) = match (zone.entry_low, zone.entry_high) {
             (Some(low), Some(high)) if low > 0.0 && high >= low => (low, high),
             _ => {
@@ -326,11 +338,7 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             match ticket_regime::resolve(&mut conn, ticket.id, code, &ticket.source, as_of) {
                 Ok(decision) => (
                     decision.regime.as_str().to_owned(),
-                    ticket_decision::entry_mode_for(
-                        decision.regime,
-                        zone.trend,
-                        &ticket.source,
-                    ),
+                    ticket_decision::entry_mode_for(decision.regime, zone.trend, &ticket.source),
                     valid_until_for(as_of, decision.regime),
                 ),
                 Err(error) => {
@@ -371,10 +379,28 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
         context.source_health = source_health.clone();
         context.evidence_grade = EvidenceGrade::L1;
         context.missing_fields.push("volume_ratio".to_owned());
+        context.selection = selection;
+        context.extension = extension;
+        if selection_error.is_some() {
+            context.missing_fields.push("selection_context".to_owned());
+        }
         context.supersedes = previous_context
             .as_ref()
             .map(|previous| previous.decision_id.clone());
         context.seal();
+
+        log::info!(
+            "[入场参考][selection] code={} state={} pre5={:?} pre10={:?} pre20={:?} dist_hi60={:?} pos60={:?} streak={:?} reasons={}",
+            code,
+            context.extension.state.as_str(),
+            context.selection.pre5_return,
+            context.selection.pre10_return,
+            context.selection.pre20_return,
+            context.selection.dist_hi60,
+            context.selection.position_60d,
+            context.selection.limit_up_streak,
+            context.extension.reasons.join(",")
+        );
 
         if shadow {
             match ticket_decision::persist_proposal(&db, &context) {

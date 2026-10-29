@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::database::DatabaseManager;
 use crate::monitor::buy_zone::Trend;
+use crate::monitor::selection_context::{ExtensionAssessment, SelectionContext};
 use crate::monitor::ticket_regime::Regime;
 
 /// 规则版本必须和证据包、回放脚本一起固定。
@@ -220,6 +221,12 @@ pub struct DecisionContext {
     pub missing_fields: Vec<String>,
     pub position: PositionContext,
     pub capacity: CapacityContext,
+    /// 选股时的历史价格位置；只记录，不参与 EntryPolicy 触发。
+    #[serde(default)]
+    pub selection: SelectionContext,
+    /// 由 SelectionContext 派生出的观察状态；不代表交易闸门。
+    #[serde(default)]
+    pub extension: ExtensionAssessment,
     pub rule_version: String,
     pub evidence_refs: Vec<EvidenceRef>,
     pub supersedes: Option<String>,
@@ -255,6 +262,8 @@ impl DecisionContext {
             missing_fields: Vec::new(),
             position: PositionContext::default(),
             capacity: CapacityContext::default(),
+            selection: SelectionContext::default(),
+            extension: ExtensionAssessment::default(),
             rule_version: RULE_VERSION.to_owned(),
             evidence_refs: Vec::new(),
             supersedes: None,
@@ -761,6 +770,29 @@ mod tests {
         let json = context.to_json().expect("serialize context");
         let decoded: DecisionContext = serde_json::from_str(&json).expect("deserialize context");
         assert_eq!(decoded, context);
+    }
+
+    #[test]
+    fn selection_context_is_part_of_decision_identity() {
+        let mut base = context(EntryMode::Pullback);
+        let original_id = base.decision_id.clone();
+
+        base.selection.pre20_return = Some(0.35);
+        base.selection.dist_hi60 = Some(-0.02);
+        base.selection.position_60d = Some(0.80);
+        base.selection.limit_up_streak = Some(2);
+        base.extension.state = crate::monitor::selection_context::ExtensionState::Extended;
+        base.extension.reasons = vec!["pre20>20%".to_owned()];
+        base.seal();
+
+        assert_ne!(base.decision_id, original_id);
+        let json = base.to_json().expect("serialize selected context");
+        let decoded: DecisionContext = serde_json::from_str(&json).expect("deserialize selected");
+        assert_eq!(decoded.selection.pre20_return, Some(0.35));
+        assert_eq!(
+            decoded.extension.state,
+            crate::monitor::selection_context::ExtensionState::Extended
+        );
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub mod signal_fusion;
 pub mod signal_state;
 pub mod quote_coverage; // 2026-10-27: WP3.5 行情覆盖率与源健康
 pub mod ticket_auction_price; // 2026-10-23: 情绪票 09:25 竞价买价 + 板块热度 (批 1.3/2.1)
+pub mod selection_context; // 2026-10-29: 选股时点上下文（只记录，不改变触发）
 pub mod ticket_decision; // 2026-10-27: DecisionContext + EntryPolicy + ticket_decision 投影
 pub mod ticket_evidence; // 2026-10-27: WP6 只读证据包/缺口
 pub mod output_contract; // 2026-10-27: WP5 参考价输出合同开关
