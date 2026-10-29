@@ -2980,3 +2980,28 @@ git diff --check
     后永久不再重算。
 - 当前仍不能算完成：P1.1 news/mf 仍 0；P2 仍 0 触发；
   WP5/WP8 激活门槛未过；P6 只覆盖有成分快照的两天。
+
+- 2026-10-29 选股时点上下文（shadow，不改变触发）：
+  - 新增 `src/monitor/selection_context.rs`：从 `stock_daily` 的
+    `date <= as_of` 日线计算 `pre5/pre10/pre20`、`dist_hi60`、
+    `position_60d`、`limit_up_streak`；窗口不足写 `None`，不补 0；
+  - `DecisionContext` 增加 `selection` 与 `extension`（serde 默认值），
+    `extension` 带 `selection_v1` 观察口径版本；现有旧 context 反序列化为
+    `Unknown`，不会被当成 Normal；
+  - `ExtensionPolicy` 只派生观察状态：
+    `pre20>20%`、`dist_hi60>-5%`、`pos60>70%`、连续涨停≥2；
+    这些阈值只写入 context/日志，不参与 `EntryPolicy` 触发，也不改变推送；
+  - `ticket_entry_proposal` 在每个提案生成时写
+    `[入场参考][selection]` 日志，并把字段写入 `ticket_decision.context_json`；
+    `selection_context` 读取失败时记录 `missing_fields=["selection_context"]`，
+    提案本身继续，不伪造位置数据；
+  - 验收：`monitor::selection_context::tests` 4/4、
+    `monitor::ticket_decision::tests` 13/13、
+    `monitor::ticket_entry_trigger::tests` 13/13；
+    `cargo check --lib --bin monitor` 通过。
+  - 边界：2026-10-28 已落库的 17 条 `ticket_decision` 没有 `selection` 字段，
+    只能显示 `Unknown`；需要在运行根部署后产生的新提案才会写入
+    `pre20/dist_hi60/pos60`。不回溯修改历史 context。
+  - 后续：至少观察 4~6 周，对比 `Extended` 与 `Normal` 的 T+1/T+3/T+5、
+    MFE/MAE 和相对板块超额，再讨论是否把它变成闸门；当前不改
+    `TICKET_ENTRY_POLICY=shadow`，也不切 `new`。
