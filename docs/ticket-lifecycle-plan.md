@@ -3026,7 +3026,10 @@ git diff --check
   最近 5 个事件日的窗口。
 - `ticket_new_gate.py` 仍为 BLOCKED：17 条 decision 只有
   `2026-10-28` 一个日期，要求 5 个 decision 日期；24 条触发事件、
-  36 条终态事件。不能因为“有触发”就切 `TICKET_ENTRY_POLICY=new`。
+  36 条终态事件。gate 输出现在另附 `selection_known=0` /
+  `extension_states={"missing":17}`，明确这是旧 context，而不是
+  “SelectionContext 没有采集”。不能因为“有触发”就切
+  `TICKET_ENTRY_POLICY=new`。
 - 15:49 运行根仍没有 `data/watch_pool/2026-10-29` marker，17 条
   `ticket_decision` 仍全是 10-28。15:30 的盘后复核尚在跑；15:40
   观察池代码条件是 `now >= 15:40` 且带持久 marker，正常情况下会在

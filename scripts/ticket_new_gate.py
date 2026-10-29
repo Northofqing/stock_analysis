@@ -39,6 +39,17 @@ def main() -> int:
             context_rows = con.execute(
                 "SELECT COUNT(*) FROM ticket_decision WHERE context_json IS NOT NULL AND context_json <> ''"
             ).fetchone()[0]
+            selection_known = con.execute(
+                "SELECT COUNT(*) FROM ticket_decision "
+                "WHERE json_valid(context_json) "
+                "AND json_extract(context_json, '$.selection.pre20_return') IS NOT NULL"
+            ).fetchone()[0]
+            extension_states = dict(
+                con.execute(
+                    "SELECT COALESCE(json_extract(context_json, '$.extension.state'), 'missing'), "
+                    "COUNT(*) FROM ticket_decision GROUP BY 1 ORDER BY 1"
+                ).fetchall()
+            )
             triggered = con.execute(
                 "SELECT COUNT(*) FROM ticket_event WHERE event_kind='entry_triggered'"
             ).fetchone()[0]
@@ -60,6 +71,8 @@ def main() -> int:
                 "decision_dates": dates,
                 "decision_rows": decisions,
                 "context_rows": context_rows,
+                "selection_known": selection_known,
+                "extension_states": extension_states,
                 "triggered_events": triggered,
                 "terminal_events": expired,
                 "reasons": reasons,
