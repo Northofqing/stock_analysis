@@ -3017,3 +3017,21 @@ git diff --check
     运行根 `data/ops_check/latest.json`，包含
     `ticket_decision.dates/selection`、`entry_events`、`selection_log`、
     `warnings/critical`。该任务只读，不推送、不修改生产数据。
+
+## 11.12 2026-10-29 15:50 验收状态
+
+- P2 `evaluated=0` 不是“没有回填”，而是窗口内 87 条建议还在 T+5
+  观察期；`phase_acceptance.py` 现在同时显示 `pending`，避免把
+  “未到期”误报成“闭环失败”。2026-10-22 及更早的已回填记录不计入
+  最近 5 个事件日的窗口。
+- `ticket_new_gate.py` 仍为 BLOCKED：17 条 decision 只有
+  `2026-10-28` 一个日期，要求 5 个 decision 日期；24 条触发事件、
+  36 条终态事件。不能因为“有触发”就切 `TICKET_ENTRY_POLICY=new`。
+- 15:49 运行根仍没有 `data/watch_pool/2026-10-29` marker，17 条
+  `ticket_decision` 仍全是 10-28。15:30 的盘后复核尚在跑；15:40
+  观察池代码条件是 `now >= 15:40` 且带持久 marker，正常情况下会在
+  当前主循环轮次结束后补跑，不是“当天没有提案”的结论。等本轮结束
+  或 21:30 日线后补跑再验收。
+- WP5 OutputContract 仍只处于 shadow，尚未切用户可见输出；WP8 的
+  5 日门槛没有变化。P1.1 news/MoneyFlow 仍是外部数据可用性问题，
+  未用旧数据填充。

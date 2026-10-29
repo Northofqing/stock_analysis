@@ -298,10 +298,16 @@ def check_p2(main, days):
         (cutoff,),
     ).fetchone()[0]
     evaluated = 0
+    pending = 0
     if table_exists(main, "advice_outcome_tracking"):
         evaluated = main.execute(
             "SELECT COUNT(*) FROM advice_outcome_tracking "
             "WHERE business_date >= ? AND (outcome_filled_at IS NOT NULL OR outcome_pct IS NOT NULL)",
+            (cutoff,),
+        ).fetchone()[0]
+        pending = main.execute(
+            "SELECT COUNT(*) FROM advice_outcome_tracking "
+            "WHERE business_date >= ? AND outcome_filled_at IS NULL AND outcome_pct IS NULL",
             (cutoff,),
         ).fetchone()[0]
     st = main.execute(
@@ -320,7 +326,7 @@ def check_p2(main, days):
         f"窗口 {cutoff}~最新 proposal={ev} open={st} triggered={trig} "
         f"trigger_events={trigger_events} "
         f"invalidated={invalidated} expired={expired} superseded={superseded} "
-        f"evaluated={evaluated} trigger_rate={trigger_rate:.1f}% "
+        f"evaluated={evaluated} pending={pending} trigger_rate={trigger_rate:.1f}% "
         f"decision={decisions} observing={obs}"
     )
     if ev == 0 and st == 0:
@@ -332,6 +338,8 @@ def check_p2(main, days):
     elif evaluated == 0:
         r.status = PARTIAL
         r.detail += " | 有触发但 0 个已评估结果；不能算闭环"
+        if pending:
+            r.detail += f"（pending={pending}，T+5 观察窗未到期）"
     else:
         r.status = OK
     return r
