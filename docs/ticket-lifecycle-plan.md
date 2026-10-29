@@ -2996,7 +2996,7 @@ git diff --check
     `selection_context` 读取失败时记录 `missing_fields=["selection_context"]`，
     提案本身继续，不伪造位置数据；
   - 验收：`monitor::selection_context::tests` 4/4、
-    `monitor::ticket_decision::tests` 13/13、
+    `monitor::ticket_decision::tests` 14/14、
     `monitor::ticket_entry_trigger::tests` 13/13；
     `cargo check --lib --bin monitor` 通过。
   - 边界：2026-10-28 已落库的 17 条 `ticket_decision` 没有 `selection` 字段，
