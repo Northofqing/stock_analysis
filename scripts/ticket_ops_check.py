@@ -47,6 +47,72 @@ def main() -> int:
         report["ticket_decision"] = {
             "rows": scalar(db, "SELECT COUNT(*) FROM ticket_decision"),
             "latest_as_of": scalar(db, "SELECT MAX(as_of) FROM ticket_decision"),
+            "dates": [
+                {"as_of": row[0], "rows": row[1]}
+                for row in db.execute(
+                    "SELECT as_of, COUNT(*) FROM ticket_decision "
+                    "GROUP BY as_of ORDER BY as_of DESC LIMIT 10"
+                ).fetchall()
+            ],
+            "statuses": {
+                row[0]: row[1]
+                for row in db.execute(
+                    "SELECT proposal_status, COUNT(*) FROM ticket_decision "
+                    "GROUP BY proposal_status ORDER BY proposal_status"
+                ).fetchall()
+            },
+            "modes": {
+                row[0]: row[1]
+                for row in db.execute(
+                    "SELECT entry_mode, COUNT(*) FROM ticket_decision "
+                    "GROUP BY entry_mode ORDER BY entry_mode"
+                ).fetchall()
+            },
+        }
+        # JSON 解析放在 Python 侧：旧 context 没有 selection 字段，不能把 null
+        # 当成 0；统计的是“有真实字段的决策数”，不是行数。
+        selection_known = 0
+        selection_states: dict[str, int] = {}
+        selection_unknown = 0
+        latest_selection_date = None
+        latest_selection_known = 0
+        for row in db.execute(
+            "SELECT as_of, context_json FROM ticket_decision "
+            "ORDER BY as_of DESC, created_at DESC LIMIT 500"
+        ).fetchall():
+            try:
+                context = json.loads(row[1] or "{}")
+            except (TypeError, ValueError):
+                selection_unknown += 1
+                continue
+            selection = context.get("selection") or {}
+            extension = context.get("extension") or {}
+            has_selection = selection.get("pre20_return") is not None
+            state = extension.get("state") or "unknown"
+            selection_states[state] = selection_states.get(state, 0) + 1
+            if latest_selection_date is None:
+                latest_selection_date = row[0]
+            if row[0] == latest_selection_date:
+                latest_selection_known += int(has_selection)
+            if has_selection:
+                selection_known += 1
+            else:
+                selection_unknown += 1
+        report["ticket_decision"]["selection"] = {
+            "known": selection_known,
+            "unknown": selection_unknown,
+            "states": selection_states,
+            "latest_as_of": latest_selection_date,
+            "latest_known": latest_selection_known,
+        }
+        report["entry_events"] = {
+            row[0]: {"count": row[1], "last_date": row[2]}
+            for row in db.execute(
+                "SELECT event_kind, COUNT(*), MAX(substr(event_at,1,10)) "
+                "FROM ticket_event WHERE event_kind IN "
+                "('entry_proposed','entry_triggered','entry_invalidated','entry_expired') "
+                "GROUP BY event_kind ORDER BY event_kind"
+            ).fetchall()
         }
         report["ticket_event_5d"] = {
             row[0]: row[1]
@@ -105,18 +171,37 @@ def main() -> int:
                 coverage[health] += 1
             last.append({"scope": match.group(1), "health": health})
         coverage["last"] = list(last)
+        selection_lines = []
+        for line in current.splitlines():
+            if "[入场参考][selection]" in line:
+                selection_lines.append(line[:500])
+        report["selection_log"] = {
+            "lines": len(selection_lines),
+            "last": selection_lines[-1] if selection_lines else None,
+        }
         report["last_log_line"] = text.splitlines()[-1][:300] if text.splitlines() else ""
     report["coverage"] = coverage
     report["log_path"] = str(log_path)
 
     critical = []
+    warnings = []
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
     if not report["stock_daily"] or report["stock_daily"][0]["rows"] < 1000:
         critical.append("stock_daily_latest_not_full_universe")
     if report["ticket_decision"]["rows"] == 0:
         critical.append("ticket_decision_empty_shadow_has_no_sample")
     if coverage["unavailable"] > 0 and coverage["available"] == 0:
         critical.append("peer_quote_source_unavailable")
+    selection = report["ticket_decision"].get("selection") or {}
+    if (
+        report["ticket_decision"].get("latest_as_of") == today
+        and selection.get("latest_known", 0) == 0
+    ):
+        critical.append("selection_context_missing_on_latest_decision")
+    elif report["ticket_decision"].get("latest_as_of") != today:
+        warnings.append("ticket_decision_not_updated_today")
     report["critical"] = critical
+    report["warnings"] = warnings
     report["status"] = "FAIL" if "peer_quote_source_unavailable" in critical else "PARTIAL"
     if not critical:
         report["status"] = "OK"
