@@ -773,6 +773,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_context_without_selection_deserializes_as_unknown() {
+        let context = context(EntryMode::Breakout);
+        let mut value = serde_json::to_value(&context).expect("serialize context");
+        let object = value.as_object_mut().expect("context object");
+        object.remove("selection");
+        object.remove("extension");
+
+        let decoded: DecisionContext = serde_json::from_value(value).expect("legacy context");
+        assert_eq!(decoded.selection, SelectionContext::default());
+        assert_eq!(
+            decoded.extension.state,
+            crate::monitor::selection_context::ExtensionState::Unknown
+        );
+    }
+
+    #[test]
     fn selection_context_is_part_of_decision_identity() {
         let mut base = context(EntryMode::Pullback);
         let original_id = base.decision_id.clone();
