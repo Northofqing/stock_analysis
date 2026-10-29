@@ -3012,3 +3012,8 @@ git diff --check
     属于既有诊断路由问题，未在本次改动中处理；
     重启后 `ticket_decision` 仍为 17 行（均为 2026-10-28 旧 context），
     没有回填 `selection`；新提案会在下一次 15:40/日线后轮次写入。
+  - 持续巡检：新增本地 cron `selection-shadow-check`（job `db7ed9d00ba5`），
+    交易日 15:55 与 21:55 运行 `ticket_ops_check_cron.sh`；报告写到
+    运行根 `data/ops_check/latest.json`，包含
+    `ticket_decision.dates/selection`、`entry_events`、`selection_log`、
+    `warnings/critical`。该任务只读，不推送、不修改生产数据。
