@@ -3005,3 +3005,10 @@ git diff --check
   - 后续：至少观察 4~6 周，对比 `Extended` 与 `Normal` 的 T+1/T+3/T+5、
     MFE/MAE 和相对板块超额，再讨论是否把它变成闸门；当前不改
     `TICKET_ENTRY_POLICY=shadow`，也不切 `new`。
+  - 2026-10-29 10:59 部署：运行根 release 构建 8m28s；PID 42012；
+    10:59:26 `bound root mode=production`；11:01:58 `core_database_bind=ok`
+    （147s）；11:01:59 `startup_health_check=degraded`，同段日志有
+    `opening_static_ready=false ... failed_routes=BoardConstituents`，
+    属于既有诊断路由问题，未在本次改动中处理；
+    重启后 `ticket_decision` 仍为 17 行（均为 2026-10-28 旧 context），
+    没有回填 `selection`；新提案会在下一次 15:40/日线后轮次写入。
