@@ -149,3 +149,6 @@ incremental = false
 [[bench]]
 name = "intraday_tick"
 harness = false
+
+[patch."https://github.com/Northofqing/magic-market-data-rs.git"]
+magic-market-core = { path = "vendor/magic-market-core" }

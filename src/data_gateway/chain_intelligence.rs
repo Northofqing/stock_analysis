@@ -7,8 +7,8 @@
 use crate::data_gateway::review::GatewayError;
 #[cfg(feature = "magic-gateway")]
 use crate::data_gateway::review::{
-    acquisition_request_hash, audit_gateway_result, audit_routed_gateway_result,
-    route_exact_date_upper_limit_pool, BatchEvidence, GatewayBatch,
+    acquisition_request_hash, audit_gateway_result, audit_routed_gateway_result, BatchEvidence,
+    GatewayBatch, ReviewDataGateway,
 };
 #[cfg(feature = "magic-gateway")]
 use crate::database::chain_intelligence::{
@@ -879,7 +879,9 @@ fn acquire_limit_pool(
     trading_date: NaiveDate,
 ) -> Result<GatewayBatch<LimitPoolEntry>, GatewayError> {
     let request_hash = acquisition_request_hash("A-10-limit-pool", trading_date.to_string());
-    let result = route_exact_date_upper_limit_pool("A-10-limit-pool", trading_date);
+    // 主仓的涨停池由 ReviewDataGateway 统一取（经桥或 library 通道），
+    // 不再走分支的独立 router。
+    let result = ReviewDataGateway.current_upper_limit_pool(trading_date);
     audit_routed_gateway_result("A-10-limit-pool", &request_hash, result)
 }
 

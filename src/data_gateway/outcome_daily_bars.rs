@@ -33,10 +33,10 @@ use crate::selection::schema_v2::{
     DOMAIN_PROVIDER_CAPABILITY, OUTCOME_ADAPTIVE_POLICY_VERSION, OUTCOME_PARENT_DESIGN_SHA256,
     OUTCOME_TDX_HISTORICAL_PAGE_SIZE, UPSTREAM_REVISION,
 };
-#[cfg(test)]
 use crate::selection::schema_v2::{
-    OutcomeProviderErrorPreimage, OutcomeTransportEvidencePreimage,
-    OutcomeTransportRequestPreimage, OutcomeTransportResultPreimage,
+    OutcomeHistoricalBarCardinalityPreimage, OutcomeProviderErrorPreimage,
+    OutcomeTransportEvidencePreimage, OutcomeTransportRequestPreimage,
+    OutcomeTransportResultPreimage,
 };
 
 use super::historical_bars::{finalize_outcome_sequence_async, OutcomeLifecycleAdmission};
@@ -2846,6 +2846,10 @@ fn validate_unit_contract() -> Result<(), GatewayError> {
     Ok(())
 }
 
+#[cfg(feature = "magic-gateway")]
+mod bridge_port {
+    use super::*;
+
 // ---------------------------------------------------------------------------
 // 桥移植（2026-10-31）：本地 TDX adaptive latest-N 取数。
 // 来源 codex/local-bridge-news-v3-20261008，server 在无 gRPC 桥时的 library 通道。
@@ -3216,13 +3220,290 @@ fn batch_covers_window_start(
     Ok(first_date <= window_start)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ValidatedHistoricalBarCardinality {
-    available_count: u16,
-    requested_total: u16,
+// 桥移植：adaptive 取数的辅助函数。
+fn successful_transport_attempt(
+    request_ordinal: u32,
+    canonical_stock_code: &str,
+    canonical_market: &str,
+    latest_n: u16,
+    batch: &DataBatch<Bar>,
+) -> Result<OutcomeTransportAttemptPreimage, GatewayError> {
+    let request = transport_request_preimage(canonical_stock_code, canonical_market, latest_n);
+    let request_hash = sha256_json(&request).map_err(schema_gateway_error)?;
+    let evidence = BatchEvidence::from_provenance(ProviderId::Tdx, batch.provenance())?;
+    let content = transport_batch_content(batch, &evidence)?;
+    let batch_content_hash = sha256_json(&content).map_err(schema_gateway_error)?;
+    let provider_evidence = OutcomeTransportEvidencePreimage {
+        source: evidence.source,
+        source_at: evidence.source_at,
+        observed_at: evidence.observed_at,
+        batch_id: evidence.batch_id,
+        record_count: u32::try_from(batch.records().len())
+            .map_err(|_| invalid_evidence("transport response count exceeds u32"))?,
+        batch_content: content,
+        batch_content_hash,
+    };
+    let provider_evidence_hash = sha256_json(&provider_evidence).map_err(schema_gateway_error)?;
+    let actual_count = u16::try_from(batch.records().len())
+        .map_err(|_| invalid_evidence("transport response count exceeds u16"))?;
+    let result = OutcomeTransportResultPreimage {
+        terminal_state: if actual_count == latest_n {
+            "available".into()
+        } else {
+            "provider_cardinality_violation".into()
+        },
+        requested_latest_n: latest_n,
+        actual_count: Some(actual_count),
+        provider_evidence: Some(provider_evidence),
+        provider_evidence_hash: Some(provider_evidence_hash),
+        provider_error: None,
+        provider_error_hash: None,
+    };
+    let result_hash = sha256_json(&result).map_err(schema_gateway_error)?;
+    Ok(OutcomeTransportAttemptPreimage {
+        request_ordinal,
+        request,
+        request_hash,
+        result,
+        result_hash,
+    })
 }
 
-/// 无 feature 构建下 TdxError 类型不存在 (library transport 编译期被移除),
-/// 但同一套 cardinality 验证逻辑被两个入口共用: feature 构建的 typed 错误
-/// 分支 (`validated_cardinality_mismatch`) 与无条件的历史复核
-/// (`validate_transport_attempts`)。验证主体与 TdxError 解耦为单一来源,
+fn unsupported_recovery_window(
+    window_start: NaiveDate,
+    largest_successful_latest_n: u16,
+    last_result_hash: Option<&str>,
+) -> GatewayError {
+    GatewayError::classified(
+        CAPABILITY,
+        Some(ProviderId::Tdx),
+        "partial",
+        "unsupported_window",
+        false,
+        format!(
+            "Magic TDX maximum recoverable latest-N={largest_successful_latest_n} does not cover \
+             immutable window start {window_start}; last_transport_result_hash={}",
+            last_result_hash.unwrap_or("missing")
+        ),
+    )
+}
+
+// 桥移植：adaptive 取数辅助（续）。
+fn failed_transport_attempt(
+    request_ordinal: u32,
+    canonical_stock_code: &str,
+    canonical_market: &str,
+    latest_n: u16,
+    actual_count: Option<u16>,
+    error: &TdxError,
+) -> Result<OutcomeTransportAttemptPreimage, GatewayError> {
+    let request = transport_request_preimage(canonical_stock_code, canonical_market, latest_n);
+    let request_hash = sha256_json(&request).map_err(schema_gateway_error)?;
+    let is_cardinality = matches!(error, TdxError::HistoricalBarCardinality { .. });
+    let provider_error = provider_error_preimage(error)?;
+    let provider_error_hash = sha256_json(&provider_error).map_err(schema_gateway_error)?;
+    let result = OutcomeTransportResultPreimage {
+        terminal_state: if is_cardinality {
+            "cardinality_mismatch".into()
+        } else {
+            "provider_error".into()
+        },
+        requested_latest_n: latest_n,
+        actual_count,
+        provider_evidence: None,
+        provider_evidence_hash: None,
+        provider_error: Some(provider_error),
+        provider_error_hash: Some(provider_error_hash),
+    };
+    let result_hash = sha256_json(&result).map_err(schema_gateway_error)?;
+    Ok(OutcomeTransportAttemptPreimage {
+        request_ordinal,
+        request,
+        request_hash,
+        result,
+        result_hash,
+    })
+}
+
+fn map_tdx_error(error: TdxError) -> GatewayError {
+    let (reason_code, retryable) = match &error {
+        TdxError::InvalidData(_)
+        | TdxError::HistoricalBarCardinality { .. }
+        | TdxError::Parse(_)
+        | TdxError::ResponseParse(_)
+        | TdxError::Core(_)
+        | TdxError::Unsupported(_) => ("provider_invalid_data", false),
+        TdxError::Io(_)
+        | TdxError::FileNotFound(_)
+        | TdxError::Connection(_)
+        | TdxError::ConnectionTimeout
+        | TdxError::SetupFailed(_)
+        | TdxError::Disconnected
+        | TdxError::RetryExhausted(_)
+        | TdxError::Coded(_) => ("provider_unavailable", true),
+    };
+    GatewayError::classified(
+        CAPABILITY,
+        Some(ProviderId::Tdx),
+        if retryable { "unavailable" } else { "partial" },
+        reason_code,
+        retryable,
+        format!("Magic TDX outcome bars failed: {error}"),
+    )
+}
+
+fn validated_cardinality_mismatch(
+    error: &TdxError,
+    current_request: u16,
+) -> Result<Option<ValidatedHistoricalBarCardinality>, GatewayError> {
+    let TdxError::HistoricalBarCardinality {
+        offset,
+        actual,
+        expected_page,
+        requested_total,
+    } = error
+    else {
+        return Ok(None);
+    };
+    validated_cardinality_from_parts(
+        *offset,
+        *actual,
+        *expected_page,
+        *requested_total,
+        current_request,
+    )
+}
+
+fn transport_request_preimage(
+    canonical_stock_code: &str,
+    canonical_market: &str,
+    latest_n: u16,
+) -> OutcomeTransportRequestPreimage {
+    OutcomeTransportRequestPreimage {
+        provider: PROVIDER.into(),
+        source: PROVIDER_SOURCE.into(),
+        canonical_stock_code: canonical_stock_code.into(),
+        canonical_market: canonical_market.into(),
+        interval: DailyIntervalKind::Day.as_str().into(),
+        adjustment: AdjustmentKind::None.as_str().into(),
+        latest_n,
+    }
+}
+
+// 桥移植：provider 错误 preimage。
+#[cfg(feature = "magic-gateway")]
+fn provider_error_preimage(error: &TdxError) -> Result<OutcomeProviderErrorPreimage, GatewayError> {
+    let (variant, coded_error, io_kind, raw_os_error, detail, historical_bar_cardinality) =
+        match error {
+            TdxError::Io(error) => (
+                "io",
+                None,
+                Some(format!("{:?}", error.kind())),
+                error.raw_os_error(),
+                None,
+                None,
+            ),
+            TdxError::Parse(detail) => ("parse", None, None, None, Some(detail.as_str()), None),
+            TdxError::InvalidData(detail) => (
+                "invalid_data",
+                None,
+                None,
+                None,
+                Some(detail.as_str()),
+                None,
+            ),
+            TdxError::HistoricalBarCardinality {
+                offset,
+                actual,
+                expected_page,
+                requested_total,
+            } => (
+                "historical_bar_cardinality",
+                None,
+                None,
+                None,
+                None,
+                Some(OutcomeHistoricalBarCardinalityPreimage {
+                    offset: *offset,
+                    actual: u64::try_from(*actual).map_err(|_| {
+                        invalid_evidence("TDX historical cardinality actual count exceeds u64")
+                    })?,
+                    expected_page: *expected_page,
+                    requested_total: *requested_total,
+                }),
+            ),
+            TdxError::FileNotFound(detail) => (
+                "file_not_found",
+                None,
+                None,
+                None,
+                Some(detail.as_str()),
+                None,
+            ),
+            TdxError::Connection(detail) => {
+                ("connection", None, None, None, Some(detail.as_str()), None)
+            }
+            TdxError::ConnectionTimeout => ("connection_timeout", None, None, None, None, None),
+            TdxError::SetupFailed(detail) => (
+                "setup_failed",
+                None,
+                None,
+                None,
+                Some(detail.as_str()),
+                None,
+            ),
+            TdxError::ResponseParse(detail) => (
+                "response_parse",
+                None,
+                None,
+                None,
+                Some(detail.as_str()),
+                None,
+            ),
+            TdxError::Disconnected => ("disconnected", None, None, None, None, None),
+            TdxError::RetryExhausted(_) => ("retry_exhausted", None, None, None, None, None),
+            TdxError::Unsupported(detail) => {
+                ("unsupported", None, None, None, Some(detail.as_str()), None)
+            }
+            TdxError::Core(_) => ("core_contract", None, None, None, None, None),
+            TdxError::Coded(error) => (
+                "coded",
+                Some(error.code.code()),
+                None,
+                None,
+                Some(error.message.as_str()),
+                None,
+            ),
+        };
+    let structured_detail_hash = match (&detail, &historical_bar_cardinality) {
+        (Some(detail), None) => Some(sha256_json(detail).map_err(schema_gateway_error)?),
+        (None, Some(cardinality)) => Some(sha256_json(cardinality).map_err(schema_gateway_error)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(invalid_evidence(
+                "TDX provider error has conflicting structured detail variants",
+            ))
+        }
+    };
+    let retry_attempts = match error {
+        TdxError::RetryExhausted(attempts) => Some(
+            u32::try_from(*attempts)
+                .map_err(|_| invalid_evidence("TDX retry attempt count exceeds u32"))?,
+        ),
+        _ => None,
+    };
+    Ok(OutcomeProviderErrorPreimage {
+        variant: variant.into(),
+        coded_error,
+        io_kind,
+        raw_os_error,
+        retry_attempts,
+        structured_detail_hash,
+        historical_bar_cardinality,
+    })
+}
+
+}
+
+#[cfg(feature = "magic-gateway")]
+pub(crate) use bridge_port::*;

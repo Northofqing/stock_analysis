@@ -46,6 +46,9 @@ fn last_t0_quotes() -> &'static Mutex<T0QuoteCache> {
     LAST_T0_QUOTES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(not(feature = "magic-gateway"))]
+mod local_t0_types {
+    use super::*;
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct T0BookLevel {
     pub price: f64,
@@ -126,6 +129,15 @@ pub struct MagicTdxT0Batch {
     /// 推送方必须标注「时间不可信」。未来时间 (损坏) 仍硬拒, 不置此位。
     pub time_untrustworthy: bool,
 }
+}
+#[cfg(not(feature = "magic-gateway"))]
+pub use local_t0_types::*;
+#[cfg(feature = "magic-gateway")]
+pub use crate::data_gateway::t0_evidence::{
+    T0Batch as MagicTdxT0Batch, T0BookLevel, T0DailyBar as MagicTdxT0DailyBar,
+    T0Evidence as MagicTdxT0Evidence, T0FiveMinuteBar as MagicTdxT0FiveMinuteBar,
+    T0Quote as MagicTdxT0Quote, T0Rejection as MagicTdxT0Rejection,
+};
 
 #[derive(Clone, Debug)]
 struct T0RequestIdentity {
@@ -164,7 +176,7 @@ fn rejection(
 ) -> MagicTdxT0Rejection {
     MagicTdxT0Rejection {
         code: code.to_string(),
-        reason_code,
+        reason_code: reason_code.to_string(),
         detail: detail.into(),
         retryable,
     }

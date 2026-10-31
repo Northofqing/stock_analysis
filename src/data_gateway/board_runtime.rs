@@ -215,7 +215,7 @@ impl BoardDataGateway {
             acquisition_request_hash(DIRECTORY_CAPABILITY, format!("{kind:?}:{limit}"));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardDirectory") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_directory_async(kind, limit).await;
                 let audit_provider = result
                     .as_ref()
@@ -228,7 +228,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     DIRECTORY_CAPABILITY,
@@ -284,7 +283,7 @@ impl BoardDataGateway {
         let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardConstituents") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_constituents_async(&code).await;
                 let audit_provider = result
                     .as_ref()
@@ -297,7 +296,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
@@ -354,7 +352,7 @@ impl BoardDataGateway {
         // BR-238: 同步消费者复用与 async memberships 完全相同的 gRPC
         // acquisition + audit 分支；桥失败显式返回，绝不降级 library。
         match super::grpc_source::bridge_for("BoardConstituents") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_constituents(&code);
                 let audit_provider = result
                     .as_ref()
@@ -367,7 +365,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     MEMBERSHIP_CAPABILITY,
@@ -405,7 +402,7 @@ impl BoardDataGateway {
             acquisition_request_hash(FLOW_CAPABILITY, format!("{kind:?}:Day1:{limit}"));
         // P4 M3: gRPC 桥 (DATA_GATEWAY_GRPC=1 时替换 transport; audit 留客户端)。
         match super::grpc_source::bridge_for("BoardFlows") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_flows_async(kind, limit).await;
                 let audit_provider = result
                     .as_ref()
@@ -418,7 +415,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     FLOW_CAPABILITY,
@@ -477,7 +473,7 @@ impl BoardDataGateway {
             acquisition_request_hash(FLOW_CAPABILITY, format!("{kind:?}:Day1:{limit}"));
         // P4 M3: gRPC 桥 (同步路径, spawn_blocking 内调用 → block_on)。
         match super::grpc_source::bridge_for("BoardFlows") {
-            Ok(Some(bridge)) => {
+            Ok(bridge) => {
                 let result = bridge.board_flows(kind, limit);
                 let audit_provider = result
                     .as_ref()
@@ -490,7 +486,6 @@ impl BoardDataGateway {
                     result,
                 );
             }
-            Ok(None) => {}
             Err(error) => {
                 return audit_gateway_result(
                     FLOW_CAPABILITY,
@@ -1339,5 +1334,28 @@ mod no_magic_bridge_tests {
             !error.message().contains("library transport disabled"),
             "blocking entry must try the configured bridge: {error}"
         );
+    }
+}
+
+/// 成员查询请求（grpc_source 复用；master 版本保留）。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MembershipRequest {
+    code: String,
+    request_hash: String,
+}
+
+impl MembershipRequest {
+    pub(crate) fn try_new(code: &str) -> Result<Self, GatewayError> {
+        let code = validate_code(code, MEMBERSHIP_CAPABILITY)?.to_owned();
+        let request_hash = acquisition_request_hash(MEMBERSHIP_CAPABILITY, &code);
+        Ok(Self { code, request_hash })
+    }
+
+    pub(crate) fn code(&self) -> &str {
+        &self.code
+    }
+
+    pub(crate) fn request_hash(&self) -> &str {
+        &self.request_hash
     }
 }

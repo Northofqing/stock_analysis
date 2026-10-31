@@ -3,7 +3,9 @@
 mod benchmark;
 pub mod block_trade;
 pub mod board;
+#[cfg(feature = "magic-gateway")]
 pub mod magic_tdx;
+#[cfg(feature = "magic-gateway")]
 pub mod magic_tdx_t0;
 pub mod board_ranking;
 mod board_runtime;

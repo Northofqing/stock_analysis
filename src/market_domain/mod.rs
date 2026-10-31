@@ -1,12 +1,43 @@
+#[cfg(feature = "magic-gateway")]
+pub mod bars { pub use magic_market_core::{Adjustment, Bar, BarInterval}; }
+#[cfg(feature = "magic-gateway")]
+pub mod evidence { pub use magic_market_core::{EvidenceTimestamp, NonEmptyText, SourceEvidence}; }
+#[cfg(feature = "magic-gateway")]
+pub mod instrument { pub use magic_market_core::{AssetClass, CoreError, Exchange, InstrumentId}; }
+#[cfg(feature = "magic-gateway")]
+pub mod lifecycle { pub use magic_market_core::{CorporateActionCategory, CorporateActionStatus, CorporateActionTerms, UnverifiedSourceUnit}; }
+#[cfg(feature = "magic-gateway")]
+pub mod market { pub use magic_market_core::{FinancialLine, FinancialStatement, LimitPoolEntry, LimitPoolKind, MarketStatistics, StatementKind}; }
+#[cfg(feature = "magic-gateway")]
+pub mod provider_id { pub use magic_market_core::ProviderId; }
+#[cfg(feature = "magic-gateway")]
+pub mod ranking { pub use magic_market_core::{DragonTigerSide, FxPair, GlobalIndexCode, MarketRankingKind, MarketRankingUnit}; }
+#[cfg(feature = "magic-gateway")]
+pub mod record { pub use magic_market_core::{DataBatch, FlowInterval, IsoDate, NorthboundChannel, Provenance, QualityReport}; }
+#[cfg(feature = "magic-gateway")]
+pub mod tdx { pub use magic_tdx_rs::protocol::types::SecurityBar; }
+#[cfg(feature = "magic-gateway")]
+pub mod value { pub use magic_market_core::{FiniteNumber, Money, PositiveU32, Price, Quantity, Ratio, RatioUnit}; }
+
+#[cfg(not(feature = "magic-gateway"))]
 pub mod bars;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod evidence;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod instrument;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod lifecycle;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod market;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod provider_id;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod ranking;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod record;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod tdx;
+#[cfg(not(feature = "magic-gateway"))]
 pub mod value;
 
 pub use bars::{Adjustment, Bar, BarInterval};

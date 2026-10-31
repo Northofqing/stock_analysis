@@ -704,7 +704,6 @@ impl BenchmarkWireTime {
 }
 
 impl BenchmarkBarWire {
-    #[cfg(test)]
     fn from_bar(bar: &BenchmarkBar) -> Self {
         let at = match bar.at {
             BenchmarkBarTime::Daily(date) => BenchmarkWireTime::from_date(date),
@@ -739,7 +738,6 @@ impl BenchmarkBarWire {
 }
 
 impl BenchmarkEvidenceWire {
-    #[cfg(test)]
     fn from_evidence(evidence: &super::review::BatchEvidence) -> Self {
         Self {
             provider: format!("{:?}", evidence.provider),
@@ -851,7 +849,6 @@ fn benchmark_trading_calendar_error(message: impl Into<String>) -> GatewayError 
 }
 
 impl BenchmarkAuditReceiptWire {
-    #[cfg(test)]
     fn from_receipt(
         receipt: &crate::database::data_acquisition_audit::DataAcquisitionAuditReceipt,
     ) -> Self {
@@ -898,7 +895,6 @@ impl BenchmarkAuditReceiptWire {
 }
 
 impl BenchmarkGrpcResponseWire {
-    #[cfg(test)]
     pub(crate) fn from_audited(
         request: &BenchmarkRequest,
         audited: &super::review::AuditedBenchmarkBatch,
