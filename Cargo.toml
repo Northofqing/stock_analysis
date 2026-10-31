@@ -17,6 +17,11 @@ name = "lhb_query"
 path = "src/bin/lhb_query.rs"
 
 [[bin]]
+name = "grpc_market_server"
+path = "src/bin/grpc_market_server.rs"
+required-features = ["magic-gateway"]
+
+[[bin]]
 name = "holding_earnings_report"
 path = "src/bin/holding_earnings_report.rs"
 
@@ -37,6 +42,7 @@ name = "ticket_dedupe"
 path = "src/bin/ticket_dedupe.rs"
 
 [features]
+magic-gateway = ["dep:magic-market-core", "dep:magic-market-router", "dep:magic-market-composition", "dep:magic-eastmoney-rs", "dep:magic-ths-rs", "dep:magic-sina-rs", "dep:magic-cninfo-rs", "dep:magic-tencent-rs", "dep:magic-cls-rs", "dep:magic-jin10-rs", "dep:magic-thepaper-rs", "dep:magic-exchange-rs", "dep:magic-baidu-rs"]
 replay-sqlite-bundled-v1 = ["rusqlite/bundled"]
 
 [dependencies]
@@ -44,6 +50,19 @@ replay-sqlite-bundled-v1 = ["rusqlite/bundled"]
 # 只依赖 vendor 里的 crate 本体；上游 magic-market-core 走 git rev，本地缓存已有。
 magic-tdx-rs = { path = "vendor/magic-tdx-rs" }
 # 2026-10-18: 新浪板块接口是 GBK 编码，需要显式解码（东财 clist 不可用时的 f3 备用源）
+magic-market-core = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-market-router = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-market-composition = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-eastmoney-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-ths-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-sina-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-cninfo-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-tencent-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-cls-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-jin10-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-thepaper-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-exchange-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
+magic-baidu-rs = { git = "https://github.com/Northofqing/magic-market-data-rs.git", rev = "75ee2a2bdd3b1ca2b01ce3afbb04aec416e7000e", version = "=0.2.0", optional = true }
 encoding_rs = "0.8"
 tokio = { version = "1.49.0", features = ["full", "rt"] }
 anyhow = "1.0.100"

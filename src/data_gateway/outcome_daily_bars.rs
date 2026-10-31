@@ -2845,3 +2845,384 @@ fn validate_unit_contract() -> Result<(), GatewayError> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// 桥移植（2026-10-31）：本地 TDX adaptive latest-N 取数。
+// 来源 codex/local-bridge-news-v3-20261008，server 在无 gRPC 桥时的 library 通道。
+// ---------------------------------------------------------------------------
+#[cfg(feature = "magic-gateway")]
+use magic_market_core::{BarsRequest, HistoricalBars};
+#[cfg(feature = "magic-gateway")]
+use magic_tdx_rs::{TdxError, TdxSmartClient};
+
+pub(crate) fn fetch_magic_tdx_outcome_adaptive(
+    instrument: InstrumentId,
+    canonical_market: String,
+    canonical_stock_code: String,
+    expected_bar_count: u16,
+    maximum_latest_n: u16,
+    window_start: NaiveDate,
+) -> Result<RawOutcomeFetch, OutcomeTransportFailure> {
+    let client = TdxSmartClient::new();
+    let instrument_for_request = instrument.clone();
+    let result = adaptive_fetch_with(
+        &canonical_stock_code,
+        &canonical_market,
+        expected_bar_count,
+        maximum_latest_n,
+        window_start,
+        |latest_n| {
+            let request =
+                BarsRequest::new(instrument_for_request.clone(), BarInterval::Day, latest_n)
+                    .map_err(TdxError::from)?;
+            client.historical_bars(&request)
+        },
+    );
+    // TdxSmartClient owns blocking resources. It must be dropped inside this
+    // spawn_blocking worker, never on the async runtime thread.
+    drop(client);
+    result
+}
+
+#[cfg(feature = "magic-gateway")]
+fn adaptive_fetch_with<Fetch>(
+    canonical_stock_code: &str,
+    canonical_market: &str,
+    expected_bar_count: u16,
+    maximum_latest_n: u16,
+    window_start: NaiveDate,
+    mut fetch: Fetch,
+) -> Result<RawOutcomeFetch, OutcomeTransportFailure>
+where
+    Fetch: FnMut(u16) -> Result<DataBatch<Bar>, TdxError>,
+{
+    if expected_bar_count == 0 || expected_bar_count > maximum_latest_n {
+        return Err(OutcomeTransportFailure::new(
+            GatewayError::invalid_request(
+                CAPABILITY,
+                format!(
+                    "invalid adaptive outcome limits expected={expected_bar_count} maximum={maximum_latest_n}"
+                ),
+            ),
+            Vec::new(),
+        ));
+    }
+
+    let transport_maximum = maximum_latest_n;
+    let mut attempts = Vec::new();
+    let mut next_limit = expected_bar_count;
+    let mut last_success: Option<(u16, DataBatch<Bar>)> = None;
+
+    loop {
+        let request_ordinal = match u32::try_from(attempts.len()) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(OutcomeTransportFailure::new(
+                    invalid_evidence("outcome transport attempts exceed u32"),
+                    attempts,
+                ))
+            }
+        };
+        match fetch(next_limit) {
+            Ok(batch) => {
+                let attempt = match successful_transport_attempt(
+                    request_ordinal,
+                    canonical_stock_code,
+                    canonical_market,
+                    next_limit,
+                    &batch,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return Err(OutcomeTransportFailure::new(error, attempts)),
+                };
+                attempts.push(attempt);
+                if let Err(error) = ensure_success_cardinality(next_limit, &batch) {
+                    return Err(OutcomeTransportFailure::new(error, attempts));
+                }
+                let covers_start = match batch_covers_window_start(&batch, window_start) {
+                    Ok(value) => value,
+                    Err(error) => return Err(OutcomeTransportFailure::new(error, attempts)),
+                };
+                last_success = Some((next_limit, batch));
+                if covers_start {
+                    let (_, batch) = last_success.expect("successful batch was just stored");
+                    return Ok(RawOutcomeFetch { batch, attempts });
+                }
+                if next_limit == transport_maximum {
+                    let last_hash = attempts
+                        .last()
+                        .map(|attempt| attempt.result_hash.as_str())
+                        .map(str::to_owned);
+                    return Err(OutcomeTransportFailure::new(
+                        unsupported_recovery_window(
+                            window_start,
+                            maximum_latest_n,
+                            last_hash.as_deref(),
+                        ),
+                        attempts,
+                    ));
+                }
+                next_limit = next_limit
+                    .checked_mul(2)
+                    .unwrap_or(transport_maximum)
+                    .min(transport_maximum);
+            }
+            Err(error) => {
+                let cardinality = validated_cardinality_mismatch(&error, next_limit);
+                let actual_count = cardinality
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.as_ref())
+                    .map(|value| value.available_count);
+                let attempt = match failed_transport_attempt(
+                    request_ordinal,
+                    canonical_stock_code,
+                    canonical_market,
+                    next_limit,
+                    actual_count,
+                    &error,
+                ) {
+                    Ok(value) => value,
+                    Err(attempt_error) => {
+                        return Err(OutcomeTransportFailure::new(attempt_error, attempts))
+                    }
+                };
+                attempts.push(attempt);
+                let cardinality = match cardinality {
+                    Ok(value) => value,
+                    Err(validation_error) => {
+                        return Err(OutcomeTransportFailure::new(validation_error, attempts))
+                    }
+                };
+                let Some(cardinality) = cardinality else {
+                    let attempt_hash = attempts
+                        .last()
+                        .map(|attempt| attempt.result_hash.as_str())
+                        .unwrap_or("missing");
+                    let mapped = map_tdx_error(error);
+                    let audit_outcome = mapped.audit_outcome();
+                    let reason_code = mapped.reason_code();
+                    let retryable = mapped.retryable();
+                    return Err(OutcomeTransportFailure::new(
+                        GatewayError::classified(
+                            CAPABILITY,
+                            Some(ProviderId::Tdx),
+                            audit_outcome,
+                            reason_code,
+                            retryable,
+                            format!(
+                                "Magic TDX adaptive request latest_n={next_limit} failed; \
+                                 transport_result_hash={attempt_hash}; cause={mapped}"
+                            ),
+                        ),
+                        attempts,
+                    ));
+                };
+                return resolve_available_cardinality(
+                    canonical_stock_code,
+                    canonical_market,
+                    window_start,
+                    transport_maximum,
+                    cardinality.available_count,
+                    cardinality.requested_total,
+                    last_success,
+                    attempts,
+                    &mut fetch,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "magic-gateway")]
+#[allow(clippy::too_many_arguments)]
+fn resolve_available_cardinality<Fetch>(
+    canonical_stock_code: &str,
+    canonical_market: &str,
+    window_start: NaiveDate,
+    maximum_latest_n: u16,
+    available_count: u16,
+    rejected_limit: u16,
+    mut last_success: Option<(u16, DataBatch<Bar>)>,
+    mut attempts: Vec<OutcomeTransportAttemptPreimage>,
+    fetch: &mut Fetch,
+) -> Result<RawOutcomeFetch, OutcomeTransportFailure>
+where
+    Fetch: FnMut(u16) -> Result<DataBatch<Bar>, TdxError>,
+{
+    let mut low = last_success.as_ref().map(|(limit, _)| *limit).unwrap_or(0);
+    let mut high = available_count
+        .min(rejected_limit.saturating_sub(1))
+        .min(maximum_latest_n);
+    if high < low {
+        return Err(OutcomeTransportFailure::new(
+            invalid_evidence(format!(
+                "Magic TDX available count regressed below last success: available={available_count} success={low}"
+            )),
+            attempts,
+        ));
+    }
+
+    while low < high {
+        let candidate = low + (high - low).div_ceil(2);
+        let request_ordinal = match u32::try_from(attempts.len()) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(OutcomeTransportFailure::new(
+                    invalid_evidence("outcome transport attempts exceed u32"),
+                    attempts,
+                ))
+            }
+        };
+        match fetch(candidate) {
+            Ok(batch) => {
+                let attempt = match successful_transport_attempt(
+                    request_ordinal,
+                    canonical_stock_code,
+                    canonical_market,
+                    candidate,
+                    &batch,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return Err(OutcomeTransportFailure::new(error, attempts)),
+                };
+                attempts.push(attempt);
+                if let Err(error) = ensure_success_cardinality(candidate, &batch) {
+                    return Err(OutcomeTransportFailure::new(error, attempts));
+                }
+                low = candidate;
+                last_success = Some((candidate, batch));
+            }
+            Err(error) => {
+                let cardinality = validated_cardinality_mismatch(&error, candidate);
+                let actual_count = cardinality
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.as_ref())
+                    .map(|value| value.available_count);
+                let attempt = match failed_transport_attempt(
+                    request_ordinal,
+                    canonical_stock_code,
+                    canonical_market,
+                    candidate,
+                    actual_count,
+                    &error,
+                ) {
+                    Ok(value) => value,
+                    Err(attempt_error) => {
+                        return Err(OutcomeTransportFailure::new(attempt_error, attempts))
+                    }
+                };
+                attempts.push(attempt);
+                let cardinality = match cardinality {
+                    Ok(value) => value,
+                    Err(validation_error) => {
+                        return Err(OutcomeTransportFailure::new(validation_error, attempts))
+                    }
+                };
+                let Some(cardinality) = cardinality else {
+                    return Err(OutcomeTransportFailure::new(map_tdx_error(error), attempts));
+                };
+                if cardinality.available_count < low {
+                    return Err(OutcomeTransportFailure::new(
+                        invalid_evidence(format!(
+                            "Magic TDX cardinality search became inconsistent: \
+                             low={low} candidate={candidate} actual={}",
+                            cardinality.available_count
+                        )),
+                        attempts,
+                    ));
+                }
+                high = cardinality.available_count.min(candidate.saturating_sub(1));
+            }
+        }
+    }
+
+    let Some((limit, batch)) = last_success else {
+        return Err(OutcomeTransportFailure::new(
+            GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Tdx),
+                "unavailable",
+                "no_verified_batch",
+                true,
+                format!(
+                    "Magic TDX has no bars for {canonical_market}.{canonical_stock_code}; \
+                     last_transport_result_hash={}",
+                    attempts
+                        .last()
+                        .map(|attempt| attempt.result_hash.as_str())
+                        .unwrap_or("missing")
+                ),
+            ),
+            attempts,
+        ));
+    };
+    if limit != low {
+        return Err(OutcomeTransportFailure::new(
+            invalid_evidence(format!(
+                "Magic TDX cardinality search did not retain highest success: low={low} success={limit}"
+            )),
+            attempts,
+        ));
+    }
+    let covers_start = match batch_covers_window_start(&batch, window_start) {
+        Ok(value) => value,
+        Err(error) => return Err(OutcomeTransportFailure::new(error, attempts)),
+    };
+    if covers_start {
+        return Ok(RawOutcomeFetch { batch, attempts });
+    }
+    let last_result_hash = attempts
+        .last()
+        .map(|attempt| attempt.result_hash.as_str())
+        .map(str::to_owned);
+    Err(OutcomeTransportFailure::new(
+        unsupported_recovery_window(window_start, limit, last_result_hash.as_deref()),
+        attempts,
+    ))
+}
+
+#[cfg(feature = "magic-gateway")]
+fn ensure_success_cardinality(
+    requested_latest_n: u16,
+    batch: &DataBatch<Bar>,
+) -> Result<(), GatewayError> {
+    if batch.records().len() != usize::from(requested_latest_n) {
+        return Err(invalid_evidence(format!(
+            "Magic TDX successful outcome response cardinality mismatch requested={} actual={}",
+            requested_latest_n,
+            batch.records().len()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "magic-gateway")]
+fn batch_covers_window_start(
+    batch: &DataBatch<Bar>,
+    window_start: NaiveDate,
+) -> Result<bool, GatewayError> {
+    let first = batch
+        .records()
+        .first()
+        .ok_or_else(|| invalid_evidence("Magic TDX successful outcome response is empty"))?;
+    let first_date = NaiveDate::parse_from_str(first.bar_end(), "%Y-%m-%d").map_err(|error| {
+        invalid_evidence(format!(
+            "Magic TDX first outcome date {:?} is invalid: {error}",
+            first.bar_end()
+        ))
+    })?;
+    Ok(first_date <= window_start)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedHistoricalBarCardinality {
+    available_count: u16,
+    requested_total: u16,
+}
+
+/// 无 feature 构建下 TdxError 类型不存在 (library transport 编译期被移除),
+/// 但同一套 cardinality 验证逻辑被两个入口共用: feature 构建的 typed 错误
+/// 分支 (`validated_cardinality_mismatch`) 与无条件的历史复核
+/// (`validate_transport_attempts`)。验证主体与 TdxError 解耦为单一来源,

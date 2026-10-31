@@ -15,7 +15,6 @@ pub(crate) mod macro_queries;
 
 // BR-251 server/client share this exact wire model without exposing the private
 // benchmark acquisition module as a general construction API.
-#[cfg(test)]
 pub(crate) use super::benchmark::BenchmarkGrpcResponseWire;
 pub(crate) use super::benchmark::BenchmarkRequestWire;
 

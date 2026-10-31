@@ -232,6 +232,8 @@ pub mod http_client;
 // this repository.
 pub mod grpc_client;
 pub mod grpc_contract;
+#[cfg(feature = "magic-gateway")]
+pub mod grpc_server;
 
 // Provider-neutral market domain types owned by this client repository.
 pub mod market_domain;

@@ -3,6 +3,8 @@
 mod benchmark;
 pub mod block_trade;
 pub mod board;
+pub mod magic_tdx;
+pub mod magic_tdx_t0;
 pub mod board_ranking;
 mod board_runtime;
 pub mod capital;
@@ -165,3 +167,11 @@ pub use t0_evidence::{
 };
 
 pub use historical_observed_store::read_offline_observed_artifact;
+
+// 桥移植：server 直接消费的类型。
+#[cfg(feature = "magic-gateway")]
+pub use magic_tdx::MagicTdxGateway;
+#[cfg(feature = "magic-gateway")]
+pub use magic_tdx_t0::{MagicTdxT0Batch, MagicTdxT0DailyBar, MagicTdxT0Evidence, MagicTdxT0FiveMinuteBar, MagicTdxT0Quote, MagicTdxT0Rejection};
+#[cfg(feature = "magic-gateway")]
+pub use chain_intelligence::ChainIntelligenceGateway;
