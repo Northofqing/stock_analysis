@@ -42,7 +42,7 @@ replay-sqlite-bundled-v1 = ["rusqlite/bundled"]
 [dependencies]
 # 2026-10-18: TDX F10 公司资料（经营分析/行业分析/最新提示/股本结构）。
 # 只依赖 vendor 里的 crate 本体；上游 magic-market-core 走 git rev，本地缓存已有。
-magic-tdx-rs = { path = ".worktrees/tdx-local-provider-20260923/vendor/magic-tdx-rs" }
+magic-tdx-rs = { path = "vendor/magic-tdx-rs" }
 # 2026-10-18: 新浪板块接口是 GBK 编码，需要显式解码（东财 clist 不可用时的 f3 备用源）
 encoding_rs = "0.8"
 tokio = { version = "1.49.0", features = ["full", "rt"] }
