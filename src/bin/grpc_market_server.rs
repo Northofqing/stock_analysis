@@ -47,6 +47,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // 2026-10-31：服务端进程禁止走 gRPC 桥（否则会把请求桥回自身 → 递归）。
+    // master 的 bridge_for 无「未配置桥」状态，这里显式切到 library-only，
+    // 让 delegate 的取数走本地 provider（公告/板块/日线等）。
+    stock_analysis::data_gateway::grpc_source::enter_library_only_mode();
+    log::info!("[grpc_market_server] 已切 library-only 模式（不使用 gRPC 桥）");
+
     let config = stock_analysis::grpc_server::ServerConfig::default();
     let (addr, handle, hub) = stock_analysis::grpc_server::start(config).await?;
     log::info!("[grpc_market_server] 就绪: {addr} (Ctrl-C 退出)");

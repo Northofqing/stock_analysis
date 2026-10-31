@@ -1268,6 +1268,28 @@ pub const HOOKED_OPS: &[&str] = &[
     "UpperLimitPoolReview",
 ];
 
+/// 服务端进程标记：delegate 只能走 library transport，不能把请求桥回自身。
+///
+/// 背景（2026-10-31）：master 的 `bridge_for` 已没有「未配置桥」状态（返回
+/// `Result<Arc<_>>`），而 `grpc_market_server` 进程若走桥就是递归调用 —— 实测
+/// MarketAnnouncements 返回 `operation was cancelled`（自己调自己）。分支版本
+/// 用 `Result<Option<_>>` + `Ok(None)` 表示「无桥，走 library」。这里保留 master
+/// 的签名不动，另加一个只给服务端路径用的入口。
+static LIBRARY_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 由 `grpc_market_server` 在启动时调用；之后 `bridge_for_server` 恒返回 `Ok(None)`。
+pub fn enter_library_only_mode() {
+    LIBRARY_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 服务端取数入口：`Ok(None)` = 无桥，调用方走 library transport。
+pub(crate) fn bridge_for_server(op: &str) -> Result<Option<Arc<GrpcSource>>, GatewayError> {
+    if LIBRARY_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(None);
+    }
+    bridge_for(op).map(Some)
+}
+
 /// Return the process-wide remote bridge. Construction is lazy and connection
 /// failures remain typed, retryable gateway errors at the operation boundary.
 pub fn bridge_for(_op: &str) -> Result<Arc<GrpcSource>, GatewayError> {
