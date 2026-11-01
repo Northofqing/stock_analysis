@@ -87,6 +87,14 @@ fn watch_codes(conn: &mut SqliteConnection) -> Result<Vec<String>, String> {
     Ok(codes)
 }
 
+/// ExternalV1 `CurrentAuctionObservations`（op 61）单请求标的上限。
+///
+/// 实测：2026-10-27 活跃票 82 + 持仓去重后 **83 只成功**；2026-10-28 起活跃票
+/// 101/118/116 只，全部 `invalid_request`。边界落在 83~101 之间，按 100 处理；
+/// 这里按 50 分片留余量。`auction_watch` 过去把全部活跃票一次塞进请求，
+/// 观察池涨到 101 只后就再也没有拿到过竞价数据。
+const MAX_AUCTION_INSTRUMENTS_PER_REQUEST: usize = 50;
+
 /// 拉观察池 + 持仓的竞价终态。
 pub async fn observe(db: &DatabaseManager) -> Result<Vec<AuctionRow>, String> {
     let codes = {
@@ -108,24 +116,28 @@ pub async fn observe(db: &DatabaseManager) -> Result<Vec<AuctionRow>, String> {
         return Ok(Vec::new());
     }
 
-    let request = CurrentAuctionRequest::new(instruments, AuctionStage::Final)
-        .map_err(|error| format!("op 61 请求构造失败: {error}"))?;
-    let batch = CurrentAuctionObservationsGateway::new()
-        .fetch(&request)
-        .await
-        .map_err(|error| format!("op 61 竞价观测获取失败: {error}"))?;
-
-    Ok(batch
-        .records()
-        .iter()
-        .map(|observation| AuctionRow {
+    let gateway = CurrentAuctionObservationsGateway::new();
+    let mut rows = Vec::new();
+    for (index, chunk) in instruments
+        .chunks(MAX_AUCTION_INSTRUMENTS_PER_REQUEST)
+        .enumerate()
+    {
+        let request = CurrentAuctionRequest::new(chunk.to_vec(), AuctionStage::Final)
+            .map_err(|error| format!("op 61 请求构造失败: {error}"))?;
+        let batch = gateway
+            .fetch(&request)
+            .await
+            .map_err(|error| format!("op 61 竞价观测获取失败 (chunk {index}): {error}"))?;
+        rows.extend(batch.records().iter().map(|observation| AuctionRow {
             code: observation.instrument.code().to_string(),
             name: observation.name.clone().unwrap_or_default(),
             auction_price: observation.auction_price,
             auction_pct: observation.auction_pct,
             auction_volume_ratio: observation.auction_volume_ratio,
-        })
-        .collect())
+        }));
+    }
+
+    Ok(rows)
 }
 
 #[cfg(test)]
