@@ -3092,14 +3092,18 @@ git diff --check
 - `cargo test --lib monitor::ticket_weekly_report` → **7 passed / 0 failed**；
   `cargo test --lib monitor::watch_pool_perf` → **4 passed / 0 failed**（含 pm 标签回归）。
 
-上线（2026-11-01 13:00）：
+上线（2026-11-01 13:25，修正后）：
 
 - 基线提交：`ab4972b13`（批6 巡检/审计 + pm 标签 + 文档）、`9ffd5a348`（paper 跨日补记 + 腾讯日线归一）。
-- `cargo build --release --bin monitor` 4m05s，产物 54,543,624 bytes；运行根旧二进制备份为
-  `target/release/monitor.bak-20261101-1300`，新二进制已替换并 `launchctl kickstart -k`。
-- 重启后 PID 18930、`state=running`；启动日志有 `[BuildIdentity]` 的 source/contract/binary
-  漂移 WARN（观测、不阻断；pinned 仍是 e6bd4d6，运行二进制来自当前工作区），
-  `DataMode-hook` 显示周末 `Unsafe`（缺 Quote/MoneyFlow/OrderBook），无 crash。
+- 第一次 13:00 部署踩坑：在主仓 `cargo build`（未设 build root）后把 binary 拷到运行根，
+  二进制嵌入的是 `Desktop/Quant/stock_analysis`；launchd 启动卡在 `open`（Desktop TCC），
+  无业务日志。已回滚到 `monitor.bak-20261101-1300`（旧 PID 19820），生产未受影响。
+- 正确构建：只把 `watch_pool_perf.rs`、`ticket_weekly_report.rs` 复制到运行根（**不要 `cp -p`**，
+  保留主仓 mtime 会让 cargo 直接跳过重编），在运行根 cwd `cargo build --release --bin monitor`
+  （16m32s，54,531,400 bytes）；`strings` 校验只含运行根路径、`Desktop/Quant` 计数 0。
+- 重启后 PID 24607，启动日志 `bound root mode=production path=/Users/.../stock-analysis-runtime`，
+  13:28:53 `数据库初始化完成`、13:28:54 `startup_health_check status=ok`、13:28:56 `观测订阅已建立`；
+  BuildIdentity 漂移 WARN、周末 `NewsFlashStale` 均为观测，不阻断。
 - 新二进制已含 pm 标签；11-06 周报是首次可验证点。
 
 边界：交易日判定只用「工作日」近似，没有节假日表；2026 年 11-12 月无公休，之后遇到节假日需先补日历或临时停跑。
