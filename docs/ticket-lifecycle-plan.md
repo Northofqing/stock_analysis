@@ -3038,3 +3038,219 @@ git diff --check
 - WP5 OutputContract 仍只处于 shadow，尚未切用户可见输出；WP8 的
   5 日门槛没有变化。P1.1 news/MoneyFlow 仍是外部数据可用性问题，
   未用旧数据填充。
+
+## 十二、下一批计划（2026-10-31，基于 10-21~10-30 一周数据）
+
+### 12.1 本期数据基线
+
+- 提案 130 只（10-21~10-30，7 个提案日），触发 38 只（29.2%）；
+  剔除 10-21/22 两批「触发引擎上线前」的 37 只后，转化率 40.9%（38/93），10-28 批 64.7%。
+- 死票 67 只：超时 45（67.2%）、价格跌破 22（32.8%）、涨停 0。
+  超时语义被拆成 `entry_invalidated`(23) 与 `entry_expired`(22) 两个 kind，按 kind 统计只剩 51.1%。
+- 触发后 D+1 只有 18 个样本，全部落在 10-29(-2.59%) 与 10-30(-3.03%) 两个普跌日；
+  原始胜率 22.2%，同日超额胜率 50.0%、均值 +0.19%，与未成交组无差异 —— **本期不能用来判定选股优劣**。
+- 触发判据 `judge_legacy` 只判 `price >= 昨高 && 当日涨幅 < 6%`（`ticket_entry_trigger.rs:490-503`，
+  默认 legacy 在 `:52`；生产 `.env` 为 `TICKET_ENTRY_POLICY=shadow`，`ticket_decision.entry_mode` 全为 legacy）。
+  12 笔「回踩 ma10」提案 12/12 在区间上方成交，中位贵 5.7%、最高 18.9%；23/38 的展示触发位与触发日实际昨高不一致。
+- `board_rotation_pm`（14:50 盘中通道）19 次触发，但 `watch_pool_perf.rs:164` 的 source 白名单不含它，
+  周报 `ticket_weekly_report.rs:152` 归入「其它」——这条通道目前没有独立胜率。
+- `ticket_decision` 现有 3 个决策日（10-28/29/30），`scripts/ticket_new_gate.py` 要求 5 个，
+  **最早 2026-11-04 才满足 WP8 切换条件**。
+
+### 12.2 批 6：数据可信 + 度量闭环（11-02，约 1.5 天）
+
+状态（2026-10-31）：脚本侧已实施并由 cron 实跑验证；`watch_pool_perf` / 周报的 pm 映射已改，
+单测通过（周报 7/7、`watch_pool_perf` 4/4），尚未 release 部署（不影响脚本巡检）。
+
+1. ops check 增加「当日应到」断言：交易日 15:45 / 21:55 检查
+   `stock_daily[今天]` 覆盖率、`paper closes[今天]` 是否存在、当日关键推送是否发出；
+   缺任一 → `status=FAIL` 并推送飞书（现在 `deliver=local`，只落盘不通知）。
+   依据：10-30 22:57 巡检 status=OK，但当天日线 0 行、paper 收盘失败。
+2. `ticket_decision_not_updated_today` 改为 15:37 之后才告警（09:35 时当天决策尚未生成，属误报）。
+3. `board_rotation_pm` 纳入 `watch_pool_perf` 与周报来源映射。
+
+验收：10-30 这类「全绿但缺数」不再出现；pm 通道出独立 D+1/D+3 胜率。
+
+#### 12.2.1 批 6 实施记录（2026-10-31）
+
+| 项 | 落点 | 实际动作 |
+|---|---|---|
+| 1 当日应到 | `scripts/ticket_ops_check.py` | 新增 `expectations`：按当地时刻阈值判断到期（09:10 盘前推送、10:00 持仓计划、15:52 观察池 marker、16:10 明日计划、21:30 全市场日线、21:45 paper 收盘），未到期记 `not_due`；到期缺失进 `critical` → `status=FAIL`。项含 `stock_daily[基准日]>=800`、paper 收盘、观察池 marker、`PreopenNewsHot`、`HoldingPlan`、`TomorrowWatch`、明日计划归档。paper 收盘从 `paper_ledger_event.Marked.marks[].source` 的 `qualified_daily_close_v1.price_date` 取最新；缺失时从日志尾部抓 `[PaperLedger-account] paper close unavailable date=…: 原因`。 |
+| 1 飞书 | 同上 + `ticket_ops_check_cron.sh` | `--notify fail`：只推 FAIL，按 `(基准日, 失败 key 集合)` 去重，落 `data/ops_check/alerted/<date>.json` 与 `notify.log`；经 magiclaw CLI（`FEISHU_TO`/`MAGICLAW_BIN` 从运行根 `.env` 读取）。手动巡检用 `--notify dry-run`。 |
+| 1 cron 入口 | `~/.hermes/scripts/ticket_ops_check_cron.sh` | 改为 `exec` 仓库内脚本，避免两处实现漂移；两个既有 job（09:35/15:45、15:55/21:55）继续复用。 |
+| 2 决策新鲜度 | 同上 | `ticket_decision_not_updated_today` 只在 15:37 之后且 `stock_daily[今日]>=800` 时告警；日线未落地时记 `ticket_decision_pending_daily_bars`，不再把 09:35 的正常空窗算成失败。 |
+| 3 pm 通道 | `src/monitor/watch_pool_perf.rs`、`src/monitor/ticket_weekly_report.rs` | perf 来源白名单加入 `board_rotation_pm`；周报来源标签加「盘中轮动」，不再归入「其它」。 |
+
+实测：
+
+- `python3 scripts/ticket_ops_check.py --expect-date 2026-10-30 --notify dry-run` →
+  `FAIL`，唯一 critical 是 `paper_close`：`最近收盘 2026-10-29，缺 2026-10-30；日志：… [002131] 2026-10-30 成交额无效: 0`。
+  `TomorrowWatch` 因归档存在判 ok，但记 warning `tomorrow_plan_delivery_not_audited`（已知 B.5 直推路径）。
+- 2026-10-31 19:31 经 Hermes cron 实跑一次：magiclaw `exit=0 send ok (feishu)`，
+  `message_id=5db35b5e-…`，`alerted/2026-10-30.json` 写入 → 通知链路已闭环。
+- `board_rotation_pm` 在库里有 **49 张票**（2026-10-26~10-30），此前 perf/周报完全没统计这条通道。
+- `cargo test --lib monitor::ticket_weekly_report` → **7 passed / 0 failed**；
+  `cargo test --lib monitor::watch_pool_perf` → **4 passed / 0 failed**（含 pm 标签回归）。
+
+边界：交易日判定只用「工作日」近似，没有节假日表；2026 年 11-12 月无公休，之后遇到节假日需先补日历或临时停跑。
+paper 收盘到期时间从方案里的 15:45 改到 21:45：实测 10-27/10-28/10-29 分别在 21:23/21:35/21:35 才确认（依赖当日合格日线），15:45 检查会每天误报。
+`TomorrowWatch` 的投递审计缺口是已知 B.5，本批只提示不拦截。
+
+新发现（未修）：paper close 只在「当天是交易日」时尝试一次失败后重试，跨日后不再补。
+10-30 因 `stock_daily[002131].amount=0` 被 BR-092/BR-171 拒收，`paper_ledger_event` 的最后一个
+收盘停在 10-29；10-31（周六）不会回头补。要修需要新增「最近 N 个交易日补齐」调度，
+并先解决 002131 的 amount 来源（TDX 该行 amount=0，provider 同样报成交额无效）。
+
+补充（2026-10-31 实测）：amount 可以从 Windows ExternalV1 取到，关键是使用**运行根**的
+`client-bundle`，仓库里的 `client-bundle/connection.json` 是旧 bundle（会报「服务不可用」）：
+
+```bash
+GRPC_MARKET_CLIENT_BUNDLE=/Users/zhangzhen/.local/share/stock-analysis-runtime/client-bundle \
+  target/release/external_bars_import --codes 000001,002131,600000 \
+  --date 2026-10-30 --window-days 10 --dry-run
+# 000001 amount=Some(2152393886.36) / 002131 amount=Some(1164520393.37) / 600000 amount=Some(647741482.86)
+# provider=Tonghuashun（Hithink 臂，不是 TDX）
+```
+
+`external_bars_import` 只补缺、不覆盖已有行；修复 10-30 的零 amount 需要先导入 scratch DB 再回填，
+或给该工具加 `--repair` 模式。paper close 不能简单回填：`settle_closing_valuation_on` 要求
+`china_day(now) == price_date`，在 10-31 无法诚实地补 10-30（伪造 `observed_at` 会破坏账本语义），
+需要单独的正式补记决策。
+
+已回填（2026-11-01 00:24）：5 只 paper 持仓的 10-30 amount 用 ExternalV1（`hithink-web`）修正——
+002131 1,164,520,393.37 / 002421 1,060,797,281.06 / 600396 462,707,533.58 /
+600667 1,899,784,266.24 / 600703 810,089,481.77；改前已校验 OHLCV 与库内 Tencent 行一致。
+全市场其余 **5,212 行仍为 0**；scratch 导入在 2026-11-01 00:27 跑到 200/5,231，
+预计约 1 小时，完成后按 close/volume 容差回填，不动不匹配的行。
+
+全市场修复结果（2026-11-01 01:10）：
+
+- scratch 拉取 5,216/5,231，11 只失败（7 只数据连续性拒绝 + 4 只北交所不覆盖）；
+  回填 5,211 行，5 只已手工修过跳过，最终 `stock_daily[2026-10-30]` 零 amount 只剩
+  **002731 一只**（provider 返回连续性失败，未补造）。amount 合计 1.674 万亿元。
+- 发现并修复第二个单位错误：腾讯 K 线对 **688/689（科创板）的 volume 返回股、其他板块返回手**。
+  10-30 的 616 只科创板行 volume 被写成股，`volume_ratio` 放大 100 倍（688001 显示 4.82，
+  实际 1.06）。已用 ExternalV1 的手口径 volume 覆盖这 616 行并重算 volume_ratio；
+  `scripts/tencent_day_backfill.py` 已加 688/689 的 `/100` 归一化，避免下次兜底再犯。
+- 数据来源标记：修复行统一写 `data_source='hithink-web'`，后续 TDX 盘后导入会用
+  `ON CONFLICT` 覆盖；在那之前，10-30 的 OHLCV/amount 来自 Hithink，volume 已归一到手。
+
+正式补记（2026-11-01 01:04，operator 批准）：
+
+- 新增 `paper_ledger_runtime::repair_closing_valuation_from_stock_daily` + `bin paper_close_repair`：
+  只读 `stock_daily`，要求 close>0 且 amount>0；写入的 `Mark` source 带 `repair=true` 和实际补记时刻，
+  `as_of` 固定为历史收盘时间，保证 `closes` 的键仍是 10-30。
+- 实跑：5 只持仓，`as_of=2026-10-30T15:00+08:00`，event `seq=24`、`version=24`、
+  `event_hash=b5c19777…`；paper close 10-30 = **44,110.94**。再跑 dry-run 返回 `already_closed=true`。
+  复核：`ticket_ops_check.py --expect-date 2026-10-30` → `status=OK`，paper_close latest=10-30、5 marks。
+- **重要边界**：paper ledger 的库存与券商不同——002421 是 1000 股（券商 2000）、
+  600396 是 2000 股（券商 1000），且没有 001216/601598。所以 44,110.94 是 paper 账本口径，
+  不是券商的 41,235.36；要镜像真实账户需要另做库存重建，不能用这次补记代替。
+
+库存重建状态（2026-11-01，operator 批准“两项都做”后核查）：
+
+- 用户账户层已经镜像：`user_position_snapshot` id=58 与 `stock_position` 的 7 只
+  （001216/002131/002421/600396/600667/600703/601598）与券商一致。
+- paper ledger 仍是 5 只、且 002421/600396 数量与券商不同；**不能原地改库存**：
+  `paper_snapshot_activation` 要求 `image_path`/`snapshot_evidence`/`import_receipt` 三份证据及其哈希，
+  10-30 只有文本导入，`data/private_evidence` 没有对应目录，现有 proof 仍是 2026-10-09 的 5 只。
+- 2026-11-01 又验证了“新建 epoch”这条路：临时写 `paper_ledger_reseed`，用文本快照构造
+  `SeedManifest` 并 apply，返回 `InactiveEpoch`。原因在 `paper_ledger::apply` 第 493 行：
+  Seed 也要先过 `require_v1_owner_on`，新 binding 不在已安装的 activation proof 里；
+  而 `paper_snapshot_activation::prepare_on` 在 proof 已存在时只接受与旧 request 完全相同的请求，
+  任何新账户/新种子都会 `IdentityConflict`。**当前 V1 合同是单例，没有原地重建/新 epoch 的入口。**
+  该临时 bin 已删除，未写入任何账本事件。
+- 要真正重建 paper 库存，需要新增 rebind 合同（新 proof generation 或显式 close→new owner，
+  含迁移、测试、monitor 重启），不是补一条 Mark 或改 `.env` 能完成的。
+
+002731：operator 2026-11-01 批准保持 `amount=0`（provider 连续性失败，不补造）；
+金额型统计应把它排除，不能当 0 参与均值。
+
+### 12.3 批 7：触发内核（11-03 ~ 11-06，约 3 天）
+
+1. 先用现有 shadow 差异日志（`ticket_entry_trigger.rs:574-586`）统计「区间外触发」占比，不改逻辑先出数。
+2. `judge` 增加 `price <= entry_high` 约束；摘要统一用触发日 `prev_high`，不再用提案时点的 trigger_level。
+3. 11-04 gate 满足后切 `new`，A/B 对照 2 周；切 `new` 前确认 09:25 竞价链路是唯一触发入口
+   （`AuctionReference|Unknown` 在 new 模式下会 `NoDecision`）。
+
+验收：成交价落在提案区间内的比例 ≥ 90%。
+
+#### 12.3.1 7.1 实测（2026-10-31，先出数未改逻辑）
+
+新增只读脚本 `scripts/ticket_trigger_audit.py`（`--db --since --until [--json]`），
+从 `ticket_event.entry_triggered.summary` 的「现价 / 区间」逐条判定；
+同一票同日多事件按 `(ticket_id, date)` 去重（旧二进制重复记账）。
+
+```bash
+python3 scripts/ticket_trigger_audit.py \
+  --db /Users/zhangzhen/.local/share/stock-analysis-runtime/data/stock_analysis.db \
+  --since 2026-10-20 --until 2026-10-31
+```
+
+基线（2026-10-20~10-31）：
+
+```text
+事件 49 → 票日 43 → 独立票 38（与 12.1 的「触发 38 只」一致）
+区间内 2｜区间上方 39｜区间下方 2｜解析失败 0
+区间上方占比 90.7%｜区间外占比 95.3%
+上方偏离：中位 +4.66%｜P90 +14.70%｜最大 +19.63%
+board_rotation    内 1 / 上 19 / 下 2
+board_rotation_pm 内 1 / 上 20 / 下 0
+```
+
+含义与代价：
+
+1. **90.7% 不能直接当成回踩提案失效率**。按 `ticket_decision.entry_mode` 回看
+   （取触发日之前最近一条决策）拆分 43 个票日：
+
+   ```text
+   无 context（旧票） 23：上 20 / 下 2 / 内 1
+   breakout          15：上 14 / 内 1
+   pullback           5：上 5 / 下 0 / 内 0
+   ```
+
+   区间上方主要由「无 context 旧票 20 + breakout 14」构成；breakout 以昨高为触发位，
+   落在 ma 区间上方是判据设计，不是回踩失效。真正与提案区间冲突的是 pullback 的 5 个
+   （加上文档 12.1 的 12 笔回踩提案口径，二者不是同一分母）。
+2. 若把 `price <= entry_high` 直接加到 legacy 判据，43 个票日只剩 **2 个**仍触发
+   （4.7%），等于同时关掉回踩与突破通道；这不是「提高质量」，是改变产品行为。
+3. `EntryPolicy` 的 `Pullback` 分支已经要求价格进入区间（`ticket_decision.rs:354-362`），
+   `new` 模式下回踩型本来就不会在区间外触发；Breakout 分支只判 `price >= trigger_level`，
+   没有上沿。7.2 的 `price <= entry_high` 对 Breakout 不成立——Breakout 的 `entry_high`
+   是 ma5，而触发位是昨高，两者语义不同；先定 Breakout 的价格窗口，再谈加帽。
+4. 建议顺序：先按 entry_mode 分模式统计触发率/区间外比例，再决定 Pullback 与 Breakout
+   各自的价格窗口；在 `new` 切换前不改 legacy 的输出行为。切 `new` 的门槛仍是
+   `ticket_new_gate.py` 的 5 个决策日（最早 11-04）。
+
+脚本只读，可随时重跑；缺失区间/现价的样本计入 `unparsed`，不补值。
+
+### 12.4 批 8：状态闭环（11-05 ~ 11-06，约 2 天）
+
+1. 触发后写终态事件；`render_plan` 过滤已失效/到期的提案（现在失效只作废价格、不改 stage，
+   次日仍以新区间回到买入候选）。
+2. 淘汰冷却 N 日（可配并写日志）；淘汰判定移到 21:30 日线后，避免「用昨收判今天跌」。
+3. `entry_expired` 合并进单一超时口径，并对 10-21/22 存量提案做一次回填/重置。
+
+验收：已失效票次日出现次数 = 0；超时占比可用单一口径查询。
+
+### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
+
+1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
+   前 3 日 +3~10% 的 6/9 胜（+0.52%）。样本太小，先 shadow 观察 10 个交易日。
+2. 情绪型超买豁免（D1）与高开帽同批上线（现在 `ticket_entry_proposal.rs:297-300` 对所有来源都套 `zone.overheated`）。
+
+验收：样本外 ≥30 笔再评估，观察期内不调参。
+
+### 12.6 时间线（按交易日历）
+
+- 11-02（周一）：批 6 上线
+- 11-03 ~ 11-04：批 7.1/7.2，gate 满足后切 new
+- 11-05 ~ 11-06：批 8
+- 11-09 ~ 11-20：批 9 观察窗（10 个交易日），11-23 出样本外结论
+
+### 12.7 本期明确不做
+
+- 不整代移植桥的 `data_gateway`（与 ticket 无关；桥的移植问题单独记录在
+  `docs/bridge-port-20261031.md`）。
+- 不给 `ticket_lifecycle` 加列（状态一律写 `ticket_event`）。
+- 不按周调整已预注册的阈值（情绪五档、财报建议比例）。

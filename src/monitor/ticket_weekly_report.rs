@@ -145,6 +145,7 @@ pub struct WeeklyReport {
 fn source_label(source: &str) -> &'static str {
     match source {
         "board_rotation" => "轮动",
+        "board_rotation_pm" => "盘中轮动",
         "news_catalyst" => "新闻",
         "p01_preopen" => "P01",
         "money_flow" => "资金流",
@@ -776,5 +777,15 @@ mod tests {
         );
         let monday = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         assert_eq!(monday_of(monday), monday);
+    }
+
+    #[test]
+    fn intraday_rotation_has_its_own_label() {
+        // 盘中 14:50 通道不能落进「其它」，否则这条通道没有独立胜率。
+        assert_eq!(source_label("board_rotation_pm"), "盘中轮动");
+        assert_ne!(
+            source_label("board_rotation_pm"),
+            source_label("board_rotation")
+        );
     }
 }

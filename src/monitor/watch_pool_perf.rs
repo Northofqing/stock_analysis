@@ -159,9 +159,9 @@ pub fn render(conn: &mut SqliteConnection, options: &PerfOptions) -> Result<Stri
         .map(|(index, date)| (date.as_str(), index))
         .collect();
 
-    // 五个来源都统计：P01 / 资金流 / 持仓同样是被推荐的票，漏掉等于只看一半样本。
+    // 六个来源都统计：P01 / 资金流 / 持仓 / 盘中轮动同样是被推荐的票，漏掉等于只看一部分样本。
     let base_sql = "SELECT id, open_date, code, source FROM ticket_lifecycle \
-         WHERE source IN ('board_rotation','news_catalyst','p01_preopen','money_flow','holding')";
+         WHERE source IN ('board_rotation','board_rotation_pm','news_catalyst','p01_preopen','money_flow','holding')";
     let tickets: Vec<TicketRow> = match &options.since {
         Some(since_date) => diesel::sql_query(format!(
             "{base_sql} AND open_date >= ? GROUP BY open_date, code \
@@ -280,6 +280,18 @@ pub fn render(conn: &mut SqliteConnection, options: &PerfOptions) -> Result<Stri
     Ok(out)
 }
 
+fn source_label(source: &str) -> &str {
+    match source {
+        "board_rotation" => "轮动",
+        "board_rotation_pm" => "盘中轮动",
+        "news_catalyst" => "新闻",
+        "p01_preopen" => "P01",
+        "money_flow" => "资金流",
+        "holding" => "持仓",
+        other => other,
+    }
+}
+
 fn render_group(
     out: &mut String,
     rows: &[&BatchTicket],
@@ -311,14 +323,7 @@ fn render_group(
             }
             out.push_str("  来源\n");
         }
-        let source_label = match row.source.as_str() {
-            "board_rotation" => "轮动",
-            "news_catalyst" => "新闻",
-            "p01_preopen" => "P01",
-            "money_flow" => "资金流",
-            "holding" => "持仓",
-            other => other,
-        };
+        let source_label = source_label(&row.source);
         out.push_str(&format!("  {:<8} {:<10}", row.code, row.name));
         for period in periods {
             out.push_str(&format!(
@@ -447,5 +452,11 @@ mod tests {
     fn regime_windows_are_documented_values() {
         assert_eq!(Regime::Emotion.perf_periods(), &[1, 3]);
         assert_eq!(Regime::Trend.perf_periods(), &[5, 10]);
+    }
+
+    #[test]
+    fn intraday_rotation_source_is_labeled() {
+        assert_eq!(source_label("board_rotation_pm"), "盘中轮动");
+        assert_ne!(source_label("board_rotation_pm"), "board_rotation_pm");
     }
 }
