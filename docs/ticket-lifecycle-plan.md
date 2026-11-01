@@ -3092,6 +3092,16 @@ git diff --check
 - `cargo test --lib monitor::ticket_weekly_report` → **7 passed / 0 failed**；
   `cargo test --lib monitor::watch_pool_perf` → **4 passed / 0 failed**（含 pm 标签回归）。
 
+上线（2026-11-01 13:00）：
+
+- 基线提交：`ab4972b13`（批6 巡检/审计 + pm 标签 + 文档）、`9ffd5a348`（paper 跨日补记 + 腾讯日线归一）。
+- `cargo build --release --bin monitor` 4m05s，产物 54,543,624 bytes；运行根旧二进制备份为
+  `target/release/monitor.bak-20261101-1300`，新二进制已替换并 `launchctl kickstart -k`。
+- 重启后 PID 18930、`state=running`；启动日志有 `[BuildIdentity]` 的 source/contract/binary
+  漂移 WARN（观测、不阻断；pinned 仍是 e6bd4d6，运行二进制来自当前工作区），
+  `DataMode-hook` 显示周末 `Unsafe`（缺 Quote/MoneyFlow/OrderBook），无 crash。
+- 新二进制已含 pm 标签；11-06 周报是首次可验证点。
+
 边界：交易日判定只用「工作日」近似，没有节假日表；2026 年 11-12 月无公休，之后遇到节假日需先补日历或临时停跑。
 paper 收盘到期时间从方案里的 15:45 改到 21:45：实测 10-27/10-28/10-29 分别在 21:23/21:35/21:35 才确认（依赖当日合格日线），15:45 检查会每天误报。
 `TomorrowWatch` 的投递审计缺口是已知 B.5，本批只提示不拦截。
@@ -3247,6 +3257,9 @@ board_rotation_pm 内 1 / 上 20 / 下 0
 - 11-03 ~ 11-04：批 7.1/7.2，gate 满足后切 new
 - 11-05 ~ 11-06：批 8
 - 11-09 ~ 11-20：批 9 观察窗（10 个交易日），11-23 出样本外结论
+
+实际：批 6 已于 11-01 提前上线（脚本 + monitor 二进制）；11-02 起进入批 1.3 定性、
+第 4 个决策日与盘后巡检。
 
 ### 12.7 本期明确不做
 
