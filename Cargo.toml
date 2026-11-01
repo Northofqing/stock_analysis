@@ -30,6 +30,10 @@ name = "external_bars_import"
 path = "src/bin/external_bars_import.rs"
 
 [[bin]]
+name = "paper_close_repair"
+path = "src/bin/paper_close_repair.rs"
+
+[[bin]]
 name = "rsi_optimize"
 path = "src/bin/rsi_optimize.rs"
 

@@ -45,13 +45,18 @@ def fetch(code: str, date: str):
                 return None
             for row in data[key]:
                 if row[0] == date and len(row) >= 6:
+                    volume = float(row[5])
+                    # 腾讯 K 线对 688/689（科创板）返回股，其他板块返回手；
+                    # stock_daily 统一用手，不归一化会让 volume_ratio 放大 100 倍。
+                    if code.startswith(("688", "689")):
+                        volume /= 100.0
                     return (
                         code,
                         float(row[1]),
                         float(row[3]),
                         float(row[4]),
                         float(row[2]),
-                        float(row[5]),
+                        volume,
                     )
             return None
         except Exception:

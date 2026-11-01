@@ -644,6 +644,154 @@ pub(crate) fn already_sold_on(
     Ok(count.n > 0)
 }
 
+#[derive(Debug, Clone)]
+pub struct ClosingRepairPreview {
+    pub price_date: NaiveDate,
+    pub as_of: DateTime<Utc>,
+    pub already_closed: bool,
+    pub codes: Vec<(String, f64, String)>,
+}
+
+/// Operator-approved formal repair for a missing historical paper close.
+///
+/// The normal `settle_closing_valuation` path refuses any day other than today.
+/// This path appends the same `Mark(closing=true)` fact with `as_of` set to the
+/// historical close time, so the projection's close key remains the price date.
+/// It reads closes only from `stock_daily` (already repaired/validated), records
+/// `repair=true` and the actual repair time in every mark source, and refuses
+/// any code whose amount is not positive or whose close is missing.
+pub fn repair_closing_valuation_from_stock_daily(
+    price_date: NaiveDate,
+    apply: bool,
+) -> Result<(ClosingRepairPreview, Option<PaperReceipt>), String> {
+    use diesel::{OptionalExtension, RunQueryDsl};
+
+    #[derive(diesel::QueryableByName)]
+    struct CloseRow {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        close: f64,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        amount: f64,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        data_source: Option<String>,
+    }
+
+    let binding = active_binding()?;
+    let db = DatabaseManager::try_get().ok_or("DB not initialized")?;
+    let now = Utc::now();
+    let china = chrono::FixedOffset::east_opt(8 * 3600).expect("China offset");
+    let close_at = china
+        .from_local_datetime(&price_date.and_hms_opt(15, 0, 0).expect("valid close"))
+        .single()
+        .expect("fixed offset")
+        .with_timezone(&Utc);
+    if close_at > now {
+        return Err("repair close time is in the future".into());
+    }
+    if !crate::calendar::verified_a_share_trading_day(price_date)? {
+        return Err(format!(
+            "{price_date} is not a verified A-share trading day"
+        ));
+    }
+
+    let ledger = PaperLedger::open(db, &Utc::now);
+    let view = ledger.read(&binding).map_err(|error| error.to_string())?;
+    if view.closes.contains_key(&price_date) {
+        return Ok((
+            ClosingRepairPreview {
+                price_date,
+                as_of: close_at,
+                already_closed: true,
+                codes: Vec::new(),
+            },
+            None,
+        ));
+    }
+    if close_at < view.as_of {
+        return Err(format!(
+            "ledger already advanced to {}; cannot insert a close at {}",
+            view.as_of, close_at
+        ));
+    }
+
+    let mut conn = db.get_conn().map_err(|error| error.to_string())?;
+    let mut marks = Vec::new();
+    let mut preview = Vec::new();
+    let codes: std::collections::BTreeSet<String> =
+        view.lots.iter().map(|lot| lot.code.clone()).collect();
+    for code in codes {
+        let row: Option<CloseRow> = diesel::sql_query(
+            "SELECT close, amount, data_source FROM stock_daily \
+             WHERE code = ?1 AND date = ?2 LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .bind::<diesel::sql_types::Text, _>(price_date.to_string())
+        .get_result(&mut conn)
+        .optional()
+        .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Err(format!("missing stock_daily close for {code} {price_date}"));
+        };
+        if !row.close.is_finite() || row.close <= 0.0 {
+            return Err(format!(
+                "invalid close for {code} {price_date}: {}",
+                row.close
+            ));
+        }
+        if !row.amount.is_finite() || row.amount <= 0.0 {
+            return Err(format!(
+                "amount not repaired for {code} {price_date}: {} (refuse to fake a close)",
+                row.amount
+            ));
+        }
+        let price = Money::from_cny(row.close).map_err(|error| error.to_string())?;
+        let source = serde_json::json!({
+            "kind": "qualified_daily_close_v1",
+            "price_date": price_date.to_string(),
+            "provider": "HithinkFinance",
+            "source": row.data_source.unwrap_or_else(|| "stock_daily".to_string()),
+            "source_at": price_date.to_string(),
+            "observed_at": now.to_rfc3339(),
+            "batch_id": format!("repair-paper-close-{price_date}"),
+            "repair": true,
+            "reason": "formal operator-approved backfill; stock_daily amount validated"
+        })
+        .to_string();
+        preview.push((code.clone(), row.close, source.clone()));
+        marks.push(Mark {
+            code,
+            price,
+            observed_at: close_at,
+            source,
+        });
+    }
+
+    let preview = ClosingRepairPreview {
+        price_date,
+        as_of: close_at,
+        already_closed: false,
+        codes: preview,
+    };
+    if !apply {
+        return Ok((preview, None));
+    }
+    let batch = ValuationBatch {
+        binding: binding.clone(),
+        command_id: format!("paper-close-v1:{}:{}", binding.epoch_id, price_date),
+        expected_version: view.version,
+        inventory_fingerprint: view
+            .inventory_fingerprint()
+            .map_err(|error| error.to_string())?,
+        as_of: close_at,
+        closing: true,
+        marks,
+    };
+    let receipt = ledger
+        .apply(PaperCommand::Mark(batch))
+        .map_err(|error| error.to_string())?;
+    Ok((preview, Some(receipt)))
+}
+
 #[cfg(test)]
 #[path = "paper_account_metrics_tests.rs"]
 mod account_metrics_tests;
