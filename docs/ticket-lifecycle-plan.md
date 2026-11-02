@@ -3262,6 +3262,13 @@ board_rotation_pm 内 1 / 上 20 / 下 0
 
 ### 12.4 批 8：状态闭环（11-05 ~ 11-06，约 2 天）
 
+状态（2026-11-02，提前开发）：`render_plan` 已改为按每张票最新一次提案生命周期事件过滤，
+只保留 `entry_proposed`；`entry_triggered` / `entry_invalidated` / `entry_expired` /
+`entry_superseded` 不再以新买入候选出现在明日计划。生产库只读核对：过滤前 103 张
+（observing 10 + entry_proposed 93），过滤后 **16 张**。新增内存库单测
+`active_watch_rows_exclude_non_open_proposal_states`，2 passed。代码已提交 `16feaa48f`，
+**未部署**。
+
 1. 触发后写终态事件；`render_plan` 过滤已失效/到期的提案（现在失效只作废价格、不改 stage，
    次日仍以新区间回到买入候选）。
 2. 淘汰冷却 N 日（可配并写日志）；淘汰判定移到 21:30 日线后，避免「用昨收判今天跌」。
