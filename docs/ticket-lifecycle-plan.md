@@ -3301,3 +3301,9 @@ board_rotation_pm 内 1 / 上 20 / 下 0
   这部分属于 paper 执行合同，不属于 ticket 生命周期；证据、影响与 A/B/C/D 方案见
   `docs/paper-ledger-execution-gap.md`。本方案只做 ticket 建议与 paper 收盘巡检，
   不改变 paper 账本的买卖执行合同。
+- **与 P6 的边界**：P6 的 `paper_attribution_daily` 是按 signal_family 的 paper
+  PnL/胜率，停在 2026-08-28；它不能从当前 V2（0 `Executed`）刷新。新二层归因
+  （`attribution_benchmark_daily`）不依赖它；若要让 paper 归因恢复，需先做
+  `paper-ledger-execution-gap.md` 的 A/B。
+- **与 12.2.1 的边界**：库存重建（5→7）只改 seed 库存，不产生买卖流水；
+  虚拟买卖执行是另一件事，不能把 rebind 当成“补上买入/卖出”。
