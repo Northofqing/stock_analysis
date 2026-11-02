@@ -292,6 +292,21 @@ def check_p2(main, days):
         "WHERE event_kind='entry_expired' AND substr(event_at,1,10) >= ?",
         (cutoff,),
     ).fetchone()[0]
+    # 单一超时口径：新事件 entry_expired + 旧版把超时误写成 entry_invalidated 的
+    # “未触发”记录。价格失效单独统计，避免再把两者混在一个 kind 里。
+    timeout = main.execute(
+        "SELECT COUNT(*) FROM ticket_event "
+        "WHERE substr(event_at,1,10) >= ? AND ("
+        "event_kind='entry_expired' OR "
+        "(event_kind='entry_invalidated' AND COALESCE(summary,'') LIKE '%未触发%'))",
+        (cutoff,),
+    ).fetchone()[0]
+    price_invalidated = main.execute(
+        "SELECT COUNT(*) FROM ticket_event "
+        "WHERE event_kind='entry_invalidated' AND substr(event_at,1,10) >= ? "
+        "AND COALESCE(summary,'') NOT LIKE '%未触发%'",
+        (cutoff,),
+    ).fetchone()[0]
     superseded = main.execute(
         "SELECT COUNT(*) FROM ticket_event "
         "WHERE event_kind='entry_superseded' AND substr(event_at,1,10) >= ?",
@@ -322,10 +337,17 @@ def check_p2(main, days):
             "SELECT COUNT(*) FROM ticket_decision WHERE as_of >= ?", (cutoff,)
         ).fetchone()[0]
     trigger_rate = (trig / ev * 100.0) if ev else 0.0
+    timeout_share = (
+        timeout / (timeout + price_invalidated) * 100.0
+        if (timeout + price_invalidated)
+        else 0.0
+    )
     r.detail = (
         f"窗口 {cutoff}~最新 proposal={ev} open={st} triggered={trig} "
         f"trigger_events={trigger_events} "
         f"invalidated={invalidated} expired={expired} superseded={superseded} "
+        f"timeout={timeout} price_invalidated={price_invalidated} "
+        f"timeout_share={timeout_share:.1f}% "
         f"evaluated={evaluated} pending={pending} trigger_rate={trigger_rate:.1f}% "
         f"decision={decisions} observing={obs}"
     )

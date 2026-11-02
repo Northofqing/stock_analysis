@@ -3275,6 +3275,13 @@ board_rotation_pm 内 1 / 上 20 / 下 0
 `eviction_cooldown_blocks_only_recent_evicted_ticket` 通过；`cargo check --bin monitor`
 通过。监控二进制尚未重编重启。
 
+超时口径已按 A 方案只读合并：`phase_acceptance.py` 的 P2 现在同时输出
+`timeout`、`price_invalidated`、`timeout_share`；`timeout` = `entry_expired` +
+旧版误写为 `entry_invalidated` 且 summary 含“未触发”的记录，价格失效单独统计。
+2026-11-02 `--days 5` 实测：`timeout=18`、`price_invalidated=23`、
+`timeout_share=43.9%`。**没有改写任何历史事件**；22 条 10-26/27 旧超时记录仍在
+`entry_invalidated`，只在统计口径中归入 timeout。回填（B）未执行，需单独批准。
+
 1. 触发后写终态事件；`render_plan` 过滤已失效/到期的提案（现在失效只作废价格、不改 stage，
    次日仍以新区间回到买入候选）。
 2. 淘汰冷却 N 日（可配并写日志）；淘汰判定移到 21:30 日线后，避免「用昨收判今天跌」。
