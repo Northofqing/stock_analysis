@@ -3293,3 +3293,11 @@ board_rotation_pm 内 1 / 上 20 / 下 0
   `docs/bridge-port-20261031.md`）。
 - 不给 `ticket_lifecycle` 加列（状态一律写 `ticket_event`）。
 - 不按周调整已预注册的阈值（情绪五档、财报建议比例）。
+
+### 12.8 相关但不在本方案范围
+
+- **paper 账本虚拟买卖执行缺口**：当前 V2 账本只有 `Seeded`/`Marked`/
+  `DerivedSnapshot`，没有 `Executed`；`paper_trades` 只到 2026-09-24。
+  这部分属于 paper 执行合同，不属于 ticket 生命周期；证据、影响与 A/B/C/D 方案见
+  `docs/paper-ledger-execution-gap.md`。本方案只做 ticket 建议与 paper 收盘巡检，
+  不改变 paper 账本的买卖执行合同。
