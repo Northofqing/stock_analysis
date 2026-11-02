@@ -3307,3 +3307,10 @@ board_rotation_pm 内 1 / 上 20 / 下 0
   `paper-ledger-execution-gap.md` 的 A/B。
 - **与 12.2.1 的边界**：库存重建（5→7）只改 seed 库存，不产生买卖流水；
   虚拟买卖执行是另一件事，不能把 rebind 当成“补上买入/卖出”。
+
+### 12.9 数据缺口专项计划
+
+DataMode（Kline/MoneyFlow/OrderBook）与 P1.1（news/mf）的根因、首选/备选修法、
+两天验证计划、恢复/仍 unavailable 清单，见
+`docs/ticket-data-gap-plan.md`。该计划不改变本方案的 ticket 批次顺序，也不把
+“数据源修好”当成“胜率提高”；胜率仍按 11-23 样本外结论单独判断。
