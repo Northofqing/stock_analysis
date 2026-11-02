@@ -315,6 +315,32 @@ const WATCH_TTL_TRADING_DAYS: i64 = 3;
 /// 板块榜取前多少名算「仍在榜」（C 规则）。
 const ACTIVE_BOARD_TOP_N: i64 = 10;
 
+/// 观察池「仍可展示」的行：只有最新一次提案生命周期事件仍是
+/// `entry_proposed` 才保留。触发/失效/到期/被取代的票不能再以新买入候选出现；
+/// `observing` 且没有提案事件的票不受影响。
+const ACTIVE_WATCH_ROWS_SQL: &str = "\
+WITH latest_entry AS (
+    SELECT e.ticket_id, e.event_kind,
+           ROW_NUMBER() OVER (
+               PARTITION BY e.ticket_id
+               ORDER BY e.event_at DESC, e.id DESC
+           ) AS rn
+      FROM ticket_event e
+     WHERE e.event_kind IN ('entry_proposed','entry_triggered','entry_invalidated',
+                            'entry_expired','entry_superseded')
+)
+SELECT t.code, MIN(t.source) AS source, MIN(t.open_date) AS open_date
+  FROM ticket_lifecycle t
+ WHERE t.close_date IS NULL
+   AND t.stage IN ('observing','entry_proposed')
+   AND NOT EXISTS (
+       SELECT 1 FROM latest_entry l
+        WHERE l.ticket_id = t.id
+          AND l.rn = 1
+          AND l.event_kind <> 'entry_proposed'
+   )
+ GROUP BY t.code";
+
 /// 生成明日计划文本。空池返回提示文本（不是错误）。
 pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> {
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
@@ -329,14 +355,9 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
     // 观察池：active ticket 里排除已持仓的（持仓走另一段）。
     // 2026-10-22: 按 code 去重——同票跨日重复入选时（历史遗留的多活跃票）
     // 不能在同一份计划里出现两行；取最早 open_date 作为「首次入池」上下文。
-    let watch_rows: Vec<WatchRow> = diesel::sql_query(
-        "SELECT code, MIN(source) AS source, MIN(open_date) AS open_date \
-           FROM ticket_lifecycle \
-          WHERE close_date IS NULL AND stage IN ('observing','entry_proposed') \
-          GROUP BY code",
-    )
-    .load(&mut conn)
-    .map_err(|error| error.to_string())?;
+    let watch_rows: Vec<WatchRow> = diesel::sql_query(ACTIVE_WATCH_ROWS_SQL)
+        .load(&mut conn)
+        .map_err(|error| error.to_string())?;
     let watching: Vec<(String, String, String)> = watch_rows
         .into_iter()
         .filter(|row| !holding_codes.contains(&row.code))
@@ -761,5 +782,73 @@ mod tests {
         // 否则盘后推送会把"没有标的"当成故障报出来
         let text = "【明日计划 2026-10-16】观察池与持仓均为空，无可算标的。";
         assert!(text.contains("无可算标的"));
+    }
+
+    #[test]
+    fn active_watch_rows_exclude_non_open_proposal_states() {
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        diesel::sql_query(
+            "CREATE TABLE ticket_lifecycle (\
+                 id INTEGER PRIMARY KEY, code TEXT NOT NULL, source TEXT NOT NULL,\
+                 open_date TEXT NOT NULL, close_date TEXT, stage TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        diesel::sql_query(
+            "CREATE TABLE ticket_event (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL,\
+                 event_at TEXT NOT NULL, event_kind TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .unwrap();
+
+        for (id, code, close_date) in [
+            (1, "A", None),
+            (2, "B", None),
+            (3, "C", None),
+            (4, "D", None),
+            (5, "E", None),
+            (6, "F", None),
+            (7, "G", None),
+            (8, "I", Some("2026-10-29")),
+        ] {
+            diesel::sql_query(
+                "INSERT INTO ticket_lifecycle (id, code, source, open_date, close_date, stage) \
+                 VALUES (?, ?, 'test', '2026-10-27', ?, \
+                         CASE WHEN ? IS NULL THEN 'entry_proposed' ELSE 'exited' END)",
+            )
+            .bind::<diesel::sql_types::Integer, _>(id)
+            .bind::<diesel::sql_types::Text, _>(code)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(close_date)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(close_date)
+            .execute(&mut conn)
+            .unwrap();
+        }
+
+        for (ticket_id, at, kind) in [
+            (2, "2026-10-30 10:00:00", "entry_proposed"),
+            (3, "2026-10-30 10:00:00", "entry_triggered"),
+            (4, "2026-10-30 10:00:00", "entry_invalidated"),
+            (5, "2026-10-30 10:00:00", "entry_expired"),
+            (6, "2026-10-30 10:00:00", "entry_superseded"),
+            (7, "2026-10-29 10:00:00", "entry_invalidated"),
+            (7, "2026-10-30 10:00:00", "entry_proposed"),
+        ] {
+            diesel::sql_query(
+                "INSERT INTO ticket_event (ticket_id, event_at, event_kind) VALUES (?, ?, ?)",
+            )
+            .bind::<diesel::sql_types::Integer, _>(ticket_id)
+            .bind::<diesel::sql_types::Text, _>(at)
+            .bind::<diesel::sql_types::Text, _>(kind)
+            .execute(&mut conn)
+            .unwrap();
+        }
+
+        let rows: Vec<WatchRow> = diesel::sql_query(ACTIVE_WATCH_ROWS_SQL)
+            .load(&mut conn)
+            .unwrap();
+        let mut codes: Vec<&str> = rows.iter().map(|row| row.code.as_str()).collect();
+        codes.sort_unstable();
+        assert_eq!(codes, vec!["A", "B", "G"]);
     }
 }
