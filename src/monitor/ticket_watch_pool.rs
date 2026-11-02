@@ -22,6 +22,8 @@
 use crate::database::ticket_lifecycle;
 use crate::database::DatabaseManager;
 use crate::monitor::ticket_decision::SourceHealth;
+use chrono::NaiveDate;
+use diesel::sql_types::Text;
 use diesel::{OptionalExtension, QueryableByName, RunQueryDsl};
 
 /// 默认回看天数（新闻催化）。
@@ -32,6 +34,50 @@ const BOARD_TOP_N: usize = 10;
 const BOARD_PER_BOARD: usize = 3;
 /// note 摘要截断长度（`core_logic` 可能数百字，只留开头）。
 const NOTE_MAX_CHARS: usize = 120;
+
+/// 淘汰后冷却天数：避免同一票刚出池又被同一催化拉回。
+const DEFAULT_EVICTION_COOLDOWN_DAYS: i64 = 5;
+
+fn eviction_cooldown_days() -> i64 {
+    std::env::var("TICKET_EVICTION_COOLDOWN_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(DEFAULT_EVICTION_COOLDOWN_DAYS)
+}
+
+/// 最近一次 `evicted` 关闭是否仍落在冷却窗口内。
+fn recent_eviction_date(
+    conn: &mut diesel::SqliteConnection,
+    code: &str,
+    as_of: &str,
+    days: i64,
+) -> Result<Option<String>, String> {
+    if days <= 0 {
+        return Ok(None);
+    }
+    let as_of_date = NaiveDate::parse_from_str(as_of, "%Y-%m-%d")
+        .map_err(|error| format!("冷却窗口 as_of 非法 ({as_of}): {error}"))?;
+    let cutoff = as_of_date - chrono::Duration::days(days);
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        close_date: String,
+    }
+    diesel::sql_query(
+        "SELECT t.close_date FROM ticket_lifecycle t \
+           JOIN ticket_event e ON e.ticket_id = t.id AND e.event_kind = 'evicted' \
+          WHERE t.code = ?1 AND t.close_date IS NOT NULL \
+            AND date(t.close_date) >= date(?2) \
+          ORDER BY t.close_date DESC LIMIT 1",
+    )
+    .bind::<Text, _>(code)
+    .bind::<Text, _>(cutoff.format("%Y-%m-%d").to_string())
+    .get_result::<Row>(conn)
+    .optional()
+    .map(|row| row.map(|row| row.close_date))
+    .map_err(|error| format!("淘汰冷却查询失败 ({code}): {error}"))
+}
 
 #[derive(Debug, Clone)]
 pub struct PoolCandidate {
@@ -73,6 +119,7 @@ pub struct WatchPoolReport {
     pub opened: usize,
     pub appended: usize,
     pub skipped_invalid_code: usize,
+    pub skipped_cooldown: usize,
     pub dry_run: bool,
     pub errors: Vec<String>,
 }
@@ -82,7 +129,7 @@ impl WatchPoolReport {
         log::info!(
             "[观察池] news_scanned={} news_candidates={} boards={} board_candidates={} board_added={} \
              mf_boards={} mf_candidates={} mf_added={} total={} opened={} appended={} \
-             skipped_invalid={} dry_run={} news_health={} board_health={} mf_health={}",
+             skipped_invalid={} skipped_cooldown={} dry_run={} news_health={} board_health={} mf_health={}",
             self.scanned_rows,
             self.news_candidates,
             self.board_scanned_rows,
@@ -95,6 +142,7 @@ impl WatchPoolReport {
             self.opened,
             self.appended,
             self.skipped_invalid_code,
+            self.skipped_cooldown,
             self.dry_run,
             health_label(self.news_health),
             health_label(self.board_health),
@@ -747,6 +795,7 @@ pub fn build_watch_pool(
     }
 
     let now = chrono::Local::now().to_rfc3339();
+    let cooldown_days = eviction_cooldown_days();
     for item in &candidates {
         let mut conn = db.get_conn().map_err(|e| e.to_string())?;
         match ticket_lifecycle::find_active_ticket(&mut *conn, &item.code) {
@@ -766,6 +815,23 @@ pub fn build_watch_pool(
                 }
             }
             Ok(None) => {
+                match recent_eviction_date(&mut *conn, &item.code, business_date, cooldown_days) {
+                    Ok(Some(close_date)) => {
+                        report.skipped_cooldown += 1;
+                        log::info!(
+                            "[观察池] {} 淘汰冷却中（close_date={}，{} 天）",
+                            item.code,
+                            close_date,
+                            cooldown_days
+                        );
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        report.errors.push(error);
+                        continue;
+                    }
+                }
                 let note = format!(
                     "{} 入池: {} 条, 最新 {} | {}",
                     source_label(item.source),
@@ -848,5 +914,49 @@ mod tests {
             "2026-10-27"
         );
         assert!(previous_trading_day_text("not-a-date").is_err());
+    }
+
+    #[test]
+    fn eviction_cooldown_blocks_only_recent_evicted_ticket() {
+        use diesel::Connection as _;
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        diesel::sql_query(
+            "CREATE TABLE ticket_lifecycle (\
+                 id INTEGER PRIMARY KEY, code TEXT NOT NULL, close_date TEXT)",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        diesel::sql_query(
+            "CREATE TABLE ticket_event (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL,\
+                 event_kind TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        diesel::sql_query(
+            "INSERT INTO ticket_lifecycle (id, code, close_date) VALUES \
+             (1, '002131', '2026-10-30'), (2, '600396', '2026-10-30')",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        diesel::sql_query(
+            "INSERT INTO ticket_event (ticket_id, event_kind) VALUES (1, 'evicted')",
+        )
+        .execute(&mut conn)
+        .unwrap();
+
+        assert_eq!(
+            recent_eviction_date(&mut conn, "002131", "2026-11-02", 5).unwrap(),
+            Some("2026-10-30".to_string())
+        );
+        assert_eq!(
+            recent_eviction_date(&mut conn, "002131", "2026-11-10", 5).unwrap(),
+            None
+        );
+        assert_eq!(
+            recent_eviction_date(&mut conn, "600396", "2026-11-02", 5).unwrap(),
+            None,
+            "非 evicted 关闭不能进入冷却"
+        );
     }
 }

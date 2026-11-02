@@ -12531,9 +12531,10 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     }
 
                     // 观察池淘汰（2026-10-18）：超期/跌幅出池，只管 observing。
-                    // 放在 15:40 观察池生成之前：先清掉已不成立的观察，再生成新的。
+                    // 批 8：放到 21:30 日线后，用当日收盘判跌幅；15:38 时 stock_daily
+                    // 还没有今天的数据，拿昨收会误判「今天跌」。
                     if calendar::is_trading_day(advice_report_date)
-                        && now_time >= chrono::NaiveTime::from_hms_opt(15, 38, 0).unwrap()
+                        && now_time >= chrono::NaiveTime::from_hms_opt(21, 35, 0).unwrap()
                     {
                         static EVICT_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
                             std::sync::Mutex::new(None);
@@ -13004,7 +13005,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                     //
                     // 只处理 entry_proposed：趋势型超过 3 个交易日、情绪型跨日仍未触发
                     // → 记 kind='entry_invalidated'。**不改 stage、不淘汰票** ——
-                    // 淘汰仍归 15:38 的 ticket_eviction（观察期上限按分型 5/10 天）。
+                    // 淘汰仍归 21:35 的 ticket_eviction（观察期上限按分型 5/10 天）。
                     // 盘中「跌破放弃价」那一条在 watch_pool_monitor_loop 里即时判，
                     // 这里补的是「一直没触发、价格窗口已过期」这一种。
                     if calendar::is_trading_day(advice_report_date)

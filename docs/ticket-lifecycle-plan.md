@@ -3269,6 +3269,12 @@ board_rotation_pm 内 1 / 上 20 / 下 0
 `active_watch_rows_exclude_non_open_proposal_states`，2 passed。代码已提交 `16feaa48f`，
 **未部署**。
 
+淘汰侧已提前落地：`ticket_watch_pool` 对最近 `evicted` 且仍在冷却窗内的票跳过并记
+`skipped_cooldown` 日志，默认 5 天（`TICKET_EVICTION_COOLDOWN_DAYS` 可覆盖）；
+淘汰调度从 15:38 移到 **21:35**，等 21:30 日线落库后再用当日收盘判跌幅。单测
+`eviction_cooldown_blocks_only_recent_evicted_ticket` 通过；`cargo check --bin monitor`
+通过。监控二进制尚未重编重启。
+
 1. 触发后写终态事件；`render_plan` 过滤已失效/到期的提案（现在失效只作废价格、不改 stage，
    次日仍以新区间回到买入候选）。
 2. 淘汰冷却 N 日（可配并写日志）；淘汰判定移到 21:30 日线后，避免「用昨收判今天跌」。
