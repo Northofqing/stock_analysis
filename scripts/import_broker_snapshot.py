@@ -52,6 +52,7 @@ def parse(text: str):
             {
                 "code": code,
                 "name": name,
+                "holding": int(holding),
                 "quantity": int(inventory),  # 库存数量=总持仓（含当日买入）
                 "sellable": int(sellable),
                 "cost_price": float(cost),
@@ -76,6 +77,11 @@ def main() -> int:
     ap.add_argument("--text-file", required=True)
     ap.add_argument("--db", required=True)
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument(
+        "--broker-assets",
+        action="store_true",
+        help="账户汇总用券商页面的参考市值/资产，而不是按收盘价重算",
+    )
     args = ap.parse_args()
 
     text = Path(args.text_file).read_text()
@@ -83,13 +89,20 @@ def main() -> int:
     if not rows:
         print("未解析到持仓行", file=sys.stderr)
         return 2
+    active_rows = [row for row in rows if row["quantity"] > 0]
+    if not active_rows:
+        print("未解析到库存数量大于 0 的持仓", file=sys.stderr)
+        return 2
     date, closes = latest_closes(args.db)
     if cash.get("可用") is None:
         print("未解析到「可用」", file=sys.stderr)
         return 2
 
     print(f"收盘日 {date}｜可用 {cash['可用']:.2f}｜余额 {cash.get('余额')}｜券商资产 {cash.get('资产')}")
-    print(f"{'代码':<8}{'名称':<10}{'数量':>6}{'成本':>9}{'券商价':>9}{'收盘':>9}{'差额':>8}{'市值(收盘)':>12}")
+    print(
+        f"{'代码':<8}{'名称':<10}{'证券':>6}{'库存':>6}{'可卖':>6}"
+        f"{'成本':>9}{'券商价':>9}{'收盘':>9}{'差额':>8}{'市值(收盘)':>12}"
+    )
     market = 0.0
     warn = []
     for row in rows:
@@ -100,20 +113,44 @@ def main() -> int:
         diff = row["broker_price"] - close
         market += row["quantity"] * close
         print(
-            f"{row['code']:<8}{row['name']:<10}{row['quantity']:>6}{row['cost_price']:>9.3f}"
+            f"{row['code']:<8}{row['name']:<10}{row['holding']:>6}{row['quantity']:>6}"
+            f"{row['sellable']:>6}{row['cost_price']:>9.3f}"
             f"{row['broker_price']:>9.3f}{close:>9.3f}{diff:>+8.3f}{row['quantity']*close:>12.2f}"
         )
+        if row["quantity"] == 0:
+            warn.append(f"{row['code']} {row['name']} 库存为 0，已排除出持仓快照")
+        elif row["holding"] != row["quantity"]:
+            warn.append(
+                f"{row['code']} {row['name']} 证券数量 {row['holding']} != 库存 {row['quantity']}，按库存入库"
+            )
         if abs(diff) > 0.005:
             warn.append(
                 f"{row['code']} {row['name']} 券商价 {row['broker_price']:.2f} vs 收盘 {close:.2f}"
             )
 
     market = round(market, 2)
-    total = round(market + cash["可用"], 2)
-    ratio = round(market / total * 100, 3) if total else 0.0
-    print(f"\n收盘口径：市值 {market:.2f}｜资产 {total:.2f}｜仓位 {ratio:.2f}%")
+    close_total = round(market + cash["可用"], 2)
+    if args.broker_assets:
+        if cash.get("参考市值") is None or cash.get("资产") is None:
+            print("--broker-assets 需要解析到「参考市值」与「资产」", file=sys.stderr)
+            return 2
+        market = round(cash["参考市值"], 2)
+        total = round(cash["资产"], 2)
+        ratio = round(market / total * 100, 3) if total else 0.0
+        print(
+            f"\n券商口径：市值 {market:.2f}｜资产 {total:.2f}｜仓位 {ratio:.2f}%"
+            f"｜市值+可用 {market + cash['可用']:.2f}｜未解释差额 {total - market - cash['可用']:+.2f}"
+        )
+        print(f"收盘重算口径：市值 {round(sum(r['quantity'] * closes.get(r['code'], r['broker_price']) for r in rows), 2):.2f}｜资产 {close_total:.2f}")
+    else:
+        total = close_total
+        ratio = round(market / total * 100, 3) if total else 0.0
+        print(f"\n收盘口径：市值 {market:.2f}｜资产 {total:.2f}｜仓位 {ratio:.2f}%")
     if cash.get("资产") is not None:
         print(f"券商口径：市值 {cash.get('参考市值')}｜资产 {cash['资产']}｜差额 {total - cash['资产']:+.2f}")
+
+    pnl_sum = round(sum(row["broker_pnl"] for row in rows), 2)
+    print(f"持仓浮盈亏合计 {pnl_sum:+.2f}｜券商盈亏 {cash.get('盈亏')}")
     for line in warn:
         print(f"  ⚠ {line}")
 
@@ -128,7 +165,7 @@ def main() -> int:
         "confirm_empty": False,
         "items": [
             {"code": r["code"], "name": r["name"], "quantity": r["quantity"], "cost_price": r["cost_price"]}
-            for r in rows
+            for r in active_rows
         ],
     }
     summary = {
