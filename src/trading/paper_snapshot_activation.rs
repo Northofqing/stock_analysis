@@ -256,7 +256,9 @@ fn validate_bundle(
         || seed.source_reference != request.source_batch_reference
         || request.source_evidence != bundle.source_evidence
         || seed.marks != bundle.opening_marks
-        || seed.excluded_residual.is_some_and(|v| v != Money::ZERO)
+        // A nonzero residual is allowed only as an explicitly approved,
+        // non-tradeable baseline gap; seed_projection enforces the exact
+        // original_total - (cash + marks) == excluded_residual check.
         || bundle.summary.source.trim().is_empty()
         || bundle.snapshot.source != "user_confirmed_full_snapshot"
         || time(&bundle.summary.effective_at)? != seed.cutover_at
@@ -375,11 +377,14 @@ fn validate_bundle(
             .cash
             .micros()
             .checked_add(market_micros)
+            .and_then(|value| {
+                value.checked_add(seed.excluded_residual.unwrap_or(Money::ZERO).micros())
+            })
             .ok_or(LedgerError::Overflow)?
             != seed.original_total.micros()
     {
         return Err(invalid(
-            "snapshot cash plus security marks does not balance to imported account total",
+            "snapshot cash + security marks + approved residual does not balance to imported account total",
         ));
     }
     // Recompute the existing complete-snapshot canonical evidence independently.

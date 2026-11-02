@@ -34,6 +34,10 @@ name = "paper_close_repair"
 path = "src/bin/paper_close_repair.rs"
 
 [[bin]]
+name = "paper_rebind_apply"
+path = "src/bin/paper_rebind_apply.rs"
+
+[[bin]]
 name = "rsi_optimize"
 path = "src/bin/rsi_optimize.rs"
 

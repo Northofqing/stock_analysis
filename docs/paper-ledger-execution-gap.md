@@ -69,6 +69,39 @@
 - 页面/推送读的是 `paper_ledger_event` 的 `Executed`，不是只读 legacy `paper_trades`；
 - 重放/幂等：同一 `command_id` 不重复成交。
 
+## 2026-11-02 期初 rebind 已执行
+
+用户明确要求先做 baseline，旧 epoch 保留归档，不删除、不改写：
+
+- 旧活动账本（`paper-actual-20261009-2113-c6124ac14803`，version 25，25 条事件）
+  已整体改名归档为 `paper_archive_v1_*`；
+- 新账本：
+  - account_id=`paper-actual-20261102-154611-687e69a6`
+  - epoch_id=`paper-epoch-20261102-154611-687e69a6`
+  - 来源：snapshot 59（2026-11-02 15:46:11）
+  - 6 只持仓：001216 100 / 002131 1000 / 002421 2000 / 600396 1000 /
+    600667 600 / 600703 500
+  - 可交易现金：2,007.82
+  - 券商资产：42,324.92
+  - 明确排除、不可交易残差：7,205.10
+  - seed equity：35,119.82
+  - 新账本 head version 2（Seed + opening closing mark）
+- 为支持这次 rebind：
+  - activation 现在允许 `excluded_residual` 非零，但必须严格满足
+    `original_total - (cash + marks) == excluded_residual`；
+  - 新增 `paper_rebind_apply`，先 preview 再 apply，并支持重复 apply 的 already_applied 校验；
+  - 运行根 `.env` 的 `PAPER_LEDGER_ACCOUNT_BINDING` 已改到新 account/epoch，
+    备份为 `.env.bak-paper-rebind-20261102`。
+- monitor 为迁移已停止；当前 gateway 禁止在本会话调用 `launchctl bootstrap/kickstart`，
+  需要运维者在独立终端执行：
+
+```bash
+launchctl bootstrap gui/501 /Users/zhangzhen/Library/LaunchAgents/com.stockanalysis.monitor.plist
+```
+
+启动后按既有标准等 `数据库初始化完成` / `startup_health_check status=ok` /
+`观测订阅已建立`，再确认 paper 读的是新 binding。
+
 ## 明确不做
 
 - 不把 seed 库存伪造成买入流水；
