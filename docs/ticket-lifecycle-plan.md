@@ -3334,3 +3334,20 @@ DataMode（Kline/MoneyFlow/OrderBook）与 P1.1（news/mf）的根因、首选/�
 两天验证计划、恢复/仍 unavailable 清单，见
 `docs/ticket-data-gap-plan.md`。该计划不改变本方案的 ticket 批次顺序，也不把
 “数据源修好”当成“胜率提高”；胜率仍按 11-23 样本外结论单独判断。
+
+### 12.10 推送缺口（2026-11-02）
+
+- **观察池入选推送**：15:40 `build_watch_pool` 后若 `opened>0`，新增一条飞书摘要
+  （代码/来源/理由），归档 `data/watch_pool_selection/<date>.txt`；无新票不推空消息。
+  实现 `4ce8471f9`，`cargo check --bin monitor` 通过。未部署。
+- **虚拟盘买入/卖出推送**：走 A（快照差额转虚拟成交），但当前最新两份券商快照
+  57→58 的持仓完全相同，A 的“逐日差额”今天会是 **0 笔**；真正的问题是 paper 账本
+  仍是 5 只 Seed 库存，与券商 7 只/数量不同。A 要先生成一次与快照 58 对齐的期初
+  baseline，之后的快照差分才有意义。
+- 这个 baseline 被 V1 `paper_snapshot_activation_v1` 单例 proof 合同阻塞：已有 proof
+  只接受完全相同的 request，不能原地换 7 只库存；必须先做显式 rebind（新 generation
+  或 close→new owner），再谈快照差分执行。没有这一步，直接按差额买卖会把“期初库存”
+  伪造成交易流水。
+- 同时 `paper_risk_context` 在收盘后因 `today_pnl=None` 每 30 秒失败
+  （`BR-134 complete account metrics are unavailable`），paper_sell 不会运行；
+  A 的执行器需要用自己的快照价格口径，不能依赖这条收盘后失效的上下文。
