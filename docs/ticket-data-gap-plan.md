@@ -222,3 +222,19 @@ f62 用这份映射选票；确保 `eastmoney_members` 有数据。
 - 2026-11-02 快照：10:31 `DataMode=Degraded`（缺 Kline/MoneyFlow/OrderBook，Quote 可用）；
   11:48 `Unsafe`（午休 Quote 缺失，属预期）；`news_ai_assessment` 最新 10-14；
   f62 3 天、board_member 150 名/5,624 行、交集 1。
+
+## 8. 实施状态（2026-11-02）
+
+- **A1 Kline：已实现，未部署**。`kline_max_age_secs_at` 以“最近已完成交易日 15:00”
+  为锚（22:00 后计入当日），替代固定 24h 墙钟；新增周末/周二回归测试。
+  `cargo check --lib` 通过；`cargo test --lib data_mode` → **40 passed / 0 failed**。
+  运行根 monitor 尚未重编/重启，生产仍跑旧二进制。
+- **A2 OrderBook/T0Advice：未开始**。卡在 T0Evidence 对端“服务端内部错误”，需要
+  原始 provider batch/request_id 才能继续；本轮没有加本地 fallback。
+- **A3 MoneyFlow：无需改代码**。`Capability::MoneyFlow` 已是非关键能力，
+  `is_critical=false`；不做备源、不做额外 try/catch。
+- **B1 news：未开始**。卡在股票级 `news_ai_assessment` 不更新；本轮没有加规则版 fallback。
+- **B2 mf：未开始**。需要东财板块→成分映射；`BoardFlows` 仍报 server internal error，
+  本轮没有加静态映射。
+- **per-push 数据依赖：未开始**。按工程约束，先只做 A1；能力表若要落代码，
+  只写现有 5 类推送的最小映射，不做通用框架。

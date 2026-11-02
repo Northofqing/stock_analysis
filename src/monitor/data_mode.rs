@@ -13,7 +13,7 @@
 //! 全批准入已把 OrderBook 接入真实 provider。因此 OrderBook Missing 或超过其 600s
 //! 预算会使 DataMode 降为 Degraded；只有 Quote 断流会使其进入 Unsafe。
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, Local, Timelike, Utc};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -334,6 +334,32 @@ impl Capability {
 /// 沿用 120s 关键窗口会让日频数据结构上不可能新鲜。
 pub const KLINE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
+/// Kline 的墙钟预算不能只用固定 24h：周五收盘到周一开盘天然超过 24h。
+/// 以"最近一个已完成交易日 15:00"为锚，另加 6h 缓冲；22:00 后当日日线
+/// 已过 21:30 同步窗口，才把当日算作已完成交易日。
+fn kline_max_age_secs_at(now: DateTime<Local>) -> u64 {
+    let today = now.date_naive();
+    let after_daily_sync = now.time() >= chrono::NaiveTime::from_hms_opt(22, 0, 0).unwrap();
+    let last_session = if crate::calendar::is_trading_day(today) && after_daily_sync {
+        today
+    } else {
+        crate::calendar::prev_trading_day(today)
+    };
+    let close = last_session
+        .and_hms_opt(15, 0, 0)
+        .expect("15:00 is a valid time");
+    let elapsed = now
+        .naive_local()
+        .signed_duration_since(close)
+        .num_seconds()
+        .max(0) as u64;
+    elapsed.saturating_add(6 * 60 * 60).max(KLINE_MAX_AGE_SECS)
+}
+
+fn kline_max_age_secs() -> u64 {
+    kline_max_age_secs_at(Local::now())
+}
+
 /// BR-216: News 采集节律由 `NEWS_POLL_INTERVAL` 决定 (默认 120s)。
 /// 预算必须显著大于轮询周期, 否则每轮之间必然抖出 stale。
 pub const NEWS_MAX_AGE_SECS: u64 = 300;
@@ -519,7 +545,7 @@ impl DataHealthInput {
     pub fn max_age_for(&self, cap: Capability) -> u64 {
         match cap {
             Capability::Quote => self.critical_max_age_secs,
-            Capability::Kline => KLINE_MAX_AGE_SECS.max(self.critical_max_age_secs),
+            Capability::Kline => kline_max_age_secs().max(self.critical_max_age_secs),
             Capability::News => NEWS_MAX_AGE_SECS.max(self.critical_max_age_secs),
             Capability::MoneyFlow | Capability::OrderBook => self.orderbook_max_age_secs,
         }
@@ -1078,12 +1104,27 @@ mod tests {
     #[test]
     fn degraded_when_kline_stale() {
         let mut input = input_all_fresh();
-        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, KLINE_MAX_AGE_SECS + 1);
+        input.capabilities[1] =
+            CapabilityStatus::fresh(Capability::Kline, kline_max_age_secs() + 3600);
         let h = evaluate(&input, Some(DataMode::Full));
         assert_eq!(h.mode, DataMode::Degraded);
         assert!(h.is_changed(), "Full → Degraded 应算变更");
         assert!(h.missing.contains(&Capability::Kline));
         assert!(h.eta.as_ref().unwrap().contains("Kline"));
+    }
+
+    #[test]
+    fn kline_budget_covers_weekend_and_rejects_missed_session() {
+        let monday = Local.with_ymd_and_hms(2026, 11, 2, 10, 30, 0).unwrap();
+        assert!(
+            kline_max_age_secs_at(monday) >= 67 * 3600,
+            "周一 10:30 必须覆盖上周五 15:00 至今的墙钟跨度"
+        );
+        let tuesday = Local.with_ymd_and_hms(2026, 11, 3, 10, 30, 0).unwrap();
+        assert!(
+            kline_max_age_secs_at(tuesday) < 43 * 3600,
+            "周二不能把周五的旧 K 线继续当新鲜"
+        );
     }
 
     /// BR-216: 日频数据不得套用 120s 关键窗口, 否则结构上不可能新鲜。
@@ -1116,11 +1157,12 @@ mod tests {
     #[test]
     fn br216_widened_critical_window_never_narrows_graded_budgets() {
         let mut input = input_all_fresh();
-        input.critical_max_age_secs = 2 * KLINE_MAX_AGE_SECS;
-        assert_eq!(input.max_age_for(Capability::Kline), 2 * KLINE_MAX_AGE_SECS);
-        assert_eq!(input.max_age_for(Capability::News), 2 * KLINE_MAX_AGE_SECS);
+        let budget = kline_max_age_secs();
+        input.critical_max_age_secs = 2 * budget;
+        assert_eq!(input.max_age_for(Capability::Kline), 2 * budget);
+        assert_eq!(input.max_age_for(Capability::News), 2 * budget);
         input.critical_max_age_secs = 1;
-        assert_eq!(input.max_age_for(Capability::Kline), KLINE_MAX_AGE_SECS);
+        assert!(input.max_age_for(Capability::Kline) >= budget);
         assert_eq!(input.max_age_for(Capability::News), NEWS_MAX_AGE_SECS);
         assert_eq!(input.max_age_for(Capability::Quote), 1);
     }
@@ -1179,7 +1221,8 @@ mod tests {
         let mut input = input_all_fresh();
         // Kline stale (Degraded) + Quote stale (Unsafe) → Unsafe
         input.capabilities[0] = CapabilityStatus::fresh(Capability::Quote, 200);
-        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, KLINE_MAX_AGE_SECS + 1);
+        input.capabilities[1] =
+            CapabilityStatus::fresh(Capability::Kline, kline_max_age_secs() + 3600);
         let h = evaluate(&input, Some(DataMode::Full));
         assert_eq!(h.mode, DataMode::Unsafe);
     }
@@ -1201,7 +1244,8 @@ mod tests {
     #[test]
     fn full_to_degraded_changed() {
         let mut input = input_all_fresh();
-        input.capabilities[1] = CapabilityStatus::fresh(Capability::Kline, KLINE_MAX_AGE_SECS + 1);
+        input.capabilities[1] =
+            CapabilityStatus::fresh(Capability::Kline, kline_max_age_secs() + 3600);
         let h = evaluate(&input, Some(DataMode::Full));
         assert!(h.is_changed());
     }
