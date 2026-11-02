@@ -229,8 +229,15 @@ f62 用这份映射选票；确保 `eastmoney_members` 有数据。
   为锚（22:00 后计入当日），替代固定 24h 墙钟；新增周末/周二回归测试。
   `cargo check --lib` 通过；`cargo test --lib data_mode` → **40 passed / 0 failed**。
   运行根 monitor 尚未重编/重启，生产仍跑旧二进制。
-- **A2 OrderBook/T0Advice：未开始**。卡在 T0Evidence 对端“服务端内部错误”，需要
-  原始 provider batch/request_id 才能继续；本轮没有加本地 fallback。
+- **A2 OrderBook/T0Advice：桥仓已改，未部署**。桥仓提交 `1a5e235`：
+  quote 空批次改为有界切换 PRIMARY 主站并缓存成功连接；T0 取数失败保留
+  `provider=Tdx / reason_code=t0_quote_unavailable`，gRPC 对 T0 返回
+  `Unavailable` 而不是笼统的 `Internal/服务端内部错误`。`cargo check --bins`
+  通过，release 已构建；`t0_lib_probe` 实测在 7 台主站全空时返回明确错误。
+  但 13:01 开盘后 7 台 PRIMARY 仍全部 `empty-quote`；Windows ExternalV1 的
+  T0Evidence 也返回 `[E2005] retry exhausted`，两侧 TDX 上游都没有数据。
+  因此 **T0/OrderBook 仍未恢复**；运行根二进制仍是 10-26 版本，未做市场时段
+  重启，P0-2 换源（Tencent/Sina 订单簿或等待 TDX 恢复）需要单独决定。
 - **A3 MoneyFlow：无需改代码**。`Capability::MoneyFlow` 已是非关键能力，
   `is_critical=false`；不做备源、不做额外 try/catch。
 - **B1 news：未开始**。卡在股票级 `news_ai_assessment` 不更新；本轮没有加规则版 fallback。
