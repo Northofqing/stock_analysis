@@ -12785,6 +12785,39 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     ) {
                                         Ok(report) => {
                                             report.log();
+                                            // 批 8：15:40 观察池新入选票给一条用户可见摘要。
+                                            // 只在确实 opened>0 时推，避免每天空消息。
+                                            if report.opened > 0 {
+                                                match stock_analysis::monitor::ticket_watch_pool::render_selection_notice(
+                                                    &db, &date_text,
+                                                ) {
+                                                    Ok(Some(text)) => {
+                                                        let archive = std::path::Path::new(
+                                                            "data/watch_pool_selection",
+                                                        )
+                                                        .join(format!("{date_text}.txt"));
+                                                        if let Some(parent) = archive.parent() {
+                                                            let _ = std::fs::create_dir_all(parent);
+                                                        }
+                                                        let _ = std::fs::write(&archive, &text);
+                                                        if crate::notify::push_wechat(&text).await {
+                                                            log::info!(
+                                                                "[观察池] 入选推送成功 opened={}",
+                                                                report.opened
+                                                            );
+                                                        } else {
+                                                            log::warn!(
+                                                                "[观察池] 入选推送失败（票已入池，归档已写）opened={}",
+                                                                report.opened
+                                                            );
+                                                        }
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(error) => log::warn!(
+                                                        "[观察池] 入选摘要生成失败: {error}"
+                                                    ),
+                                                }
+                                            }
                                             // P2：观察池建完立刻给「确实有买点」的票推入场区间
                                             // （observing → entry_proposed）。必须早于 16:00 明日计划，
                                             // 否则明日计划读到的是上一轮的旧 stage。

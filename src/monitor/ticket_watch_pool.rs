@@ -79,6 +79,51 @@ fn recent_eviction_date(
     .map_err(|error| format!("淘汰冷却查询失败 ({code}): {error}"))
 }
 
+/// 15:40 观察池新入选票的用户可见摘要。只读 ticket_lifecycle，不改变任何状态。
+pub fn render_selection_notice(
+    db: &DatabaseManager,
+    business_date: &str,
+) -> Result<Option<String>, String> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        code: String,
+        #[diesel(sql_type = Text)]
+        source: String,
+        #[diesel(sql_type = Text)]
+        note: String,
+    }
+    let mut conn = db.get_conn().map_err(|error| error.to_string())?;
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT code, source, COALESCE(note, '') AS note \
+           FROM ticket_lifecycle \
+          WHERE open_date = ?1 \
+            AND source IN ('news_catalyst','board_rotation','money_flow','board_rotation_pm') \
+          ORDER BY code",
+    )
+    .bind::<Text, _>(business_date)
+    .load(&mut conn)
+    .map_err(|error| format!("观察池入选摘要查询失败: {error}"))?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut text = format!(
+        "【观察池入选 {business_date}】15:40 新入选 {} 只\n",
+        rows.len()
+    );
+    for row in rows {
+        let note = row.note.trim();
+        let note: String = note.chars().take(160).collect();
+        text.push_str(&format!(
+            "- {} | {} | {}\n",
+            row.code,
+            source_label(&row.source),
+            if note.is_empty() { "无理由摘要" } else { &note }
+        ));
+    }
+    Ok(Some(text))
+}
+
 #[derive(Debug, Clone)]
 pub struct PoolCandidate {
     pub code: String,
