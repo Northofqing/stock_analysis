@@ -3128,6 +3128,32 @@ git diff --check
 从 9/4/1 变为 **10 达标 / 4 部分 / 0 未达标**，批1.3 由“未达标”转为“达标”。
 分片修复已验证，不再列为待修项。
 
+#### 12.2.3 2026-11-03 竞价再次失败：`auction_unmatched=null`
+
+11-03 09:30 的日志：
+
+```text
+[竞价观察] 拉取失败, 下一轮重试: op 61 竞价观测获取失败 (chunk 1):
+CurrentAuctionObservations data gateway failed reason_code=invalid_evidence
+auction record fields invalid: invalid type: null, expected f64
+(field=auction_volume_ratio expected=f64 actual=map raw={"unit":"Decimal","value":1.1459})
+```
+
+根因不是分片，也不是 `auction_volume_ratio` 的 map 形态：
+
+- `auction_unmatched` 在同一批记录上返回了 `null`；
+- `AuctionWire` 把它声明成必填 `f64`，serde 报 `invalid type: null, expected f64`；
+- `locate_numeric_field_mismatch` 先跳过 null，再命中合法的
+  `auction_volume_ratio` map，所以诊断文本把字段名误导成 `auction_volume_ratio`。
+
+修复：`auction_unmatched` 改为 `Option<f64>`，null 保留为未知，不补 0；
+`auction_volume_ratio` 的 `{value,unit}` 兼容解析保持不变。
+
+验证：`data_gateway::current_auction_observations::tests` **4 passed**，
+新增 `live_auction_accepts_null_unmatched_and_map_ratio`。
+状态：代码已提交 `58e019e0e`，**尚未部署**；今天 09:25 的终态已过窗口，
+本次修复只能保证下一个交易日 09:25-09:32 不再因该字段失败。
+
 边界：交易日判定只用「工作日」近似，没有节假日表；2026 年 11-12 月无公休，之后遇到节假日需先补日历或临时停跑。
 paper 收盘到期时间从方案里的 15:45 改到 21:45：实测 10-27/10-28/10-29 分别在 21:23/21:35/21:35 才确认（依赖当日合格日线），15:45 检查会每天误报。
 `TomorrowWatch` 的投递审计缺口是已知 B.5，本批只提示不拦截。
