@@ -86,7 +86,8 @@ pub struct CurrentAuctionObservation {
     pub auction_pct: Option<f64>,
     pub auction_volume_shares: Option<f64>,
     pub auction_amount: Option<f64>,
-    pub auction_unmatched: f64,
+    /// 对端在部分记录上返回 null（无未匹配量可报）；null 表示未知，不补 0。
+    pub auction_unmatched: Option<f64>,
     pub auction_turnover_pct: Option<f64>,
     pub auction_volume_ratio: Option<f64>,
     pub auction_yesterday_ratio_pct: Option<f64>,
@@ -151,7 +152,7 @@ struct AuctionWire {
     auction_pct: Option<f64>,
     auction_volume_shares: Option<f64>,
     auction_amount: Option<f64>,
-    auction_unmatched: f64,
+    auction_unmatched: Option<f64>,
     #[serde(default, deserialize_with = "ratio_f64::deserialize")]
     auction_turnover_pct: Option<f64>,
     #[serde(default, deserialize_with = "ratio_f64::deserialize")]
@@ -301,7 +302,9 @@ pub(crate) fn convert_response(
             || wire.evidence.provider() != ProviderId::Tonghuashun
             || wire.evidence.source_at().is_some()
             || wire.evidence.batch_id() != response.batch_id
-            || !wire.auction_unmatched.is_finite()
+            || wire
+                .auction_unmatched
+                .is_some_and(|value| !value.is_finite())
         {
             return Err(invalid(
                 "auction stage, provider, evidence, or unmatched value conflicts",
@@ -410,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn live_auction_preserves_null_price_ratio_and_signed_unmatched() {
+    fn live_auction_accepts_null_unmatched_and_map_ratio() {
         let instrument = InstrumentId::new(Exchange::Shanghai, "600519", AssetClass::Equity)
             .expect("published example instrument");
         let request = CurrentAuctionRequest::new(vec![instrument], AuctionStage::Live)
@@ -420,8 +423,9 @@ mod tests {
             "name":"贵州茅台", "requested_stage":"live", "auction_phase":"matching",
             "data_status":"live", "auction_price":null, "pre_close_price":1316.01,
             "auction_pct":null, "auction_volume_shares":0.0, "auction_amount":0.0,
-            "auction_unmatched":-321.0, "auction_turnover_pct":null,
-            "auction_volume_ratio":null, "auction_yesterday_ratio_pct":null,
+            "auction_unmatched":null, "auction_turnover_pct":null,
+            "auction_volume_ratio":{"value":1.1459,"unit":"Decimal"},
+            "auction_yesterday_ratio_pct":null,
             "float_market_cap":1653000000000.0, "last_price":null, "open_price":null,
             "evidence": {"provider":"Tonghuashun", "source_at":null,
                          "observed_at":"unix-ms:1788956044416", "batch_id":"TEST_CODE_AUCTION_BATCH"}
@@ -449,8 +453,8 @@ mod tests {
         assert_eq!(batch.evidence().source_at, None);
         let auction = &batch.records()[0];
         assert_eq!(auction.auction_price, None);
-        assert_eq!(auction.auction_volume_ratio, None);
-        assert_eq!(auction.auction_unmatched, -321.0);
+        assert_eq!(auction.auction_volume_ratio, Some(1.1459));
+        assert_eq!(auction.auction_unmatched, None);
         assert_eq!(auction.evidence.provider(), ProviderId::Tonghuashun);
         assert_eq!(auction.evidence.source_at(), None);
 
@@ -501,7 +505,7 @@ mod tests {
         .expect("auction gateway deadline")
         .expect("qualified auction batch");
         assert_eq!(batch.records().len(), 1);
-        assert_eq!(batch.records()[0].auction_unmatched, -321.0);
+        assert_eq!(batch.records()[0].auction_unmatched, Some(-321.0));
         assert_eq!(batch.evidence().provider, ProviderId::HithinkFinance);
         let observed = fixture.snapshot();
         assert_eq!(observed.capabilities_calls, 1);
