@@ -25,6 +25,9 @@ use crate::monitor::ticket_regime::Regime;
 pub const RULE_VERSION: &str = "ticket_decision_v1";
 /// 突破型触发允许的最大当日涨幅；超过它不追。
 pub const MAX_TRIGGER_CHANGE_PCT: f64 = 6.0;
+/// Breakout 的追高上限（相对 trigger_level）。首版只用于 EntryPolicy/shadow，
+/// 不改变 legacy；后续按 shadow 的区间外比例再调。
+pub const MAX_BREAKOUT_CHASE_PCT: f64 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -363,7 +366,9 @@ impl EntryPolicy {
             },
             EntryMode::Breakout => match context.trigger_level {
                 Some(level) if quote.price >= level => {
-                    if quote.change_pct < MAX_TRIGGER_CHANGE_PCT {
+                    if quote.price > level * (1.0 + MAX_BREAKOUT_CHASE_PCT / 100.0) {
+                        PolicyOutcome::new(Decision::NoDecision, "above_breakout_chase_cap")
+                    } else if quote.change_pct < MAX_TRIGGER_CHANGE_PCT {
                         PolicyOutcome::new(Decision::Triggered, "above_trigger_level")
                     } else {
                         PolicyOutcome::new(Decision::NoDecision, "above_change_cap")
@@ -678,6 +683,28 @@ mod tests {
             },
         );
         assert_eq!(too_hot.decision, Decision::NoDecision);
+    }
+
+    #[test]
+    fn breakout_rejects_chase_above_the_cap() {
+        let context = context(EntryMode::Breakout);
+        let inside = EntryPolicy::evaluate(
+            &context,
+            QuoteView {
+                price: 11.30,
+                change_pct: 3.0,
+            },
+        );
+        assert_eq!(inside.decision, Decision::Triggered);
+        let too_far = EntryPolicy::evaluate(
+            &context,
+            QuoteView {
+                price: 11.50,
+                change_pct: 3.0,
+            },
+        );
+        assert_eq!(too_far.decision, Decision::NoDecision);
+        assert_eq!(too_far.reason, "above_breakout_chase_cap");
     }
 
     #[test]
