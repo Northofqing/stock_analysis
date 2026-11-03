@@ -3260,6 +3260,26 @@ board_rotation_pm 内 1 / 上 20 / 下 0
 
 脚本只读，可随时重跑；缺失区间/现价的样本计入 `unparsed`，不补值。
 
+#### 12.3.2 7.2 第一版：Breakout 追高上限（2026-11-02）
+
+不改原方案的 `price <= entry_high` 统一约束（已由 7.1 证明会把 43 个票日砍到 2 个）。
+按 entry_mode 拆开后，第一版只补 Breakout 缺口：
+
+- Pullback：`EntryPolicy` 已要求价格落在 `price_low..price_high`，本次不改；
+- Breakout：在 `price >= trigger_level` 基础上增加
+  `price <= trigger_level * (1 + 5%)`，超过记 `above_breakout_chase_cap`；
+- 原 `当日涨幅 < 6%` 上限保留；
+- 5% 只是 shadow 观察起点，不是最终阈值；`TICKET_ENTRY_POLICY=shadow`
+  下只记录旧/新差异，不改变用户可见触发；
+- legacy 路径完全不变，回滚不需要改数据。
+
+实现：`src/monitor/ticket_decision.rs` 的 `MAX_BREAKOUT_CHASE_PCT=5.0`；
+单测 `breakout_rejects_chase_above_the_cap`。
+验证：`monitor::ticket_decision::tests` 15 passed；
+`monitor::ticket_entry_trigger::tests` 13 passed。
+状态：代码已提交 `4e85563e5`，**尚未部署**；等 21:30 日线/21:45 paper close
+结束后再同步运行根并重编，避免打断当日盘后任务。
+
 ### 12.4 批 8：状态闭环（11-05 ~ 11-06，约 2 天）
 
 状态（2026-11-02，提前开发）：`render_plan` 已改为按每张票最新一次提案生命周期事件过滤，
