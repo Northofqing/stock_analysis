@@ -3361,6 +3361,25 @@ operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 
 - `TICKET_ENTRY_POLICY=shadow` 不变；BuildIdentity 三项漂移 WARN 属预期（源码变了未更新 pin），观测不阻断；
 - 行为验证要等下一个交易日 15:40 的新提案正文出现「突破确认」。
 
+#### 12.3.4 Breakout 触发位改昨高 + 回踩文案修正（2026-11-07）
+
+- `EntryPolicy::evaluate_with_trigger_level`：评估时点可显式传入突破位；
+  `judge_policy` 用 `TriggerTarget.prev_high`（触发日昨高），不再用提案时点快照。
+  跨日仍挂着的提案必须用当日昨高，否则「站上三天前的昨高」会被当成突破。
+- 提案 context：`trigger_level = prev_high`（提案日最高价），与 `prev_high` 同步；
+  缺失保持 None。
+- `TriggerHit` 文案：Pullback 只有价格真在区间内才写「进入参考区间」，否则写
+  「高于参考区间上沿 / 低于参考区间下沿」并把区间放在后面。本周 183 条触发中
+  43 条「进入参考区间」实际价格在区间上方，就是这里造成的。
+- 边界：判定仍走 legacy（`TICKET_ENTRY_POLICY=shadow`），只有 Pullback 触发事件
+  的措辞按真实位置改写；Breakout 的「站上触发位」数值改为触发日昨高。
+- 验证：`cargo check --lib --bin monitor` 通过；`monitor::ticket_decision` 16/16、
+  `monitor::ticket_entry_trigger` 14/14（含新增 `breakout_level_can_be_overridden_by_evaluation_day_prev_high`、
+  `pullback_label_reflects_actual_position_vs_range`）。
+- 部署：2026-11-07 20:19 运行根 release 构建 14m40s；20:19:59 kickstart，PID 41232；
+  20:22:43 `core_database_bind=ok`（158s）、`startup_health_check=ok`；二进制含
+  「高于参考区间上沿 / 低于参考区间下沿」。`TICKET_ENTRY_POLICY=shadow` 不变。
+
 ### 12.4 批 8：状态闭环（11-05 ~ 11-06，约 2 天）
 
 状态（2026-11-02，提前开发）：`render_plan` 已改为按每张票最新一次提案生命周期事件过滤，
