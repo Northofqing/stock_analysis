@@ -442,7 +442,7 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
         );
         context.price_low = Some(low);
         context.price_high = Some(high);
-        context.trigger_level = zone.ma5;
+        context.trigger_level = prev_high;
         context.prev_high = prev_high;
         context.abandon = zone.abandon;
         context.confirmation = "price_only".to_owned();

@@ -100,10 +100,9 @@ impl TriggerTarget {
             .unwrap_or(EntryMode::Unknown)
     }
 
+    /// 突破位按**触发日昨高**（Q5），不用提案时的快照。
     pub fn trigger_level(&self) -> Option<f64> {
-        self.context
-            .as_ref()
-            .and_then(|context| context.trigger_level)
+        Some(self.prev_high)
     }
 
     pub fn decision_id(&self) -> Option<&str> {
@@ -180,10 +179,34 @@ impl TriggerHit {
     pub fn basis(&self) -> String {
         match self.action {
             HitAction::Triggered => match self.entry_mode {
-                EntryMode::Pullback => format!(
-                    "进入参考区间 {:.2}-{:.2}（现价 {:.2}，{:+.2}%）",
-                    self.entry_low, self.entry_high, self.price, self.change_pct
-                ),
+                EntryMode::Pullback => {
+                    // 只有价格真落在区间内才叫「进入参考区间」。legacy 判据是
+                    // 站上昨高，可能远高于区间上沿；照抄 entry_mode 会把追高说成回踩成交。
+                    if self.price >= self.entry_low && self.price <= self.entry_high {
+                        format!(
+                            "进入参考区间 {:.2}-{:.2}（现价 {:.2}，{:+.2}%）",
+                            self.entry_low, self.entry_high, self.price, self.change_pct
+                        )
+                    } else if self.price > self.entry_high {
+                        format!(
+                            "高于参考区间上沿 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            self.entry_high,
+                            self.price,
+                            self.change_pct,
+                            self.entry_low,
+                            self.entry_high
+                        )
+                    } else {
+                        format!(
+                            "低于参考区间下沿 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            self.entry_low,
+                            self.price,
+                            self.change_pct,
+                            self.entry_low,
+                            self.entry_high
+                        )
+                    }
+                }
                 EntryMode::Breakout => self.trigger_level.map_or_else(
                     || {
                         format!(
@@ -291,6 +314,7 @@ fn legacy_shadow_context(
     source: &str,
     as_of: &str,
     regime: Regime,
+    prev_high: f64,
     zone: &buy_zone::BuyZone,
 ) -> DecisionContext {
     let mut context = DecisionContext::new(
@@ -303,7 +327,8 @@ fn legacy_shadow_context(
     );
     context.price_low = zone.entry_low;
     context.price_high = zone.entry_high;
-    context.trigger_level = zone.ma5;
+    context.trigger_level = Some(prev_high);
+    context.prev_high = Some(prev_high);
     context.abandon = zone.abandon;
     context.confirmation = "price_only".to_owned();
     context.valid_from = Some(as_of.to_owned());
@@ -452,6 +477,7 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
                 &ticket.source,
                 as_of,
                 regime,
+                prev_high,
                 &zone,
             )),
             None => None,
@@ -516,7 +542,11 @@ fn judge_policy(
     let Some(context) = target.context.as_ref() else {
         return (None, "legacy_context_missing");
     };
-    let outcome = EntryPolicy::evaluate(context, QuoteView { price, change_pct });
+    let outcome = EntryPolicy::evaluate_with_trigger_level(
+        context,
+        QuoteView { price, change_pct },
+        Some(target.prev_high),
+    );
     let action = match outcome.decision {
         Decision::Triggered => Some(HitAction::Triggered),
         Decision::Invalidated => Some(HitAction::Invalidated),
@@ -1005,10 +1035,13 @@ mod tests {
     }
 
     #[test]
-    fn breakout_policy_uses_trigger_level_not_prev_high() {
+    fn breakout_policy_uses_prevailing_prev_high() {
         let target = policy_target(EntryMode::Breakout, 11.0);
+        // 提案 context 的 trigger_level 是 10.8，但触发日昨高 11.0：
+        // 10.9 不算突破（旧逻辑会误触发）。
         let (price, change) = quote(10.9, 3.0);
-        assert_eq!(judge_legacy(&target, price, change), None);
+        assert_eq!(judge_policy(&target, price, change).0, None);
+        let (price, change) = quote(11.2, 3.0);
         assert_eq!(
             judge_policy(&target, price, change).0,
             Some(HitAction::Triggered)
@@ -1087,6 +1120,31 @@ mod tests {
         assert!(text.contains("突破确认"));
         assert!(text.contains("情绪型"));
         assert!(text.contains("002696"));
+    }
+
+    #[test]
+    fn pullback_label_reflects_actual_position_vs_range() {
+        let mut hit = TriggerHit {
+            ticket_id: 1,
+            code: "002696".to_string(),
+            name: "测试".to_string(),
+            price: 12.0,
+            change_pct: 3.2,
+            prev_high: 10.3,
+            entry_low: 10.0,
+            entry_high: 10.5,
+            abandon: Some(9.0),
+            regime: Regime::Emotion,
+            action: HitAction::Triggered,
+            decision_id: None,
+            entry_mode: EntryMode::Pullback,
+            trigger_level: Some(10.3),
+        };
+        assert!(hit.basis().starts_with("高于参考区间上沿"));
+        hit.price = 10.2;
+        assert!(hit.basis().starts_with("进入参考区间"));
+        hit.price = 9.8;
+        assert!(hit.basis().starts_with("低于参考区间下沿"));
     }
 
     #[test]

@@ -336,7 +336,20 @@ impl PolicyOutcome {
 pub struct EntryPolicy;
 
 impl EntryPolicy {
+    /// 评估入口：没给突破位时用 context 里的提案日快照。
     pub fn evaluate(context: &DecisionContext, quote: QuoteView) -> PolicyOutcome {
+        Self::evaluate_with_trigger_level(context, quote, context.prev_high)
+    }
+
+    /// `breakout_level` 是评估时点的突破位（触发日昨高）。
+    ///
+    /// 提案 context 里的 `prev_high` 只是提案日快照；跨日仍挂着的提案必须用当日
+    /// 昨高，否则「站上三天前的昨高」会被当成突破。
+    pub fn evaluate_with_trigger_level(
+        context: &DecisionContext,
+        quote: QuoteView,
+        breakout_level: Option<f64>,
+    ) -> PolicyOutcome {
         if quote.price <= 0.0 {
             return PolicyOutcome::new(Decision::NoDecision, "invalid_quote");
         }
@@ -369,7 +382,7 @@ impl EntryPolicy {
                 }
                 _ => PolicyOutcome::new(Decision::NoDecision, "missing_price_window"),
             },
-            EntryMode::Breakout => match context.trigger_level {
+            EntryMode::Breakout => match breakout_level {
                 Some(level) if quote.price >= level => {
                     if quote.price > level * (1.0 + MAX_BREAKOUT_CHASE_PCT / 100.0) {
                         PolicyOutcome::new(Decision::NoDecision, "above_breakout_chase_cap")
@@ -643,6 +656,7 @@ mod tests {
         context.price_low = Some(10.0);
         context.price_high = Some(10.5);
         context.trigger_level = Some(10.8);
+        context.prev_high = Some(10.8);
         context.abandon = Some(9.0);
         context.seal();
         context
@@ -688,6 +702,30 @@ mod tests {
             },
         );
         assert_eq!(too_hot.decision, Decision::NoDecision);
+    }
+
+    #[test]
+    fn breakout_level_can_be_overridden_by_evaluation_day_prev_high() {
+        let context = context(EntryMode::Breakout);
+        // 提案日昨高 10.8；评估日昨高抬到 11.5 → 11.2 不算突破
+        let below = EntryPolicy::evaluate_with_trigger_level(
+            &context,
+            QuoteView {
+                price: 11.2,
+                change_pct: 3.0,
+            },
+            Some(11.5),
+        );
+        assert_eq!(below.decision, Decision::NoDecision);
+        let above = EntryPolicy::evaluate_with_trigger_level(
+            &context,
+            QuoteView {
+                price: 11.6,
+                change_pct: 3.0,
+            },
+            Some(11.5),
+        );
+        assert_eq!(above.decision, Decision::Triggered);
     }
 
     #[test]
