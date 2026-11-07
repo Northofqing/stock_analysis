@@ -701,6 +701,111 @@ fn entry_triggered_exists(
     Ok(row.n > 0)
 }
 
+/// 6.3：盘中触发的决策证据包。best-effort，失败只告警，不影响触发记账。
+fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &TriggerHit) {
+    use crate::monitor::ticket_evidence_bundle as evidence;
+
+    let (positions, position_error) = match crate::portfolio::load_positions() {
+        Ok(positions) => (
+            positions
+                .into_iter()
+                .map(|position| (position.code.clone(), (position.shares, position.cost_price)))
+                .collect::<std::collections::HashMap<_, _>>(),
+            None,
+        ),
+        Err(error) => (std::collections::HashMap::new(), Some(error)),
+    };
+    let (portfolio, mut missing) = match &position_error {
+        Some(_) => (
+            evidence::Portfolio {
+                position_quantity: None,
+                cost_price: None,
+                market_value: None,
+                weight_pct: None,
+                source: "read_failed".to_owned(),
+            },
+            vec!["position_snapshot".to_owned()],
+        ),
+        None => match positions.get(&hit.code) {
+            Some((shares, cost)) => (
+                evidence::Portfolio {
+                    position_quantity: Some(*shares),
+                    cost_price: Some(*cost),
+                    market_value: None,
+                    weight_pct: None,
+                    source: "user_confirmed_snapshot".to_owned(),
+                },
+                Vec::new(),
+            ),
+            None => (
+                evidence::Portfolio {
+                    position_quantity: None,
+                    cost_price: None,
+                    market_value: None,
+                    weight_pct: None,
+                    source: "user_confirmed_snapshot".to_owned(),
+                },
+                Vec::new(),
+            ),
+        },
+    };
+    missing.extend([
+        "auction_price".to_owned(),
+        "raw_auction_depth".to_owned(),
+        "limit_pool_batch_id".to_owned(),
+        "official_filing".to_owned(),
+        "independent_financial_source".to_owned(),
+        "financial_statements".to_owned(),
+        "streak".to_owned(),
+        "phase".to_owned(),
+    ]);
+    let bundle = evidence::EvidenceBundle {
+        schema_version: evidence::SCHEMA_VERSION.to_owned(),
+        business_date: as_of.get(..10).unwrap_or(as_of).to_owned(),
+        code: hit.code.clone(),
+        name: hit.name.clone(),
+        ticket_id: hit.ticket_id,
+        captured_at: as_of.to_owned(),
+        level: "L1".to_owned(),
+        selection: evidence::Selection {
+            source: "intraday_trigger".to_owned(),
+            concept: None,
+            limit_pool_batch_id: None,
+            streak_raw: None,
+            recommend_price_raw: None,
+            news: Vec::new(),
+        },
+        pricing: evidence::Pricing {
+            auction_batch_id: None,
+            auction_source_at: None,
+            auction_price: None,
+            auction_pct: Some(hit.change_pct),
+            tier: None,
+            quoted_price: Some(hit.price),
+            streak: None,
+            streak_source_date: None,
+            phase: None,
+            phase_source_date: None,
+            prev_high: Some(hit.prev_high),
+            entry_low: Some(hit.entry_low),
+            entry_high: Some(hit.entry_high),
+            trigger_level: hit.trigger_level,
+            decision_id: hit.decision_id.clone(),
+        },
+        portfolio,
+        fundamentals: evidence::Fundamentals {
+            status: "unavailable".to_owned(),
+            reason: Some("financial_statements_not_fetched".to_owned()),
+        },
+        missing,
+    };
+    if let Err(error) =
+        evidence::write_bundle(std::path::Path::new("."), conn, &bundle, 3)
+    {
+        log::warn!("[证据包] 盘中触发 {} 写入失败: {error}", hit.code);
+    }
+}
+
 /// 把一次命中写进库。同日同票同动作只记一次。
 pub fn record(
     db: &DatabaseManager,
@@ -742,6 +847,8 @@ pub fn record(
             .map_err(|error| error.to_string())?;
             // 事件提交成功后再写候选行；这样失败的事务不会留下孤儿候选。
             db.record_candidate_trigger(as_of, &hit.code, &hit.name, &basis)?;
+            // 6.3：触发决策也留证据包（best-effort，不影响记账）。
+            write_trigger_evidence(&mut conn, as_of, hit);
             Ok(RecordOutcome::Recorded)
         }
         HitAction::Invalidated => {

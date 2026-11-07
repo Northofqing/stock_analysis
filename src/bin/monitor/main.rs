@@ -15518,7 +15518,7 @@ async fn auction_watch_loop() {
                                             root,
                                             &mut evidence_conn,
                                             &bundle,
-                                            1,
+                                            2,
                                         ) {
                                             Ok(_) => written += 1,
                                             Err(error) => {

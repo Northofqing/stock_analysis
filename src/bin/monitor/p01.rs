@@ -1748,6 +1748,11 @@ fn record_p01_tickets(
                         streak_source_date: None,
                         phase: None,
                         phase_source_date: None,
+                        prev_high: None,
+                        entry_low: None,
+                        entry_high: None,
+                        trigger_level: None,
+                        decision_id: None,
                     },
                     portfolio,
                     fundamentals:

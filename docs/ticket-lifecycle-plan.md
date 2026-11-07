@@ -3473,6 +3473,13 @@ operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 
 - 09:25 路径：`AuctionPriceReport` 增 `evidence_facts`（ticket_id、竞价价/涨幅、
   tier、streak/phase 及来源日期、持仓数量/成本、读取错误）；`main.rs` 在推送前
   先落包，`[证据包] 09:25 写入 N/M` 记录条数。写入失败只告警，不阻断推送。
+- 盘中触发：`ticket_entry_trigger::record` 记完 `entry_triggered` 后写
+  `source=intraday_trigger` 的包，`pricing` 带现价/涨幅/昨高/区间/触发位/decision_id，
+  `selection` 只写来源；写失败 `[证据包] 盘中触发 …` 告警。
+- `pricing` 新增 `prev_high/entry_low/entry_high/trigger_level/decision_id`；
+  非盘中路径保持 `null`，不补值。
+- 文件 occurrence 固定区分来源：P01=`01`、09:25=`02`、盘中触发=`03`，同日同票
+  不会互相覆盖。
 - P01 开盘路径：`record_p01_tickets` 开票成功后写同一 schema 的包；
   `selection` 带概念/连板/推荐价/新闻（不含 batch_id，缺项进 `missing`），
   `pricing` 全为 null 并标 `auction_price/raw_auction_depth` 缺失。

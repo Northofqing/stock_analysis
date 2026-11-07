@@ -42,6 +42,12 @@ pub struct Pricing {
     pub streak_source_date: Option<String>,
     pub phase: Option<String>,
     pub phase_source_date: Option<String>,
+    /// 盘中触发路径才有的判定价位（竞价路径为 null）。
+    pub prev_high: Option<f64>,
+    pub entry_low: Option<f64>,
+    pub entry_high: Option<f64>,
+    pub trigger_level: Option<f64>,
+    pub decision_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,6 +134,11 @@ impl EvidenceBundle {
                 streak_source_date: fact.streak_source_date.clone(),
                 phase: fact.phase.clone(),
                 phase_source_date: fact.phase_source_date.clone(),
+                prev_high: None,
+                entry_low: None,
+                entry_high: None,
+                trigger_level: None,
+                decision_id: None,
             },
             portfolio,
             fundamentals: Fundamentals {
@@ -223,6 +234,11 @@ mod tests {
                 streak_source_date: None,
                 phase: None,
                 phase_source_date: None,
+                prev_high: None,
+                entry_low: None,
+                entry_high: None,
+                trigger_level: None,
+                decision_id: None,
             },
             portfolio: Portfolio {
                 position_quantity: Some(500),
