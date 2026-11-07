@@ -3391,6 +3391,33 @@ operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 
 
 验收：已失效票次日出现次数 = 0；超时占比可用单一口径查询。
 
+#### 12.4.1 淘汰补跑与 D1 情绪豁免（2026-11-07，已部署）
+
+**淘汰补跑**（修 11-06 漏跑：17:11 停进程、22:27 才起，21:35 那班没执行）
+
+- `ticket_eviction::latest_complete_daily_date`：取最新一个 ≥800 行的日线日。
+- 文件 marker `data/ticket_eviction/<date>`（内容 `evicted=N`），成功才写；日常 21:35
+  成功也写。market_loop 盘后段按「最近完整日线日」补一次，失败不置完成位、下一轮重试。
+- **边界：`market_loop` 在非交易日直接 `continue`，补跑只在交易日盘后段执行。**
+  2026-11-07 是周六，首次补跑落在 11-09 15:40 后。
+
+**D1 情绪豁免**（批 9 第 2 项，提前落地）
+
+- 原实现只在提案层跳过 `zone.overheated` 是无效的：`buy_zone` 命中超买门时会把
+  `entry_low/entry_high` 清空，跳过门仍然拿不到价格。
+- 新增 `buy_zone::compute_with_options(..., allow_overheat)`：情绪型保留区间，
+  `trigger` 标注「情绪型豁免超买门，按区间给价」；`overheated` 仍为 true；
+  非情绪型行为不变。
+- 提案日志新增 `overheat_exempt=`，用于比较豁免前后的成交与收益。
+
+**存量核对（2026-11-07，只读）**：34 张 open_date ≤10-27 的 `entry_proposed` 全部
+趋势型；按 11-06 口径 17 张（10-26，age 11>10）到期，按 11-09 口径其余 17 张
+（10-27）到期。补跑与 21:35 各关一批，最迟 11-09 21:35 清完；不绕过淘汰规则强关。
+
+**验证**：`cargo check --lib --bin monitor` 通过；`monitor::ticket_entry_proposal` 2/2、
+`monitor::buy_zone_dispatch` 3/3、`monitor::ticket_decision` 15/15；运行根 release
+10m54s，PID 82166，11:04 启动检查 ok；二进制含「情绪型豁免超买门」「overheat_exempt」。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
