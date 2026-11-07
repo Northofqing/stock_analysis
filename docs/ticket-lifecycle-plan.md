@@ -1653,6 +1653,16 @@ first_seal_at / board_name` 与 `stock_daily` 原始日线逐票对照，确认�
 op 61 提供的是竞价终态报价，不是完整逐笔/盘口深度；无法据此验证成交概率和撤单，
 只能验证“系统拿到的竞价价是什么”。完整盘口需要新的数据源，见 11.6。
 
+**2026-11-03 状态**：已实现 `AuctionRow` 证据字段和 `write_raw`
+（`data/auction_raw/<date>.json`），主循环在推送前写原始文件，失败重试；
+`source_at` 仍按 op61 合同为 null，不伪造。待 2026-11-04 09:25 用真实回执
+验收行数、批次证据和可复算价格。
+
+**2026-11-04 补充**：新增只读 `scripts/auction_raw_replay.py`，从
+`data/auction_raw/<date>.json` 重算 `tier_for`/`quote_price`，支持
+`--code --expect-tier --expect-price` 断言；已用 001216/26.60/Bargain
+样本验证。真实文件仍待下一个交易日 09:25 生成。
+
 #### 6.8 P2：条件收益与样本外评估
 
 **目的**：回答“财报差的低开情绪票是否更差”“26.60 这类价位是否有正期望”，
@@ -3039,6 +3049,21 @@ git diff --check
   5 日门槛没有变化。P1.1 news/MoneyFlow 仍是外部数据可用性问题，
   未用旧数据填充。
 
+## 11.13 2026-11-03 21:50 P2 验收口径与部分回填
+
+- `phase_acceptance.py` 的 P2 不再用最近 5 个事件日当胜率窗口：改用最近
+  10 个**完整日线日**（>=800 行）作为成熟样本窗，只统计
+  `push_kind='EntryProposal'`；`trigger_rate` 按提案票去重，不再出现 >100%。
+- `advice_outcome_backfill` 先写 T+1/T+3，`outcome_filled_at` 保持 NULL，
+  避免 10-28 之后的数据被 T+5 观察期整体挡住；T+5 到齐后再覆盖为完整结果。
+- 21:46 手工跑 `advice_backfill --date 2026-11-03`：
+  `scanned=117 filled=0 partial=98 not_mature=117`。10-28/29/30/11-02 已写入
+  T+1（部分含 T+3）；10-27 的 T+5 仍只有 4/5 个交易日有数据，不能算完成。
+- 21:46 P2：`evaluated=165 complete=87 partial=78 pending=74`
+  `entry_t1=51/165 (30.9%, avg=-1.08%)`、`entry_t3=38/124 (30.6%, avg=-2.89%)`、
+  `trigger_rate=62.2%`。P2 显示“达标”只代表已有可用 T+1/T+3 样本，
+  **不代表 T+5 已闭环**；`partial` 行仍需等 T+5。
+
 ## 十二、下一批计划（2026-10-31，基于 10-21~10-30 一周数据）
 
 ### 12.1 本期数据基线
@@ -3151,8 +3176,8 @@ auction record fields invalid: invalid type: null, expected f64
 
 验证：`data_gateway::current_auction_observations::tests` **4 passed**，
 新增 `live_auction_accepts_null_unmatched_and_map_ratio`。
-状态：代码已提交 `58e019e0e`，**尚未部署**；今天 09:25 的终态已过窗口，
-本次修复只能保证下一个交易日 09:25-09:32 不再因该字段失败。
+状态：代码已提交 `58e019e0e`；2026-11-03 16:31 运行根 release 已包含并重启（PID 71253），
+当天 09:25 的终态已过窗口，本次修复只能保证下一个交易日 09:25-09:32 不再因该字段失败。
 
 边界：交易日判定只用「工作日」近似，没有节假日表；2026 年 11-12 月无公休，之后遇到节假日需先补日历或临时停跑。
 paper 收盘到期时间从方案里的 15:45 改到 21:45：实测 10-27/10-28/10-29 分别在 21:23/21:35/21:35 才确认（依赖当日合格日线），15:45 检查会每天误报。
@@ -3303,8 +3328,38 @@ board_rotation_pm 内 1 / 上 20 / 下 0
 单测 `breakout_rejects_chase_above_the_cap`。
 验证：`monitor::ticket_decision::tests` 15 passed；
 `monitor::ticket_entry_trigger::tests` 13 passed。
-状态：代码已提交 `4e85563e5`，**尚未部署**；等 21:30 日线/21:45 paper close
-结束后再同步运行根并重编，避免打断当日盘后任务。
+状态：代码已提交 `4e85563e5`；2026-11-03 16:31 已同步到运行根并随 release 重启（PID 71253），
+`TICKET_ENTRY_POLICY=shadow` 保持不变；次日按 shadow 差异统计，不改变用户可见触发。
+
+#### 12.3.3 A 方案：回踩区间 + 突破确认双价（2026-11-07）
+
+operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 口径）；两者都是参考价，不是成交承诺。
+
+依据（本周 11-02~11-06 实测）：79 个提案按严格口径可成交 7、半触及 5、未触及 67；
+次日开盘已在提案区间上方的 75/79；未触及者距区间上沿中位 +5.1%、P90 +14.3%。
+即「选对但买不到」是当前主矛盾，双价是让执行方式可见，不是放宽价格。
+
+实现：
+
+- `DecisionContext` 新增 `prev_high`（`#[serde(default)]`，旧 context 反序列化为 None，不改表结构）。
+- `ticket_entry_proposal`：取提案日 `stock_daily.high`（下一交易日即为昨高）写入 context 与正文
+  `｜突破确认 X.XX（站上才追）`；无日线写「突破确认缺失（无日线）」并在 `missing_fields` 记 `prev_high`，不补 0。
+  区间仍在正文最前（周报 `parse_zone` 取首个 `A-B｜`，口径不变）。
+- `buy_zone_dispatch`：明日计划新买入候选在「买点」下增加一行「突破确认：站上 X.XX 才追」。
+
+验证：`cargo check --lib` 通过；`monitor::ticket_entry_proposal` 2/2、
+`monitor::buy_zone_dispatch` 3/3、`monitor::ticket_decision` 15/15。
+
+边界：未改 `EntryPolicy` 触发位（`trigger_level` 仍是 ma5），未切 `TICKET_ENTRY_POLICY=new`。
+
+部署（2026-11-07 凌晨，operator 批准「现在部署」）：
+
+- 只同步 3 个源文件到运行根（同步前核对过运行根这三份 == `HEAD`，其余未提交改动未带入）；
+- 运行根 `cargo build --release --bin monitor` 12m29s，二进制 54,654,448 bytes（02:26）；
+- 02:27:37 kickstart，PID 24725；02:30:47 `core_database_bind=ok`（185s）、
+  02:30:48 `startup_health_check=ok`、`观测订阅已建立`；
+- `TICKET_ENTRY_POLICY=shadow` 不变；BuildIdentity 三项漂移 WARN 属预期（源码变了未更新 pin），观测不阻断；
+- 行为验证要等下一个交易日 15:40 的新提案正文出现「突破确认」。
 
 ### 12.4 批 8：状态闭环（11-05 ~ 11-06，约 2 天）
 
@@ -3312,8 +3367,9 @@ board_rotation_pm 内 1 / 上 20 / 下 0
 只保留 `entry_proposed`；`entry_triggered` / `entry_invalidated` / `entry_expired` /
 `entry_superseded` 不再以新买入候选出现在明日计划。生产库只读核对：过滤前 103 张
 （observing 10 + entry_proposed 93），过滤后 **16 张**。新增内存库单测
-`active_watch_rows_exclude_non_open_proposal_states`，2 passed。代码已提交 `16feaa48f`，
-**未部署**。
+`active_watch_rows_exclude_non_open_proposal_states`，2 passed。代码已提交 `16feaa48f`；
+生产 binary（11-02 20:11）已包含 `latest_entry` 过滤（`strings` 可见），
+但尚未完成“失效票次日出现次数=0”的交易日验收。
 
 淘汰侧已提前落地：`ticket_watch_pool` 对最近 `evicted` 且仍在冷却窗内的票跳过并记
 `skipped_cooldown` 日志，默认 5 天（`TICKET_EVICTION_COOLDOWN_DAYS` 可覆盖）；
