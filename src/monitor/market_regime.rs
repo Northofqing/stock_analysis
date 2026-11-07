@@ -318,18 +318,31 @@ pub async fn capture(db: &DatabaseManager, date: &str) -> Result<MarketSnapshot,
 
 /// 查询某日阶段（读不到返回 None，不猜）。
 pub fn phase_on(conn: &mut diesel::SqliteConnection, date: &str) -> Option<MarketPhase> {
+    phase_with_source_on(conn, date).map(|(phase, _)| phase)
+}
+
+/// 最近一份市场阶段快照：(phase, 该快照的 trade_date)。未知返回 None。
+pub fn phase_with_source_on(
+    conn: &mut diesel::SqliteConnection,
+    date: &str,
+) -> Option<(MarketPhase, String)> {
     #[derive(diesel::QueryableByName)]
     struct PhaseRow {
+        #[diesel(sql_type = Text)]
+        trade_date: String,
         #[diesel(sql_type = Text)]
         phase: String,
     }
     let row: Option<PhaseRow> = diesel::sql_query(
-        "SELECT phase FROM market_regime_daily WHERE trade_date <= ?1 ORDER BY trade_date DESC LIMIT 1",
+        "SELECT trade_date, phase FROM market_regime_daily \
+          WHERE trade_date <= ?1 ORDER BY trade_date DESC LIMIT 1",
     )
     .bind::<Text, _>(date.to_owned())
     .get_result(conn)
     .ok();
-    row.and_then(|row| MarketPhase::parse(&row.phase))
+    row.and_then(|row| {
+        MarketPhase::parse(&row.phase).map(|phase| (phase, row.trade_date))
+    })
 }
 
 /// 某票在指定日期可用的最新涨停池高度。
@@ -337,13 +350,27 @@ pub fn phase_on(conn: &mut diesel::SqliteConnection, date: &str) -> Option<Marke
 /// 09:25 时当日 15:35 的快照还不存在，因此不能只查 `trade_date = date`；
 /// 取 `<= date` 的最近一份快照，并返回 `None` 表示“未知”，调用方不得把它当成 0。
 pub fn streak_on(conn: &mut diesel::SqliteConnection, date: &str, code: &str) -> Option<u32> {
+    streak_with_source_on(conn, date, code).map(|(streak, _)| streak)
+}
+
+/// 最近一条涨停池快照：(streak, 该快照的 trade_date)。
+///
+/// 只返回 `streak` 会让调用方把「没有快照」当成 0；把来源日期一起带出来，
+/// 未知才能被显式标注（6.1）。
+pub fn streak_with_source_on(
+    conn: &mut diesel::SqliteConnection,
+    date: &str,
+    code: &str,
+) -> Option<(u32, String)> {
     #[derive(diesel::QueryableByName)]
     struct StreakRow {
+        #[diesel(sql_type = Text)]
+        trade_date: String,
         #[diesel(sql_type = Nullable<Integer>)]
         streak: Option<i32>,
     }
     let row: Option<StreakRow> = diesel::sql_query(
-        "SELECT streak FROM limit_up_pool_daily \
+        "SELECT trade_date, streak FROM limit_up_pool_daily \
           WHERE trade_date <= ?1 AND code = ?2 \
           ORDER BY trade_date DESC LIMIT 1",
     )
@@ -351,8 +378,10 @@ pub fn streak_on(conn: &mut diesel::SqliteConnection, date: &str, code: &str) ->
     .bind::<Text, _>(code)
     .get_result(conn)
     .ok();
-    row.and_then(|row| row.streak)
-        .map(|value| value.max(0) as u32)
+    row.and_then(|row| {
+        row.streak
+            .map(|value| (value.max(0) as u32, row.trade_date))
+    })
 }
 
 #[cfg(test)]

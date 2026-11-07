@@ -76,6 +76,16 @@ impl Tier {
             Tier::Bargain => "低开参考",
         }
     }
+
+    /// 证据包里的稳定键（不受文案改动影响）。
+    pub fn key(self) -> &'static str {
+        match self {
+            Tier::SkipHigh => "skip_high",
+            Tier::Light => "light",
+            Tier::EnsureFill => "ensure_fill",
+            Tier::Bargain => "bargain",
+        }
+    }
 }
 
 pub fn tier_for(auction_pct: f64) -> Tier {
@@ -113,6 +123,12 @@ pub struct PriceLine {
     pub tier: Tier,
     /// 默认只输出参考价；旧文案要显式降级。
     pub output_kind: OutputKind,
+    /// 涨停池/市场阶段快照缺失时置 true：正文写「高位状态未核实」，
+    /// 不能把未知当成「不属于高位」（6.1）。
+    pub high_state_unverified: bool,
+    /// 持仓上下文（6.4）：有底仓写「已有 N 股/成本/浮盈亏」，
+    /// 无持仓写「持仓：无」，读取失败写「读取失败」，不能省略。
+    pub position_note: String,
 }
 
 impl PriceLine {
@@ -126,41 +142,55 @@ impl PriceLine {
     }
 
     pub fn render_as(&self, kind: OutputKind) -> String {
-        match (kind, self.price) {
+        let note = if self.high_state_unverified {
+            "｜高位状态未核实"
+        } else {
+            ""
+        };
+        let base = match (kind, self.price) {
             (OutputKind::ReferencePrice, Some(price)) => format!(
-                "{} {} 竞价 {:.2}（{:+.2}%）→ 竞价参考价 {:.2}〔{}〕",
+                "{} {} 竞价 {:.2}（{:+.2}%）→ 竞价参考价 {:.2}〔{}〕{}",
                 self.code,
                 self.name,
                 self.auction_price,
                 self.auction_pct,
                 price,
-                self.tier.reference_label()
+                self.tier.reference_label(),
+                note
             ),
             (OutputKind::ReferencePrice, None) => format!(
-                "{} {} 竞价 {:.2}（{:+.2}%）→ 不给参考价〔{}〕",
+                "{} {} 竞价 {:.2}（{:+.2}%）→ 不给参考价〔{}〕{}",
                 self.code,
                 self.name,
                 self.auction_price,
                 self.auction_pct,
-                self.tier.reference_label()
+                self.tier.reference_label(),
+                note
             ),
             (OutputKind::LegacyAction, Some(price)) => format!(
-                "{} {} 竞价 {:.2}（{:+.2}%）→ 买价 {:.2}〔{}〕",
+                "{} {} 竞价 {:.2}（{:+.2}%）→ 买价 {:.2}〔{}〕{}",
                 self.code,
                 self.name,
                 self.auction_price,
                 self.auction_pct,
                 price,
-                self.tier.label()
+                self.tier.label(),
+                note
             ),
             (OutputKind::LegacyAction, None) => format!(
-                "{} {} 竞价 {:.2}（{:+.2}%）→ 不给价〔{}〕",
+                "{} {} 竞价 {:.2}（{:+.2}%）→ 不给价〔{}〕{}",
                 self.code,
                 self.name,
                 self.auction_price,
                 self.auction_pct,
-                self.tier.label()
+                self.tier.label(),
+                note
             ),
+        };
+        if self.position_note.is_empty() {
+            base
+        } else {
+            format!("{base}\n  {}", self.position_note)
         }
     }
 }
@@ -186,16 +216,39 @@ impl BoardHeat {
     }
 }
 
+/// 一条 09:25 决策的原始事实，供 6.3 证据包落盘。
+#[derive(Debug, Clone)]
+pub struct EvidenceFact {
+    pub ticket_id: i64,
+    pub code: String,
+    pub name: String,
+    pub auction_price: f64,
+    pub auction_pct: f64,
+    pub tier: String,
+    pub quoted_price: Option<f64>,
+    pub streak: Option<u32>,
+    pub streak_source_date: Option<String>,
+    pub phase: Option<String>,
+    pub phase_source_date: Option<String>,
+    pub position_quantity: Option<u64>,
+    pub cost_price: Option<f64>,
+    pub position_error: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct AuctionPriceReport {
     pub emotion: usize,
     pub quoted: Vec<PriceLine>,
     pub skipped_high: Vec<PriceLine>,
     pub no_price: usize,
+    /// 涨停池/市场阶段快照缺失的票数（高位状态未核实）。
+    pub high_state_unknown: usize,
     /// 情绪高潮期被压掉的连板票（2026-10-24）
     pub skipped_phase: Vec<PriceLine>,
     pub errors: Vec<String>,
     pub board_heat: Vec<BoardHeat>,
+    /// 每条带价决策的原始事实（6.3 证据包用）。
+    pub evidence_facts: Vec<EvidenceFact>,
 }
 
 impl AuctionPriceReport {
@@ -206,13 +259,14 @@ impl AuctionPriceReport {
             "竞价买价"
         };
         format!(
-            "[{}] emotion={} quoted={} skipped_high={} skipped_phase={} no_price={} errors={}",
+            "[{}] emotion={} quoted={} skipped_high={} skipped_phase={} no_price={} high_state_unknown={} errors={}",
             label,
             self.emotion,
             self.quoted.len(),
             self.skipped_high.len(),
             self.skipped_phase.len(),
             self.no_price,
+            self.high_state_unknown,
             self.errors.len()
         )
     }
@@ -358,6 +412,18 @@ pub fn build(
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
     let mut report = AuctionPriceReport::default();
 
+    // 6.4：持仓上下文。读取失败不能当成「无持仓」，单独写「读取失败」。
+    let (positions, positions_error) = match crate::portfolio::load_positions() {
+        Ok(positions) => (
+            positions
+                .into_iter()
+                .map(|p| (p.code.clone(), (p.shares, p.cost_price)))
+                .collect::<HashMap<_, _>>(),
+            None,
+        ),
+        Err(error) => (HashMap::new(), Some(error)),
+    };
+
     for row in rows {
         let ticket = match ticket_lifecycle::find_active_ticket(&mut conn, &row.code) {
             Ok(Some(ticket)) => ticket,
@@ -388,15 +454,47 @@ pub fn build(
         };
         // 2026-10-24：情绪高潮期不给连板 ≥4 的票定价 —— 文章说的「情绪高潮不追高」，
         // 我们这边就用市场级情绪档来压，而不是逐票拍脑袋。
-        let streak = crate::monitor::market_regime::streak_on(&mut conn, as_of, &row.code);
-        let phase = crate::monitor::market_regime::phase_on(&mut conn, as_of);
-        if streak.is_none() {
-            log::debug!(
-                "[竞价买价] {} 高位状态未核实（无 <= {} 的涨停池快照）",
+        let streak_src = crate::monitor::market_regime::streak_with_source_on(
+            &mut conn, as_of, &row.code,
+        );
+        let phase_src = crate::monitor::market_regime::phase_with_source_on(&mut conn, as_of);
+        let high_state_unverified = streak_src.is_none() || phase_src.is_none();
+        if high_state_unverified {
+            report.high_state_unknown += 1;
+            log::info!(
+                "[竞价买价] {} 高位状态未核实 streak_src={:?} phase_src={:?}",
                 row.code,
-                as_of
+                streak_src.as_ref().map(|(_, date)| date.as_str()),
+                phase_src.as_ref().map(|(_, date)| date.as_str())
+            );
+        } else {
+            log::debug!(
+                "[竞价买价] {} streak={:?} src={:?} phase={:?} src={:?}",
+                row.code,
+                streak_src.as_ref().map(|(value, _)| *value),
+                streak_src.as_ref().map(|(_, date)| date.as_str()),
+                phase_src.as_ref().map(|(value, _)| *value),
+                phase_src.as_ref().map(|(_, date)| date.as_str())
             );
         }
+        let streak = streak_src.as_ref().map(|(value, _)| *value);
+        let phase = phase_src.as_ref().map(|(value, _)| *value);
+        let position_note = match &positions_error {
+            Some(error) => format!("持仓：读取失败（{error}）"),
+            None => match positions.get(&row.code) {
+                Some((shares, cost)) if *shares > 0 => {
+                    if *cost > 0.0 {
+                        let pnl = (auction_price - cost) / cost * 100.0;
+                        format!(
+                            "持仓：已有 {shares} 股，成本 {cost:.2}，浮盈亏 {pnl:+.2}%（加仓参考）"
+                        )
+                    } else {
+                        format!("持仓：已有 {shares} 股，成本缺失（浮盈亏未算，加仓参考）")
+                    }
+                }
+                _ => "持仓：无（新买入参考）".to_string(),
+            },
+        };
         let line_for_skip = || PriceLine {
             code: row.code.clone(),
             name: row.name.clone(),
@@ -405,6 +503,8 @@ pub fn build(
             price: None,
             tier: Tier::SkipHigh,
             output_kind: OutputKind::ReferencePrice,
+            high_state_unverified,
+            position_note: position_note.clone(),
         };
         if streak.is_some_and(|value| value >= crate::monitor::market_regime::EMOTION_STREAK)
             && phase == Some(crate::monitor::market_regime::MarketPhase::Climax)
@@ -414,6 +514,22 @@ pub fn build(
         }
         let tier = tier_for(auction_pct);
         let price = quote_price(auction_price, tier);
+        report.evidence_facts.push(EvidenceFact {
+            ticket_id: ticket.id,
+            code: row.code.clone(),
+            name: row.name.clone(),
+            auction_price,
+            auction_pct,
+            tier: tier.key().to_owned(),
+            quoted_price: price,
+            streak,
+            streak_source_date: streak_src.as_ref().map(|(_, date)| date.clone()),
+            phase: phase.map(|value| value.code().to_owned()),
+            phase_source_date: phase_src.as_ref().map(|(_, date)| date.clone()),
+            position_quantity: positions.get(&row.code).map(|(shares, _)| *shares),
+            cost_price: positions.get(&row.code).map(|(_, cost)| *cost),
+            position_error: positions_error.clone(),
+        });
         let line = PriceLine {
             code: row.code.clone(),
             name: row.name.clone(),
@@ -422,6 +538,8 @@ pub fn build(
             price,
             tier,
             output_kind: OutputKind::ReferencePrice,
+            high_state_unverified,
+            position_note,
         };
         match tier {
             Tier::SkipHigh => report.skipped_high.push(line),
@@ -472,6 +590,8 @@ mod tests {
                 price: Some(10.0),
                 tier: Tier::Light,
                 output_kind: OutputKind::ReferencePrice,
+                high_state_unverified: false,
+                position_note: "持仓：无（新买入参考）".to_string(),
             }],
             ..Default::default()
         };
@@ -491,6 +611,8 @@ mod tests {
             price: Some(22.78),
             tier: Tier::Bargain,
             output_kind: OutputKind::ReferencePrice,
+            high_state_unverified: false,
+            position_note: "持仓：无（新买入参考）".to_string(),
         };
         let text = line.render_as(OutputKind::ReferencePrice);
         assert!(text.contains("竞价参考价"));
@@ -498,6 +620,24 @@ mod tests {
         assert!(!text.contains("保成交"));
         assert!(!text.contains("保证成交"));
         assert!(!text.contains("可执行"));
+    }
+
+    #[test]
+    fn unverified_high_state_is_visible_in_text() {
+        let line = PriceLine {
+            code: "001216".to_string(),
+            name: "华瓷股份".to_string(),
+            auction_price: 22.78,
+            auction_pct: -5.41,
+            price: Some(22.78),
+            tier: Tier::Bargain,
+            output_kind: OutputKind::ReferencePrice,
+            high_state_unverified: true,
+            position_note: "持仓：已有 500 股，成本 26.61，浮盈亏 -4.9%（加仓参考）".to_string(),
+        };
+        let text = line.render_as(OutputKind::ReferencePrice);
+        assert!(text.contains("高位状态未核实"));
+        assert!(text.contains("持仓：已有 500 股"));
     }
 
     #[test]

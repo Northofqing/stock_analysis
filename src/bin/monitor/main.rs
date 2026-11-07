@@ -15501,6 +15501,40 @@ async fn auction_watch_loop() {
                         for error in &report.errors {
                             log::warn!("[竞价买价] {error}");
                         }
+                        // 6.3：先落证据包，再推送——推送失败也要能追溯当次决策。
+                        if !report.evidence_facts.is_empty() {
+                            match db.get_conn() {
+                                Ok(mut evidence_conn) => {
+                                    let root = std::path::Path::new(".");
+                                    let captured_at = chrono::Local::now().to_rfc3339();
+                                    let mut written = 0usize;
+                                    for fact in &report.evidence_facts {
+                                        let bundle = stock_analysis::monitor::ticket_evidence_bundle::EvidenceBundle::for_auction(
+                                            &date_text,
+                                            &captured_at,
+                                            fact,
+                                        );
+                                        match stock_analysis::monitor::ticket_evidence_bundle::write_bundle(
+                                            root,
+                                            &mut evidence_conn,
+                                            &bundle,
+                                            1,
+                                        ) {
+                                            Ok(_) => written += 1,
+                                            Err(error) => {
+                                                log::warn!("[证据包] {} 写入失败: {error}", fact.code)
+                                            }
+                                        }
+                                    }
+                                    log::info!(
+                                        "[证据包] 09:25 写入 {}/{}",
+                                        written,
+                                        report.evidence_facts.len()
+                                    );
+                                }
+                                Err(error) => log::warn!("[证据包] 取连接失败: {error}"),
+                            }
+                        }
                         match report.render(&date_text) {
                             Some(text) => {
                                 if crate::notify::push_wechat(&text).await {

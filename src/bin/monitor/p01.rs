@@ -1617,6 +1617,17 @@ fn record_p01_tickets(
     };
     let open_date = context.business_date.format("%Y-%m-%d").to_string();
     let event_at = observed_at.to_rfc3339();
+    // 6.3：持仓上下文与 09:25 同一口径；读取失败不降级成「无持仓」。
+    let (positions, positions_error) = match stock_analysis::portfolio::load_positions() {
+        Ok(positions) => (
+            positions
+                .into_iter()
+                .map(|position| (position.code.clone(), (position.shares, position.cost_price)))
+                .collect::<std::collections::HashMap<_, _>>(),
+            None,
+        ),
+        Err(error) => (std::collections::HashMap::new(), Some(error)),
+    };
     for head in heads {
         let note = format!(
             "P01盘前热点（依据 {}）｜{}｜推荐价 {:?}｜连板 {:?}｜封单 {:?}｜换手 {:?}｜炸板 {:?}",
@@ -1654,6 +1665,108 @@ fn record_p01_tickets(
                     head.name,
                     head.recommend_price
                 );
+                // 6.3：开票即写证据包（盘前无竞价价，pricing 全为 null）。
+                let (portfolio, mut missing) = match &positions_error {
+                    Some(_) => (
+                        stock_analysis::monitor::ticket_evidence_bundle::Portfolio {
+                            position_quantity: None,
+                            cost_price: None,
+                            market_value: None,
+                            weight_pct: None,
+                            source: "read_failed".to_owned(),
+                        },
+                        vec!["position_snapshot".to_owned()],
+                    ),
+                    None => match positions.get(&head.code) {
+                        Some((shares, cost)) => (
+                            stock_analysis::monitor::ticket_evidence_bundle::Portfolio {
+                                position_quantity: Some(*shares),
+                                cost_price: Some(*cost),
+                                market_value: None,
+                                weight_pct: None,
+                                source: "user_confirmed_snapshot".to_owned(),
+                            },
+                            Vec::new(),
+                        ),
+                        None => (
+                            stock_analysis::monitor::ticket_evidence_bundle::Portfolio {
+                                position_quantity: None,
+                                cost_price: None,
+                                market_value: None,
+                                weight_pct: None,
+                                source: "user_confirmed_snapshot".to_owned(),
+                            },
+                            Vec::new(),
+                        ),
+                    },
+                };
+                missing.extend([
+                    "auction_price".to_owned(),
+                    "raw_auction_depth".to_owned(),
+                    "limit_pool_batch_id".to_owned(),
+                    "official_filing".to_owned(),
+                    "independent_financial_source".to_owned(),
+                    "financial_statements".to_owned(),
+                ]);
+                let bundle = stock_analysis::monitor::ticket_evidence_bundle::EvidenceBundle {
+                    schema_version:
+                        stock_analysis::monitor::ticket_evidence_bundle::SCHEMA_VERSION
+                            .to_owned(),
+                    business_date: open_date.clone(),
+                    code: head.code.clone(),
+                    name: head.name.clone(),
+                    ticket_id,
+                    captured_at: event_at.clone(),
+                    level: "L1".to_owned(),
+                    selection: stock_analysis::monitor::ticket_evidence_bundle::Selection {
+                        source: "p01_preopen".to_owned(),
+                        concept: Some(head.concept.clone()),
+                        limit_pool_batch_id: None,
+                        streak_raw: head.streak,
+                        recommend_price_raw: head.recommend_price,
+                        news: head
+                            .news
+                            .iter()
+                            .map(|news| {
+                                serde_json::json!({
+                                    "title": news.title,
+                                    "source_name": news.source_name,
+                                    "published_at": news.published_at.to_rfc3339(),
+                                    "canonical_url": null,
+                                })
+                            })
+                            .collect(),
+                    },
+                    pricing: stock_analysis::monitor::ticket_evidence_bundle::Pricing {
+                        auction_batch_id: None,
+                        auction_source_at: None,
+                        auction_price: None,
+                        auction_pct: None,
+                        tier: None,
+                        quoted_price: None,
+                        streak: None,
+                        streak_source_date: None,
+                        phase: None,
+                        phase_source_date: None,
+                    },
+                    portfolio,
+                    fundamentals:
+                        stock_analysis::monitor::ticket_evidence_bundle::Fundamentals {
+                            status: "unavailable".to_owned(),
+                            reason: Some("financial_statements_not_fetched".to_owned()),
+                        },
+                    missing,
+                };
+                if let Err(error) =
+                    stock_analysis::monitor::ticket_evidence_bundle::write_bundle(
+                        std::path::Path::new("."),
+                        &mut conn,
+                        &bundle,
+                        1,
+                    )
+                {
+                    log::warn!("[P-01][evidence] {} 写证据包失败: {error}", head.code);
+                }
             }
             Err(error) => log::warn!("[P-01][bookkeeping] {} 开票失败: {error}", head.code),
         }

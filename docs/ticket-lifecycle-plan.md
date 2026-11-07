@@ -3437,6 +3437,50 @@ operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 
 `monitor::buy_zone_dispatch` 3/3、`monitor::ticket_decision` 15/15；运行根 release
 10m54s，PID 82166，11:04 启动检查 ok；二进制含「情绪型豁免超买门」「overheat_exempt」。
 
+### 12.4.2 6.1 高位状态来源标注 + 6.4 持仓上下文（2026-11-07）
+
+**问题**：`streak_on`/`phase_on` 只返回 `Option`，查不到时调用方按 0/None 继续，
+正文看不出「高位状态未核实」；09:25 竞价推送只有价格，没有「已有底仓/成本/浮亏」，
+华瓷股份那类「加仓被当成新买」的风险仍在。
+
+**实现**：
+
+- `market_regime.rs` 新增 `streak_with_source_on` / `phase_with_source_on`，返回
+  `(值, 快照 trade_date)`；`streak_on`/`phase_on` 保留为薄包装，其它调用方不受影响。
+- `ticket_auction_price.rs`：`PriceLine` 增 `high_state_unverified` 与 `position_note`；
+  任一快照缺失时正文追加「｜高位状态未核实」，日志记来源日期
+  （`streak_src=… phase_src=…`），报告汇总新增 `high_state_unknown=`。
+- 持仓上下文在 `build()` 开头一次 `portfolio::load_positions()`；有底仓写
+  「持仓：已有 N 股，成本 X，浮盈亏 ±Y%（加仓参考）」，无持仓写「持仓：无（新买入参考）」，
+  读取失败写「持仓：读取失败（原因）」，不把失败降级成「无持仓」。
+
+**验证**：`cargo check --lib --bin monitor` 通过；`monitor::ticket_auction_price` 7/7
+（含 `unverified_high_state_is_visible_in_text`）、`monitor::market_regime` 5/5。
+
+### 12.4.3 6.3 决策时证据包（2026-11-07）
+
+**边界**：与 `ticket_evidence.rs`（事后只读审计包）分开，新建
+`ticket_evidence_bundle.rs` 只写「当次决策看到了什么」，不重算、不补缺失。
+
+**实现**：
+
+- JSON：`data/ticket_evidence/<business_date>/<code>-01.json`，schema
+  `ticket-evidence-v1`，字段按 6.3 最小集：`selection / pricing / portfolio /
+  fundamentals / missing`；未知保留 `null`，不写 0。
+- 索引：每次写文件后追加 `ticket_event(kind='evidence_bundle')`，
+  summary 为 `path|sha256|level=L1|missing=...`，`occurrence_identity` 按
+  `evidence:<date>:<code>:01` 幂等。
+- 09:25 路径：`AuctionPriceReport` 增 `evidence_facts`（ticket_id、竞价价/涨幅、
+  tier、streak/phase 及来源日期、持仓数量/成本、读取错误）；`main.rs` 在推送前
+  先落包，`[证据包] 09:25 写入 N/M` 记录条数。写入失败只告警，不阻断推送。
+- P01 开盘路径：`record_p01_tickets` 开票成功后写同一 schema 的包；
+  `selection` 带概念/连板/推荐价/新闻（不含 batch_id，缺项进 `missing`），
+  `pricing` 全为 null 并标 `auction_price/raw_auction_depth` 缺失。
+- 写入失败只告警（`[P-01][evidence]` / `[证据包]`），不阻断已完成的推送。
+
+**验证**：`cargo check --lib --bin monitor` 通过；`monitor::ticket_evidence_bundle`
+单测见部署记录。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
