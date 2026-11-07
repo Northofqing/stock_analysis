@@ -3491,9 +3491,12 @@ operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 
 
 **部署**：2026-11-07 21:34 运行根 release 构建 13m28s；21:48:49 kickstart，PID 56541；
 21:50:55 `startup_health_check=ok`；二进制含「高位状态未核实」「持仓：读取失败」及
-`ticket_evidence_bundle::write_bundle` 符号。**待验证**：`持仓：无（新买入参考）` 字面量
-在 rlib 中存在、最终二进制里 grep 不到（`（加仓参考）` 在），周一 09:25 看实际输出确认
-无持仓分支是否正常；若缺行，按 6.4 回归处理。
+`ticket_evidence_bundle::write_bundle` 符号。说明：短字符串会被 rustc 拆进指令立即数，
+`grep` 二进制找不到某条文案不等于代码缺失（`持仓：无（新买入参考）` 属此情况，
+rlib 与单测均正常），最终以 09:25 实际输出为准。
+
+盘中证据包增量：2026-11-08 00:18 release 构建 13m56s；00:19 kickstart，PID 77075；
+00:21:02 `startup_health_check=ok`。
 
 ### 12.4.4 6.2 streak 语义探针（2026-11-07）
 
