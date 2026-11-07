@@ -12552,6 +12552,7 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                 ) {
                                     Ok(report) => {
                                         report.log();
+                                        write_evict_marker(&date_text, report.evicted.len());
                                         *EVICT_LAST
                                             .lock()
                                             .unwrap_or_else(|e| e.into_inner()) =
@@ -12559,6 +12560,52 @@ async fn monitor_loop(paper_scans: &PaperScanSession) {
                                     }
                                     Err(error) => log::warn!(
                                         "[观察淘汰] 失败, 保留重试 date={date_text}: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+
+                    // 淘汰补跑（2026-11-07）：进程在 21:35 前后停摆/重启时，当天那次
+                    // 淘汰不会执行（11-06：17:11 停进程、22:27 才起，34 张票超期未出池）。
+                    // 启动后按「最近完整日线日」补一次；marker 判重，成功才写。
+                    {
+                        static EVICT_CATCHUP_DONE: std::sync::Mutex<bool> =
+                            std::sync::Mutex::new(false);
+                        let done = *EVICT_CATCHUP_DONE
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if !done {
+                            if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+                                match stock_analysis::monitor::ticket_eviction::latest_complete_daily_date(&db, 800) {
+                                    Ok(Some(target_date)) => {
+                                        let marker = std::path::Path::new("data/ticket_eviction").join(&target_date);
+                                        if marker.is_file() {
+                                            *EVICT_CATCHUP_DONE
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) = true;
+                                        } else {
+                                            match stock_analysis::monitor::ticket_eviction::evict_stale_observations(&db, &target_date) {
+                                                Ok(report) => {
+                                                    report.log();
+                                                    write_evict_marker(&target_date, report.evicted.len());
+                                                    *EVICT_CATCHUP_DONE
+                                                        .lock()
+                                                        .unwrap_or_else(|e| e.into_inner()) = true;
+                                                }
+                                                Err(error) => log::warn!(
+                                                    "[观察淘汰][补跑] 失败, 下一轮重试 date={target_date}: {error}"
+                                                ),
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        *EVICT_CATCHUP_DONE
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) = true;
+                                    }
+                                    Err(error) => log::warn!(
+                                        "[观察淘汰][补跑] 最近完整日线日查询失败: {error}"
                                     ),
                                 }
                             }
@@ -15389,8 +15436,21 @@ async fn post_close_news_review() {
 /// 用陈旧值算"日内涨跌幅"会误报。
 /// 观察池竞价观测（2026-10-18）：每个交易日 09:25-09:32 拉一次竞价终态。
 ///
+/// 淘汰完成 marker（`data/ticket_eviction/<date>`）：跨进程判重，也是补跑依据。
+fn write_evict_marker(date: &str, evicted: usize) {
+    let marker = std::path::Path::new("data/ticket_eviction").join(date);
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = std::fs::write(&marker, format!("evicted={evicted}\n")) {
+        log::warn!("[观察淘汰] marker 写入失败 date={date}: {error}");
+    }
+}
+
 /// 为什么不常驻拉：竞价只有一个终态（09:25 撮合完成），
 /// 拉一次就够。`done_for` 保证当天只拉一次，失败才重试。
+/// 2026-11-04：09:25 批量回执可能瞬时 invalid，09:32 后延长到 09:45
+/// 只补写原始证据，不再补推 P-02（P-02 仍在 09:32 前结束）。
 async fn auction_watch_loop() {
     let mut done_for: Option<chrono::NaiveDate> = None;
     loop {
@@ -15403,10 +15463,11 @@ async fn auction_watch_loop() {
         }
         let time = now.time();
         if time < chrono::NaiveTime::from_hms_opt(9, 25, 0).unwrap()
-            || time > chrono::NaiveTime::from_hms_opt(9, 32, 0).unwrap()
+            || time > chrono::NaiveTime::from_hms_opt(9, 45, 0).unwrap()
         {
             continue;
         }
+        let raw_only = time > chrono::NaiveTime::from_hms_opt(9, 32, 0).unwrap();
 
         let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
             continue;
@@ -15414,13 +15475,25 @@ async fn auction_watch_loop() {
 
         match stock_analysis::monitor::auction_watch::observe(&db).await {
             Ok(rows) => {
-                log::info!("[竞价观察] 标的={} 竞价终态", rows.len());
+                let date_text = today.format("%Y-%m-%d").to_string();
+                log::info!("[竞价观察] 标的={} 竞价终态 raw_only={raw_only}", rows.len());
                 for row in &rows {
                     log::info!("[竞价观察] {}", row.render());
                 }
+                // 先把原始回执落盘；失败不写 marker，下一轮重试。
+                if let Err(error) =
+                    stock_analysis::monitor::auction_watch::write_raw(&date_text, &rows)
+                {
+                    log::warn!("[竞价原始] 写入失败, 下一轮重试: {error}");
+                    continue;
+                }
+                if raw_only {
+                    log::info!("[竞价原始] 09:32 后只补原始归档，不补推 P-02");
+                    done_for = Some(today);
+                    continue;
+                }
                 // 批 1.3（2026-10-23）：情绪型票给竞价买价，趋势型仍走 ma 回踩。
                 // 与竞价观察共用同一批 rows，不额外拉一次 op 61。
-                let date_text = today.format("%Y-%m-%d").to_string();
                 let price_marker = std::path::Path::new("data/auction_price").join(&date_text);
                 match stock_analysis::monitor::ticket_auction_price::build(&db, &date_text, &rows) {
                     Ok(report) => {

@@ -172,10 +172,24 @@ fn name_from_f10(conn: &mut SqliteConnection, code: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// 买点计算（默认保留超买门）。
 pub fn compute(
     conn: &mut SqliteConnection,
     code: &str,
     as_of: &str,
+) -> Result<Option<BuyZone>, String> {
+    compute_with_options(conn, code, as_of, false)
+}
+
+/// 买点计算，可指定是否豁免超买门。
+///
+/// `allow_overheat` 只给情绪型票用（D1，2026-11-07）：超买门命中时不清空
+/// `entry_low/entry_high`，仍按趋势分支给区间；`overheated` 标记保留，便于计数。
+pub fn compute_with_options(
+    conn: &mut SqliteConnection,
+    code: &str,
+    as_of: &str,
+    allow_overheat: bool,
 ) -> Result<Option<BuyZone>, String> {
     #[derive(QueryableByName)]
     struct BarRow {
@@ -371,12 +385,17 @@ pub fn compute(
         }
     }
 
-    // 三道超买门任一命中：覆盖 trend 分支给出的买点
+    // 三道超买门任一命中：覆盖 trend 分支给出的买点。
+    // 情绪型（D1，2026-11-07）豁免：保留区间，只在 trigger 说明；overheated 仍为 true。
     if let Some(reason) = overheat.as_deref() {
-        entry_low = None;
-        entry_high = None;
-        at_support = false;
-        trigger = format!("{reason}，不参与；等回踩或开板后再看");
+        if allow_overheat {
+            trigger = format!("{reason}（情绪型豁免超买门，按区间给价）");
+        } else {
+            entry_low = None;
+            entry_high = None;
+            at_support = false;
+            trigger = format!("{reason}，不参与；等回踩或开板后再看");
+        }
     }
 
     // 跌停价是理论底：放弃价不应低于它（否则永远触发不了），只作下限提示

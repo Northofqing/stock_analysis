@@ -48,6 +48,8 @@ pub struct ProposalReport {
     pub scanned: usize,
     pub proposed: Vec<String>,
     pub skipped_overheat: Vec<String>,
+    /// 情绪型票命中超买门但按 D1 豁免（2026-11-07）：不再直接跳过。
+    pub exempt_overheat: Vec<String>,
     pub skipped_at_support: Vec<String>,
     pub skipped_no_data: Vec<String>,
     /// 连板 ≥4 的情绪段票：不给 ma 回踩价（2026-10-24）
@@ -60,10 +62,11 @@ pub struct ProposalReport {
 impl ProposalReport {
     pub fn summary_line(&self) -> String {
         format!(
-            "[入场参考] scanned={} proposed={} overheated={} at_support={} no_data={} emotion_phase={} duplicate={} superseded={} errors={}",
+            "[入场参考] scanned={} proposed={} overheated={} overheat_exempt={} at_support={} no_data={} emotion_phase={} duplicate={} superseded={} errors={}",
             self.scanned,
             self.proposed.len(),
             self.skipped_overheat.len(),
+            self.exempt_overheat.len(),
             self.skipped_at_support.len(),
             self.skipped_no_data.len(),
             self.skipped_emotion_phase.len(),
@@ -329,7 +332,20 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             continue;
         }
 
-        let zone = match buy_zone::compute(&mut conn, code, as_of) {
+        // 分型要先于买点计算（2026-11-07，D1）：情绪型豁免超买门，需要把
+        // allow_overheat 传给 buy_zone —— overheat 命中时它会清空 entry_low/high，
+        // 只在提案层跳过门是拿不到价格的。resolve 只读，不写事件。
+        let (regime, regime_label) =
+            match ticket_regime::resolve(&mut conn, ticket.id, code, &ticket.source, as_of) {
+                Ok(decision) => (Some(decision.regime), decision.regime.as_str().to_owned()),
+                Err(error) => {
+                    report.errors.push(format!("{code} 分型失败: {error}"));
+                    (None, "unknown".to_owned())
+                }
+            };
+        let allow_overheat = regime == Some(Regime::Emotion);
+
+        let zone = match buy_zone::compute_with_options(&mut conn, code, as_of, allow_overheat) {
             Ok(Some(zone)) => zone,
             Ok(None) => {
                 report.skipped_no_data.push(code.to_string());
@@ -343,10 +359,21 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
 
         // 超买：连板 / 近 5 日涨幅过大 / 偏离 ma5 过多。这类票不是「没数据」，
         // 是明确不建议追，分开计数便于盘后复盘。
+        // 情绪型按 D1 豁免（不再跳过），但单独计数，便于比较豁免前后的成交与收益。
         if zone.overheated {
-            report.skipped_overheat.push(code.to_string());
-            continue;
+            if allow_overheat {
+                report.exempt_overheat.push(code.to_string());
+            } else {
+                report.skipped_overheat.push(code.to_string());
+                continue;
+            }
         }
+
+        let entry_mode = match regime {
+            Some(value) => ticket_decision::entry_mode_for(value, zone.trend, &ticket.source),
+            None => EntryMode::Unknown,
+        };
+        let valid_until = regime.and_then(|value| valid_until_for(as_of, value));
         if zone.at_support {
             report.skipped_at_support.push(code.to_string());
             continue;
@@ -390,19 +417,6 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
                 continue;
             }
         }
-
-        let (regime_label, entry_mode, valid_until) =
-            match ticket_regime::resolve(&mut conn, ticket.id, code, &ticket.source, as_of) {
-                Ok(decision) => (
-                    decision.regime.as_str().to_owned(),
-                    ticket_decision::entry_mode_for(decision.regime, zone.trend, &ticket.source),
-                    valid_until_for(as_of, decision.regime),
-                ),
-                Err(error) => {
-                    report.errors.push(format!("{code} 分型失败: {error}"));
-                    ("unknown".to_owned(), EntryMode::Unknown, None)
-                }
-            };
 
         let previous_context = if shadow {
             match ticket_decision::latest_open_proposal(&mut conn, ticket.id) {

@@ -23,12 +23,36 @@
 
 use chrono::NaiveDate;
 use diesel::prelude::*;
-use diesel::sql_types::{Double, Nullable, Text};
+use diesel::sql_types::{BigInt, Double, Nullable, Text};
 
 use crate::database::{ticket_lifecycle, DatabaseManager};
 use crate::monitor::ticket_regime;
 
 const MAX_DRAWDOWN_FROM_ENTRY: f64 = 0.15;
+
+/// 最近一个「完整日线」交易日（行数 >= `min_rows`）。
+///
+/// 淘汰补跑用它选日期：进程停摆错过 21:35 后，仍能按最近完整日线日补一次，
+/// 而不是依赖进程内 static（2026-11-06 就是这样漏了一批超期票）。
+pub fn latest_complete_daily_date(
+    db: &DatabaseManager,
+    min_rows: i64,
+) -> Result<Option<String>, String> {
+    #[derive(QueryableByName)]
+    struct DateRow {
+        #[diesel(sql_type = Text)]
+        date: String,
+    }
+    let mut conn = db.get_conn().map_err(|error| error.to_string())?;
+    let rows: Vec<DateRow> = diesel::sql_query(
+        "SELECT date FROM stock_daily GROUP BY date HAVING COUNT(*) >= ?1 \
+         ORDER BY date DESC LIMIT 1",
+    )
+    .bind::<BigInt, _>(min_rows)
+    .load(&mut conn)
+    .map_err(|error| format!("最近完整日线日查询失败: {error}"))?;
+    Ok(rows.into_iter().next().map(|row| row.date))
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct EvictReport {
