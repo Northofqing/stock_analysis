@@ -3479,7 +3479,14 @@ operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 
 - 写入失败只告警（`[P-01][evidence]` / `[证据包]`），不阻断已完成的推送。
 
 **验证**：`cargo check --lib --bin monitor` 通过；`monitor::ticket_evidence_bundle`
-单测见部署记录。
+1/1（未知字段保持 `null`，持仓 500 股正确落盘）；`monitor::ticket_auction_price` 7/7、
+`monitor::market_regime` 5/5。
+
+**部署**：2026-11-07 21:34 运行根 release 构建 13m28s；21:48:49 kickstart，PID 56541；
+21:50:55 `startup_health_check=ok`；二进制含「高位状态未核实」「持仓：读取失败」及
+`ticket_evidence_bundle::write_bundle` 符号。**待验证**：`持仓：无（新买入参考）` 字面量
+在 rlib 中存在、最终二进制里 grep 不到（`（加仓参考）` 在），周一 09:25 看实际输出确认
+无持仓分支是否正常；若缺行，按 6.4 回归处理。
 
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
