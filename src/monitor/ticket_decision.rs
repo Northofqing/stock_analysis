@@ -214,6 +214,10 @@ pub struct DecisionContext {
     pub price_low: Option<f64>,
     pub price_high: Option<f64>,
     pub trigger_level: Option<f64>,
+    /// 提案日的日线最高价，即下一交易日的「昨高」。只作为突破确认参考价，
+    /// 不参与 Pullback 判定；旧 context 没有该字段，反序列化为 None。
+    #[serde(default)]
+    pub prev_high: Option<f64>,
     pub abandon: Option<f64>,
     pub confirmation: String,
     pub valid_from: Option<String>,
@@ -255,6 +259,7 @@ impl DecisionContext {
             price_low: None,
             price_high: None,
             trigger_level: None,
+            prev_high: None,
             abandon: None,
             confirmation: "price_only".to_owned(),
             valid_from: None,

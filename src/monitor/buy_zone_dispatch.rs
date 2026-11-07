@@ -41,6 +41,38 @@ pub struct PlanRow {
     pub label: String,
     pub zone: buy_zone::BuyZone,
     pub advice: position_sizing::SizingAdvice,
+    /// 提案日（= 次日「昨高」）的最高价；只用于突破确认参考，缺失就不写。
+    pub prev_high: Option<f64>,
+}
+
+/// 突破确认行的文案。两个价格是两种执行方式：买点是回踩区间，
+/// 突破确认是站上昨高才追；缺失时明写缺失，不用 0 代替（BR-222）。
+fn breakout_confirmation_line(prev_high: Option<f64>) -> String {
+    match prev_high {
+        Some(value) => format!("  突破确认：站上 {value:.2} 才追"),
+        None => "  突破确认：缺失（无日线）".to_string(),
+    }
+}
+
+/// 截至 `as_of` 的最后一根日线最高价；下一交易日触发时它就是「昨高」。
+fn prev_high_on_or_before(conn: &mut SqliteConnection, code: &str, as_of: &str) -> Option<f64> {
+    #[derive(QueryableByName)]
+    struct HighRow {
+        #[diesel(sql_type = Nullable<Double>)]
+        high: Option<f64>,
+    }
+    diesel::sql_query(
+        "SELECT high FROM stock_daily \
+          WHERE code = ?1 AND date <= ?2 AND high IS NOT NULL \
+          ORDER BY date DESC LIMIT 1",
+    )
+    .bind::<Text, _>(code)
+    .bind::<Text, _>(as_of)
+    .get_result::<HighRow>(conn)
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|row| row.high)
 }
 
 impl PlanRow {
@@ -56,7 +88,10 @@ impl PlanRow {
         lines.push(format!("  位置：{} · {}", self.zone.trend.label(), ma_text));
 
         match (self.zone.entry_low, self.zone.entry_high) {
-            (Some(low), Some(high)) => lines.push(format!("  买点：{low}-{high}")),
+            (Some(low), Some(high)) => {
+                lines.push(format!("  买点：{low}-{high}"));
+                lines.push(breakout_confirmation_line(self.prev_high));
+            }
             _ if self.zone.overheated => {
                 lines.push("  买点：不给（超买/异动，不参与）".to_string())
             }
@@ -588,11 +623,13 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
                     }
                     let advice = position_sizing::advise(&zone.display_name(), &zone);
                     let label = zone.display_name();
+                    let prev_high = prev_high_on_or_before(&mut conn, code, as_of);
                     rows.push(PlanRow {
                         code: code.clone(),
                         label,
                         zone,
                         advice,
+                        prev_high,
                     });
                     let _ = source;
                 }
@@ -775,6 +812,13 @@ pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breakout_confirmation_line_marks_missing_without_zero() {
+        assert!(breakout_confirmation_line(Some(13.88)).contains("站上 13.88"));
+        assert!(breakout_confirmation_line(None).contains("缺失"));
+        assert!(!breakout_confirmation_line(None).contains("0.00"));
+    }
 
     #[test]
     fn empty_pool_returns_message_not_error() {

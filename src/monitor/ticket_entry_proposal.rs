@@ -18,7 +18,7 @@
 //! - 单票失败不影响其余票：错误进 `errors`，继续下一只。
 
 use chrono::NaiveDate;
-use diesel::sql_types::{BigInt, Nullable, Text};
+use diesel::sql_types::{BigInt, Double, Nullable, Text};
 use diesel::OptionalExtension;
 use diesel::{QueryableByName, RunQueryDsl, SqliteConnection};
 
@@ -234,6 +234,55 @@ fn already_proposed_today(
     Ok(row.n > 0)
 }
 
+/// 提案日的日线最高价：下一交易日触发时它就是「昨高」。
+///
+/// 取 `date <= as_of` 的最后一根：15:40 提案时当日日线已落库，21:30 后补跑同理。
+/// 没有日线返回 None，不补值（BR-222）。
+fn prev_high_for_proposal(
+    conn: &mut SqliteConnection,
+    code: &str,
+    as_of: &str,
+) -> Result<Option<f64>, String> {
+    #[derive(QueryableByName)]
+    struct HighRow {
+        #[diesel(sql_type = Nullable<Double>)]
+        high: Option<f64>,
+    }
+    let row = diesel::sql_query(
+        "SELECT high FROM stock_daily \
+          WHERE code = ?1 AND date <= ?2 AND high IS NOT NULL \
+          ORDER BY date DESC LIMIT 1",
+    )
+    .bind::<Text, _>(code)
+    .bind::<Text, _>(as_of)
+    .get_result::<HighRow>(conn)
+    .optional()
+    .map_err(|error| format!("昨高查询失败 ({code}): {error}"))?;
+    Ok(row.and_then(|row| row.high))
+}
+
+/// 入场参考正文：回踩区间 + 理由 + 放弃价 + 突破确认价（昨高）。
+///
+/// 两个价格是两种执行方式，不能混成一个：区间是回踩才买，突破确认是站上昨高才追。
+/// 区间必须在最前面——周报按 `A-B｜…` 解析可成交率。
+fn proposal_summary(
+    low: f64,
+    high: f64,
+    trigger: &str,
+    abandon: Option<f64>,
+    prev_high: Option<f64>,
+) -> String {
+    let mut summary = format!(
+        "{low:.2}-{high:.2}｜{trigger}｜放弃 {:.2}",
+        abandon.unwrap_or(0.0)
+    );
+    match prev_high {
+        Some(value) => summary.push_str(&format!("｜突破确认 {value:.2}（站上才追）")),
+        None => summary.push_str("｜突破确认缺失（无日线）"),
+    }
+    summary
+}
+
 /// 给所有 `observing` 的票算一次入场参考。
 ///
 /// `as_of` 必须是交易日（`YYYY-MM-DD`），盘后调度传当天日期。
@@ -322,6 +371,14 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             }
         };
 
+        let prev_high = match prev_high_for_proposal(&mut conn, code, as_of) {
+            Ok(value) => value,
+            Err(error) => {
+                report.errors.push(format!("{code} {error}"));
+                None
+            }
+        };
+
         match already_proposed_today(&mut conn, ticket.id, as_of) {
             Ok(true) => {
                 report.skipped_duplicate += 1;
@@ -372,6 +429,7 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
         context.price_low = Some(low);
         context.price_high = Some(high);
         context.trigger_level = zone.ma5;
+        context.prev_high = prev_high;
         context.abandon = zone.abandon;
         context.confirmation = "price_only".to_owned();
         context.valid_from = Some(as_of.to_owned());
@@ -379,6 +437,9 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
         context.source_health = source_health.clone();
         context.evidence_grade = EvidenceGrade::L1;
         context.missing_fields.push("volume_ratio".to_owned());
+        if prev_high.is_none() {
+            context.missing_fields.push("prev_high".to_owned());
+        }
         context.selection = selection;
         context.extension = extension;
         if selection_error.is_some() {
@@ -434,11 +495,7 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
             }
         }
 
-        let summary = format!(
-            "{low:.2}-{high:.2}｜{}｜放弃 {:.2}",
-            zone.trigger,
-            zone.abandon.unwrap_or(0.0)
-        );
+        let summary = proposal_summary(low, high, &zone.trigger, zone.abandon, prev_high);
 
         if let Err(error) = ticket_lifecycle::append_event(
             &mut conn,
@@ -482,4 +539,31 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proposal_summary;
+
+    #[test]
+    fn proposal_summary_keeps_range_first_and_adds_breakout_price() {
+        let text = proposal_summary(
+            12.99,
+            13.25,
+            "回踩 ma10 13.12 附近可买；确认条件：量比>1.2",
+            Some(11.90),
+            Some(13.88),
+        );
+        // 周报按 `A-B｜…` 解析可成交率，区间必须在最前面
+        assert!(text.starts_with("12.99-13.25｜"));
+        assert!(text.contains("突破确认 13.88（站上才追）"));
+        assert!(text.contains("放弃 11.90"));
+    }
+
+    #[test]
+    fn proposal_summary_marks_missing_prev_high_instead_of_zero() {
+        let text = proposal_summary(10.0, 10.2, "回踩 ma10", Some(9.5), None);
+        assert!(text.contains("突破确认缺失（无日线）"));
+        assert!(!text.contains("突破确认 0.00"));
+    }
 }
