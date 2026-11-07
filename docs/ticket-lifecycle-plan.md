@@ -3487,7 +3487,7 @@ operator 选 A：保留回踩区间，另给突破确认参考价（昨高，Q5 
 
 **验证**：`cargo check --lib --bin monitor` 通过；`monitor::ticket_evidence_bundle`
 1/1（未知字段保持 `null`，持仓 500 股正确落盘）；`monitor::ticket_auction_price` 7/7、
-`monitor::market_regime` 5/5。
+`monitor::market_regime` 5/5、`monitor::ticket_entry_trigger` 14/14（触发/失效/过期/去重回归）。
 
 **部署**：2026-11-07 21:34 运行根 release 构建 13m28s；21:48:49 kickstart，PID 56541；
 21:50:55 `startup_health_check=ok`；二进制含「高位状态未核实」「持仓：读取失败」及
