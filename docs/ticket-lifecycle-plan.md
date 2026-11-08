@@ -3509,6 +3509,23 @@ rlib 与单测均正常），最终以 09:25 实际输出为准。
 - 边界：窗口自 10-26 左截断；`board_name` 全 NULL；桥接层只落映射字段、
   未存原始响应，provider 原始「几天几板」无法核对（需要桥接侧 raw 归档）。
 
+### 12.4.5 6.9 决策证据包独立审计（2026-11-07）
+
+新增 `scripts/ticket_decision_evidence_audit.py`（只读）。与 WP6 的
+`ticket_evidence_audit.py`（校验 manifest）分开，审 6.3 的当次决策包：
+
+- schema/目录/文件名/必填字段；`business_date` 必须等于目录；
+- 竞价路径独立重算 tier 与应给价（不复用被测代码的常量），偏差 >0.011 判错；
+- 未知不得伪造来源：`streak=null` 时 `streak_source_date` 必须为 null（phase 同）；
+- 文件 sha256 与 `ticket_event(kind='evidence_bundle')` 的
+  `path|sha256|level|missing` 摘要对账，缺事件/重复事件/路径不符都报错；
+- 统计 `missing` 分布；PASS/PARTIAL/FAIL，FAIL 退出码 1。
+
+**验证（fixture，scratch，非生产数据）**：2 个包（1 正常 + 1 tier 错）→ 正确报
+`tier=light，按 -5.41% 应为 bargain`；补建 `ticket_event` 后哈希对账 1 个通过；
+篡改文件 1 字节 → 报 `sha256 与事件摘要不符`。真实运行根当前无 6.3 包，
+`data/ticket_evidence/001216/control_group-*.json` 为非 6.3 布局，脚本跳过不误判。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
