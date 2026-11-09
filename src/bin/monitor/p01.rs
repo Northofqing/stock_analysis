@@ -1611,7 +1611,10 @@ fn record_p01_tickets(
     if heads.is_empty() {
         return;
     }
-    let db = stock_analysis::database::DatabaseManager::get();
+    let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+        log::warn!("[P-01][bookkeeping] 数据库未初始化，跳过开票（best-effort）");
+        return;
+    };
     let mut conn = match db.get_conn() {
         Ok(conn) => conn,
         Err(error) => {
