@@ -705,6 +705,15 @@ fn entry_triggered_exists(
 fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &TriggerHit) {
     use crate::monitor::ticket_evidence_bundle as evidence;
 
+    let business_date = as_of.get(..10).unwrap_or(as_of).to_owned();
+    let streak_src = crate::monitor::market_regime::streak_with_source_on(
+        conn,
+        &business_date,
+        &hit.code,
+    );
+    let phase_src =
+        crate::monitor::market_regime::phase_with_source_on(conn, &business_date);
+
     let (positions, position_error) = match crate::portfolio::load_positions() {
         Ok(positions) => (
             positions
@@ -756,12 +765,16 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
         "official_filing".to_owned(),
         "independent_financial_source".to_owned(),
         "financial_statements".to_owned(),
-        "streak".to_owned(),
-        "phase".to_owned(),
     ]);
+    if streak_src.is_none() {
+        missing.push("streak".to_owned());
+    }
+    if phase_src.is_none() {
+        missing.push("phase".to_owned());
+    }
     let bundle = evidence::EvidenceBundle {
         schema_version: evidence::SCHEMA_VERSION.to_owned(),
-        business_date: as_of.get(..10).unwrap_or(as_of).to_owned(),
+        business_date: business_date.clone(),
         code: hit.code.clone(),
         name: hit.name.clone(),
         ticket_id: hit.ticket_id,
@@ -782,10 +795,10 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
             auction_pct: Some(hit.change_pct),
             tier: None,
             quoted_price: Some(hit.price),
-            streak: None,
-            streak_source_date: None,
-            phase: None,
-            phase_source_date: None,
+            streak: streak_src.as_ref().map(|(value, _)| *value),
+            streak_source_date: streak_src.as_ref().map(|(_, date)| date.clone()),
+            phase: phase_src.as_ref().map(|(value, _)| value.code().to_owned()),
+            phase_source_date: phase_src.as_ref().map(|(_, date)| date.clone()),
             prev_high: Some(hit.prev_high),
             entry_low: Some(hit.entry_low),
             entry_high: Some(hit.entry_high),

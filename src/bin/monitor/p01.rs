@@ -222,6 +222,8 @@ pub struct P01BoundHead {
     pub code: String,
     pub name: String,
     pub news: Vec<P01BoundNews>,
+    /// 当日涨停池批次 id（6.3 证据包对账用；测试构造可为 None）。
+    pub limit_pool_batch_id: Option<String>,
     /// 前一交易日收盘价（涨停池给出的 price）。
     ///
     /// P01 在 09:00 推送，集合竞价尚未结束，拿不到当日实时价；涨停池的
@@ -418,6 +420,7 @@ impl P01InputBinding {
                         .expect("valid TEST_CODE published time")
                         .with_timezone(&Utc),
                 }],
+                limit_pool_batch_id: None,
                 recommend_price: None,
                 streak: None,
                 sealed_amount: None,
@@ -634,6 +637,7 @@ pub fn bind_p01_sources(
             code: code.clone(),
             name,
             news,
+            limit_pool_batch_id: Some(completed.projection.limit_pool_batch_id.clone()),
             recommend_price: pool.map(|entry| entry.price.get()),
             streak: pool.and_then(|entry| entry.streak).map(|value| value.get()),
             sealed_amount: pool.and_then(|entry| entry.sealed_amount).map(|value| value.get()),
@@ -1703,11 +1707,13 @@ fn record_p01_tickets(
                 missing.extend([
                     "auction_price".to_owned(),
                     "raw_auction_depth".to_owned(),
-                    "limit_pool_batch_id".to_owned(),
                     "official_filing".to_owned(),
                     "independent_financial_source".to_owned(),
                     "financial_statements".to_owned(),
                 ]);
+                if head.limit_pool_batch_id.is_none() {
+                    missing.push("limit_pool_batch_id".to_owned());
+                }
                 let bundle = stock_analysis::monitor::ticket_evidence_bundle::EvidenceBundle {
                     schema_version:
                         stock_analysis::monitor::ticket_evidence_bundle::SCHEMA_VERSION
@@ -1721,7 +1727,7 @@ fn record_p01_tickets(
                     selection: stock_analysis::monitor::ticket_evidence_bundle::Selection {
                         source: "p01_preopen".to_owned(),
                         concept: Some(head.concept.clone()),
-                        limit_pool_batch_id: None,
+                        limit_pool_batch_id: head.limit_pool_batch_id.clone(),
                         streak_raw: head.streak,
                         recommend_price_raw: head.recommend_price,
                         news: head
