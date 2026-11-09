@@ -3526,6 +3526,25 @@ rlib 与单测均正常），最终以 09:25 实际输出为准。
 篡改文件 1 字节 → 报 `sha256 与事件摘要不符`。真实运行根当前无 6.3 包，
 `data/ticket_evidence/001216/control_group-*.json` 为非 6.3 布局，脚本跳过不误判。
 
+### 12.4.6 验收自检与首日实测（2026-11-09）
+
+新增 `scripts/ticket_acceptance_check.py`（只读），一次检查：monitor 进程、
+6.3 证据包按 occurrence 计数、09:25 推送 marker、上一交易日淘汰补跑 marker、
+当日 evicted 事件、日线覆盖 ≥800、并自动调用 6.9 审计。退出码只在有 FAIL 时为 1，
+PENDING 不算错。
+
+定时（Hermes 一次性任务，`ticket_acceptance_check.sh` 包装）：09:30 / 15:55 / 21:50，
+job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
+
+**09:00 首日实测**：P01 写入 3 个证据包（002086、600261、601599），
+`ticket_event` 哈希对账 3/3；`selection` 带概念/连板/推荐价/新闻，
+`pricing` 全 null、`missing` 含 auction_price 等 6 项；
+持仓三者均不在 `stock_position`（与 11-06 用户快照的 6 只完全一致），
+`portfolio` 为 null 且 `source=user_confirmed_snapshot` 正确。
+
+审计修正：P01 写入的 summary 路径是运行根相对路径 `./data/...`，
+审计改为相对 `--root` 解析后比较，3/3 通过。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
