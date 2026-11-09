@@ -126,8 +126,8 @@ def main() -> int:
             detail = evict.read_text(encoding="utf-8").strip() if evict.exists() else f"无 {prev} marker"
             statuses.append(
                 check(
-                    "15:40 淘汰补跑",
-                    evict.exists() if not pending_before("1545") else None,
+                    "淘汰补跑（上一交易日）",
+                    evict.exists(),
                     detail,
                 )
             )
