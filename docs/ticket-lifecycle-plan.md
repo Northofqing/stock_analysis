@@ -3751,3 +3751,13 @@ Balance/Income/CashFlow 各 1 期，报告期均为 2026-09-30，
 `kinds/report_period/announced_on≤业务日/batch_id`，且 `missing` 不得再列
 `financial_statements`；2026-11-11 起缺 `filings` 直接判 FAIL。
 正负例已用合成证据包验证（晚于业务日 → FAIL）。
+
+**6.8 评估脚本（2026-11-10）**：新增 `scripts/ticket_expert_eval.py`，
+读取运行根已签字的预注册文件（`status=signed_frozen`），按
+exploratory/confirmatory 窗口运行；样本为 `entry_triggered`，按
+(code, trade_date) 去重，触发价取事件 summary 的「现价」；排除 ST/停牌/
+缺 D-4·D-1·D+1；Q1 前 3 日涨幅、Q2 竞价涨幅（收益分母用
+`quoted_price||auction_price`）、Q3 证据包 `portfolio.position_quantity`；
+每组报 n/均值/中位/胜率/95% bootstrap CI（10000 次）与 0.1%/0.2%/0.3%
+成本敏感性。确认性窗口 2026-11-10 起，当前 35 条触发但当日日线未入库
+（no_trade_date），入样 0；20 个交易日后才会输出可判定结论。
