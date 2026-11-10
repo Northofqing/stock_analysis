@@ -1,70 +1,74 @@
-# 外部依赖确认：公告按票查询 / 财报网关（2026-11-10）
+# 公告 / 财报：Windows 可用，问题在 Mac 桥路由（2026-11-10 修订）
 
-> 目的：6.5（公告回链）与 6.6（结构化财务事实）都需要对端能力。以下是本机实测，
-> 请桥接/数据侧确认可行性与时间。
+> 前一版把 Mac 本地桥的实测误当成 Windows ExternalV1 的结论，已作废。
+> 本版依据 operator 在 Windows 侧的直接实测（2026-11-10），以及 Mac 侧 grpcurl 对照。
 
-## 1. 公告：MarketAnnouncements 目前不可按票、不可回看
+## 结论
 
-实测命令（grpcurl 直连 `127.0.0.1:18082`，proto `client-bundle/market.proto`）：
+| 能力 | Windows ExternalV1 | Mac 本地桥 127.0.0.1:18082 | 归属 |
+|---|---|---|---|
+| 按票公告 `Announcements` | 可用：单 instrument + 日期范围，001216 返回 8 条 | 未按票路由，落到全市场 feed | Mac 桥改路由 |
+| 全市场公告 `MarketAnnouncements` | 可用但有上限：`limit<=300`，无 page/offset | 忽略日期、只给 100 条、`complete=true` 错报 | Mac 桥修请求/字段 |
+| 结构化财报 `FinancialStatements` | 可用：001216 8 期、77 lines/期、约 410ms | 报 `observation_stale age_ms=-1` | Mac 本地 gateway 修复 |
+| `fiscal_period` | 恒为 null | 同 | 字段缺口，不伪造 Q1/H1 |
 
-```
-MarketDataService/MarketAnnouncements
-payload: {"start":"2026-11-06","end":"2026-11-06","limit":300}
-```
+## Windows 实测（operator 提供）
 
-返回：
-
-```
-batchId = cninfo:...:market-announcements:2026-11-10:2026-11-10:pages=4:total=1039
-complete = true
-records  = 1 个 chunk，解包后 100 条
-```
-
-观察：
-
-1. 请求的 `start/end=2026-11-06` 被忽略，返回的是**当天 2026-11-10** 的公告；
-2. `batchId` 说 `pages=4:total=1039`，但实际只给了 **100 条**（约 9.6%），
-   `complete=true` 与实际覆盖不一致；
-3. `Announcements` 方法同样落到这个 feed，传 `code`/`codes` 都不生效；
-4. 记录字段齐全：`announcement_id / category / code / published_at / title / url`，
-   `url` 全部存在（100/100）。
-
-需要的能力（任一即可）：
-
-- A. **按票查询**：入参 `code`（或 `codes`）+ 日期范围，返回该票公告；
-- B. **分页**：按 `page/page_size` 或 `offset/limit` 翻页，能取完 `total`；
-- C. 若短期做不到，明确告知“只能当天前 100 条”，我们就不把公告作为证据来源，
-  继续在证据包里写 `missing: official_filing`。
-
-验收口径：目标票（持仓 6 只 + 当日 P01 入选）近 5 个交易日公告命中率；
-返回条目必须带 `url` 与 `published_at`。
-
-## 2. 财报：FinancialStatements 网关当前不可用
-
-实测：
+公告窗口：
 
 ```
-MarketDataService/FinancialStatements
-payload: {"codes":["001216"],"kind":"income"}
+start=2026-11-06 end=2026-11-06 limit=300
+selected_provider=Cninfo
+pages=10 total=1104 limit=300
+raw=300 unique=300 returned=300
+complete=false            # limit 截断，不是全量
+url/pdf_url 300/300
 ```
 
-返回：
+按票公告（001216，2026-10-01..2026-11-10）：
 
 ```
-Code: Internal
-Message: 取数失败: 财务报告 Gateway 不可用: CompanyFinancialStatements data gateway
-         failed reason_code=observation_stale provider=Some(Sina) retryable=true:
-         provider observation failed freshness gate age_ms=-1 max_ms=30000
+selected_provider=Cninfo  complete=true  records=8
+published_at 范围 2026-10-26 .. 2026-11-10
+canonical_url / pdf_url 8/8
 ```
 
-`age_ms=-1` 表示没有拿到有效观测时间，不是“数据旧”，更像上游未返回。
+请求形态：
 
-需要确认：
+```json
+{
+  "instrument": {"exchange":"Shenzhen","code":"001216","asset_class":"Equity"},
+  "start":"2026-10-01",
+  "end":"2026-11-10",
+  "limit":100
+}
+```
 
-1. 该网关是否还在维护/可用；
-2. 可用时 `report_period / announced_on / lines` 的字段口径；
-3. 单票单次调用的大致耗时与限频，避免 09:25 路径被拖慢。
+6 只持仓（11-03..11-10）：001216 / 002131 / 600396 有记录；
+002421 / 600667 / 600703 返回 `CNInfo returned no announcements`（合法空，
+应记 0 命中，不能当 gateway failure）。
 
-在上述两项确认前，ticket 证据包保持：
-`fundamentals.status=unavailable, reason=financial_statements_not_fetched`；
-公告保持 `missing: official_filing`，不伪造来源。
+财报（001216）：`report_period` 2026-09-30/06-30/03-31…；`announced_on` 取
+Sina publish_date；`lines` 77 条/期含 null，不补 0；`fiscal_period=null`。
+6 只一次请求 48 条、约 1120ms，无显式限频；单次最多 10 个 instrument。
+
+## Mac 桥需要改什么
+
+1. `Announcements` 改为按票请求，路由到 Windows ExternalV1 的
+   `Announcements`（instrument + start/end/limit），不要落全市场 feed；
+   多票由 Mac 侧循环，单次一个 instrument。
+2. 公告空结果单独归类为「0 命中」，不得报 gateway failure。
+3. `MarketAnnouncements` 修正：日期窗口生效、不要虚报 `complete=true`；
+   全市场分页（page/offset）属于合同变更，Gate A，暂不做。
+4. `FinancialStatements` 修本地 gateway 的 observation 时间；按
+   `report_period/announced_on/lines` 验收，`fiscal_period` 保持 null。
+5. 财报不要在 09:25 逐票调用：盘后预取/缓存，09:25 只读缓存（6 只约 1.1s）。
+
+## 验收
+
+- 001216 近 5 个交易日公告 ≥1 条，且 `canonical_url` 非空；
+- 002421 这类无公告票返回 0 条 + 明确「0 命中」，不是错误；
+- 6 只持仓财报一次取回 48 条（8 期/只），字段完整；
+- ticket 证据包 `selection.filings[]` 与 `fundamentals` 能引用上述批次 id。
+
+Windows 侧这轮不需要改代码；A（按票）与财报接线在 Mac 侧，估 1 天以内。

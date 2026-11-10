@@ -2,7 +2,7 @@
   "schema_version": 1,
   "kind": "ticket_expert_preregistration",
   "created_at": "2026-11-10T09:40:00+08:00",
-  "status": "draft_awaiting_operator_signoff",
+  "status": "signed_frozen",
   "exploratory_window": {
     "start": "2026-10-26",
     "end": "2026-11-09",
@@ -109,8 +109,8 @@
   "missing_policy": "缺数据直接排除并计入 skipped，不补 0、不用券商价代替收盘价。",
   "analysis_script": "scripts/ticket_expert_eval.py（签字后编写，只读，输出 n/CI/成本敏感性）",
   "signoff": {
-    "operator": null,
-    "signed_at": null,
+    "operator": "zhangzhen",
+    "signed_at": "2026-11-10T10:09:31+08:00",
     "note": "签字后本文件冻结；任何修改必须新增版本文件并说明原因。"
   }
 }
