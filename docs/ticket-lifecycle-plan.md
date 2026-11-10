@@ -3741,3 +3741,13 @@ Balance 135 行 / Income 77 行 / CashFlow 61 行，报告期 2026-09-30、
 读取最新 `user_position_snapshot` 的持仓代码，调用
 `ticket_fundamentals --codes ... --date <当天>`；08:50 早于 09:00 P01，
 P01 与 09:25 证据包都只读当天缓存。
+
+**6.6 预取口径与 6.9 审计（2026-11-10 补）**：预取范围不是只有持仓，
+而是 `ticket_lifecycle` 未关闭票（entry_proposed/observing/holding）∪ 最新
+持仓快照，按 10 只一批调用。2026-11-10 实测 66 只全部成功：每只
+Balance/Income/CashFlow 各 1 期，报告期均为 2026-09-30，
+`missing=[]`，无空字段。审计脚本新增：
+`filings` 状态/items 一致性；`fundamentals.status=ok` 时校验
+`kinds/report_period/announced_on≤业务日/batch_id`，且 `missing` 不得再列
+`financial_statements`；2026-11-11 起缺 `filings` 直接判 FAIL。
+正负例已用合成证据包验证（晚于业务日 → FAIL）。

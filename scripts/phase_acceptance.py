@@ -67,6 +67,16 @@ class Result:
         return f"{self.phase:6s} {self.name:16s} [{self.status}] {self.detail}"
 
 
+def complete_trading_days(con, days):
+    """最近 N 个有完整日线覆盖的交易日；避免 1 行的半日线把 cutoff 推前。"""
+    rows = con.execute(
+        "SELECT date FROM stock_daily GROUP BY date "
+        "HAVING COUNT(*) >= 800 ORDER BY date DESC LIMIT ?",
+        (days,),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def check_p11(main, days, log_lines):
     """P1.1 观察池：最近 N 个交易日必须真的选出了候选票。
 
@@ -267,6 +277,23 @@ def check_p2(main, days):
         ).fetchall()
     ]
     cutoff = min(dates) if dates else "0000-00-00"
+    # 胜率评估不能用最近 5 个事件日做窗口：T+5 天然滞后 5 个交易日，
+    # 窗口内的新提案必然 pending，窗口外已回填的样本又会被 cutoff 排除。
+    # 用最近 10 个完整日线日作为成熟样本窗；不完整的 1 行日线不算交易日。
+    complete_dates = complete_trading_days(main, max(days, 10))
+    outcome_cutoff = min(complete_dates) if complete_dates else cutoff
+    proposal_tickets = main.execute(
+        "SELECT COUNT(DISTINCT ticket_id) FROM ticket_event "
+        "WHERE event_kind='entry_proposed' AND substr(event_at,1,10) >= ?",
+        (cutoff,),
+    ).fetchone()[0]
+    triggered_tickets = main.execute(
+        "SELECT COUNT(DISTINCT t.ticket_id) FROM ticket_event t "
+        "WHERE t.event_kind='entry_triggered' AND substr(t.event_at,1,10) >= ? "
+        "AND t.ticket_id IN (SELECT p.ticket_id FROM ticket_event p "
+        "WHERE p.event_kind='entry_proposed' AND substr(p.event_at,1,10) >= ?)",
+        (cutoff, cutoff),
+    ).fetchone()[0]
     ev = main.execute(
         "SELECT COUNT(*) FROM ticket_event "
         "WHERE event_kind='entry_proposed' AND substr(event_at,1,10) >= ?",
@@ -313,18 +340,44 @@ def check_p2(main, days):
         (cutoff,),
     ).fetchone()[0]
     evaluated = 0
+    evaluated_full = 0
+    evaluated_partial = 0
     pending = 0
+    t1_n = t1_win = t3_n = t3_win = 0
+    t1_avg = t3_avg = None
     if table_exists(main, "advice_outcome_tracking"):
-        evaluated = main.execute(
-            "SELECT COUNT(*) FROM advice_outcome_tracking "
-            "WHERE business_date >= ? AND (outcome_filled_at IS NOT NULL OR outcome_pct IS NOT NULL)",
-            (cutoff,),
+        evaluated_full = main.execute(
+            "SELECT COUNT(*) FROM advice_outcome_tracking WHERE push_kind='EntryProposal' "
+            "AND business_date >= ? AND outcome_filled_at IS NOT NULL",
+            (outcome_cutoff,),
         ).fetchone()[0]
+        evaluated_partial = main.execute(
+            "SELECT COUNT(*) FROM advice_outcome_tracking WHERE push_kind='EntryProposal' "
+            "AND business_date >= ? AND outcome_filled_at IS NULL AND outcome_pct IS NOT NULL",
+            (outcome_cutoff,),
+        ).fetchone()[0]
+        evaluated = evaluated_full + evaluated_partial
+        evaluated_row = main.execute(
+            "SELECT COUNT(*), COUNT(change_t1), SUM(change_t1>0), AVG(change_t1), "
+            "COUNT(change_t3), SUM(change_t3>0), AVG(change_t3) "
+            "FROM advice_outcome_tracking WHERE push_kind='EntryProposal' "
+            "AND business_date >= ? AND (outcome_filled_at IS NOT NULL OR outcome_pct IS NOT NULL)",
+            (outcome_cutoff,),
+        ).fetchone()
+        evaluated = evaluated_row[0] or 0
+        t1_n = evaluated_row[1] or 0
+        t1_win = evaluated_row[2] or 0
+        t1_avg = evaluated_row[3]
+        t3_n = evaluated_row[4] or 0
+        t3_win = evaluated_row[5] or 0
+        t3_avg = evaluated_row[6]
         pending = main.execute(
-            "SELECT COUNT(*) FROM advice_outcome_tracking "
-            "WHERE business_date >= ? AND outcome_filled_at IS NULL AND outcome_pct IS NULL",
+            "SELECT COUNT(*) FROM advice_outcome_tracking WHERE push_kind='EntryProposal' "
+            "AND business_date >= ? AND outcome_filled_at IS NULL",
             (cutoff,),
         ).fetchone()[0]
+    t1_rate = (t1_win / t1_n * 100.0) if t1_n else 0.0
+    t3_rate = (t3_win / t3_n * 100.0) if t3_n else 0.0
     st = main.execute(
         "SELECT COUNT(*) FROM ticket_lifecycle WHERE stage='entry_proposed'"
     ).fetchone()[0]
@@ -336,20 +389,27 @@ def check_p2(main, days):
         decisions = main.execute(
             "SELECT COUNT(*) FROM ticket_decision WHERE as_of >= ?", (cutoff,)
         ).fetchone()[0]
-    trigger_rate = (trig / ev * 100.0) if ev else 0.0
+    trigger_rate = (
+        triggered_tickets / proposal_tickets * 100.0 if proposal_tickets else 0.0
+    )
     timeout_share = (
         timeout / (timeout + price_invalidated) * 100.0
         if (timeout + price_invalidated)
         else 0.0
     )
     r.detail = (
-        f"窗口 {cutoff}~最新 proposal={ev} open={st} triggered={trig} "
+        f"窗口 {cutoff}~最新 proposal={ev} proposal_tickets={proposal_tickets} "
+        f"open={st} triggered={trig} triggered_tickets={triggered_tickets} "
         f"trigger_events={trigger_events} "
         f"invalidated={invalidated} expired={expired} superseded={superseded} "
         f"timeout={timeout} price_invalidated={price_invalidated} "
         f"timeout_share={timeout_share:.1f}% "
-        f"evaluated={evaluated} pending={pending} trigger_rate={trigger_rate:.1f}% "
-        f"decision={decisions} observing={obs}"
+        f"evaluated={evaluated} complete={evaluated_full} partial={evaluated_partial} "
+        f"pending={pending} "
+        f"outcome_window={outcome_cutoff}~ "
+        f"entry_t1={t1_win}/{t1_n} ({t1_rate:.1f}%, avg={t1_avg if t1_avg is not None else 'NA'}) "
+        f"entry_t3={t3_win}/{t3_n} ({t3_rate:.1f}%, avg={t3_avg if t3_avg is not None else 'NA'}) "
+        f"trigger_rate={trigger_rate:.1f}% decision={decisions} observing={obs}"
     )
     if ev == 0 and st == 0:
         r.status = FAIL

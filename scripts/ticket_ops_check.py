@@ -93,6 +93,7 @@ def due_at(slot: str, name: str, minute_of_day: int) -> bool:
         return True
     thresholds = {
         "PreopenNewsHot": 9 * 60 + 10,
+        "auction_raw": 9 * 60 + 35,
         "HoldingPlan": 10 * 60,
         "watch_pool": 15 * 60 + 52,
         "TomorrowWatch": 16 * 60 + 10,
@@ -479,6 +480,11 @@ def main() -> int:
 
     watch_pool_marker = data_dir / "watch_pool" / check_text
     plan_archive = data_dir / "buy_zone_archive" / f"{check_text}.txt"
+    auction_raw_path = data_dir / "auction_raw" / f"{check_text}.json"
+    report["auction_raw"] = {
+        "path": str(auction_raw_path),
+        "exists": auction_raw_path.is_file(),
+    }
     paper_reason = None
     if paper_latest != check_text:
         paper_reason = last_log_reason(
@@ -509,6 +515,14 @@ def main() -> int:
             "09:00 盘前热点推送",
             report["key_pushes"]["PreopenNewsHot"]["count"] > 0,
             f"Delivered {report['key_pushes']['PreopenNewsHot']['count']} 条",
+        )
+    )
+    items.append(
+        item(
+            "auction_raw",
+            "竞价原始归档",
+            auction_raw_path.is_file(),
+            f"{auction_raw_path} {'存在' if auction_raw_path.is_file() else '缺失'}",
         )
     )
     holding_due = report["open_positions"] > 0

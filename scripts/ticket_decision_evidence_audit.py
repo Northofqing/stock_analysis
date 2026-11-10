@@ -163,13 +163,47 @@ def audit_bundle(path: Path, date_dir: str) -> list[str]:
     if portfolio.get("source") == "read_failed" and portfolio.get("position_quantity"):
         errors.append(f"{path.name}: 读取失败却带持仓数量")
 
-    if fundamentals.get("status") == "unavailable":
+    filings = bundle.get("filings")
+    if filings is None and bundle["business_date"] >= "2026-11-11":
+        errors.append(f"{path.name}: 缺 filings（6.5 已接线）")
+    has_filings = filings is not None
+    filings = filings or {}
+    if has_filings:
+        if filings.get("status") not in {"ok", "empty", "unavailable", "timeout", "not_fetched"}:
+            errors.append(f"{path.name}: filings.status={filings.get('status')!r}")
+        if filings.get("status") == "ok" and not filings.get("items"):
+            errors.append(f"{path.name}: filings.status=ok 但 items 为空")
+        if filings.get("status") != "ok" and "official_filing" not in (bundle.get("missing") or []):
+            errors.append(f"{path.name}: 公告未取到但 missing 未列 official_filing")
+
+    status = fundamentals.get("status")
+    if status not in {"ok", "empty", "unavailable", "invalid_cache"}:
+        errors.append(f"{path.name}: fundamentals.status={status!r}")
+    if status == "ok":
+        kinds = fundamentals.get("kinds") or []
+        if not kinds:
+            errors.append(f"{path.name}: fundamentals.status=ok 但 kinds 为空")
+        period = fundamentals.get("report_period") or ""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", period):
+            errors.append(f"{path.name}: report_period={period!r}")
+        announced = fundamentals.get("announced_on") or ""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", announced):
+            errors.append(f"{path.name}: announced_on={announced!r}")
+        elif announced > bundle["business_date"]:
+            errors.append(
+                f"{path.name}: announced_on={announced} 晚于业务日 {bundle['business_date']}"
+            )
+        if not fundamentals.get("batch_id"):
+            errors.append(f"{path.name}: fundamentals.status=ok 但 batch_id 为空")
+        if "financial_statements" in (bundle.get("missing") or []):
+            errors.append(f"{path.name}: 财务已取到但 missing 仍列 financial_statements")
+    elif status == "unavailable":
         if "financial_statements" not in (bundle.get("missing") or []):
             errors.append(f"{path.name}: 财务不可用但 missing 未列 financial_statements")
     return errors
 
 
-def audit_events(db: Path, bundles: list[tuple[Path, dict]]) -> tuple[list[str], int]:
+def audit_events(root: Path, db: Path, bundles: list[tuple[Path, dict]]) -> tuple[list[str], int]:
     errors: list[str] = []
     checked = 0
     if not db.exists():
@@ -195,7 +229,11 @@ def audit_events(db: Path, bundles: list[tuple[Path, dict]]) -> tuple[list[str],
                 errors.append(f"{path.name}: sha256 与事件摘要不符")
                 continue
             if parts[0] != str(path):
-                errors.append(f"{path.name}: 事件路径 {parts[0]} 与文件不符")
+                event_path = Path(parts[0])
+                if not event_path.is_absolute():
+                    event_path = root / event_path
+                if event_path.resolve() != path.resolve():
+                    errors.append(f"{path.name}: 事件路径 {parts[0]} 与文件不符")
             checked += 1
     finally:
         conn.close()
@@ -241,7 +279,7 @@ def main() -> int:
     event_checked = 0
     if not args.no_db:
         event_errors, event_checked = audit_events(
-            args.root / "data" / "stock_analysis.db", bundles
+            args.root, args.root / "data" / "stock_analysis.db", bundles
         )
         errors.extend(event_errors)
 
