@@ -804,6 +804,7 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
             entry_high: Some(hit.entry_high),
             trigger_level: hit.trigger_level,
             decision_id: hit.decision_id.clone(),
+            risk_note: None,
         },
         portfolio,
         fundamentals: evidence::Fundamentals {

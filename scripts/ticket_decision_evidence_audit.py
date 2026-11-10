@@ -257,6 +257,8 @@ def main() -> int:
     errors: list[str] = []
     bundles: list[tuple[Path, dict]] = []
     missing_counter: dict[str, int] = {}
+    risk_flagged = 0
+    risk_conflicts = 0
     skipped = 0
     for date in dates:
         date_dir = base / date
@@ -273,6 +275,11 @@ def main() -> int:
             except Exception:  # noqa: BLE001 - 已在 audit_bundle 记错
                 continue
             bundles.append((path, bundle))
+            pricing = bundle.get("pricing") or {}
+            if pricing.get("risk_note"):
+                risk_flagged += 1
+                if pricing.get("quoted_price") is not None:
+                    risk_conflicts += 1
             for field in bundle.get("missing") or []:
                 missing_counter[field] = missing_counter.get(field, 0) + 1
 
@@ -285,6 +292,8 @@ def main() -> int:
 
     print(f"日期: {', '.join(dates) if dates else '（无）'}")
     print(f"证据包: {len(bundles)} 个；哈希对账: {event_checked} 个；跳过非 6.3 文件: {skipped} 个")
+    if risk_flagged:
+        print(f"6.10 风险披露: 带 risk_note {risk_flagged} 个；其中仍给参考价的冲突 {risk_conflicts} 个")
     if missing_counter:
         top = ", ".join(
             f"{key}={value}" for key, value in sorted(missing_counter.items(), key=lambda x: -x[1])

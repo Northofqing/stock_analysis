@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use diesel::prelude::*;
-use diesel::sql_types::Text;
+use diesel::sql_types::{Nullable, Text};
 
 use crate::database::{ticket_lifecycle, DatabaseManager};
 use crate::monitor::auction_watch::AuctionRow;
@@ -43,6 +43,18 @@ pub enum OutputKind {
     ReferencePrice,
     /// 旧文案；仅用于 shadow 期保持推送不变。
     LegacyAction,
+}
+
+/// 6.10：正文必须区分「持仓加仓参考 / 新买入参考 / 持仓未知」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PositionContext {
+    /// 有底仓。
+    Held,
+    /// 确认无持仓。
+    #[default]
+    NoPosition,
+    /// 持仓读取失败：不能伪装成「无持仓」。
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +141,11 @@ pub struct PriceLine {
     /// 持仓上下文（6.4）：有底仓写「已有 N 股/成本/浮盈亏」，
     /// 无持仓写「持仓：无」，读取失败写「读取失败」，不能省略。
     pub position_note: String,
+    /// 6.10：持仓状态决定参考价前缀，读取失败不能当无持仓。
+    pub position: PositionContext,
+    /// 6.10：同日风险提示（risk_flag，最近 5 日）；有则正文必须披露，
+    /// 与给出的加仓参考同时存在时标「冲突」。
+    pub risk_note: Option<String>,
 }
 
 impl PriceLine {
@@ -147,9 +164,17 @@ impl PriceLine {
         } else {
             ""
         };
+        let prefix = match (kind, self.price) {
+            (OutputKind::ReferencePrice, Some(_)) => match self.position {
+                PositionContext::Held => "持仓加仓参考｜",
+                PositionContext::NoPosition => "新买入参考｜",
+                PositionContext::Unknown => "持仓未知｜",
+            },
+            _ => "",
+        };
         let base = match (kind, self.price) {
             (OutputKind::ReferencePrice, Some(price)) => format!(
-                "{} {} 竞价 {:.2}（{:+.2}%）→ 竞价参考价 {:.2}〔{}〕{}",
+                "{prefix}{} {} 竞价 {:.2}（{:+.2}%）→ 竞价参考价 {:.2}〔{}〕{}",
                 self.code,
                 self.name,
                 self.auction_price,
@@ -187,11 +212,23 @@ impl PriceLine {
                 note
             ),
         };
-        if self.position_note.is_empty() {
+        let mut rendered = if self.position_note.is_empty() {
             base
         } else {
             format!("{base}\n  {}", self.position_note)
+        };
+        if matches!(kind, OutputKind::ReferencePrice) {
+            if let Some(risk) = &self.risk_note {
+                let risk = risk.strip_prefix("风险提示：").unwrap_or(risk);
+                let conflict = if self.price.is_some() {
+                    "｜冲突：风险提示与参考价同时存在"
+                } else {
+                    ""
+                };
+                rendered.push_str(&format!("\n  ⚠ 风险提示：{risk}{conflict}"));
+            }
         }
+        rendered
     }
 }
 
@@ -233,6 +270,8 @@ pub struct EvidenceFact {
     pub position_quantity: Option<u64>,
     pub cost_price: Option<f64>,
     pub position_error: Option<String>,
+    /// 6.10：risk_flag 摘要（最近 5 日），写证据包并与正文同源。
+    pub risk_note: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -273,10 +312,15 @@ impl AuctionPriceReport {
 
     /// 推送正文；没有情绪型票时返回 `None`（不推空消息）。
     pub fn render(&self, as_of: &str) -> Option<String> {
+        self.render_with(as_of, crate::monitor::output_contract::reference_language_enabled())
+    }
+
+    /// 6.10：同一份正文可按参考/legacy 语义渲染，便于四态单测，
+    /// 避免测试修改进程级环境变量。
+    pub fn render_with(&self, as_of: &str, reference: bool) -> Option<String> {
         if self.emotion == 0 {
             return None;
         }
-        let reference = crate::monitor::output_contract::reference_language_enabled();
         let mut out = String::new();
         if reference {
             out.push_str(&format!("【{as_of} 09:25 竞价参考价】\n"));
@@ -307,7 +351,11 @@ impl AuctionPriceReport {
             }
         }
         if self.no_price > 0 {
-            let no_price_label = if reference { "不给参考价" } else { "不给价" };
+            let no_price_label = if reference {
+                "不给参考价（证据不足）"
+            } else {
+                "不给价"
+            };
             out.push_str(&format!(
                 "\n{} 只竞价价缺失（停牌/未撮合），{}\n",
                 self.no_price, no_price_label
@@ -424,6 +472,30 @@ pub fn build(
         Err(error) => (HashMap::new(), Some(error)),
     };
 
+    // 6.10：同日冲突披露。risk_flag 由 15:52 排雷写 ticket_event，
+    // 这里只读取最近 5 日；signal_fusion 分值未落库，不伪造。
+    #[derive(QueryableByName)]
+    struct RiskRow {
+        #[diesel(sql_type = Text)]
+        code: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        summary: Option<String>,
+    }
+    let risk_notes: HashMap<String, String> = diesel::sql_query(
+        "SELECT t.code AS code, e.summary AS summary \
+           FROM ticket_event e JOIN ticket_lifecycle t ON t.id = e.ticket_id \
+          WHERE e.event_kind = 'risk_flag' AND date(e.event_at) >= date(?1, '-5 day') \
+          ORDER BY e.event_at ASC, e.id ASC",
+    )
+    .bind::<Text, _>(as_of)
+    .load::<RiskRow>(&mut conn)
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| row.summary.map(|summary| (row.code, summary)))
+            .collect()
+    })
+    .unwrap_or_default();
+
     for row in rows {
         let ticket = match ticket_lifecycle::find_active_ticket(&mut conn, &row.code) {
             Ok(Some(ticket)) => ticket,
@@ -502,6 +574,14 @@ pub fn build(
                 _ => "持仓：无（新买入参考）".to_string(),
             },
         };
+        let position_context = match &positions_error {
+            Some(_) => PositionContext::Unknown,
+            None => match positions.get(&row.code) {
+                Some((shares, _)) if *shares > 0 => PositionContext::Held,
+                _ => PositionContext::NoPosition,
+            },
+        };
+        let risk_note = risk_notes.get(&row.code).cloned();
         let line_for_skip = || PriceLine {
             code: row.code.clone(),
             name: row.name.clone(),
@@ -512,6 +592,8 @@ pub fn build(
             output_kind: OutputKind::ReferencePrice,
             high_state_unverified,
             position_note: position_note.clone(),
+            position: position_context,
+            risk_note: risk_note.clone(),
         };
         if streak.is_some_and(|value| value >= crate::monitor::market_regime::EMOTION_STREAK)
             && phase == Some(crate::monitor::market_regime::MarketPhase::Climax)
@@ -536,6 +618,7 @@ pub fn build(
             position_quantity: positions.get(&row.code).map(|(shares, _)| *shares),
             cost_price: positions.get(&row.code).map(|(_, cost)| *cost),
             position_error: positions_error.clone(),
+            risk_note: risk_note.clone(),
         });
         let line = PriceLine {
             code: row.code.clone(),
@@ -547,6 +630,8 @@ pub fn build(
             output_kind: OutputKind::ReferencePrice,
             high_state_unverified,
             position_note,
+            position: position_context,
+            risk_note,
         };
         match tier {
             Tier::SkipHigh => report.skipped_high.push(line),
@@ -599,6 +684,8 @@ mod tests {
                 output_kind: OutputKind::ReferencePrice,
                 high_state_unverified: false,
                 position_note: "持仓：无（新买入参考）".to_string(),
+                position: PositionContext::NoPosition,
+                risk_note: None,
             }],
             ..Default::default()
         };
@@ -620,6 +707,8 @@ mod tests {
             output_kind: OutputKind::ReferencePrice,
             high_state_unverified: false,
             position_note: "持仓：无（新买入参考）".to_string(),
+            position: PositionContext::NoPosition,
+            risk_note: None,
         };
         let text = line.render_as(OutputKind::ReferencePrice);
         assert!(text.contains("竞价参考价"));
@@ -641,11 +730,72 @@ mod tests {
             output_kind: OutputKind::ReferencePrice,
             high_state_unverified: true,
             position_note: "持仓：已有 500 股，成本 26.61，浮盈亏 -4.9%｜动作：加仓观察".to_string(),
+            position: PositionContext::Held,
+            risk_note: None,
         };
         let text = line.render_as(OutputKind::ReferencePrice);
         assert!(text.contains("高位状态未核实"));
         assert!(text.contains("持仓：已有 500 股"));
         assert!(text.contains("动作：加仓观察"));
+    }
+
+    #[test]
+    fn reference_prefix_and_risk_conflict_are_explicit() {
+        let mut line = PriceLine {
+            code: "001216".to_string(),
+            name: "华瓷股份".to_string(),
+            auction_price: 22.78,
+            auction_pct: -5.41,
+            price: Some(22.78),
+            tier: Tier::Bargain,
+            output_kind: OutputKind::ReferencePrice,
+            high_state_unverified: false,
+            position_note: "持仓：已有 100 股，成本 61.80，浮盈亏 -72.06%｜动作：止损核查"
+                .to_string(),
+            position: PositionContext::Held,
+            risk_note: Some("风险提示：违规减持".to_string()),
+        };
+        let text = line.render_as(OutputKind::ReferencePrice);
+        assert!(text.contains("持仓加仓参考｜"));
+        assert!(text.contains("风险提示：违规减持"));
+        assert!(text.contains("冲突：风险提示与参考价同时存在"));
+        assert!(text.contains("竞价参考价"));
+
+        line.position = PositionContext::NoPosition;
+        line.position_note = "持仓：无（新买入参考）".to_string();
+        let text = line.render_as(OutputKind::ReferencePrice);
+        assert!(text.contains("新买入参考｜"));
+
+        line.position = PositionContext::Unknown;
+        let text = line.render_as(OutputKind::ReferencePrice);
+        assert!(text.contains("持仓未知｜"));
+
+        // 不给价时不写「冲突」，但风险仍必须披露。
+        line.price = None;
+        line.tier = Tier::SkipHigh;
+        line.position = PositionContext::Held;
+        let text = line.render_as(OutputKind::ReferencePrice);
+        assert!(text.contains("不给参考价"));
+        assert!(!text.contains("冲突"));
+        assert!(text.contains("风险提示：违规减持"));
+
+        // legacy 文案保持 shadow 期原样，不新增风险行。
+        let legacy = line.render_as(OutputKind::LegacyAction);
+        assert!(!legacy.contains("风险提示"));
+    }
+
+    #[test]
+    fn missing_auction_is_labelled_evidence_insufficient_in_reference_mode() {
+        let report = AuctionPriceReport {
+            emotion: 1,
+            no_price: 1,
+            ..Default::default()
+        };
+        let reference = report.render_with("2026-11-10", true).expect("non-empty");
+        assert!(reference.contains("不给参考价（证据不足）"));
+        let legacy = report.render_with("2026-11-10", false).expect("non-empty");
+        assert!(legacy.contains("不给价"));
+        assert!(!legacy.contains("证据不足"));
     }
 
     #[test]

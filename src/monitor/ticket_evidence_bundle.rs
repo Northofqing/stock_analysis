@@ -48,6 +48,8 @@ pub struct Pricing {
     pub entry_high: Option<f64>,
     pub trigger_level: Option<f64>,
     pub decision_id: Option<String>,
+    /// 6.10：同日风险提示（risk_flag）；与参考价/加仓参考同时存在即冲突。
+    pub risk_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +165,7 @@ impl EvidenceBundle {
                 entry_high: None,
                 trigger_level: None,
                 decision_id: None,
+                risk_note: fact.risk_note.clone(),
             },
             portfolio,
             fundamentals: Fundamentals {
@@ -422,6 +425,7 @@ mod tests {
                 entry_high: None,
                 trigger_level: None,
                 decision_id: None,
+                risk_note: None,
             },
             portfolio: Portfolio {
                 position_quantity: Some(500),

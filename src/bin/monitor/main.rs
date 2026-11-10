@@ -15585,6 +15585,13 @@ async fn auction_watch_loop() {
                                 Err(error) => log::warn!("[证据包] 取连接失败: {error}"),
                             }
                         }
+                        // 6.10 shadow：开关未开时也生成一份参考语义正文，
+                        // 只写日志不推送，用于切换前对照（避免“改词后才发现”）。
+                        if !stock_analysis::monitor::output_contract::reference_language_enabled() {
+                            if let Some(reference_text) = report.render_with(&date_text, true) {
+                                log::info!("[6.10-shadow] 参考语义预览（未推送）:\n{reference_text}");
+                            }
+                        }
                         match report.render(&date_text) {
                             Some(text) => {
                                 if crate::notify::push_wechat(&text).await {
