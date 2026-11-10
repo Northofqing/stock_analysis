@@ -3713,14 +3713,30 @@ announced_on / currency / lines[] / evidence{provider,source_at,observed_at,batc
 Mac 桥报 `observation_stale`）；`fiscal_period` 恒 null，不能伪造 Q1/H1。
 下一步按盘后预取 + 09:25 读缓存实现，单票 3 个 kind、约 1.2 秒。
 
-**2026-11-10 阻塞点（已复现）**：monitor 的 ExternalV1 客户端由独立 proto
-快照生成（`src/grpc_client/external_pb.rs`），该快照**没有**
-`FinancialStatements` RPC；`GrpcSource::financial_statements_external_async`
-直接返回 `Unimplemented`（reason_code=external_query_rejected），与参数无关。
-同一端点用 grpcurl 直调 `MarketDataService/FinancialStatements` 正常返回
-（001216 单票 Balance 8 期），因此不是 Windows 数据问题，也不是我们的请求体
-问题，而是 Mac 侧 ExternalV1 合同快照未包含该 RPC。
+**2026-11-10 根因与修复（已实测通过）**：先前把 `Unimplemented` 归因为
+“proto 快照缺 RPC”是错的，proto 里有 `FinancialStatements`。真实缺口在
+客户端三处白名单：
 
-下一步需要：用 Windows 当前 `market.proto` 重新生成 external proto 快照
-（或对端确认该 RPC 已冻结），之后 `ticket_fundamentals` 预取即可工作；
-在此之前 6.6 不接线、不伪造 `fundamentals`。
+1. `ExternalQueryMethod` 未收录 FinancialStatements（`from_local_operation`
+   返回 None → 本地 `Unimplemented`，请求根本没发出）；
+2. `parse_external_query_response` 只映射 4 个 op，财报响应被判
+   `OperationMismatch`（表现为 `code=envelope`）；
+3. 请求 schemaVersion 用了 1，`bundle-metadata.json` 要求 2；
+   另外财报响应的 `complete=false` 是有界批次，转换器不能按
+   “partial batch 一律拒绝”处理。
+
+修复：补路由表/方法分派/响应 op 映射，schemaVersion=2，新增
+`external_financial_statements` 接纳有界记录；`external_v1` 只接受
+`instruments+kind`、≤10 只。
+
+**实测**：`ticket_fundamentals --codes 001216,002131,600396,002421,600667,600703`
+6/6 成功，每只 3 个 kind、`missing=[]`，文件 44KB/只；001216 为
+Balance 135 行 / Income 77 行 / CashFlow 61 行，报告期 2026-09-30、
+公告日 2026-10-26、CNY，批次 `sina-web:...:financial:*`。
+09:25 证据包改为读 `data/fundamentals/<date>/<code>.json`，缺失写
+`cache_missing`，不在盘中现场拉取。
+
+**调度**：新增 cron `ticket-fundamentals-prefetch`（交易日 09:10，job
+`5b4d5da276ae`），脚本 `~/.hermes/scripts/ticket_fundamentals_prefetch.sh`
+读取最新 `user_position_snapshot` 的持仓代码，调用
+`ticket_fundamentals --codes ... --date <当天>`；09:25 只读当天缓存。
