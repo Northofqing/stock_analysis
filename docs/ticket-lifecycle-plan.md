@@ -3736,7 +3736,8 @@ Balance 135 行 / Income 77 行 / CashFlow 61 行，报告期 2026-09-30、
 09:25 证据包改为读 `data/fundamentals/<date>/<code>.json`，缺失写
 `cache_missing`，不在盘中现场拉取。
 
-**调度**：新增 cron `ticket-fundamentals-prefetch`（交易日 09:10，job
+**调度**：新增 cron `ticket-fundamentals-prefetch`（交易日 08:50，job
 `5b4d5da276ae`），脚本 `~/.hermes/scripts/ticket_fundamentals_prefetch.sh`
 读取最新 `user_position_snapshot` 的持仓代码，调用
-`ticket_fundamentals --codes ... --date <当天>`；09:25 只读当天缓存。
+`ticket_fundamentals --codes ... --date <当天>`；08:50 早于 09:00 P01，
+P01 与 09:25 证据包都只读当天缓存。

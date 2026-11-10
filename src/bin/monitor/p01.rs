@@ -1707,13 +1707,20 @@ fn record_p01_tickets(
                         ),
                     },
                 };
+                let fundamentals =
+                    stock_analysis::monitor::ticket_evidence_bundle::load_fundamentals_cache(
+                        &head.code,
+                        &open_date,
+                    );
                 missing.extend([
                     "auction_price".to_owned(),
                     "raw_auction_depth".to_owned(),
                     "official_filing".to_owned(),
                     "independent_financial_source".to_owned(),
-                    "financial_statements".to_owned(),
                 ]);
+                if fundamentals.status != "ok" {
+                    missing.push("financial_statements".to_owned());
+                }
                 if head.limit_pool_batch_id.is_none() {
                     missing.push("limit_pool_batch_id".to_owned());
                 }
@@ -1764,15 +1771,7 @@ fn record_p01_tickets(
                         decision_id: None,
                     },
                     portfolio,
-                    fundamentals:
-                        stock_analysis::monitor::ticket_evidence_bundle::Fundamentals {
-                            status: "unavailable".to_owned(),
-                            reason: Some("financial_statements_not_fetched".to_owned()),
-                            report_period: None,
-                            announced_on: None,
-                            batch_id: None,
-                            kinds: Vec::new(),
-                        },
+                    fundamentals,
                     filings: stock_analysis::monitor::ticket_evidence_bundle::Filings {
                         status: "not_fetched".to_owned(),
                         items: Vec::new(),
