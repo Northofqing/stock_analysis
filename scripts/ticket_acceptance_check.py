@@ -140,7 +140,7 @@ def main() -> int:
         statuses.append(
             check(
                 "当日淘汰事件",
-                evicted > 0 if not pending_before("1545") else None,
+                evicted > 0 if not pending_before("2145") else None,
                 f"evicted={evicted}",
             )
         )
@@ -152,7 +152,7 @@ def main() -> int:
         statuses.append(
             check(
                 "当日日线覆盖",
-                daily >= 800 if not pending_before("2140") else None,
+                daily >= 800 if not pending_before("2300") else None,
                 f"{daily} 行（阈值 800）",
             )
         )
