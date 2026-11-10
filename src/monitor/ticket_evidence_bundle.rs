@@ -67,6 +67,24 @@ pub struct Fundamentals {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct FilingItem {
+    pub announcement_id: String,
+    pub title: String,
+    pub published_at: String,
+    pub category: Option<String>,
+    pub url: String,
+}
+
+/// 6.5 公告：按票取 ExternalV1 `Announcements`，窗口固定为业务日前 5 个自然日。
+#[derive(Debug, Clone, Serialize)]
+pub struct Filings {
+    /// `ok` / `empty` / `unavailable` / `timeout`。
+    pub status: String,
+    pub items: Vec<FilingItem>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EvidenceBundle {
     pub schema_version: String,
     pub business_date: String,
@@ -79,6 +97,7 @@ pub struct EvidenceBundle {
     pub pricing: Pricing,
     pub portfolio: Portfolio,
     pub fundamentals: Fundamentals,
+    pub filings: Filings,
     pub missing: Vec<String>,
 }
 
@@ -145,12 +164,82 @@ impl EvidenceBundle {
                 status: "unavailable".to_owned(),
                 reason: Some("financial_statements_not_fetched".to_owned()),
             },
+            filings: Filings {
+                status: "not_fetched".to_owned(),
+                items: Vec::new(),
+                reason: Some("not_fetched_at_build".to_owned()),
+            },
             missing: vec![
                 "official_filing".to_owned(),
                 "independent_financial_source".to_owned(),
                 "raw_auction_depth".to_owned(),
                 "financial_statements".to_owned(),
             ],
+        }
+    }
+}
+
+/// 6.5：按票取公告。失败/超时只记录状态，不伪造条数，也不阻断推送。
+pub async fn fetch_filings(code: &str, business_date: &str) -> Filings {
+    let end = match chrono::NaiveDate::parse_from_str(business_date, "%Y-%m-%d") {
+        Ok(date) => date,
+        Err(_) => {
+            return Filings {
+                status: "unavailable".to_owned(),
+                items: Vec::new(),
+                reason: Some("invalid_business_date".to_owned()),
+            }
+        }
+    };
+    let start = end - chrono::Duration::days(5);
+    let exchange = match code.chars().next() {
+        Some('6') => "Shanghai",
+        Some('4') | Some('8') => "Beijing",
+        _ => "Shenzhen",
+    };
+    let instrument = serde_json::json!({
+        "exchange": exchange,
+        "code": code,
+        "asset_class": "Equity",
+    });
+    let gateway = crate::data_gateway::event_calendar::EventCalendarGateway::new();
+    let start_text = start.to_string();
+    let end_text = end.to_string();
+    let call = gateway.instrument_announcements(instrument, &start_text, &end_text, 50);
+    match tokio::time::timeout(std::time::Duration::from_secs(3), call).await {
+        Err(_) => Filings {
+            status: "timeout".to_owned(),
+            items: Vec::new(),
+            reason: Some("announcements_timeout".to_owned()),
+        },
+        Ok(Err(error)) => Filings {
+            status: "unavailable".to_owned(),
+            items: Vec::new(),
+            reason: Some(error.to_string()),
+        },
+        Ok(Ok(batch)) => {
+            let records = batch.records();
+            if records.is_empty() {
+                return Filings {
+                    status: "empty".to_owned(),
+                    items: Vec::new(),
+                    reason: None,
+                };
+            }
+            Filings {
+                status: "ok".to_owned(),
+                items: records
+                    .iter()
+                    .map(|record| FilingItem {
+                        announcement_id: record.announcement_id.clone(),
+                        title: record.title.clone(),
+                        published_at: record.published_at.clone(),
+                        category: record.category.clone(),
+                        url: record.canonical_url.clone(),
+                    })
+                    .collect(),
+                reason: None,
+            }
         }
     }
 }
@@ -250,6 +339,11 @@ mod tests {
             fundamentals: Fundamentals {
                 status: "unavailable".to_owned(),
                 reason: Some("financial_statements_not_fetched".to_owned()),
+            },
+            filings: Filings {
+                status: "not_fetched".to_owned(),
+                items: Vec::new(),
+                reason: None,
             },
             missing: Vec::new(),
         };

@@ -19,9 +19,11 @@
 //! - 停牌票拿不到竞价数据，自动不出现在结果里
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use diesel::prelude::*;
 use diesel::sql_types::Text;
+use serde_json::json;
 
 use crate::data_gateway::current_auction_observations::{
     AuctionStage, CurrentAuctionObservationsGateway, CurrentAuctionRequest,
@@ -36,6 +38,11 @@ pub struct AuctionRow {
     pub auction_price: Option<f64>,
     pub auction_pct: Option<f64>,
     pub auction_volume_ratio: Option<f64>,
+    /// 原始回执证据：用于 09:25 后独立复算，不参与渲染/筛选。
+    pub provider: String,
+    pub source_at: Option<String>,
+    pub observed_at: String,
+    pub batch_id: String,
 }
 
 impl AuctionRow {
@@ -61,6 +68,8 @@ fn exchange_for(code: &str) -> Exchange {
         Some('6') => Exchange::Shanghai,
         Some('0') | Some('3') => Exchange::Shenzhen,
         Some('8') | Some('4') => Exchange::Beijing,
+        // 920xxx 是北交所新代码段；900xxx 仍是上海 B 股，不能把 9 全部改北交所。
+        Some('9') if code.starts_with("92") => Exchange::Beijing,
         _ => Exchange::Shanghai,
     }
 }
@@ -94,6 +103,49 @@ fn watch_codes(conn: &mut SqliteConnection) -> Result<Vec<String>, String> {
 /// 这里按 50 分片留余量。`auction_watch` 过去把全部活跃票一次塞进请求，
 /// 观察池涨到 101 只后就再也没有拿到过竞价数据。
 const MAX_AUCTION_INSTRUMENTS_PER_REQUEST: usize = 50;
+
+/// 写当日原始竞价证据；成功后再由调用方写 `data/auction_price/<date>` marker。
+/// 文件包含每只票的原始值 + provider/source_at/observed_at/batch_id，供事后复算。
+pub fn write_raw(date: &str, rows: &[AuctionRow]) -> Result<PathBuf, String> {
+    let dir = PathBuf::from("data/auction_raw");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("创建 {} 失败: {error}", dir.display()))?;
+    let path = dir.join(format!("{date}.json"));
+    let records: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "code": row.code,
+                "name": row.name,
+                "auction_price": row.auction_price,
+                "auction_pct": row.auction_pct,
+                "auction_volume_ratio": row.auction_volume_ratio,
+                "provider": row.provider,
+                "source_at": row.source_at,
+                "observed_at": row.observed_at,
+                "batch_id": row.batch_id,
+            })
+        })
+        .collect();
+    let payload = json!({
+        "date": date,
+        "count": records.len(),
+        "records": records,
+    });
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|error| format!("竞价原始证据序列化失败: {error}"))?;
+    // 先写临时文件再 rename，避免半截 JSON 被当成当日证据。
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|error| format!("写入 {} 失败: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|error| {
+        format!(
+            "重命名 {} -> {} 失败: {error}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
 
 /// 拉观察池 + 持仓的竞价终态。
 pub async fn observe(db: &DatabaseManager) -> Result<Vec<AuctionRow>, String> {
@@ -134,6 +186,10 @@ pub async fn observe(db: &DatabaseManager) -> Result<Vec<AuctionRow>, String> {
             auction_price: observation.auction_price,
             auction_pct: observation.auction_pct,
             auction_volume_ratio: observation.auction_volume_ratio,
+            provider: format!("{:?}", observation.evidence.provider()),
+            source_at: observation.evidence.source_at().map(str::to_owned),
+            observed_at: observation.evidence.observed_at().to_owned(),
+            batch_id: observation.evidence.batch_id().to_owned(),
         }));
     }
 
@@ -152,6 +208,8 @@ mod tests {
         assert_eq!(exchange_for("300750"), Exchange::Shenzhen);
         assert_eq!(exchange_for("830799"), Exchange::Beijing);
         assert_eq!(exchange_for("430047"), Exchange::Beijing);
+        assert_eq!(exchange_for("920249"), Exchange::Beijing);
+        assert_eq!(exchange_for("900901"), Exchange::Shanghai);
     }
 
     #[test]
@@ -162,6 +220,10 @@ mod tests {
             auction_price: None,
             auction_pct: None,
             auction_volume_ratio: None,
+            provider: "Tonghuashun".to_string(),
+            source_at: None,
+            observed_at: "test".to_string(),
+            batch_id: "test".to_string(),
         };
         let text = row.render();
         assert!(text.contains("601811"));

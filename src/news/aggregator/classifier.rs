@@ -291,7 +291,7 @@ pub fn validate_announcement_source_fact_with_provenance(
         return Err(NormalizedSourceError::EmptySource);
     }
     let now = chrono::Local::now();
-    if observed_at > now {
+    if observed_at > now + super::source_event::OBSERVED_AT_FUTURE_TOLERANCE {
         return Err(NormalizedSourceError::FutureObservedAt);
     }
     let published_on = a
@@ -471,6 +471,31 @@ mod tests {
         assert_eq!(event.push_kind, SourcePushKind::Announcement);
         assert_eq!(event.event_id, "ann-1");
         assert_eq!(event.code.as_deref(), Some("TEST_CODE_ANNOUNCEMENT"));
+    }
+
+    #[test]
+    fn announcement_observed_at_clock_lead_within_one_minute_is_accepted() {
+        // 生产回归：ExternalV1 对端时钟快约 1 秒，曾使公告整批 300 条间歇
+        // 被判 FutureObservedAt（全过/全拒交替）；容差内必须接纳，超容差仍拒。
+        let a = test_important_announcement(
+            "TEST_CODE_CLOCK_LEAD",
+            "TEST_CODE_ANNOUNCEMENT",
+            "关于回购公司股份方案的公告",
+        );
+        assert!(validate_announcement_source_fact_with_provenance(
+            &a,
+            Local::now() + chrono::Duration::seconds(30),
+            "cninfo-market",
+        )
+        .is_ok());
+        assert_eq!(
+            validate_announcement_source_fact_with_provenance(
+                &a,
+                Local::now() + chrono::Duration::minutes(2),
+                "cninfo-market",
+            ),
+            Err(NormalizedSourceError::FutureObservedAt)
+        );
     }
 
     #[test]

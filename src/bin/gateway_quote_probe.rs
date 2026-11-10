@@ -35,4 +35,15 @@ fn main() {
         }
         Err(e) => println!("QUOTE BATCH FAIL: {e}"),
     }
+    println!("== gateway order-book probe codes={codes:?} ==");
+    match stock_analysis::data_gateway::grpc_source::bridge_for("OrderBooks")
+        .and_then(|bridge| bridge.order_books(&codes))
+    {
+        Ok(batch) => println!(
+            "BOOK BATCH OK: provider={:?} records={}",
+            batch.evidence().provider,
+            batch.records().len()
+        ),
+        Err(e) => println!("BOOK BATCH FAIL: {e}"),
+    }
 }

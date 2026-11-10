@@ -1,5 +1,5 @@
 use crate::agent::tool::Tool;
-use crate::search_service::get_search_service;
+use crate::data_gateway::{grpc_source, GatewayBatch};
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -24,7 +24,7 @@ impl Tool for FetchNewsTool {
     }
 
     fn description(&self) -> &str {
-        "获取指定 A 股的近期重大新闻、公告或突发事件催化剂。如果你需要评估涨停原因或突然闪崩的具体利空利多消息，应该优先使用此工具。"
+        "获取指定 A 股的近期个股新闻（gRPC InstrumentNews，近 7 天）。如果你需要评估涨停原因或突然闪崩的具体利空利多消息，应该优先使用此工具。"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -49,19 +49,63 @@ impl Tool for FetchNewsTool {
             .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
-        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
         let max_results = 5;
-        let response = get_search_service()
-            .search_stock_news(code, name, max_results)
-            .await;
-
-        let news_str = response.to_context(max_results);
-
-        if news_str.is_empty() || news_str.contains("未找到相关结果") {
-            anyhow::bail!("No recent news found for stock {code}")
-        } else {
-            Ok(news_str)
+        let source = grpc_source::bridge_for("InstrumentNews")
+            .map_err(|error| anyhow::anyhow!("InstrumentNews 网关不可用: {error}"))?;
+        let batch = source
+            .instrument_news_async(&[code.to_string()], 7)
+            .await
+            .map_err(|error| anyhow::anyhow!("InstrumentNews 查询失败: {error}"))?;
+        let evidence = batch.evidence();
+        let records = match &batch {
+            GatewayBatch::Available { records, .. } => records,
+            GatewayBatch::VerifiedEmpty(_) => anyhow::bail!(
+                "[数据缺失: InstrumentNews/records] code={code} provider={:?} \
+                 source={} batch_id={} observed_at={}",
+                evidence.provider,
+                evidence.source,
+                evidence.batch_id,
+                evidence.observed_at
+            ),
+        };
+        if records.is_empty() {
+            anyhow::bail!(
+                "[数据缺失: InstrumentNews/records] code={code} provider={:?} batch_id={}",
+                evidence.provider,
+                evidence.batch_id
+            );
         }
+
+        let lines = records
+            .iter()
+            .take(max_results)
+            .map(|record| {
+                let item = record.persistence_item();
+                let summary = if item.summary.trim().is_empty() {
+                    "（无摘要）"
+                } else {
+                    item.summary.trim()
+                };
+                format!(
+                    "- [{}] {}（{}）\n  {}\n  {}",
+                    item.published_at.format("%Y-%m-%d %H:%M UTC"),
+                    item.title,
+                    item.source_name,
+                    item.url,
+                    summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(format!(
+            "个股新闻（InstrumentNews，近 7 天，provider={:?} source={} batch_id={} observed_at={}）：\n{}",
+            evidence.provider,
+            evidence.source,
+            evidence.batch_id,
+            evidence.observed_at,
+            lines
+        ))
     }
 }

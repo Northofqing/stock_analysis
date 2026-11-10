@@ -26,11 +26,23 @@ fn format_complete_fund_flow_context(
 ) -> anyhow::Result<String> {
     let flow = flow_result
         .map_err(|error| anyhow::anyhow!("[{code}] money-flow batch unavailable: {error:#}"))?;
-    let shape = shape_result.map_err(|error| {
-        anyhow::anyhow!("[{code}] intraday money-flow shape unavailable: {error:#}")
-    })?;
+    // 分时形态是补充证据；它失败不应把已经拿到的真实资金流一起丢掉。
+    // 缺失必须显式标注，不能静默当成“形态正常”。
+    let (shape, shape_missing) = match shape_result {
+        Ok(shape) => (shape, None),
+        Err(error) => {
+            log::warn!("[{code}] 日内形态缺失，保留资金流证据: {error:#}");
+            (
+                Arc::new(IntradayShape::default()),
+                Some(format!("[数据缺失: IntradayShape] {error:#}")),
+            )
+        }
+    };
 
-    let prompt = format_for_prompt(&flow, &shape);
+    let mut prompt = format_for_prompt(&flow, &shape);
+    if let Some(note) = shape_missing {
+        prompt.push_str(&format!("\n{note}\n"));
+    }
     if prompt.trim().is_empty() {
         anyhow::bail!("No fund flow data found for {code}")
     }
@@ -80,7 +92,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn intraday_gateway_failure_rejects_the_complete_agent_context() {
+    fn intraday_gateway_failure_keeps_fund_flow_and_marks_shape_missing() {
         let flow = MoneyFlowSummary {
             days: vec![MoneyFlowDay {
                 date: "2026-07-27".to_string(),
@@ -92,19 +104,18 @@ mod tests {
             }],
         };
 
-        let error = format_complete_fund_flow_context(
+        let rendered = format_complete_fund_flow_context(
             "TEST_CODE_600001",
             Ok(Arc::new(flow)),
             Err(anyhow::anyhow!(
                 "Magic TDX intraday-shape gateway unavailable"
             )),
         )
-        .expect_err("gateway failure must reject the complete context");
+        .expect("real fund flow must survive a supplemental shape failure");
 
-        let message = error.to_string();
-        assert!(message.contains("TEST_CODE_600001"));
-        assert!(message.contains("Magic TDX"));
-        assert!(message.contains("intraday money-flow shape"));
+        assert!(rendered.contains("主力资金流向"));
+        assert!(rendered.contains("[数据缺失: IntradayShape]"));
+        assert!(rendered.contains("Magic TDX intraday-shape gateway unavailable"));
     }
 
     #[test]

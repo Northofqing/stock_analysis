@@ -1548,7 +1548,7 @@ fn announcement_code(v: &Value, capability: &'static str) -> Result<String, Gate
 
 /// 公告链接。2026-10-17 对端实测帧用 `canonical_url`；旧 op 用 `url`。
 fn announcement_url(v: &Value, capability: &'static str) -> Result<String, GatewayError> {
-    for key in ["canonical_url", "url"] {
+    for key in ["canonical_url", "url", "pdf_url"] {
         if let Some(url) = v.get(key).and_then(Value::as_str) {
             if !url.trim().is_empty() {
                 return Ok(url.to_owned());

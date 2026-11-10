@@ -11,9 +11,12 @@ use super::slices::DomainSlices;
 /// 单个分析师的结构化输出（仲裁可数值化聚合）
 #[derive(Debug, Clone, Deserialize, Default)]
 pub(super) struct AnalystView {
-    /// 0-100 本领域评分（>=70 强多, 60-70 偏多, 40-60 中性, <=40 偏空）
+    /// 0-100 本领域评分；角色失败/弃权时为 None，不能伪装成 50 分中性
     #[serde(default)]
-    pub score: i32,
+    pub score: Option<i32>,
+    /// ok / unavailable
+    #[serde(default)]
+    pub status: String,
     /// bull / bear / neutral
     #[serde(default)]
     pub stance: String,
@@ -26,17 +29,32 @@ pub(super) struct AnalystView {
     /// 1-2 句总结
     #[serde(default)]
     pub summary: String,
+    /// 本角色实际引用的证据编号/字段
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    /// 角色提示词版本
+    #[serde(default)]
+    pub role_version: String,
 }
 
 impl AnalystView {
     pub fn empty(reason: &str) -> Self {
         Self {
-            score: 50,
+            score: None,
+            status: "unavailable".to_string(),
             stance: "neutral".to_string(),
             confidence: "low".to_string(),
             key_signals: vec![],
             summary: format!("（{}）", reason),
+            evidence_refs: vec![],
+            role_version: "v1".to_string(),
         }
+    }
+
+    pub fn score_text(&self) -> String {
+        self.score
+            .map(|score| score.to_string())
+            .unwrap_or_else(|| "N/A".to_string())
     }
 
     /// 转为 markdown 片段（供下游 Agent 阅读）
@@ -51,11 +69,12 @@ impl AnalystView {
                 .join("\n")
         };
         format!(
-            "### {} — score={} stance={} confidence={}\n摘要：{}\n关键信号：\n{}",
+            "### {} — score={} stance={} confidence={} status={}\n摘要：{}\n关键信号：\n{}",
             role,
-            self.score,
+            self.score_text(),
             empty_or(&self.stance, "neutral"),
             empty_or(&self.confidence, "low"),
+            empty_or(&self.status, "ok"),
             empty_or(&self.summary, "（无）"),
             signals
         )
@@ -77,7 +96,9 @@ const JSON_FORMAT_NOTE: &str = r#"
   "stance": "bull" | "bear" | "neutral",
   "confidence": "high" | "medium" | "low",
   "key_signals": ["信号1", "信号2", ...],
-  "summary": "1-2 句中文总结"
+  "summary": "1-2 句中文总结",
+  "evidence_refs": ["本判断引用的输入字段或段落，最多 5 条"],
+  "role_version": "v1"
 }
 "#;
 
@@ -202,11 +223,15 @@ fn parse_view(raw: &str, role: &str) -> Result<AnalystView> {
             let json_str = &cleaned[s..=e];
             match serde_json::from_str::<AnalystView>(json_str) {
                 Ok(mut v) => {
-                    v.score = v.score.clamp(0, 100);
+                    let Some(score) = v.score else {
+                        return Err(anyhow!("[{}] JSON 缺少 score，不能伪装成中性", role));
+                    };
+                    v.score = Some(score.clamp(0, 100));
+                    v.status = "ok".to_string();
                     if v.stance.is_empty() {
-                        v.stance = if v.score >= 60 {
+                        v.stance = if score >= 60 {
                             "bull".to_string()
-                        } else if v.score <= 40 {
+                        } else if score <= 40 {
                             "bear".to_string()
                         } else {
                             "neutral".to_string()
@@ -214,6 +239,9 @@ fn parse_view(raw: &str, role: &str) -> Result<AnalystView> {
                     }
                     if v.confidence.is_empty() {
                         v.confidence = "medium".to_string();
+                    }
+                    if v.role_version.is_empty() {
+                        v.role_version = "v1".to_string();
                     }
                     return Ok(v);
                 }
@@ -353,8 +381,10 @@ mod tests {
     #[test]
     fn analyst_view_parser_clamps_defaults_formats_and_rejects_bad_protocols() {
         let empty = AnalystView::empty("TEST_CODE_无事实");
-        assert_eq!(empty.score, 50);
+        assert_eq!(empty.score, None);
+        assert_eq!(empty.status, "unavailable");
         assert!(empty.to_markdown("测试分析师").contains("无关键信号"));
+        assert!(empty.to_markdown("测试分析师").contains("score=N/A"));
 
         let parsed = parse_view(
             r#"前缀```json
@@ -363,18 +393,19 @@ mod tests {
             "测试分析师",
         )
         .expect("complete analyst JSON");
-        assert_eq!(parsed.score, 100);
+        assert_eq!(parsed.score, Some(100));
         assert_eq!(parsed.stance, "bull");
         assert_eq!(parsed.confidence, "medium");
         assert!(parsed.to_markdown("测试分析师").contains("信号A"));
 
         let bear = parse_view(r#"{"score":-5}"#, "测试分析师").unwrap();
-        assert_eq!(bear.score, 0);
+        assert_eq!(bear.score, Some(0));
         assert_eq!(bear.stance, "bear");
         let neutral = parse_view(r#"{"score":50}"#, "测试分析师").unwrap();
         assert_eq!(neutral.stance, "neutral");
         assert!(parse_view("no json", "测试分析师").is_err());
         assert!(parse_view("{bad}", "测试分析师").is_err());
+        assert!(parse_view(r#"{"stance":"bull"}"#, "测试分析师").is_err());
         assert!(build_prompt("测试角色", "测试切片", "测试标的").contains(JSON_FORMAT_NOTE));
     }
 
@@ -391,7 +422,8 @@ mod tests {
             run_sector(&analyzer, &all).await,
             run_timeframe(&analyzer, &all).await,
         ] {
-            assert_eq!(view.score, 50);
+            assert_eq!(view.score, None);
+            assert_eq!(view.status, "unavailable");
             assert_eq!(view.confidence, "low");
         }
 
@@ -401,7 +433,8 @@ mod tests {
             slices(None, None),
         ] {
             let view = run_news(&analyzer, &partial).await;
-            assert_eq!(view.score, 50);
+            assert_eq!(view.score, None);
+            assert_eq!(view.status, "unavailable");
             assert_eq!(view.confidence, "low");
         }
     }

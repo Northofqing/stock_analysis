@@ -65,6 +65,10 @@ pub(crate) enum ExternalQueryMethod {
     EconomicReleaseSchedule,
     #[serde(rename = "OPERATION_QUALIFIED_TRADING_FACTS")]
     QualifiedTradingFacts,
+    #[serde(rename = "OPERATION_REALTIME_QUOTES")]
+    RealtimeQuotes,
+    #[serde(rename = "OPERATION_ORDER_BOOKS")]
+    OrderBooks,
     /// 2026-10-19: Windows e2319f5 给 BoardMemberships 加了 Eastmoney provider
     /// （preferred_provider=Eastmoney → eastmoney:industry:<名称>，与 BoardFlows
     /// 的 board_name 同源）。之前不在 ExternalV1 路由表里，客户端直接本地
@@ -96,6 +100,8 @@ impl ExternalQueryMethod {
             Self::EconomicReleaseObservations => "EconomicReleaseObservations",
             Self::EconomicReleaseSchedule => "EconomicReleaseSchedule",
             Self::QualifiedTradingFacts => "QualifiedTradingFacts",
+            Self::RealtimeQuotes => "RealtimeQuotes",
+            Self::OrderBooks => "OrderBooks",
             Self::BoardMemberships => "BoardMemberships",
             Self::BoardConstituents => "BoardConstituents",
         }
@@ -123,6 +129,8 @@ impl ExternalQueryMethod {
             Self::QualifiedTradingFacts => {
                 "/magic.market.v1.MarketDataService/QualifiedTradingFacts"
             }
+            Self::RealtimeQuotes => "/magic.market.v1.MarketDataService/RealtimeQuotes",
+            Self::OrderBooks => "/magic.market.v1.MarketDataService/OrderBooks",
             Self::BoardMemberships => "/magic.market.v1.MarketDataService/BoardMemberships",
             Self::BoardConstituents => "/magic.market.v1.MarketDataService/BoardConstituents",
         }
@@ -163,6 +171,8 @@ impl ExternalQueryMethod {
             Operation::EconomicReleaseObservations => Some(Self::EconomicReleaseObservations),
             Operation::EconomicReleaseSchedule => Some(Self::EconomicReleaseSchedule),
             Operation::QualifiedTradingFacts => Some(Self::QualifiedTradingFacts),
+            Operation::RealtimeQuotes => Some(Self::RealtimeQuotes),
+            Operation::OrderBooks => Some(Self::OrderBooks),
             Operation::BoardMemberships => Some(Self::BoardMemberships),
             _ => None,
         }
@@ -457,6 +467,8 @@ impl ExternalQueryTransport {
                 ExternalQueryMethod::QualifiedTradingFacts => {
                     client.qualified_trading_facts(request).await
                 }
+                ExternalQueryMethod::RealtimeQuotes => client.realtime_quotes(request).await,
+                ExternalQueryMethod::OrderBooks => client.order_books(request).await,
                 ExternalQueryMethod::BoardMemberships => client.board_memberships(request).await,
                 ExternalQueryMethod::BoardConstituents => client.board_constituents(request).await,
             }

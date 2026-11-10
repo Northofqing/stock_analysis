@@ -91,7 +91,7 @@ const ARBITRATOR_SYS: &str = r#"你是 A 股买方机构的**首席投资官 / �
 
 pub(super) struct ArbitratorOutput {
     pub markdown: String,
-    pub composite_score: i32,
+    pub composite_score: Option<i32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -102,18 +102,35 @@ fn weighted_score(
     news: &AnalystView,
     sector: &AnalystView,
     timeframe: &AnalystView,
-) -> i32 {
+) -> Option<i32> {
     // 权重合计 1.00：技术 28 / 资金 22 / 基本面 15 / 消息 12 / 板块 13 / 时间窗口 10
-    let s = 0.28 * tech.score as f64
-        + 0.22 * cap.score as f64
-        + 0.15 * fund.score as f64
-        + 0.12 * news.score as f64
-        + 0.13 * sector.score as f64
-        + 0.10 * timeframe.score as f64;
-    s.round().clamp(0.0, 100.0) as i32
+    let mut weighted = 0.0;
+    let mut total_weight = 0.0;
+    let mut available = 0;
+    for (view, weight) in [
+        (tech, 0.28),
+        (cap, 0.22),
+        (fund, 0.15),
+        (news, 0.12),
+        (sector, 0.13),
+        (timeframe, 0.10),
+    ] {
+        if let Some(score) = view.score {
+            weighted += score as f64 * weight;
+            total_weight += weight;
+            available += 1;
+        }
+    }
+    if available < 4 {
+        return None;
+    }
+    Some((weighted / total_weight).round().clamp(0.0, 100.0) as i32)
 }
 
-fn preliminary_advice(score: i32) -> &'static str {
+fn preliminary_advice(score: Option<i32>) -> &'static str {
+    let Some(score) = score else {
+        return "N/A（可用分析师不足 4 位）";
+    };
     match score {
         70..=100 => "强烈买入",
         55..=69 => "买入",
@@ -164,6 +181,10 @@ pub(super) async fn run_arbitrator(
         debate.risk.as_str()
     };
 
+    let composite_text = composite
+        .map(|score| score.to_string())
+        .unwrap_or_else(|| "N/A（可用分析师不足 4 位）".to_string());
+
     let user_prompt = format!(
         r#"# 仲裁与终稿任务
 
@@ -193,7 +214,7 @@ pub(super) async fn run_arbitrator(
         bull = bull,
         bear = bear,
         risk = risk,
-        composite = composite,
+        composite = composite_text,
         advice = advice,
     );
 
@@ -213,12 +234,19 @@ mod tests {
 
     fn view(score: i32) -> AnalystView {
         AnalystView {
-            score,
+            score: Some(score),
+            status: "ok".to_string(),
             stance: String::new(),
             confidence: String::new(),
             key_signals: Vec::new(),
             summary: String::new(),
+            evidence_refs: Vec::new(),
+            role_version: "v1".to_string(),
         }
+    }
+
+    fn unavailable() -> AnalystView {
+        AnalystView::empty("TEST_CODE_不可用")
     }
 
     #[tokio::test]
@@ -232,7 +260,7 @@ mod tests {
                 &view(100),
                 &view(100)
             ),
-            100
+            Some(100)
         );
         assert_eq!(
             weighted_score(
@@ -243,7 +271,31 @@ mod tests {
                 &view(-100),
                 &view(-100)
             ),
-            0
+            Some(0)
+        );
+        assert_eq!(
+            weighted_score(
+                &view(100),
+                &view(100),
+                &view(100),
+                &view(100),
+                &view(100),
+                &unavailable()
+            ),
+            Some(100),
+            "5 个可用角色应按权重重新归一，不能把缺失角色当 0 分"
+        );
+        assert_eq!(
+            weighted_score(
+                &view(100),
+                &view(100),
+                &view(100),
+                &unavailable(),
+                &unavailable(),
+                &unavailable()
+            ),
+            None,
+            "可用角色不足 4 位时 composite 必须是 N/A"
         );
         for (score, advice) in [
             (70, "强烈买入"),
@@ -252,8 +304,9 @@ mod tests {
             (30, "减持"),
             (29, "强烈卖出"),
         ] {
-            assert_eq!(preliminary_advice(score), advice);
+            assert_eq!(preliminary_advice(Some(score)), advice);
         }
+        assert_eq!(preliminary_advice(None), "N/A（可用分析师不足 4 位）");
 
         let analyzer = GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
             max_retries: 1,

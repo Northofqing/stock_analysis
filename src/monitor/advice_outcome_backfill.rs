@@ -19,7 +19,7 @@
 //!       且覆盖全量已采集票.
 
 use crate::database::advice_outcome_tracking::{
-    apply_outcome, load_pending_outcomes, mark_outcome_void, FilledOutcome,
+    apply_outcome, apply_partial_outcome, load_pending_outcomes, mark_outcome_void, FilledOutcome,
 };
 use crate::database::DatabaseManager;
 use chrono::NaiveDate;
@@ -39,6 +39,8 @@ pub struct BackfillReport {
     pub scanned: usize,
     /// 成功写回的行数
     pub filled: usize,
+    /// 只写回 T+1/T+3、仍在等 T+5 的行数
+    pub partial: usize,
     /// 观察窗未走完或数据未到 (滚动下轮再算)
     pub not_mature: usize,
     /// 超期无数据, 已标记作废 (数值列仍为 NULL)
@@ -53,9 +55,10 @@ impl BackfillReport {
             return;
         }
         log::info!(
-            "[建议回填] scanned={} filled={} not_mature={} voided={}",
+            "[建议回填] scanned={} filled={} partial={} not_mature={} voided={}",
             self.scanned,
             self.filled,
+            self.partial,
             self.not_mature,
             self.voided
         );
@@ -141,6 +144,24 @@ fn pct_from(base: f64, value: f64) -> f64 {
     (value - base) / base * 100.
 }
 
+/// 读取某个 horizon 的收盘涨跌；目标日尚未到 as_of 时返回 None.
+fn read_change_as_of(
+    db: &DatabaseManager,
+    code: &str,
+    base_date: NaiveDate,
+    base_close: f64,
+    horizon: u32,
+    as_of: NaiveDate,
+) -> Result<Option<f64>, String> {
+    match advance_trading_days(base_date, horizon)? {
+        Some(target) if target <= as_of => {
+            let day = target.format("%Y-%m-%d").to_string();
+            Ok(read_close(db, code, &day)?.map(|close| pct_from(base_close, close)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// 回填一轮: 取未回填行, 能算的算完写回.
 pub fn backfill_advice_outcomes(
     db: &DatabaseManager,
@@ -187,6 +208,20 @@ pub fn backfill_advice_outcomes(
             continue;
         };
 
+        // 先写已经成熟的 T+1/T+3，不阻塞在 T+5 观察窗上；T+5 走完后再由
+        // 下面的完整回填覆盖。outcome_filled_at 保持 NULL，确保下一轮继续扫。
+        let partial_t1 = read_change_as_of(db, &row.code, base_date, base_close, 1, as_of)?;
+        let partial_t3 = read_change_as_of(db, &row.code, base_date, base_close, 3, as_of)?;
+        if partial_t1.is_some() || partial_t3.is_some() {
+            let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+            match apply_partial_outcome(&mut *conn, row.id, base_close, partial_t1, partial_t3) {
+                Ok(()) => report.partial += 1,
+                Err(error) => report
+                    .errors
+                    .push(format!("id={} 部分回填写回失败: {error}", row.id)),
+            }
+        }
+
         // 观察窗终点: T+5. 日历数据不足时先推迟, 超期则作废.
         let Some(window_end) = advance_trading_days(base_date, HORIZON_DAYS)? else {
             if overdue {
@@ -225,19 +260,10 @@ pub fn backfill_advice_outcomes(
             continue;
         };
 
-        // 各期收盘: 缺哪期就记 NULL, 不阻碍整行写回.
-        let mut read_change = |horizon: u32| -> Result<Option<f64>, String> {
-            match advance_trading_days(base_date, horizon)? {
-                Some(target) if target <= as_of => {
-                    let day = target.format("%Y-%m-%d").to_string();
-                    Ok(read_close(db, &row.code, &day)?.map(|close| pct_from(base_close, close)))
-                }
-                _ => Ok(None),
-            }
-        };
-        let change_t1 = read_change(1)?;
-        let change_t3 = read_change(3)?;
-        let change_t5 = read_change(5)?;
+        // 各期收盘: 缺哪期就记 NULL, 不阻碍整行写回。
+        let change_t1 = partial_t1;
+        let change_t3 = partial_t3;
+        let change_t5 = read_change_as_of(db, &row.code, base_date, base_close, 5, as_of)?;
 
         let expected_days = HORIZON_DAYS as i64;
         let note = if traded_days < expected_days {

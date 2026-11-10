@@ -122,6 +122,49 @@ impl EventCalendarGateway {
             }
         }
     }
+
+    /// 按票公告（ExternalV1）。本地全市场 feed 不支持按票，必须走 external
+    /// bundle；未配置或桥不可用时显式失败，不返回全市场记录冒充按票结果。
+    pub async fn instrument_announcements(
+        &self,
+        instrument: serde_json::Value,
+        start: &str,
+        end: &str,
+        limit: u32,
+    ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
+        let code = instrument
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let request_hash =
+            acquisition_request_hash(CAPABILITY, format!("{code}:{start}:{end}:{limit}"));
+        match super::grpc_source::bridge_for_server("Announcements") {
+            Ok(Some(bridge)) => {
+                let result = bridge
+                    .announcements_for_instrument_async(instrument, start, end, limit)
+                    .await;
+                let audit_provider = result
+                    .as_ref()
+                    .map(|b| b.evidence().provider)
+                    .unwrap_or(ProviderId::Cninfo);
+                audit_gateway_result(CAPABILITY, audit_provider, &request_hash, result)
+            }
+            Ok(None) => Err(GatewayError::classified(
+                CAPABILITY,
+                Some(ProviderId::Cninfo),
+                "unavailable",
+                "provider_transport",
+                true,
+                "按票公告需要 ExternalV1 client bundle",
+            )),
+            Err(error) => audit_gateway_result(
+                CAPABILITY,
+                ProviderId::Cninfo,
+                &request_hash,
+                Err(error),
+            ),
+        }
+    }
 }
 
 #[cfg(feature = "magic-gateway")]

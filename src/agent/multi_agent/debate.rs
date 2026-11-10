@@ -162,11 +162,14 @@ mod tests {
             ..crate::analyzer::GeminiConfig::default()
         });
         let view = AnalystView {
-            score: 60,
+            score: Some(60),
+            status: "ok".to_string(),
             stance: "bull".to_string(),
             confidence: "high".to_string(),
             key_signals: vec!["TEST_CODE_证据".to_string()],
             summary: "TEST_CODE_摘要".to_string(),
+            evidence_refs: Vec::new(),
+            role_version: "v1".to_string(),
         };
         let summary = analyst_summary(&view, &view, &view, &view, &view, &view);
         assert!(summary.contains("技术面分析师"));

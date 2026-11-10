@@ -28,6 +28,11 @@ pub fn build_slices(
     macro_context: Option<&str>,
     trend_snapshot: Option<&TrendSnapshot>,
 ) -> DomainSlices {
+    // 统一按最新在前排序。gRPC HistoricalBars 实际返回升序（最旧在前），
+    // 而本函数及下游 technical/capital 计算都按 [0]=最新 的契约取值。
+    let mut ordered = kline_data.to_vec();
+    ordered.sort_by(|left, right| right.date.cmp(&left.date));
+    let kline_data = ordered.as_slice();
     let latest = &kline_data[0];
     let closes: Vec<f64> = kline_data.iter().map(|k| k.close).collect();
     let n = closes.len();
@@ -1010,6 +1015,23 @@ mod tests {
             growth_percentile: Some(90.0),
         });
         history
+    }
+
+    #[test]
+    fn build_slices_normalizes_ascending_history_to_latest_first() {
+        let mut history = rich_history(5);
+        history.reverse(); // gRPC HistoricalBars 的升序形态
+        let slices = build_slices(
+            "TEST_CODE_688001",
+            Some("测试公司"),
+            &history,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(slices.basics.contains("最新交易日: 2026-07-18"));
+        assert!(slices.basics.contains("最新价: 12.00"));
     }
 
     #[test]

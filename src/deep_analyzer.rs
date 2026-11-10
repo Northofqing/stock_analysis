@@ -1,7 +1,6 @@
 //! 深度分析入口
 //!
-//! 提供两条路径：
-//! - [`run_react_analysis`]：单角色 ReAct Agent + Critic（保留备用，原 `--deep-analysis` 实现）
+//! 提供多角色流水线：
 //! - [`run_multi_agent_analysis`]：方案 X 多角色流水线
 //!     1. 串行/并行调用 6 个工具拿真实数据（财务/研报/资金/筹码/板块/新闻）
 //!     2. `build_slices` 转 [`crate::analyzer::DomainSlices`]
@@ -12,15 +11,13 @@
 //! - [`run_and_save`] 默认走多角色路径
 
 use crate::agent::{
-    build_slices, AgentRunner, FetchChipDistributionTool, FetchFinancialTool, FetchFundFlowTool,
-    FetchNewsTool, FetchResearchTool, FetchSectorTool, Tool, Toolbelt, ValidationEngine,
+    build_slices, FetchChipDistributionTool, FetchFinancialTool, FetchFundFlowTool, FetchNewsTool,
+    FetchResearchTool, FetchSectorTool, Tool,
 };
 use crate::analyzer::GeminiAnalyzer;
 use crate::data_provider::KlineData;
 use anyhow::Result;
-use async_openai::{config::OpenAIConfig, Client};
 use serde_json::json;
-use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -107,8 +104,6 @@ async fn fetch_kline_via_gateway(code: &str, days: usize) -> Result<Vec<KlineDat
     Ok(kline)
 }
 
-const DEFAULT_MAX_ITERATIONS: usize = 12;
-
 // 修复 P1-F (2026-06-30 codex review): 6 Tool 失败显式标注 (AGENTS §2.1, BR-011).
 // 之前 `unwrap_or_warn` 把 `Ok(json!({"error": ...}))` 当成功, LLM 拿到错误 JSON 照样编造.
 // 现在 collect 返回 ToolResult{ok, data, err}, 拼装 data_inventory 注入 LLM prompt,
@@ -174,10 +169,6 @@ fn render_data_inventory(results: &[ToolResult]) -> String {
 const DATA_INVENTORY_RULE: &str =
     "【强制规则】data_inventory 标 MISSING 的字段，在结论中必须写 [数据缺失]，禁止编造。\
      至少 2 个数据源成功才给出综合分；不足 2 个时综合分标 N/A。";
-const DEFAULT_SYSTEM_PROMPT: &str = "你是一个专精于 A 股深研的金融量化 Agent。\n\
-你的任务是通过调用提供的工具（Tool）来获取真实数据，严禁编造财务数据。\n\
-在拿到数据后，你需要做交叉分析。如果在分析中触发了系统校验失败，请立刻通过报错提示进行修正，不要固执己见。\n\
-请根据个股数据和行业板块联动，给出最终深入的评估。";
 
 /// 主流程（`process_stock`）已抓取数据的快照，供重点股深度研判复用，
 /// 避免在 [`run_multi_agent_analysis`] 中重复抓取 K线/资金/新闻/财务等数据。
@@ -218,86 +209,9 @@ pub struct TrendSnapshot {
     pub risk_factors: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct ModelConfig {
-    api_key: String,
-    api_base: String,
-    model: String,
-}
-
-fn collect_model_configs_from<F>(get: F) -> Vec<ModelConfig>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let mut configs = Vec::new();
-
-    if let Some(key) = get("DOUBAO_API_KEY").filter(|value| !value.is_empty()) {
-        configs.push(ModelConfig {
-            api_key: key,
-            api_base: get("DOUBAO_BASE_URL")
-                .unwrap_or_else(|| "https://ark.cn-beijing.volces.com/api/v3".to_string()),
-            model: get("DOUBAO_MODEL").unwrap_or_else(|| "doubao-seed-2-0-pro-260215".to_string()),
-        });
-    }
-    if let Some(key) = get("DEEPSEEK_API_KEY").filter(|value| !value.is_empty()) {
-        configs.push(ModelConfig {
-            api_key: key,
-            api_base: get("DEEPSEEK_BASE_URL")
-                .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string()),
-            model: get("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-chat".to_string()),
-        });
-    }
-    if let Some(key) = get("GEMINI_API_KEY").filter(|value| !value.is_empty()) {
-        configs.push(ModelConfig {
-            api_key: key,
-            api_base: get("GEMINI_BASE_URL").unwrap_or_else(|| {
-                "https://generativelanguage.googleapis.com/v1beta/openai/".to_string()
-            }),
-            model: get("GEMINI_MODEL").unwrap_or_else(|| "gemini-2.5-flash".to_string()),
-        });
-    }
-
-    configs
-}
-
-fn collect_model_configs() -> Vec<ModelConfig> {
-    collect_model_configs_from(|name| env::var(name).ok())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_collect_model_configs_order() {
-        let values = std::collections::HashMap::from([
-            ("DOUBAO_API_KEY", "doubao-key"),
-            ("DOUBAO_MODEL", "doubao-test"),
-            ("DEEPSEEK_API_KEY", "deepseek-key"),
-            ("DEEPSEEK_BASE_URL", "https://api.deepseek.example/v1"),
-            ("DEEPSEEK_MODEL", "deepseek-test"),
-            ("GEMINI_API_KEY", "gemini-key"),
-            ("GEMINI_MODEL", "gemini-test"),
-        ]);
-        let configs = collect_model_configs_from(|name| values.get(name).map(|v| (*v).to_string()));
-        assert_eq!(configs[0].model, "doubao-test");
-        assert_eq!(configs[1].model, "deepseek-test");
-        assert_eq!(configs[2].model, "gemini-test");
-        assert_eq!(configs[1].api_base, "https://api.deepseek.example/v1");
-    }
-
-    #[test]
-    fn test_collect_model_configs_stale_openai_ignored() {
-        let stale_only = std::collections::HashMap::from([
-            ("OPENAI_API_KEY", "stale-key"),
-            ("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
-            ("OPENAI_MODEL", "deepseek-chat"),
-        ]);
-        assert!(collect_model_configs_from(|name| {
-            stale_only.get(name).map(|v| (*v).to_string())
-        })
-        .is_empty());
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn br156_async_kline_path_does_not_nest_runtime() {
@@ -328,73 +242,6 @@ mod tests {
     }
 }
 
-fn build_client(cfg: &ModelConfig) -> Client<OpenAIConfig> {
-    let openai_cfg = OpenAIConfig::new()
-        .with_api_key(cfg.api_key.clone())
-        .with_api_base(cfg.api_base.clone());
-    Client::with_config(openai_cfg)
-}
-
-fn build_toolbelt() -> Toolbelt {
-    let mut toolbelt = Toolbelt::new();
-    toolbelt.register(FetchFinancialTool::new());
-    toolbelt.register(FetchSectorTool::new());
-    toolbelt.register(FetchResearchTool::new());
-    toolbelt.register(FetchFundFlowTool::new());
-    toolbelt.register(FetchChipDistributionTool::new());
-    toolbelt.register(FetchNewsTool::new());
-    toolbelt
-}
-
-/// 对单只股票运行 ReAct Agent 深度分析（旧路径，保留备用）。
-///
-/// 返回最终的 Markdown 报告文本（即使 Critic 未通过，也会返回带警示的草稿）。
-pub async fn run_react_analysis(code: &str) -> Result<String> {
-    let model_configs = collect_model_configs();
-    if model_configs.is_empty() {
-        anyhow::bail!(
-            "未在 .env 中找到 DOUBAO_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY 任一有效配置"
-        );
-    }
-    log::info!(
-        "[DeepAnalyzer] 加载 {} 个模型配置，主模型: {}，fallback 链: {}",
-        model_configs.len(),
-        model_configs[0].model,
-        model_configs[1..]
-            .iter()
-            .map(|c| c.model.as_str())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    );
-
-    let primary = &model_configs[0];
-    let primary_client = build_client(primary);
-    let primary_model = primary.model.clone();
-    let fallback_pairs: Vec<(Client<OpenAIConfig>, String)> = model_configs[1..]
-        .iter()
-        .map(|c| (build_client(c), c.model.clone()))
-        .collect();
-
-    let toolbelt = build_toolbelt();
-    let validation = ValidationEngine::new_with_defaults();
-
-    let mut agent = AgentRunner::new(
-        primary_client,
-        toolbelt,
-        validation,
-        DEFAULT_SYSTEM_PROMPT.to_string(),
-        primary_model,
-    )
-    .with_fallbacks(fallback_pairs);
-
-    let query = format!(
-        "请帮我重点看看股票 {} 的财报，以及它最近的板块联动效应。要求内容详实。",
-        code
-    );
-
-    agent.run(&query, DEFAULT_MAX_ITERATIONS).await
-}
-
 /// 方案 X：多角色 + 工具数据 + 辩论仲裁 流水线。
 ///
 /// 步骤：
@@ -406,7 +253,27 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     log::info!("[MultiAgent] 开始抓取数据：{}", code);
 
     // 1. K 线（BR-010/BR-156/BR-164）：统一 Magic Gateway。
-    let kline = fetch_kline_via_gateway(code, 250).await?;
+    // 250 日窗口一旦命中“未获权威证据的历史停牌缺口”，整批会被 fail-closed；
+    // 对深度研判降级到 120 日窗口（完全避开缺口），并在切片里显式标注，
+    // 不把缺口推断成停牌，也不丢整只票。
+    let mut window_note = None;
+    let kline = match fetch_kline_via_gateway(code, 250).await {
+        Ok(kline) => kline,
+        Err(error) if error.to_string().contains("suspension_evidence_unavailable_v1") => {
+            log::warn!(
+                "[MultiAgent] {} 250 日窗口含未证实停牌缺口，降级到 120 日窗口: {:#}",
+                code,
+                error
+            );
+            window_note = Some(
+                "【数据窗口】250 日窗口含未证实停牌缺口，本次使用 120 日窗口；\
+                 缺口原因未获权威停牌证据，本报告不推断其性质。"
+                    .to_string(),
+            );
+            fetch_kline_via_gateway(code, 120).await?
+        }
+        Err(error) => return Err(error),
+    };
     if kline.is_empty() {
         anyhow::bail!("K 线数据为空，无法进行多角色分析");
     }
@@ -510,6 +377,9 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
         None,
         None,
     );
+    if let Some(note) = window_note {
+        slices.basics.push_str(&format!("\n{}", note));
+    }
 
     // 5. 把财务工具数据注入基本面切片
     if !fin_str.is_empty() {

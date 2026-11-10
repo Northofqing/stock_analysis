@@ -287,6 +287,35 @@ pub fn apply_outcome(
     Ok(())
 }
 
+/// 写回已成熟但尚未走完 T+5 观察窗的部分结果。
+///
+/// 只填 `change_t1/change_t3`，**不写 `outcome_filled_at`**，让该行继续留在
+/// pending 集合；等 T+5 走完后由 `apply_outcome` 写最终值。这样周初/上周的
+/// T+1、T+3 不必等 T+5 才能看到，同时不会把 T+5 误标成已完成。
+pub fn apply_partial_outcome(
+    conn: &mut SqliteConnection,
+    id: i64,
+    expected_price: f64,
+    change_t1: Option<f64>,
+    change_t3: Option<f64>,
+) -> Result<(), String> {
+    diesel::sql_query(
+        "UPDATE advice_outcome_tracking SET \
+         expected_price = ?, change_t1 = COALESCE(?, change_t1), \
+         change_t3 = COALESCE(?, change_t3), outcome_pct = COALESCE(?, outcome_pct), \
+         note = 'partial_t1_t3', updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ? AND outcome_filled_at IS NULL",
+    )
+    .bind::<Double, _>(expected_price)
+    .bind::<Nullable<Double>, _>(change_t1)
+    .bind::<Nullable<Double>, _>(change_t3)
+    .bind::<Nullable<Double>, _>(change_t1)
+    .bind::<BigInt, _>(id)
+    .execute(conn)
+    .map_err(|e| format!("advice partial outcome update failed: {e}"))?;
+    Ok(())
+}
+
 /// 标记该行无法回填 (基准日缺收盘, 或观察窗超期仍无数据).
 ///
 /// 只写 `note` + `outcome_filled_at`, **数值列保持 NULL** —— 不补 0

@@ -71,6 +71,9 @@ struct Args {
     market_announcements_date: Option<String>,
     #[arg(long, default_value = "600396")]
     code: String,
+    /// 逗号分隔的多个代码；用于复现 op61 批量请求（单票仍用 --code）。
+    #[arg(long)]
+    codes: Option<String>,
     #[arg(long, default_value = "live")]
     stage: String,
     #[arg(long, default_value_t = 20)]
@@ -152,13 +155,21 @@ fn native_query_spec(args: &Args, selection: NativeOperation) -> anyhow::Result<
             if !matches!(args.stage.as_str(), "live" | "final") {
                 anyhow::bail!("auction stage must be live or final");
             }
-            let instrument = resolve_production_equity(&args.code, None)
-                .map_err(|error| anyhow::anyhow!("auction instrument is invalid: {error}"))?
-                .instrument()
-                .clone();
+            let raw = args.codes.as_deref().unwrap_or(&args.code);
+            let mut instruments = Vec::new();
+            for code in raw.split(',').map(str::trim).filter(|code| !code.is_empty()) {
+                let instrument = resolve_production_equity(code, None)
+                    .map_err(|error| anyhow::anyhow!("auction instrument {code} is invalid: {error}"))?
+                    .instrument()
+                    .clone();
+                instruments.push(instrument);
+            }
+            if instruments.is_empty() {
+                anyhow::bail!("auction codes must not be empty");
+            }
             NativeQuerySpec {
                 operation: ExternalOperation::CurrentAuctionObservations,
-                params: serde_json::json!({"instruments":[instrument],"stage":args.stage.as_str()}),
+                params: serde_json::json!({"instruments": instruments, "stage": args.stage.as_str()}),
                 provider: "HithinkFinance",
                 record_provider: "Tonghuashun",
                 record_schema: "magic.market.current_auction_observation",

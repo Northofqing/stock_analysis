@@ -50,8 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let report = backfill_advice_outcomes(DatabaseManager::get(), as_of)?;
     println!(
-        "as_of={as_of} scanned={} filled={} not_mature={} voided={}",
-        report.scanned, report.filled, report.not_mature, report.voided
+        "as_of={as_of} scanned={} filled={} partial={} not_mature={} voided={}",
+        report.scanned, report.filled, report.partial, report.not_mature, report.voided
     );
     for error in &report.errors {
         println!("  - {error}");

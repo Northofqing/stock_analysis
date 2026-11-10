@@ -1769,6 +1769,11 @@ fn record_p01_tickets(
                             status: "unavailable".to_owned(),
                             reason: Some("financial_statements_not_fetched".to_owned()),
                         },
+                    filings: stock_analysis::monitor::ticket_evidence_bundle::Filings {
+                        status: "not_fetched".to_owned(),
+                        items: Vec::new(),
+                        reason: Some("p01_sync_path".to_owned()),
+                    },
                     missing,
                 };
                 if let Err(error) =

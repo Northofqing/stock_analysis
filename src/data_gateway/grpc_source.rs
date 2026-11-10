@@ -1309,6 +1309,9 @@ pub fn bridge_for(_op: &str) -> Result<Arc<GrpcSource>, GatewayError> {
         external_bundle: std::env::var_os("GRPC_MARKET_CLIENT_BUNDLE")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from),
+        quote_book_external: std::env::var("DATA_GATEWAY_QUOTE_BOOK_ROUTE")
+            .map(|value| value.eq_ignore_ascii_case("external"))
+            .unwrap_or(false),
         external_client: AsyncMutex::new(None),
         local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
         external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2623,6 +2626,9 @@ pub struct GrpcSource {
     client: AsyncMutex<Option<GrpcMarketClient>>,
     /// Optional authenticated ExternalV1 bundle. The path is never logged.
     external_bundle: Option<PathBuf>,
+    /// Opt-in route for ordinary quote/book reads through ExternalV1.
+    /// T0Evidence remains on the local bridge; this flag never widens it.
+    quote_book_external: bool,
     /// ExternalV1 has a separate channel/profile from the normalized local bridge.
     external_client: AsyncMutex<Option<ExternalClientState>>,
     local_initialization: Arc<tokio::sync::Semaphore>,
@@ -2889,6 +2895,7 @@ impl GrpcSource {
             addr,
             client: AsyncMutex::new(Some(client)),
             external_bundle: None,
+            quote_book_external: false,
             external_client: AsyncMutex::new(None),
             local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
             external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2901,6 +2908,7 @@ impl GrpcSource {
             addr: "http://127.0.0.1:board-loopback-test".to_owned(),
             client: AsyncMutex::new(Some(client)),
             external_bundle: None,
+            quote_book_external: false,
             external_client: AsyncMutex::new(None),
             local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
             external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3024,6 +3032,18 @@ impl GrpcSource {
         self.query_op_with_provider(op, params, None).await
     }
 
+    /// ExternalV1 的时间戳由 Windows 主机生成；Mac/Windows 时钟不是同一时钟，
+    /// 实测 observed_at 可比 Mac 的 now 早/晚几十毫秒。只给外部 quote/book
+    /// 的 consumer 时间门留 2s 未来偏斜；本地桥仍使用精确 now。
+    fn quote_book_conversion_now(&self) -> DateTime<chrono::Utc> {
+        let now = chrono::Utc::now();
+        if self.quote_book_external {
+            now + chrono::Duration::seconds(2)
+        } else {
+            now
+        }
+    }
+
     /// Same as [`Self::query_op`] with an explicit provider route. Only the
     /// ExternalV1 profile carries it; LocalBridgeV1 ignores the hint.
     async fn query_op_with_provider(
@@ -3035,6 +3055,41 @@ impl GrpcSource {
         #[cfg(test)]
         if let Some(result) = take_test_query_response() {
             return result.map_err(|error| map_current_routed_query_error(op, &error));
+        }
+        if self.quote_book_external
+            && preferred_provider.is_none()
+            && matches!(op, Operation::RealtimeQuotes | Operation::OrderBooks)
+        {
+            let codes = params
+                .get("codes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    GatewayError::invalid_request(
+                        "GrpcExternalV1",
+                        "RealtimeQuotes/OrderBooks 需要 codes 数组",
+                    )
+                })?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        GatewayError::invalid_request(
+                            "GrpcExternalV1",
+                            "RealtimeQuotes/OrderBooks 的 codes 必须是字符串",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let external_op = match op {
+                Operation::RealtimeQuotes => ExternalOperation::RealtimeQuotes,
+                Operation::OrderBooks => ExternalOperation::OrderBooks,
+                _ => unreachable!(),
+            };
+            return self
+                .query_external_native_op(
+                    external_op,
+                    crate::grpc_contract::params::instruments_for(&codes),
+                )
+                .await;
         }
         self.ensure_connected().await?;
         // BR-243: 锁只保护惰性连接初始化, 查询必须并发。全局锁覆盖整个
@@ -3467,6 +3522,89 @@ impl GrpcSource {
             .map_err(|error| map_external_query_error(operation, &error))
     }
 
+    fn normalize_external_quote_book_records(
+        result: &mut QueryResult,
+        operation: ExternalOperation,
+    ) -> Result<(), GatewayError> {
+        const CAPABILITY: &str = "ExternalQuoteBook";
+        let (schema, quote) = match operation {
+            ExternalOperation::RealtimeQuotes => ("market.realtime_quotes", true),
+            ExternalOperation::OrderBooks => ("market.order_books", false),
+            _ => return Ok(()),
+        };
+        let batch_source_at = result.source_at.clone();
+        let mut values = Vec::with_capacity(result.records.len());
+        for record in &result.records {
+            let value: Value = serde_json::from_slice(&record.data).map_err(|error| {
+                GatewayError::invalid_evidence(
+                    CAPABILITY,
+                    None,
+                    format!("external record is not canonical JSON: {error}"),
+                )
+            })?;
+            let code = value
+                .get("instrument")
+                .and_then(|instrument| instrument.get("code"))
+                .and_then(Value::as_str)
+                .or_else(|| value.get("code").and_then(Value::as_str))
+                .ok_or_else(|| {
+                    GatewayError::invalid_evidence(
+                        CAPABILITY,
+                        None,
+                        "external record has no instrument.code",
+                    )
+                })?;
+            let mut normalized = serde_json::Map::new();
+            normalized.insert("code".to_owned(), Value::String(code.to_owned()));
+            if quote {
+                if let Some(name) = value.get("name").and_then(Value::as_str) {
+                    normalized.insert("name".to_owned(), Value::String(name.to_owned()));
+                }
+                for key in ["price", "previous_close"] {
+                    if let Some(field) = value.get(key) {
+                        normalized.insert(key.to_owned(), field.clone());
+                    }
+                }
+                let change_percent = value
+                    .get("change_pct")
+                    .cloned()
+                    .or_else(|| {
+                        value
+                            .get("change_percent")
+                            .and_then(|percent| percent.get("value"))
+                            .cloned()
+                    })
+                    .unwrap_or(Value::Null);
+                normalized.insert("change_pct".to_owned(), change_percent);
+            } else {
+                for key in ["bids", "asks", "total_bid_quantity", "total_ask_quantity"] {
+                    if let Some(field) = value.get(key) {
+                        normalized.insert(key.to_owned(), field.clone());
+                    }
+                }
+            }
+            normalized.insert(
+                "source_at".to_owned(),
+                Value::String(batch_source_at.clone()),
+            );
+            values.push(Value::Object(normalized));
+        }
+        let data = serde_json::to_vec(&Value::Array(values)).map_err(|error| {
+            GatewayError::invalid_evidence(
+                CAPABILITY,
+                None,
+                format!("cannot encode canonical external array: {error}"),
+            )
+        })?;
+        result.records = vec![crate::grpc_client::envelope::CanonicalRecord {
+            schema: schema.to_owned(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".to_owned(),
+            data,
+        }];
+        Ok(())
+    }
+
     async fn query_external_native_op(
         &self,
         operation: ExternalOperation,
@@ -3495,10 +3633,12 @@ impl GrpcSource {
         let (mut client, _) = self
             .ensure_external_connected(known_external_method(operation))
             .await?;
-        client
+        let mut result = client
             .query_external_native(operation, params)
             .await
-            .map_err(|error| map_external_query_error_named(&format!("{operation:?}"), &error))
+            .map_err(|error| map_external_query_error_named(&format!("{operation:?}"), &error))?;
+        Self::normalize_external_quote_book_records(&mut result, operation)?;
+        Ok(result)
     }
 
     /// op 67 QualifiedTradingFacts（provider-observed 观察值）。
@@ -3569,7 +3709,7 @@ impl GrpcSource {
                 serde_json::json!({ "codes": codes }),
             )
             .await?;
-        let batch = convert::realtime_quotes_at(&q, chrono::Utc::now())?;
+        let batch = convert::realtime_quotes_at(&q, self.quote_book_conversion_now())?;
         let returned = batch
             .records()
             .iter()
@@ -3627,7 +3767,7 @@ impl GrpcSource {
                 )
                 .await;
             match answer {
-                Ok(q) => match convert::realtime_quotes_at(&q, chrono::Utc::now()) {
+                Ok(q) => match convert::realtime_quotes_at(&q, self.quote_book_conversion_now()) {
                     Ok(GatewayBatch::Available { records, .. }) => accepted.extend(records),
                     Ok(GatewayBatch::VerifiedEmpty(_)) => isolated.extend(chunk),
                     Err(_) => isolated.extend(chunk),
@@ -3666,7 +3806,7 @@ impl GrpcSource {
                 serde_json::json!({ "codes": codes }),
             )
             .await?;
-        convert::realtime_quote_candidates_at(&q, chrono::Utc::now())
+        convert::realtime_quote_candidates_at(&q, self.quote_book_conversion_now())
     }
 
     pub(crate) fn realtime_quote_candidates(
@@ -3709,7 +3849,7 @@ impl GrpcSource {
         let q = self
             .query_op(Operation::OrderBooks, serde_json::json!({ "codes": codes }))
             .await?;
-        let batch = convert::order_books_at(&q, chrono::Utc::now())?;
+        let batch = convert::order_books_at(&q, self.quote_book_conversion_now())?;
         let returned = batch
             .records()
             .iter()
@@ -3846,6 +3986,37 @@ impl GrpcSource {
     ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
         let q = self
             .query_op(Operation::Announcements, serde_json::json!({}))
+            .await?;
+        convert::announcements(&q)
+    }
+
+    /// 按票公告（ExternalV1）：instrument + 日期范围。要求 external bundle，
+    /// 本地全市场 feed 不支持按票，不能把它当按票结果返回。
+    pub async fn announcements_for_instrument_async(
+        &self,
+        instrument: Value,
+        start: &str,
+        end: &str,
+        limit: u32,
+    ) -> Result<GatewayBatch<EventAnnouncement>, GatewayError> {
+        if self.external_bundle.is_none() {
+            return Err(GatewayError::classified(
+                "Announcements",
+                Some(ProviderId::Cninfo),
+                "unavailable",
+                "external_bundle_unconfigured",
+                false,
+                "按票公告需要 ExternalV1 client bundle",
+            ));
+        }
+        let params = serde_json::json!({
+            "instrument": instrument,
+            "start": start,
+            "end": end,
+            "limit": limit,
+        });
+        let q = self
+            .query_external_op(Operation::Announcements, params)
             .await?;
         convert::announcements(&q)
     }
@@ -4375,7 +4546,7 @@ impl GrpcSource {
                 Operation::FundFlowSeries,
                 serde_json::json!({
                     "codes": [code],
-                    "interval": format!("{interval:?}"),
+                    "interval": format!("{interval:?}").to_ascii_lowercase(),
                     "limit": limit,
                 }),
             )
@@ -4789,6 +4960,7 @@ mod tests {
             addr: "http://127.0.0.1:1".to_owned(),
             client: AsyncMutex::new(None),
             external_bundle: None,
+            quote_book_external: false,
             external_client: AsyncMutex::new(None),
             local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
             external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -6151,6 +6323,122 @@ mod tests {
             provenance: AcquisitionProvenance::LocalWireSource("TEST_CODE_tdx".to_owned()),
             diagnostic_blocker: String::new(),
         }
+    }
+
+    #[test]
+    fn external_quote_book_records_are_normalized_to_local_canonical_array() {
+        use crate::grpc_client::envelope::{AcquisitionProvenance, CanonicalRecord, QueryAdmission};
+
+        let raw_record = |schema: &str, data: serde_json::Value| CanonicalRecord {
+            schema: schema.to_owned(),
+            schema_version: 1,
+            content_type: "application/json; charset=utf-8".to_owned(),
+            data: serde_json::to_vec(&data).expect("TEST_CODE external record"),
+        };
+        let mut quote = QueryResult {
+            admission: QueryAdmission::Admitted,
+            selected_provider: "Tencent".to_owned(),
+            batch_id: "TEST_CODE_external_quote".to_owned(),
+            complete: true,
+            observed_at: "2026-08-17T01:30:02.250Z".to_owned(),
+            source_at: "2026-08-17T01:30:02Z".to_owned(),
+            records: vec![
+                raw_record(
+                    "magic.market.quote",
+                    serde_json::json!({
+                        "instrument": {"exchange": "Shanghai", "code": "600396", "asset_class": "Equity"},
+                        "name": "TEST_CODE_600396",
+                        "price": 8.98,
+                        "previous_close": 9.15,
+                        "change_percent": {"value": -1.86, "unit": "Percent"},
+                        "source_at": "2026-08-17T01:30:02+08:00"
+                    }),
+                ),
+                raw_record(
+                    "magic.market.quote",
+                    serde_json::json!({
+                        "instrument": {"exchange": "Shenzhen", "code": "001216", "asset_class": "Equity"},
+                        "name": "TEST_CODE_001216",
+                        "price": 17.6,
+                        "previous_close": 18.68,
+                        "change_percent": {"value": -5.78, "unit": "Percent"},
+                        "source_at": "2026-08-17T01:30:03+08:00"
+                    }),
+                ),
+            ],
+            provenance: AcquisitionProvenance::LocalWireSource("TEST_CODE_tencent".to_owned()),
+            diagnostic_blocker: String::new(),
+        };
+        GrpcSource::normalize_external_quote_book_records(
+            &mut quote,
+            ExternalOperation::RealtimeQuotes,
+        )
+        .expect("TEST_CODE external quote normalization");
+        assert_eq!(quote.records.len(), 1);
+        assert_eq!(quote.records[0].schema, "market.realtime_quotes");
+        let quote_batch = convert::realtime_quotes_at(
+            &quote,
+            chrono::DateTime::parse_from_rfc3339("2026-08-17T01:30:03Z")
+                .expect("TEST_CODE now")
+                .with_timezone(&chrono::Utc),
+        )
+        .expect("TEST_CODE normalized quote batch");
+        let quotes = quote_batch.records();
+        assert_eq!(quotes.len(), 2);
+        assert_eq!(quotes[0].code, "600396");
+        assert_eq!(quotes[0].change_percent, -1.86);
+        assert_eq!(quotes[1].code, "001216");
+        assert_eq!(quotes[1].previous_close, 18.68);
+
+        let mut book = QueryResult {
+            admission: QueryAdmission::Admitted,
+            selected_provider: "Tencent".to_owned(),
+            batch_id: "TEST_CODE_external_book".to_owned(),
+            complete: true,
+            observed_at: "2026-08-17T01:30:02.250Z".to_owned(),
+            source_at: "2026-08-17T01:30:02Z".to_owned(),
+            records: vec![raw_record(
+                "magic.market.order_book",
+                serde_json::json!({
+                    "instrument": {"exchange": "Shanghai", "code": "600396", "asset_class": "Equity"},
+                    "bids": [
+                        {"price": 8.97, "quantity": 860.0},
+                        {"price": 8.96, "quantity": 1043.0},
+                        {"price": 8.95, "quantity": 1470.0},
+                        {"price": 8.94, "quantity": 191.0},
+                        {"price": 8.93, "quantity": 337.0}
+                    ],
+                    "asks": [
+                        {"price": 8.98, "quantity": 482.0},
+                        {"price": 8.99, "quantity": 259.0},
+                        {"price": 9.0, "quantity": 344.0},
+                        {"price": 9.01, "quantity": 173.0},
+                        {"price": 9.02, "quantity": 12.0}
+                    ],
+                    "total_bid_quantity": 3901.0,
+                    "total_ask_quantity": 1270.0,
+                    "source_at": "2026-08-17T01:30:03+08:00"
+                }),
+            )],
+            provenance: AcquisitionProvenance::LocalWireSource("TEST_CODE_tencent".to_owned()),
+            diagnostic_blocker: String::new(),
+        };
+        GrpcSource::normalize_external_quote_book_records(&mut book, ExternalOperation::OrderBooks)
+            .expect("TEST_CODE external book normalization");
+        assert_eq!(book.records.len(), 1);
+        assert_eq!(book.records[0].schema, "market.order_books");
+        let book_batch = convert::order_books_at(
+            &book,
+            chrono::DateTime::parse_from_rfc3339("2026-08-17T01:30:03Z")
+                .expect("TEST_CODE now")
+                .with_timezone(&chrono::Utc),
+        )
+        .expect("TEST_CODE normalized order book batch");
+        let books = book_batch.records();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].code, "600396");
+        assert_eq!(books[0].bids[0].price, 8.97);
+        assert_eq!(books[0].total_ask_quantity, 1270.0);
     }
 
     #[test]

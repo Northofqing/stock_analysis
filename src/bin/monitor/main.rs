@@ -15503,7 +15503,8 @@ async fn auction_watch_loop() {
                         }
                         // 6.3：先落证据包，再推送——推送失败也要能追溯当次决策。
                         if !report.evidence_facts.is_empty() {
-                            match db.get_conn() {
+                            // 先转成 String：Box<dyn Error> 跨 await 会破坏 Send。
+                            match db.get_conn().map_err(|error| error.to_string()) {
                                 Ok(mut evidence_conn) => {
                                     let root = std::path::Path::new(".");
                                     let captured_at = chrono::Local::now().to_rfc3339();
@@ -15543,6 +15544,16 @@ async fn auction_watch_loop() {
                                                     }
                                                 }
                                             }
+                                        }
+                                        bundle.filings = stock_analysis::monitor::ticket_evidence_bundle::fetch_filings(
+                                            &fact.code,
+                                            &date_text,
+                                        )
+                                        .await;
+                                        if bundle.filings.status == "ok" {
+                                            bundle
+                                                .missing
+                                                .retain(|field| field != "official_filing");
                                         }
                                         match stock_analysis::monitor::ticket_evidence_bundle::write_bundle(
                                             root,

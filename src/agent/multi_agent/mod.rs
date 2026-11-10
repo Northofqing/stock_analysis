@@ -76,7 +76,12 @@ impl GeminiAnalyzer {
 
         info!(
             "[Agent流水线] 分析师评分 — 技术={} 资金={} 基本面={} 消息={} 板块={} 时间窗={}",
-            tech.score, cap.score, fund.score, news.score, sector.score, timeframe.score
+            tech.score_text(),
+            cap.score_text(),
+            fund.score_text(),
+            news.score_text(),
+            sector.score_text(),
+            timeframe.score_text()
         );
         trace::print_analyst(self, "技术面分析师", &tech);
         trace::print_analyst(self, "资金面分析师", &cap);
@@ -116,6 +121,8 @@ impl GeminiAnalyzer {
         info!(
             "[Agent流水线] 完成 — composite_score={}",
             arb.composite_score
+                .map(|score| score.to_string())
+                .unwrap_or_else(|| "N/A".to_string())
         );
         trace::print_final(self, arb.composite_score, &arb.markdown);
         Ok(arb.markdown)

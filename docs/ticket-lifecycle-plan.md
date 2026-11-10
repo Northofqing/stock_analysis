@@ -3632,3 +3632,33 @@ DataMode（Kline/MoneyFlow/OrderBook）与 P1.1（news/mf）的根因、首选/�
 - 同时 `paper_risk_context` 在收盘后因 `today_pnl=None` 每 30 秒失败
   （`BR-134 complete account metrics are unavailable`），paper_sell 不会运行；
   A 的执行器需要用自己的快照价格口径，不能依赖这条收盘后失效的上下文。
+
+### 12.11 6.5 公告接线（2026-11-10）
+
+**归属纠正**：此前两次探针打在 Mac 本地桥 `127.0.0.1:18082`，结论作废。
+operator 在 Windows `ExternalV1 50051` 实测：`Announcements` 支持按票 +
+日期范围（001216 返回 8 条，`canonical_url/pdf_url` 8/8），`MarketAnnouncements`
+有 `limit<=300` 上限、无 page/offset。Mac 侧从 `127.0.0.1:50052`（Parallels
+转发）用 runtime `client-bundle` 复核通过，schema 为
+`magic.market.announcements.request`，请求体 `{instrument,start,end,limit}`。
+
+**实现（monitor 侧直连 ExternalV1，不经过本地全市场 feed）**：
+
+- `src/grpc_client/external_v1.rs`：新增 `Operation::Announcements` 合同分支，
+  只接受 `instrument/start/end/limit`，limit 1..=300。
+- `src/data_gateway/grpc_source.rs::announcements_for_instrument_async`：
+  未配置 `GRPC_MARKET_CLIENT_BUNDLE` 时显式失败，不回落全市场。
+- `src/data_gateway/event_calendar.rs::instrument_announcements`：同一审计链。
+- `src/monitor/ticket_evidence_bundle.rs`：证据包新增
+  `filings{status,items,reason}`，窗口=业务日前 5 个自然日、limit 50、
+  单票 3s 超时；`ok/empty/unavailable/timeout` 四态，成功才从 `missing`
+  移除 `official_filing`。
+- 09:25 竞价路径逐票取公告；P01 与盘中触发路径暂记
+  `not_fetched`（同步路径，未接线），不伪造条数。
+
+**已验证**：`cargo check --lib --bin monitor` 通过；ExternalV1 直连实测
+001216 8 条（含 2026-10-26 三季报、11-09 违规减持致歉）、002421 在
+2026-10-01..11-10 有 3 条（更窄窗口为空属合法 0 命中）。
+
+**未做**：财报 6.6 接线（Windows 可用，但应在盘后预取，09:25 只读缓存）；
+全市场分页（Gate A）；P01 证据包的公告补取。

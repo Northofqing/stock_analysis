@@ -12,6 +12,11 @@ use chrono::{DateTime, Local, NaiveDate};
 use std::collections::BTreeMap;
 use std::fmt;
 
+/// BR-210: 对端网关时钟可比本机快约 1 秒（ExternalV1 实测），observed_at
+/// 超前本机 now 不超过 1 分钟时视为时钟偏差予以接纳；超过仍 fail-closed，
+/// 时区级错误（如 ±8 小时）与重放/伪造时间戳依旧被拒绝。
+pub const OBSERVED_AT_FUTURE_TOLERANCE: chrono::Duration = chrono::Duration::minutes(1);
+
 /// The six source-push kinds that map to PushKind variants in the v17.7 adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourcePushKind {
@@ -154,7 +159,7 @@ impl SourceBatchEvidence {
             return Err(NormalizedSourceError::InvalidBatchEvidence);
         }
         let observed_at = self.observed_at_local()?;
-        if observed_at > Local::now() {
+        if observed_at > Local::now() + OBSERVED_AT_FUTURE_TOLERANCE {
             return Err(NormalizedSourceError::FutureObservedAt);
         }
         Ok(())
@@ -334,7 +339,7 @@ impl NormalizedSourceEvent {
             return Err(NormalizedSourceError::CertaintyOutOfRange(self.certainty));
         }
         let now = Local::now();
-        if self.observed_at > now {
+        if self.observed_at > now + OBSERVED_AT_FUTURE_TOLERANCE {
             return Err(NormalizedSourceError::FutureObservedAt);
         }
         match self.source_published_on {
@@ -836,6 +841,54 @@ mod tests {
         assert_eq!(
             build(Some(today + chrono::Duration::days(1))),
             Err(NormalizedSourceError::FuturePublishedDate)
+        );
+    }
+
+    #[test]
+    fn br210_batch_observed_at_clock_lead_within_one_minute_is_accepted() {
+        // 生产回归：ExternalV1 对端时钟快约 1 秒曾使公告整批间歇被拒；
+        // 容差内必须接纳，超容差仍 fail-closed。
+        let build = |observed_at: DateTime<Local>| {
+            SourceBatchEvidence::new(
+                ProviderId::Cninfo,
+                "TEST_CODE_cninfo-market".into(),
+                None,
+                observed_at.to_rfc3339(),
+                "TEST_CODE_batch".into(),
+                "a".repeat(64),
+            )
+        };
+        assert!(build(Local::now() + chrono::Duration::seconds(30)).is_ok());
+        assert_eq!(
+            build(Local::now() + chrono::Duration::minutes(2)),
+            Err(NormalizedSourceError::FutureObservedAt)
+        );
+    }
+
+    #[test]
+    fn source_event_observed_at_clock_lead_within_one_minute_is_accepted() {
+        let (_, today) = now_and_today();
+        let build = |observed_at| {
+            NormalizedSourceEvent::new(
+                SourcePushKind::PolicyHit,
+                "policy-clock-lead".into(),
+                None,
+                "政策事实".into(),
+                "summary".into(),
+                Direction::Neutral,
+                80,
+                90,
+                observed_at,
+                Some(today),
+                false,
+                "official-provider".into(),
+                None,
+            )
+        };
+        assert!(build(Local::now() + chrono::Duration::seconds(30)).is_ok());
+        assert_eq!(
+            build(Local::now() + chrono::Duration::minutes(2)),
+            Err(NormalizedSourceError::FutureObservedAt)
         );
     }
 }

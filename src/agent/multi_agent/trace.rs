@@ -50,7 +50,7 @@ pub(super) fn print_analyst(analyzer: &GeminiAnalyzer, role: &str, v: &AnalystVi
     info!(
         "[Agent结果] {} score={} stance={} confidence={} | signals={} | summary={}",
         role,
-        v.score,
+        v.score_text(),
         nz(&v.stance, "neutral"),
         nz(&v.confidence, "low"),
         truncate(&signals, 300),
@@ -102,14 +102,20 @@ pub(super) fn print_debate(analyzer: &GeminiAnalyzer, d: &DebateOutput) {
 }
 
 /// 打印仲裁终稿（trace 模式打全文，否则只打前 600 字预览）
-pub(super) fn print_final(analyzer: &GeminiAnalyzer, composite: i32, md: &str) {
+pub(super) fn print_final(analyzer: &GeminiAnalyzer, composite: Option<i32>, md: &str) {
+    let composite_text = composite
+        .map(|score| score.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
     if trace_enabled(analyzer) {
-        banner(&format!("🏛️ 仲裁终稿（composite_score={}）", composite));
+        banner(&format!(
+            "🏛️ 仲裁终稿（composite_score={}）",
+            composite_text
+        ));
         info!("\n{}", md);
     } else {
         info!(
             "[Agent结果] 仲裁终稿预览（composite={}, 共 {} 字）：\n{}",
-            composite,
+            composite_text,
             md.chars().count(),
             truncate(md, 600)
         );
@@ -165,11 +171,14 @@ mod tests {
         };
         print_slices(&slices);
         let view = AnalystView {
-            score: 50,
+            score: Some(50),
+            status: "ok".to_string(),
             stance: String::new(),
             confidence: String::new(),
             key_signals: Vec::new(),
             summary: "摘要".repeat(250),
+            evidence_refs: Vec::new(),
+            role_version: "v1".to_string(),
         };
         print_analyst(&disabled, "测试分析师", &view);
         print_analyst(&enabled, "测试分析师", &view);
@@ -180,8 +189,8 @@ mod tests {
         };
         print_debate(&disabled, &debate);
         print_debate(&enabled, &debate);
-        print_final(&disabled, 50, &"终稿".repeat(700));
-        print_final(&enabled, 50, "TEST_CODE_终稿");
+        print_final(&disabled, Some(50), &"终稿".repeat(700));
+        print_final(&enabled, Some(50), "TEST_CODE_终稿");
         assert_eq!(truncate("短文本", 10), "短文本");
         assert!(truncate("很长的文本", 2).contains("已截断"));
         assert_eq!(nz("  ", "fallback"), "fallback");

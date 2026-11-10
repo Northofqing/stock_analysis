@@ -74,6 +74,14 @@
 备选：把 OrderBook 与 T0Evidence 解耦，用腾讯/新浪五档盘口独立源，按新鲜度标注；
 T0Advice 在 T0 修好前继续显式 unavailable，绝不用 stale T0 标记 OrderBook。
 
+2026-11-03 接入进展：Mac 客户端已补 ExternalV1 的普通 `RealtimeQuotes` /
+`OrderBooks` 请求与传输路径，通过 `DATA_GATEWAY_QUOTE_BOOK_ROUTE=external`
+显式启用；探头已在 13:32 取得 `provider=Tencent` 的 quote 2 条、五档 book 2 条，
+客户端把逐标的 `magic.market.quote` / `magic.market.order_book` 归一化为本地
+单 payload 数组。这只解决普通行情和 readiness，**不改变** A2 的业务证据口径：
+`OrderBooks` 仍不能替代 `T0Evidence.T0Quote`，做T仍要求 T0 四项证据完整。
+详见 `docs/windows-grpc-handoff-20261103.md`。
+
 失败模式：备选盘口只有五档、深度不足，必须标“浅盘口”，不能写成完整 OrderBook。
 
 验收：T0 批次 `records>0` 且完整才标记 OrderBook；T0Advice 有记录；否则显式 unavailable。

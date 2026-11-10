@@ -810,6 +810,11 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
             status: "unavailable".to_owned(),
             reason: Some("financial_statements_not_fetched".to_owned()),
         },
+        filings: evidence::Filings {
+            status: "not_fetched".to_owned(),
+            items: Vec::new(),
+            reason: Some("intraday_sync_path".to_owned()),
+        },
         missing,
     };
     if let Err(error) =

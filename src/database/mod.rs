@@ -2770,7 +2770,6 @@ pub mod factor_snapshot;
 pub mod repository;
 // v12 MVP-5 §8.1
 pub mod advice_outcome_tracking;
-pub(crate) mod agent_logs;
 pub mod attribution_epochs;
 pub mod attribution_reports;
 pub mod benchmark_segments;

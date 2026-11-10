@@ -44,6 +44,7 @@ impl GrpcSource {
             addr: "TEST_CODE_EXTERNAL_MACRO_LOCAL_SENTINEL".to_owned(),
             client: AsyncMutex::new(None),
             external_bundle: Some(bundle),
+            quote_book_external: false,
             external_client: AsyncMutex::new(None),
             local_initialization: Arc::new(tokio::sync::Semaphore::new(1)),
             external_initialization: Arc::new(tokio::sync::Semaphore::new(1)),

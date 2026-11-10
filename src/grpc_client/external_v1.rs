@@ -224,6 +224,40 @@ pub fn build_external_query_request(
                 serde_json::json!({"limit": limit}),
             )
         }
+        Operation::Announcements => {
+            ensure_only_keys(&params, &["instrument", "start", "end", "limit"])?;
+            let instrument = required_instrument(&params)?;
+            let start = parse_iso_date(
+                params
+                    .get("start")
+                    .ok_or(ExternalContractError::InvalidParameters)?,
+            )?;
+            let end = parse_iso_date(
+                params
+                    .get("end")
+                    .ok_or(ExternalContractError::InvalidParameters)?,
+            )?;
+            if start > end {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            let limit = params.get("limit").map_or(Ok(300_u64), |value| {
+                value
+                    .as_u64()
+                    .filter(|limit| (1..=300).contains(limit))
+                    .ok_or(ExternalContractError::InvalidParameters)
+            })?;
+            (
+                "magic.market.announcements.request",
+                1,
+                String::new(),
+                serde_json::json!({
+                    "instrument": instrument,
+                    "start": start.to_string(),
+                    "end": end.to_string(),
+                    "limit": limit,
+                }),
+            )
+        }
         Operation::InstrumentNews => {
             ensure_only_keys(
                 &params,
@@ -446,6 +480,26 @@ pub fn build_external_native_query_request(
                 Value::Object(request),
             )
         }
+        ExternalOperation::RealtimeQuotes => {
+            ensure_only_keys(&params, &["instruments"])?;
+            let instruments = required_instruments(&params)?;
+            (
+                "magic.market.realtime_quotes.request",
+                1,
+                String::new(),
+                serde_json::json!({ "instruments": instruments }),
+            )
+        }
+        ExternalOperation::OrderBooks => {
+            ensure_only_keys(&params, &["instruments"])?;
+            let instruments = required_instruments(&params)?;
+            (
+                "magic.market.order_books.request",
+                1,
+                String::new(),
+                serde_json::json!({ "instruments": instruments }),
+            )
+        }
         _ => return Err(ExternalContractError::UndeliveredOperation),
     };
     assemble_request(schema, schema_version, preferred_provider, data)
@@ -634,6 +688,34 @@ mod tests {
         let payload = request.payload.expect("external request payload");
         let data = serde_json::from_slice(&payload.data).expect("external request JSON");
         (payload.schema, data, request.allow_unadmitted)
+    }
+
+    #[test]
+    fn realtime_quotes_and_order_books_use_delivered_external_schemas() {
+        let instrument = json!({
+            "exchange": "Shanghai", "code": "600396", "asset_class": "Equity"
+        });
+        let quotes = build_external_native_query_request(
+            ExternalOperation::RealtimeQuotes,
+            json!({"instruments": [instrument.clone()]}),
+        )
+        .expect("published RealtimeQuotes contract");
+        assert_eq!(quotes.preferred_provider, "");
+        let (schema, data, allow_unadmitted) = payload_json(quotes);
+        assert_eq!(schema, "magic.market.realtime_quotes.request");
+        assert_eq!(data, json!({"instruments": [instrument.clone()]}));
+        assert!(!allow_unadmitted);
+
+        let books = build_external_native_query_request(
+            ExternalOperation::OrderBooks,
+            json!({"instruments": [instrument.clone()]}),
+        )
+        .expect("published OrderBooks contract");
+        assert_eq!(books.preferred_provider, "");
+        let (schema, data, allow_unadmitted) = payload_json(books);
+        assert_eq!(schema, "magic.market.order_books.request");
+        assert_eq!(data, json!({"instruments": [instrument]}));
+        assert!(!allow_unadmitted);
     }
 
     #[test]
