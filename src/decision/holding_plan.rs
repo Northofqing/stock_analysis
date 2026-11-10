@@ -7,6 +7,70 @@
 
 use chrono::Local;
 
+/// 持仓动作（D1，2026-11-10）：与 I-04 HoldingPlan 同一套阈值，供 09:25
+/// 竞价正文复用；不新增风控规则。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PositionIntent {
+    /// 触及成本止损参考线（cost*0.92）
+    StopLossReview,
+    /// 浮盈 > +5%
+    Reduce,
+    /// 浮亏 < -3%
+    Add,
+    /// 其余
+    Hold,
+}
+
+impl PositionIntent {
+    pub fn label(self) -> &'static str {
+        match self {
+            PositionIntent::StopLossReview => "止损核查",
+            PositionIntent::Reduce => "减仓观察",
+            PositionIntent::Add => "加仓观察",
+            PositionIntent::Hold => "持有观望",
+        }
+    }
+}
+
+/// 返回动作与浮盈亏百分比；阈值与 `holding_plan::prepare_tick_with` 完全一致。
+pub fn position_intent(
+    price: f64,
+    cost: f64,
+    fully_locked: bool,
+) -> (PositionIntent, f64) {
+    let pnl_pct = (price / cost - 1.0) * 100.0;
+    let stop = cost * 0.92;
+    let intent = if price <= stop {
+        PositionIntent::StopLossReview
+    } else if pnl_pct > 5.0 {
+        if fully_locked {
+            PositionIntent::Hold
+        } else {
+            PositionIntent::Reduce
+        }
+    } else if pnl_pct < -3.0 {
+        PositionIntent::Add
+    } else {
+        PositionIntent::Hold
+    };
+    (intent, pnl_pct)
+}
+
+#[cfg(test)]
+mod position_intent_tests {
+    use super::*;
+
+    #[test]
+    fn thresholds_match_holding_plan() {
+        assert_eq!(position_intent(92.0, 100.0, false).0, PositionIntent::StopLossReview);
+        assert_eq!(position_intent(106.0, 100.0, false).0, PositionIntent::Reduce);
+        assert_eq!(position_intent(106.0, 100.0, true).0, PositionIntent::Hold);
+        assert_eq!(position_intent(96.0, 100.0, false).0, PositionIntent::Add);
+        assert_eq!(position_intent(100.0, 100.0, false).0, PositionIntent::Hold);
+        assert!((position_intent(110.0, 100.0, false).1 - 10.0).abs() < 1e-9);
+    }
+}
+
 /// 预案动作
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PlanAction {

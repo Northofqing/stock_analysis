@@ -519,26 +519,30 @@ fn prepare_fresh_subset(
             log::warn!("[T-03] code={} 成本价非法, 跳过", item.code);
             continue;
         }
-        let pnl_pct = (quote.price / item.cost_price - 1.0) * 100.0;
-        let stop = item.cost_price * 0.92;
         let held_qty = u32::try_from(item.quantity).unwrap_or(u32::MAX);
+        let stop = item.cost_price * 0.92;
         // T+1：当日买入的股数当天不能卖（A 股交割制度）。
-        // locked >= held_qty 表示整仓都是今天买的，任何卖出类建议都不可执行，
-        // 降级为「持有」并说明原因，而不是照常给减仓价让人下单。
         let locked = t1_locked.get(&item.code).copied().unwrap_or(0);
         let fully_locked = locked > 0 && locked >= item.quantity;
-        let intent = if quote.price <= stop {
-            push_templates::Intent::StopLossReview
-        } else if pnl_pct > 5.0 {
-            if fully_locked {
-                push_templates::Intent::Hold
-            } else {
+        let (intent, pnl_pct) =
+            stock_analysis::decision::holding_plan::position_intent(
+                quote.price,
+                item.cost_price,
+                fully_locked,
+            );
+        let intent = match intent {
+            stock_analysis::decision::holding_plan::PositionIntent::StopLossReview => {
+                push_templates::Intent::StopLossReview
+            }
+            stock_analysis::decision::holding_plan::PositionIntent::Reduce => {
                 push_templates::Intent::Reduce
             }
-        } else if pnl_pct < -3.0 {
-            push_templates::Intent::Add
-        } else {
-            push_templates::Intent::Hold
+            stock_analysis::decision::holding_plan::PositionIntent::Add => {
+                push_templates::Intent::Add
+            }
+            stock_analysis::decision::holding_plan::PositionIntent::Hold => {
+                push_templates::Intent::Hold
+            }
         };
         let reason = match intent {
             push_templates::Intent::StopLossReview => {

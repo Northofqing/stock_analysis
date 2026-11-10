@@ -3662,3 +3662,27 @@ operator 在 Windows `ExternalV1 50051` 实测：`Announcements` 支持按票 +
 
 **未做**：财报 6.6 接线（Windows 可用，但应在盘后预取，09:25 只读缓存）；
 全市场分页（Gate A）；P01 证据包的公告补取。
+
+### 12.12 P4 D1：09:25 持仓票动作（2026-11-10）
+
+**口径**：只在 09:25 竞价正文里给**有底仓**的票加动作，无底仓保持原样；
+复用 I-04 HoldingPlan 的阈值，不新增风控规则：
+
+- `price <= cost*0.92` → 止损核查
+- 浮盈 > +5% → 减仓观察（整仓 T+1 锁定时降级为持有）
+- 浮亏 < -3% → 加仓观察
+- 其余 → 持有观望
+
+**实现**：
+- `src/decision/holding_plan.rs` 新增 `PositionIntent` / `position_intent()`，
+  I-04 与 09:25 共用同一函数，避免两套阈值漂移；
+- `src/monitor/ticket_auction_price.rs` 的持仓行由
+  「浮盈亏 x%（加仓参考）」改为「浮盈亏 x%｜动作：持有观望/加仓观察/减仓观察/止损核查」；
+  成本缺失时写「动作无法判定」，不猜。
+
+**验证**：`cargo check --lib --bin monitor` 通过；
+`position_intent_tests` 1/1、`ticket_auction_price` 7/7；
+`cargo test --bin monitor holding_plan` 34/35，唯一失败
+`t03_exact_owner_bin_alias...` 单跑通过，属既有共享状态 flake，与本次改动无关。
+
+**未做**：动作只出现在 09:25 竞价正文，不额外推一条；盘中动作仍由 I-04 负责。

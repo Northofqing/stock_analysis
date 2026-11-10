@@ -484,12 +484,19 @@ pub fn build(
             None => match positions.get(&row.code) {
                 Some((shares, cost)) if *shares > 0 => {
                     if *cost > 0.0 {
-                        let pnl = (auction_price - cost) / cost * 100.0;
+                        // D1：动作与 I-04 HoldingPlan 同口径（09:25 早于 09:45 计划）。
+                        let (intent, pnl) =
+                            crate::decision::holding_plan::position_intent(
+                                auction_price,
+                                *cost,
+                                false,
+                            );
                         format!(
-                            "持仓：已有 {shares} 股，成本 {cost:.2}，浮盈亏 {pnl:+.2}%（加仓参考）"
+                            "持仓：已有 {shares} 股，成本 {cost:.2}，浮盈亏 {pnl:+.2}%｜动作：{}",
+                            intent.label()
                         )
                     } else {
-                        format!("持仓：已有 {shares} 股，成本缺失（浮盈亏未算，加仓参考）")
+                        format!("持仓：已有 {shares} 股，成本缺失（动作无法判定）")
                     }
                 }
                 _ => "持仓：无（新买入参考）".to_string(),
@@ -633,11 +640,12 @@ mod tests {
             tier: Tier::Bargain,
             output_kind: OutputKind::ReferencePrice,
             high_state_unverified: true,
-            position_note: "持仓：已有 500 股，成本 26.61，浮盈亏 -4.9%（加仓参考）".to_string(),
+            position_note: "持仓：已有 500 股，成本 26.61，浮盈亏 -4.9%｜动作：加仓观察".to_string(),
         };
         let text = line.render_as(OutputKind::ReferencePrice);
         assert!(text.contains("高位状态未核实"));
         assert!(text.contains("持仓：已有 500 股"));
+        assert!(text.contains("动作：加仓观察"));
     }
 
     #[test]
