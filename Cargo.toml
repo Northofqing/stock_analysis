@@ -53,6 +53,10 @@ path = "src/bin/winrate_simulator.rs"
 name = "ticket_dedupe"
 path = "src/bin/ticket_dedupe.rs"
 
+[[bin]]
+name = "ticket_fundamentals"
+path = "src/bin/ticket_fundamentals.rs"
+
 [features]
 magic-gateway = ["dep:magic-market-core", "dep:magic-market-router", "dep:magic-market-composition", "dep:magic-eastmoney-rs", "dep:magic-ths-rs", "dep:magic-sina-rs", "dep:magic-cninfo-rs", "dep:magic-tencent-rs", "dep:magic-cls-rs", "dep:magic-jin10-rs", "dep:magic-thepaper-rs", "dep:magic-exchange-rs", "dep:magic-baidu-rs"]
 replay-sqlite-bundled-v1 = ["rusqlite/bundled"]
