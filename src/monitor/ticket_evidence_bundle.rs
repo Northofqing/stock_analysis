@@ -63,6 +63,15 @@ pub struct Portfolio {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct HoldingDecision {
+    pub action: String,
+    pub reason: String,
+    pub pnl_pct: f64,
+    pub t1_locked: u64,
+    pub fully_locked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Fundamentals {
     pub status: String,
     pub reason: Option<String>,
@@ -105,6 +114,8 @@ pub struct EvidenceBundle {
     pub portfolio: Portfolio,
     pub fundamentals: Fundamentals,
     pub filings: Filings,
+    /// 6.3/6.9：HoldingPlan 决策（动作/理由/T+1 锁定）；其他路径为 null。
+    pub holding: Option<HoldingDecision>,
     pub missing: Vec<String>,
 }
 
@@ -181,6 +192,7 @@ impl EvidenceBundle {
                 items: Vec::new(),
                 reason: Some("not_fetched_at_build".to_owned()),
             },
+            holding: None,
             missing: vec![
                 "official_filing".to_owned(),
                 "independent_financial_source".to_owned(),
@@ -447,6 +459,7 @@ mod tests {
                 items: Vec::new(),
                 reason: None,
             },
+            holding: None,
             missing: Vec::new(),
         };
         let json = serde_json::to_string(&bundle).unwrap();

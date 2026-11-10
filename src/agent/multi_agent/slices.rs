@@ -16,6 +16,28 @@ pub struct DomainSlices {
     pub macro_ctx: Option<String>,
     /// 行业/板块联动切片：从代码判断中类业务 + 从新闻/宏观中提取板块信号
     pub sector: String,
+    /// 本领域是否有可判读的证据。false = 该维度弃权，不按中性 50 分混进合成。
+    pub availability: DomainAvailability,
+}
+
+/// 领域证据可用性。默认全部可用；调用方只在确认证据为空时置 false。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DomainAvailability {
+    pub fundamental: bool,
+    pub capital: bool,
+    pub news: bool,
+    pub sector: bool,
+}
+
+impl Default for DomainAvailability {
+    fn default() -> Self {
+        Self {
+            fundamental: true,
+            capital: true,
+            news: true,
+            sector: true,
+        }
+    }
 }
 
 /// 从 K 线 / 额外上下文 / 新闻 / 宏观 构建领域切片。
@@ -78,6 +100,10 @@ pub fn build_slices(
         news: news_context.map(|s| s.to_string()),
         macro_ctx: macro_context.map(|s| s.to_string()),
         sector,
+        availability: DomainAvailability {
+            news: news_context.is_some() || macro_context.is_some(),
+            ..DomainAvailability::default()
+        },
     }
 }
 

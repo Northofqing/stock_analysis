@@ -258,6 +258,10 @@ pub(super) async fn run_fundamental(
     analyzer: &GeminiAnalyzer,
     slices: &DomainSlices,
 ) -> AnalystView {
+    if !slices.availability.fundamental {
+        log::warn!("[基本面 Agent] 无估值/财务证据，弃权不参与加权");
+        return AnalystView::empty("无估值/财务数据");
+    }
     run_analyst(
         analyzer,
         FUNDAMENTAL_SYS,
@@ -375,6 +379,7 @@ mod tests {
             news: news.map(str::to_string),
             macro_ctx: macro_ctx.map(str::to_string),
             sector: "TEST_CODE_板块事实".to_string(),
+            availability: DomainAvailability::default(),
         }
     }
 

@@ -14,6 +14,7 @@ use crate::agent::{
     build_slices, FetchChipDistributionTool, FetchFinancialTool, FetchFundFlowTool, FetchNewsTool,
     FetchResearchTool, FetchSectorTool, Tool,
 };
+use crate::analyzer::AgentMode;
 use crate::analyzer::GeminiAnalyzer;
 use crate::data_provider::KlineData;
 use anyhow::Result;
@@ -242,6 +243,40 @@ mod tests {
     }
 }
 
+/// 报告尾注：数据时点 + 数据源 + 链路/模型 + 免责。
+///
+/// 2026-11-10 补齐口径：此前 187 份报告 0 处数据时点、0 处免责声明，
+/// 读者无法判断数字属于哪一刻、也无法区分研究记录与交易指令。
+fn append_provenance_footer(
+    markdown: &str,
+    data_date: &str,
+    data_sources: Option<&str>,
+    model: &str,
+) -> String {
+    let generated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%:z");
+    let sources = data_sources
+        .map(|inventory| inventory.replace('\n', "；"))
+        .unwrap_or_else(|| "复用主流程已抓取数据（K 线/资金/新闻/财务）".to_string());
+    format!(
+        "{markdown}\n\n---\n\n\
+         数据时点：{data_date} 收盘（日线，最近交易日）\n\
+         数据源：{sources}\n\
+         分析链路：6 领域分析师 + 多空 2 轮辩论 + 风控 + 仲裁；模型 {model}\n\
+         生成时间：{generated_at}\n\
+         本报告由自动化多角色分析生成，仅供研究记录，不构成投资建议。\n"
+    )
+}
+
+fn active_model_label(analyzer: &GeminiAnalyzer) -> String {
+    if analyzer.use_doubao {
+        format!("豆包 {}", analyzer.doubao_model_for(AgentMode::Deep))
+    } else if analyzer.use_deepseek {
+        format!("DeepSeek {}", analyzer.deepseek_model_for(AgentMode::Deep))
+    } else {
+        format!("Gemini {}", analyzer.gemini_model_for(AgentMode::Deep))
+    }
+}
+
 /// 方案 X：多角色 + 工具数据 + 辩论仲裁 流水线。
 ///
 /// 步骤：
@@ -381,12 +416,22 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
         slices.basics.push_str(&format!("\n{}", note));
     }
 
-    // 5. 把财务工具数据注入基本面切片
+    // 5. 把财务/估值工具数据注入基本面切片
     if !fin_str.is_empty() {
-        slices.fundamental = format!(
-            "{}\n【真实财务指标 (来自 fetch_financials 工具)】\n{}",
-            slices.fundamental, fin_str
-        );
+        // 日线视图没有估值字段时切片会写「（无估值与财务数据）」；拿到工具数据后
+        // 必须替换掉这个占位，否则模型会把"有数据"读成"缺失"。
+        let base = slices.fundamental.trim();
+        slices.fundamental = if base.is_empty() || base == "（无估值与财务数据）" {
+            format!("【真实财务/估值数据（gRPC，客户端派生比率）】\n{}", fin_str)
+        } else {
+            format!(
+                "{}\n【真实财务/估值数据（gRPC，客户端派生比率）】\n{}",
+                base, fin_str
+            )
+        };
+    } else {
+        // 财务/估值工具整体失败：基本面维度弃权，不按中性 50 分混进合成。
+        slices.availability.fundamental = false;
     }
     // 修复 P1-F: 把 data_inventory + 强制规则注入 basics 字段 (所有分析师都读).
     // 修复 P1-F: 综合分门控 — 不足 2 个 OK 时禁止给出综合分.
@@ -394,18 +439,29 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
         "{}\n\n【数据可用性清单】\n{}\n\n{}",
         slices.basics, data_inventory, DATA_INVENTORY_RULE
     );
+    // 2026-11-10: 数据源门从提示词搬进代码 —— 不足 2 个可用来源不出报告。
+    // 之前只打 warn，是否给综合分取决于模型自觉（提示词规则）。
     if ok_count < 2 {
-        log::warn!(
-            "[MultiAgent] {} 数据源 OK={} 不足 2, 强制综合分 = N/A",
+        anyhow::bail!(
+            "[MultiAgent] {} 可用数据源 {} < 2（{}），按数据门拒绝出报告：{}",
             code,
-            ok_count
+            ok_count,
+            tool_results.len(),
+            data_inventory.replace('\n', "；")
         );
     }
 
     // 6. 调用 GeminiAnalyzer 多 Agent 流水线
     let analyzer = GeminiAnalyzer::from_env();
     log::info!("[MultiAgent] 进入 6 分析师 + 辩论 + 仲裁阶段");
-    analyzer.run_text_pipeline(slices).await
+    let markdown = analyzer.run_text_pipeline(slices).await?;
+    let data_date = kline.iter().map(|bar| bar.date).max().unwrap_or_default().to_string();
+    Ok(append_provenance_footer(
+        &markdown,
+        &data_date,
+        Some(&data_inventory),
+        &active_model_label(&analyzer),
+    ))
 }
 
 /// 复用主流程数据的多角色流水线（重点股深度研判走此路径）。
@@ -436,11 +492,26 @@ pub async fn run_multi_agent_analysis_with_seed(seed: &DeepAnalysisSeed) -> Resu
             "{}\n【主流程已抓取的财务/估值/研报/行业数据】\n{}",
             slices.fundamental, fund
         );
+    } else {
+        slices.availability.fundamental = false;
     }
 
     let analyzer = GeminiAnalyzer::from_env();
     log::info!("[MultiAgent] 进入 6 分析师 + 辩论 + 仲裁阶段（复用数据）");
-    analyzer.run_text_pipeline(slices).await
+    let markdown = analyzer.run_text_pipeline(slices).await?;
+    let data_date = seed
+        .kline
+        .iter()
+        .map(|bar| bar.date)
+        .max()
+        .unwrap_or_default()
+        .to_string();
+    Ok(append_provenance_footer(
+        &markdown,
+        &data_date,
+        None,
+        &active_model_label(&analyzer),
+    ))
 }
 
 /// 执行深度分析并将结果写入到 `reports/details/{date}_{code}.md`。

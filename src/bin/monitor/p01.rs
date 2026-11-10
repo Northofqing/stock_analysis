@@ -1778,6 +1778,7 @@ fn record_p01_tickets(
                         items: Vec::new(),
                         reason: Some("p01_sync_path".to_owned()),
                     },
+                    holding: None,
                     missing,
                 };
                 if let Err(error) =

@@ -41,7 +41,7 @@ REQUIRED_TOP = {
     "fundamentals",
     "missing",
 }
-SOURCES = {"p01_preopen", "auction_0925", "intraday_trigger"}
+SOURCES = {"p01_preopen", "auction_0925", "intraday_trigger", "holding_plan"}
 MAX_AUCTION_PCT = 6.0
 ENSURE_FILL_MARKUP = 0.005
 PRICE_TOLERANCE = 0.011
@@ -122,7 +122,13 @@ def audit_bundle(path: Path, date_dir: str) -> list[str]:
         if pricing.get(value_key) is None and pricing.get(source_key) is not None:
             errors.append(f"{path.name}: {value_key}=null 但 {source_key} 有值")
 
-    if source == "auction_0925":
+    if source == "holding_plan":
+        holding = bundle.get("holding") or {}
+        if not holding.get("action") or not holding.get("reason"):
+            errors.append(f"{path.name}: holding_plan 缺 action/reason")
+        if pricing.get("quoted_price") is None:
+            errors.append(f"{path.name}: holding_plan 缺 quoted_price")
+    elif source == "auction_0925":
         auction_price = pricing.get("auction_price")
         auction_pct = pricing.get("auction_pct")
         tier = pricing.get("tier")

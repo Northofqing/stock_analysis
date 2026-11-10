@@ -578,6 +578,117 @@ fn prepare_fresh_subset(
                 reasons: &reasons,
             },
         );
+        // 6.3/6.9：HoldingPlan 决策证据包（只对已有活跃 ticket 的持仓）。
+        if let Some(db) = stock_analysis::database::DatabaseManager::try_get() {
+            match db.get_conn() {
+                Ok(mut conn) => {
+                    match stock_analysis::database::ticket_lifecycle::find_active_ticket(
+                        &mut conn,
+                        &item.code,
+                    ) {
+                        Ok(Some(ticket)) => {
+                            let business_text = business_date.to_string();
+                            let mut missing = vec![
+                                "official_filing".to_owned(),
+                                "independent_financial_source".to_owned(),
+                                "raw_auction_depth".to_owned(),
+                            ];
+                            let fundamentals = stock_analysis::monitor::ticket_evidence_bundle::load_fundamentals_cache(
+                                &item.code,
+                                &business_text,
+                            );
+                            if fundamentals.status != "ok" {
+                                missing.push("financial_statements".to_owned());
+                            }
+                            let bundle = stock_analysis::monitor::ticket_evidence_bundle::EvidenceBundle {
+                                schema_version: stock_analysis::monitor::ticket_evidence_bundle::SCHEMA_VERSION.to_owned(),
+                                business_date: business_text.clone(),
+                                code: item.code.clone(),
+                                name: item.name.clone(),
+                                ticket_id: ticket.id,
+                                captured_at: observed_at.to_rfc3339(),
+                                level: "L1".to_owned(),
+                                selection: stock_analysis::monitor::ticket_evidence_bundle::Selection {
+                                    source: "holding_plan".to_owned(),
+                                    concept: None,
+                                    limit_pool_batch_id: None,
+                                    streak_raw: None,
+                                    recommend_price_raw: None,
+                                    news: Vec::new(),
+                                },
+                                pricing: stock_analysis::monitor::ticket_evidence_bundle::Pricing {
+                                    auction_batch_id: None,
+                                    auction_source_at: None,
+                                    auction_price: None,
+                                    auction_pct: None,
+                                    tier: None,
+                                    quoted_price: Some(quote.price),
+                                    streak: None,
+                                    streak_source_date: None,
+                                    phase: None,
+                                    phase_source_date: None,
+                                    prev_high: None,
+                                    entry_low: None,
+                                    entry_high: None,
+                                    trigger_level: None,
+                                    decision_id: None,
+                                    risk_note: None,
+                                },
+                                portfolio: stock_analysis::monitor::ticket_evidence_bundle::Portfolio {
+                                    position_quantity: Some(item.quantity),
+                                    cost_price: Some(item.cost_price),
+                                    market_value: None,
+                                    weight_pct: None,
+                                    source: "user_confirmed_snapshot".to_owned(),
+                                },
+                                fundamentals,
+                                filings: stock_analysis::monitor::ticket_evidence_bundle::Filings {
+                                    status: "not_fetched".to_owned(),
+                                    items: Vec::new(),
+                                    reason: Some("holding_plan_sync_path".to_owned()),
+                                },
+                                holding: Some(stock_analysis::monitor::ticket_evidence_bundle::HoldingDecision {
+                                    action: intent.label().to_owned(),
+                                    reason: reasons[0].clone(),
+                                    pnl_pct,
+                                    t1_locked: locked,
+                                    fully_locked,
+                                }),
+                                missing,
+                            };
+                            let minutes = hhmm
+                                .split(':')
+                                .filter_map(|part| part.parse::<u32>().ok())
+                                .fold(0u32, |acc, value| acc * 60 + value);
+                            let occurrence = 10 + minutes.saturating_sub(9 * 60 + 30) / 30;
+                            if let Err(error) = stock_analysis::monitor::ticket_evidence_bundle::write_bundle(
+                                std::path::Path::new("."),
+                                &mut conn,
+                                &bundle,
+                                occurrence.min(19),
+                            ) {
+                                log::warn!(
+                                    "[T-03] {} 证据包写入失败: {error}",
+                                    item.code
+                                );
+                            }
+                        }
+                        Ok(None) => log::debug!(
+                            "[T-03] {} 无活跃 ticket，证据包跳过",
+                            item.code
+                        ),
+                        Err(error) => log::warn!(
+                            "[T-03] {} 活跃 ticket 读取失败，证据包跳过: {error}",
+                            item.code
+                        ),
+                    }
+                }
+                Err(error) => log::warn!(
+                    "[T-03] {} 证据包取连接失败: {error}",
+                    item.code
+                ),
+            }
+        }
         let canonical = serde_json::json!({
             "schema_version": "HOLDING_PLAN_SOURCE_BINDING_V1",
             "code": item.code,

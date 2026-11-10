@@ -3774,3 +3774,13 @@ exploratory/confirmatory 窗口运行；样本为 `entry_triggered`，按
 每组报 n/均值/中位/胜率/95% bootstrap CI（10000 次）与 0.1%/0.2%/0.3%
 成本敏感性。确认性窗口 2026-11-10 起，当前 35 条触发但当日日线未入库
 （no_trade_date），入样 0；20 个交易日后才会输出可判定结论。
+
+**6.3/6.9 HoldingPlan 证据包（2026-11-10）**：`prepare_fresh_subset` 在
+生成持仓动作正文时，对有活跃 ticket 的持仓写
+`data/ticket_evidence/<date>/<code>-NN.json`（`selection.source=holding_plan`，
+`holding={action,reason,pnl_pct,t1_locked,fully_locked}`，`pricing.quoted_price`
+为当次行情，`portfolio` 取已确认快照，`fundamentals` 读当天缓存）。
+occurrence 按 30 分钟槽映射到 10~19，避免与 P01=01、09:25=02、盘中=03 冲突。
+无活跃 ticket 的持仓跳过并写 debug 日志；写入失败只告警，不阻断推送。
+审计脚本已接受该 source，并校验 `holding.action/reason` 与 `quoted_price`；
+正负例已用合成证据包验证。真实 09:45 输出待下一交易日验收。

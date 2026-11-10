@@ -31,7 +31,7 @@ use log::info;
 use super::super::analyzer::types::AgentMode;
 use super::super::analyzer::GeminiAnalyzer;
 
-pub use slices::{build_slices, DomainSlices};
+pub use slices::{build_slices, DomainAvailability, DomainSlices};
 
 impl GeminiAnalyzer {
     /// 运行多 Agent 文本流水线，返回最终 markdown 报告。
@@ -150,6 +150,7 @@ mod tests {
                 news: None,
                 macro_ctx: None,
                 sector: "TEST_CODE_板块".to_string(),
+                availability: DomainAvailability::default(),
             })
             .await
             .expect_err("unavailable model cannot synthesize a report");

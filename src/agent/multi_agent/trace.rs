@@ -168,6 +168,7 @@ mod tests {
             news: Some("新闻".repeat(1_600)),
             macro_ctx: Some("宏观".repeat(1_600)),
             sector: "TEST_CODE_sector".to_string(),
+            availability: crate::agent::multi_agent::slices::DomainAvailability::default(),
         };
         print_slices(&slices);
         let view = AnalystView {

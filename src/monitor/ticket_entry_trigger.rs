@@ -820,6 +820,7 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
             items: Vec::new(),
             reason: Some("intraday_sync_path".to_owned()),
         },
+        holding: None,
         missing,
     };
     if let Err(error) =
