@@ -15509,11 +15509,41 @@ async fn auction_watch_loop() {
                                     let captured_at = chrono::Local::now().to_rfc3339();
                                     let mut written = 0usize;
                                     for fact in &report.evidence_facts {
-                                        let bundle = stock_analysis::monitor::ticket_evidence_bundle::EvidenceBundle::for_auction(
+                                        let mut bundle = stock_analysis::monitor::ticket_evidence_bundle::EvidenceBundle::for_auction(
                                             &date_text,
                                             &captured_at,
                                             fact,
                                         );
+                                        // 09:25 包继承同日 P01 包的选入理由（concept/新闻/batch id），
+                                        // 避免同一只票在两条入口里一个有一个没有。
+                                        let prior_path = root
+                                            .join("data")
+                                            .join("ticket_evidence")
+                                            .join(&date_text)
+                                            .join(format!("{}-01.json", fact.code));
+                                        if bundle.selection.concept.is_none() {
+                                            if let Ok(text) = std::fs::read_to_string(&prior_path) {
+                                                if let Ok(prior) =
+                                                    serde_json::from_str::<serde_json::Value>(&text)
+                                                {
+                                                    if let Some(selection) = prior.get("selection") {
+                                                        bundle.selection.concept = selection
+                                                            .get("concept")
+                                                            .and_then(|value| value.as_str())
+                                                            .map(str::to_owned);
+                                                        bundle.selection.limit_pool_batch_id = selection
+                                                            .get("limit_pool_batch_id")
+                                                            .and_then(|value| value.as_str())
+                                                            .map(str::to_owned);
+                                                        if let Some(news) =
+                                                            selection.get("news").and_then(|value| value.as_array())
+                                                        {
+                                                            bundle.selection.news = news.clone();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         match stock_analysis::monitor::ticket_evidence_bundle::write_bundle(
                                             root,
                                             &mut evidence_conn,
