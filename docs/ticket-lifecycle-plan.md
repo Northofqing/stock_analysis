@@ -3686,3 +3686,29 @@ operator 在 Windows `ExternalV1 50051` 实测：`Announcements` 支持按票 +
 `t03_exact_owner_bin_alias...` 单跑通过，属既有共享状态 flake，与本次改动无关。
 
 **未做**：动作只出现在 09:25 竞价正文，不额外推一条；盘中动作仍由 I-04 负责。
+
+### 12.13 6.6 财务外部合同已探明（2026-11-10，未接线）
+
+用 runtime `client-bundle` 直连 `127.0.0.1:50052` 实测，ExternalV1
+`FinancialStatements` 合同为：
+
+```json
+{
+  "schema": "magic.market.financial_statements.request",
+  "data": {
+    "instruments": [{"exchange":"Shenzhen","code":"001216","asset_class":"Equity"}],
+    "kind": "Balance"            // Balance | Income | CashFlow，必填
+  }
+}
+```
+
+单票单 kind 返回 8 期；记录字段：`instrument / kind / report_period /
+announced_on / currency / lines[] / evidence{provider,source_at,observed_at,batch_id}`；
+`lines[]` 为 `{key, source_label, value, unit}`，缺失值是 null，不补 0。
+001216 样例：Balance 2026-09-30（公告 2026-10-26）总资产 3,195,370,255.21，
+归母净利 141,860,704.57，经营现金流净额 148,984,095.30，`currency=CNY`。
+
+**未做**：monitor 侧还没有 `Operation::FinancialStatements` 的 external 分支
+与转换器（现有 `CompanyDataGateway::financial_statements` 只走本地桥，
+Mac 桥报 `observation_stale`）；`fiscal_period` 恒 null，不能伪造 Q1/H1。
+下一步按盘后预取 + 09:25 读缓存实现，单票 3 个 kind、约 1.2 秒。
