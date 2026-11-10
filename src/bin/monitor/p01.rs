@@ -1591,9 +1591,32 @@ async fn run_p01_once_with_ports<P: P01Ports>(
     // P01 推送成功（durable 已确认 Delivered）后开票记账。
     // best-effort：失败只记日志，绝不影响已经完成的投递。
     if matches!(outcome, P01RunOutcome::Delivered { .. }) {
-        record_p01_tickets(context, &bookkeeping_heads, observed_at);
+        let filings = prefetch_p01_filings(&bookkeeping_heads, context.business_date).await;
+        record_p01_tickets(context, &bookkeeping_heads, observed_at, &filings);
     }
     outcome.with_source_evidence_sha256(source_evidence_sha256)
+}
+
+/// P01 证据包用公告：只在运行时已配置 ExternalV1 bundle 时拉取，
+/// 单票 3s 超时；失败写状态，不阻断开票与推送。
+async fn prefetch_p01_filings(
+    heads: &[P01BoundHead],
+    business_date: chrono::NaiveDate,
+) -> std::collections::HashMap<String, stock_analysis::monitor::ticket_evidence_bundle::Filings> {
+    use stock_analysis::monitor::ticket_evidence_bundle::{fetch_filings, Filings};
+    let mut out = std::collections::HashMap::new();
+    if heads.is_empty()
+        || stock_analysis::database::DatabaseManager::try_get().is_none()
+        || std::env::var("GRPC_MARKET_CLIENT_BUNDLE").is_err()
+    {
+        return out;
+    }
+    let date_text = business_date.to_string();
+    for head in heads {
+        let filings = fetch_filings(&head.code, &date_text).await;
+        out.insert(head.code.clone(), filings);
+    }
+    out
 }
 
 /// P01 入选票写入 ticket 台账（第三个开票入口，`source=p01_preopen`）。
@@ -1607,6 +1630,10 @@ fn record_p01_tickets(
     context: P01BusinessContext,
     heads: &[P01BoundHead],
     observed_at: DateTime<Local>,
+    filings: &std::collections::HashMap<
+        String,
+        stock_analysis::monitor::ticket_evidence_bundle::Filings,
+    >,
 ) {
     if heads.is_empty() {
         return;
@@ -1712,12 +1739,24 @@ fn record_p01_tickets(
                         &head.code,
                         &open_date,
                     );
+                let filing = filings
+                    .get(&head.code)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        stock_analysis::monitor::ticket_evidence_bundle::Filings {
+                            status: "not_fetched".to_owned(),
+                            items: Vec::new(),
+                            reason: Some("p01_sync_path".to_owned()),
+                        }
+                    });
                 missing.extend([
                     "auction_price".to_owned(),
                     "raw_auction_depth".to_owned(),
-                    "official_filing".to_owned(),
                     "independent_financial_source".to_owned(),
                 ]);
+                if filing.status != "ok" {
+                    missing.push("official_filing".to_owned());
+                }
                 if fundamentals.status != "ok" {
                     missing.push("financial_statements".to_owned());
                 }
@@ -1773,11 +1812,7 @@ fn record_p01_tickets(
                     },
                     portfolio,
                     fundamentals,
-                    filings: stock_analysis::monitor::ticket_evidence_bundle::Filings {
-                        status: "not_fetched".to_owned(),
-                        items: Vec::new(),
-                        reason: Some("p01_sync_path".to_owned()),
-                    },
+                    filings: filing,
                     holding: None,
                     missing,
                 };

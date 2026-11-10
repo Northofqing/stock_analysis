@@ -3784,3 +3784,12 @@ occurrence 按 30 分钟槽映射到 10~19，避免与 P01=01、09:25=02、盘�
 无活跃 ticket 的持仓跳过并写 debug 日志；写入失败只告警，不阻断推送。
 审计脚本已接受该 source，并校验 `holding.action/reason` 与 `quoted_price`；
 正负例已用合成证据包验证。真实 09:45 输出待下一交易日验收。
+
+**6.5 P01 公告接线（2026-11-10）**：P01 在 durable `Delivered` 之后、
+开票记账之前，对本次入选票逐只调用 `fetch_filings`（窗口=业务日前 5 自然日，
+limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
+`GRPC_MARKET_CLIENT_BUNDLE` 才发起，测试与无 bundle 环境直接跳过。
+`filings.status=ok` 时从 `missing` 移除 `official_filing`，否则保留；
+失败只影响证据包状态，不影响已完成的推送与开票。
+仍未接线：盘中触发证据包（`intraday_sync_path`）与
+`ticket_event(kind='filing')` 逐条事件；P01 真实公告命中最快下一交易日 09:00 验收。
