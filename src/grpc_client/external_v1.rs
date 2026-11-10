@@ -258,6 +258,27 @@ pub fn build_external_query_request(
                 }),
             )
         }
+        Operation::FinancialStatements => {
+            ensure_only_keys(&params, &["instruments", "kind"])?;
+            let instruments = required_instruments(&params)?;
+            if instruments.len() > 10 {
+                return Err(ExternalContractError::InvalidParameters);
+            }
+            let kind = params
+                .get("kind")
+                .and_then(Value::as_str)
+                .filter(|kind| matches!(*kind, "Balance" | "Income" | "CashFlow"))
+                .ok_or(ExternalContractError::InvalidParameters)?;
+            (
+                "magic.market.financial_statements.request",
+                1,
+                String::new(),
+                serde_json::json!({
+                    "instruments": instruments,
+                    "kind": kind,
+                }),
+            )
+        }
         Operation::InstrumentNews => {
             ensure_only_keys(
                 &params,

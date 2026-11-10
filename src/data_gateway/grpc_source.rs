@@ -4493,6 +4493,50 @@ impl GrpcSource {
         convert::financial_statements(&q)
     }
 
+    /// 6.6 预取专用：不写 BR-159 审计、不要求 DatabaseManager 已初始化。
+    /// 只用于盘后缓存构建；缓存文件自带 batch_id，决策包引用它。
+    pub async fn financial_statements_external_prefetch(
+        instruments: Vec<Value>,
+        kind: StatementKind,
+    ) -> Result<GatewayBatch<FinancialStatement>, GatewayError> {
+        let source = bridge_for("FinancialStatements")?;
+        source
+            .financial_statements_external_async(instruments, kind)
+            .await
+    }
+
+    /// 6.6：ExternalV1 财报（Balance/Income/CashFlow），单请求最多 10 只。
+    /// 本地桥的 CompanyFinancialStatements 在 Mac 侧不可用时，这是唯一可用路径。
+    pub async fn financial_statements_external_async(
+        &self,
+        instruments: Vec<Value>,
+        kind: StatementKind,
+    ) -> Result<GatewayBatch<FinancialStatement>, GatewayError> {
+        if self.external_bundle.is_none() {
+            return Err(GatewayError::classified(
+                "FinancialStatements",
+                Some(ProviderId::Sina),
+                "unavailable",
+                "external_bundle_unconfigured",
+                false,
+                "财报需要 ExternalV1 client bundle",
+            ));
+        }
+        let kind_text = match kind {
+            StatementKind::Balance => "Balance",
+            StatementKind::Income => "Income",
+            StatementKind::CashFlow => "CashFlow",
+        };
+        let params = serde_json::json!({
+            "instruments": instruments,
+            "kind": kind_text,
+        });
+        let q = self
+            .query_external_op(Operation::FinancialStatements, params)
+            .await?;
+        convert::financial_statements(&q)
+    }
+
     /// 估值统计: codes (与本地 CompanyDataGateway::market_statistics 对齐)。
     pub async fn market_statistics_async(
         &self,

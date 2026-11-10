@@ -3712,3 +3712,15 @@ announced_on / currency / lines[] / evidence{provider,source_at,observed_at,batc
 与转换器（现有 `CompanyDataGateway::financial_statements` 只走本地桥，
 Mac 桥报 `observation_stale`）；`fiscal_period` 恒 null，不能伪造 Q1/H1。
 下一步按盘后预取 + 09:25 读缓存实现，单票 3 个 kind、约 1.2 秒。
+
+**2026-11-10 阻塞点（已复现）**：monitor 的 ExternalV1 客户端由独立 proto
+快照生成（`src/grpc_client/external_pb.rs`），该快照**没有**
+`FinancialStatements` RPC；`GrpcSource::financial_statements_external_async`
+直接返回 `Unimplemented`（reason_code=external_query_rejected），与参数无关。
+同一端点用 grpcurl 直调 `MarketDataService/FinancialStatements` 正常返回
+（001216 单票 Balance 8 期），因此不是 Windows 数据问题，也不是我们的请求体
+问题，而是 Mac 侧 ExternalV1 合同快照未包含该 RPC。
+
+下一步需要：用 Windows 当前 `market.proto` 重新生成 external proto 快照
+（或对端确认该 RPC 已冻结），之后 `ticket_fundamentals` 预取即可工作；
+在此之前 6.6 不接线、不伪造 `fundamentals`。
