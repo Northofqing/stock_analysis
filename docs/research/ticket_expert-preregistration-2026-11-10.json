@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "kind": "ticket_expert_preregistration",
+  "created_at": "2026-11-10T09:40:00+08:00",
+  "status": "draft_awaiting_operator_signoff",
+  "exploratory_window": {
+    "start": "2026-10-26",
+    "end": "2026-11-09",
+    "note": "该窗口的数据已被看过（周报/触发统计），只用于提出假设，不进入确认性检验。"
+  },
+  "confirmatory_window": {
+    "start": "2026-11-10",
+    "end": null,
+    "target_trading_days": 20,
+    "note": "从 11-10 起的新触发样本；达到 20 个交易日或每组 n>=30 后评估，期间不改规则。"
+  },
+  "questions": [
+    {
+      "id": "Q1_pre3_gain",
+      "question": "触发前 3 日涨幅 >10% 的样本，D+1/D+3 收益是否低于 <=3% 组？",
+      "direction": "lower",
+      "primary_metric": "D+1 收盘相对触发价收益",
+      "groups": ["pre3_gt_10", "pre3_le_3"],
+      "action_if_confirmed": "把「前 3 日 >10% 不触发」写入触发规则（需再经 shadow）",
+      "action_if_not_confirmed": "维持现状，不新增该闸门"
+    },
+    {
+      "id": "Q2_low_open",
+      "question": "竞价低开 >2% 的情绪票，D+1 收益是否高于高开组？",
+      "direction": "higher",
+      "primary_metric": "D+1 收盘相对竞价参考价收益",
+      "groups": ["auction_lt_-2", "auction_2_to_6"],
+      "action_if_confirmed": "维持低开博弈区给价；不额外加高开门",
+      "action_if_not_confirmed": "重新评估低开组的定价与档位"
+    },
+    {
+      "id": "Q3_position_bias",
+      "question": "有底仓的加仓样本，D+1 是否差于无底仓的新买入样本？",
+      "direction": "lower",
+      "primary_metric": "D+1 收盘相对触发价收益",
+      "groups": ["has_position", "no_position"],
+      "action_if_confirmed": "在推送中强化「加仓参考」与仓位风险提示",
+      "action_if_not_confirmed": "不改变现有持仓上下文文案"
+    }
+  ],
+  "sample": {
+    "unit": "一次 entry_triggered 事件（同日同票只取第一条）",
+    "trading_window": "confirmatory_window",
+    "exclusions": [
+      "ST / 退市整理 / 停牌（stock_daily 缺当日行）",
+      "触发价 <= 0 或解析失败",
+      "缺 D-4 或 D-1 收盘价（无法算前 3 日涨幅）",
+      "缺 D+1 收盘价（D+3 分析时允许样本数更少，单独报 n）"
+    ],
+    "dedupe": "按 (code, trade_date) 去重，保留当天最早一条触发",
+    "note": "同一票跨日重复触发保留，因为研究单位是事件，不是票。"
+  },
+  "groups": {
+    "pre3": {
+      "definition": "close(D-1)/close(D-4)-1，按交易日",
+      "buckets": {"le_3": "<=3%", "3_to_10": "3%~10%", "gt_10": ">10%"}
+    },
+    "auction_pct": {
+      "definition": "09:25 竞价涨幅（ticket_evidence_bundle.pricing.auction_pct）",
+      "buckets": {"lt_-2": "<-2%", "-2_to_2": "-2%~2%", "2_to_6": "2%~6%", "gt_6": ">6%（不给价）"}
+    },
+    "position": {
+      "definition": "触发日是否有底仓（stock_position quantity>0 或证据包 portfolio.position_quantity>0）",
+      "buckets": {"has_position": "有底仓", "no_position": "无底仓"}
+    },
+    "regime": {"source": "ticket_decision.context.regime", "buckets": ["trend", "emotion"]},
+    "streak": {"source": "ticket_evidence_bundle.pricing.streak", "buckets": ["null/0-1", "2-3", ">=4"]},
+    "phase": {"source": "ticket_evidence_bundle.pricing.phase", "buckets": ["ice/repair/ferment", "climax", "ebb", "null"]}
+  },
+  "metrics": {
+    "primary": "D+1 收盘收益 = close(D+1)/trigger_price - 1",
+    "secondary": [
+      "D+3 收盘收益 = close(D+3)/trigger_price - 1",
+      "胜率 = 收益 > 0 的占比",
+      "中位数收益（抗极端值）",
+      "可成交率（触发后当日最低价 <= 触发价，仅描述）"
+    ],
+    "report": "每组 n、均值、中位数、胜率、95% bootstrap CI（10000 次）"
+  },
+  "costs": {
+    "base_round_trip_pct": 0.2,
+    "sensitivity_pct": [0.1, 0.3],
+    "applied_to": "所有收益指标扣减双边成本；另报未扣成本版本"
+  },
+  "stopping_rules": {
+    "min_trading_days": 20,
+    "min_group_n": 30,
+    "interim_peek_policy": "期间只允许看样本量，不看分组收益；避免提前停止偏差",
+    "max_window_days": 40
+  },
+  "decision_rules": {
+    "confirm": "预先声明的方向成立，且 95% bootstrap CI 不跨 0，且组 n>=30",
+    "reject": "方向相反且 CI 不跨 0",
+    "inconclusive": "CI 跨 0 或 n<30；保持现状，不新增规则",
+    "multiple_testing": "三个问题分别评估；不做 p-hacking 式合并，报告全部结果"
+  },
+  "data_sources": {
+    "triggers": "ticket_event(kind='entry_triggered').summary 中的现价",
+    "closes": "stock_daily.close（D-4/D-1/D+1/D+3）",
+    "auction": "data/ticket_evidence/<date>/<code>-02.json pricing.auction_pct",
+    "position": "stock_position（触发日）与证据包 portfolio",
+    "decision": "ticket_decision.context（regime/prev_high）"
+  },
+  "missing_policy": "缺数据直接排除并计入 skipped，不补 0、不用券商价代替收盘价。",
+  "analysis_script": "scripts/ticket_expert_eval.py（签字后编写，只读，输出 n/CI/成本敏感性）",
+  "signoff": {
+    "operator": null,
+    "signed_at": null,
+    "note": "签字后本文件冻结；任何修改必须新增版本文件并说明原因。"
+  }
+}
