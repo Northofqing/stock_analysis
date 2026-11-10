@@ -72,3 +72,14 @@ Sina publish_date；`lines` 77 条/期含 null，不补 0；`fiscal_period=null`
 - ticket 证据包 `selection.filings[]` 与 `fundamentals` 能引用上述批次 id。
 
 Windows 侧这轮不需要改代码；A（按票）与财报接线在 Mac 侧，估 1 天以内。
+
+## 追加（2026-11-10）：Mac 客户端 proto 快照缺 FinancialStatements
+
+- Windows 数据面正常：grpcurl 直调 50052 的
+  `MarketDataService/FinancialStatements`，schema
+  `magic.market.financial_statements.request`，`kind=Balance/Income/CashFlow`，
+  001216 单票 8 期、lines 含 null、Sina provider。
+- monitor 的 ExternalV1 客户端返回 `Unimplemented`；原因是
+  `src/grpc_client/external_pb.rs` 使用的 proto 快照没有该 RPC，不是对端拒绝。
+- 需要：用 Windows 当前 `market.proto` 重新生成 external proto 快照（或书面确认
+  该 RPC 已冻结）。完成后 Mac 侧 6.6 预取即可接线，Windows 无需改代码。
