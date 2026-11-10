@@ -15555,6 +15555,15 @@ async fn auction_watch_loop() {
                                                 .missing
                                                 .retain(|field| field != "official_filing");
                                         }
+                                        bundle.fundamentals = stock_analysis::monitor::ticket_evidence_bundle::load_fundamentals_cache(
+                                            &fact.code,
+                                            &date_text,
+                                        );
+                                        if bundle.fundamentals.status == "ok" {
+                                            bundle
+                                                .missing
+                                                .retain(|field| field != "financial_statements");
+                                        }
                                         match stock_analysis::monitor::ticket_evidence_bundle::write_bundle(
                                             root,
                                             &mut evidence_conn,

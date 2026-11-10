@@ -81,6 +81,10 @@ pub(crate) enum ExternalQueryMethod {
     /// 请求根本没发出去（日志表现为 reason_code=external_query_rejected、provider=None）。
     #[serde(rename = "OPERATION_BOARD_CONSTITUENTS")]
     BoardConstituents,
+    /// 6.6：ExternalV1 已有 FinancialStatements RPC，但此前未进 ExternalV1
+    /// 查询路由表，客户端在本地就返回 Unimplemented（请求没发出去）。
+    #[serde(rename = "OPERATION_FINANCIAL_STATEMENTS")]
+    FinancialStatements,
 }
 
 impl ExternalQueryMethod {
@@ -104,6 +108,7 @@ impl ExternalQueryMethod {
             Self::OrderBooks => "OrderBooks",
             Self::BoardMemberships => "BoardMemberships",
             Self::BoardConstituents => "BoardConstituents",
+            Self::FinancialStatements => "FinancialStatements",
         }
     }
 
@@ -133,6 +138,7 @@ impl ExternalQueryMethod {
             Self::OrderBooks => "/magic.market.v1.MarketDataService/OrderBooks",
             Self::BoardMemberships => "/magic.market.v1.MarketDataService/BoardMemberships",
             Self::BoardConstituents => "/magic.market.v1.MarketDataService/BoardConstituents",
+            Self::FinancialStatements => "/magic.market.v1.MarketDataService/FinancialStatements",
         }
     }
 
@@ -154,6 +160,7 @@ impl ExternalQueryMethod {
             Operation::GlobalNews => Some(Self::GlobalNews),
             Operation::InstrumentNews => Some(Self::InstrumentNews),
             Operation::BoardConstituents => Some(Self::BoardConstituents),
+            Operation::FinancialStatements => Some(Self::FinancialStatements),
             _ => None,
         }
     }
@@ -174,6 +181,7 @@ impl ExternalQueryMethod {
             Operation::RealtimeQuotes => Some(Self::RealtimeQuotes),
             Operation::OrderBooks => Some(Self::OrderBooks),
             Operation::BoardMemberships => Some(Self::BoardMemberships),
+            Operation::FinancialStatements => Some(Self::FinancialStatements),
             _ => None,
         }
     }
@@ -471,6 +479,9 @@ impl ExternalQueryTransport {
                 ExternalQueryMethod::OrderBooks => client.order_books(request).await,
                 ExternalQueryMethod::BoardMemberships => client.board_memberships(request).await,
                 ExternalQueryMethod::BoardConstituents => client.board_constituents(request).await,
+                ExternalQueryMethod::FinancialStatements => {
+                    client.financial_statements(request).await
+                }
             }
         };
         let bind = |mut evidence: ExternalWireEvidenceV1| {

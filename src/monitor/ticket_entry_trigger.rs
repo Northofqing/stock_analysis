@@ -809,6 +809,10 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
         fundamentals: evidence::Fundamentals {
             status: "unavailable".to_owned(),
             reason: Some("financial_statements_not_fetched".to_owned()),
+            report_period: None,
+            announced_on: None,
+            batch_id: None,
+            kinds: Vec::new(),
         },
         filings: evidence::Filings {
             status: "not_fetched".to_owned(),

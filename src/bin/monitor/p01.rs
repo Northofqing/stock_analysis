@@ -1768,6 +1768,10 @@ fn record_p01_tickets(
                         stock_analysis::monitor::ticket_evidence_bundle::Fundamentals {
                             status: "unavailable".to_owned(),
                             reason: Some("financial_statements_not_fetched".to_owned()),
+                            report_period: None,
+                            announced_on: None,
+                            batch_id: None,
+                            kinds: Vec::new(),
                         },
                     filings: stock_analysis::monitor::ticket_evidence_bundle::Filings {
                         status: "not_fetched".to_owned(),

@@ -215,6 +215,7 @@ pub(crate) fn parse_external_query_response(
         Operation::MarketAnnouncements => ExternalOperation::MarketAnnouncements,
         Operation::GlobalNews => ExternalOperation::GlobalNews,
         Operation::InstrumentNews => ExternalOperation::InstrumentNews,
+        Operation::FinancialStatements => ExternalOperation::FinancialStatements,
         _ => {
             return Err(EnvelopeError::OperationMismatch(
                 expected_operation as i32,

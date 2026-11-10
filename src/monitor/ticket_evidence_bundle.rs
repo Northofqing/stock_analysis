@@ -64,6 +64,11 @@ pub struct Portfolio {
 pub struct Fundamentals {
     pub status: String,
     pub reason: Option<String>,
+    /// 6.6：来自盘后缓存的最新报告期/公告日/批次（无缓存则 null）。
+    pub report_period: Option<String>,
+    pub announced_on: Option<String>,
+    pub batch_id: Option<String>,
+    pub kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +168,10 @@ impl EvidenceBundle {
             fundamentals: Fundamentals {
                 status: "unavailable".to_owned(),
                 reason: Some("financial_statements_not_fetched".to_owned()),
+                report_period: None,
+                announced_on: None,
+                batch_id: None,
+                kinds: Vec::new(),
             },
             filings: Filings {
                 status: "not_fetched".to_owned(),
@@ -241,6 +250,91 @@ pub async fn fetch_filings(code: &str, business_date: &str) -> Filings {
                 reason: None,
             }
         }
+    }
+}
+
+/// 6.6：读盘后缓存（`ticket_fundamentals` 生成）。缺失就明确写 cache_missing，
+/// 不在 09:25 现场拉 ExternalV1。
+pub fn load_fundamentals_cache(code: &str, business_date: &str) -> Fundamentals {
+    let path = Path::new("data")
+        .join("fundamentals")
+        .join(business_date)
+        .join(format!("{code}.json"));
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            return Fundamentals {
+                status: "unavailable".to_owned(),
+                reason: Some(format!("cache_missing:{}", path.display())),
+                report_period: None,
+                announced_on: None,
+                batch_id: None,
+                kinds: Vec::new(),
+            }
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            return Fundamentals {
+                status: "invalid_cache".to_owned(),
+                reason: Some(error.to_string()),
+                report_period: None,
+                announced_on: None,
+                batch_id: None,
+                kinds: Vec::new(),
+            }
+        }
+    };
+    let kinds: Vec<String> = value
+        .get("kinds")
+        .and_then(|kinds| kinds.as_object())
+        .map(|kinds| kinds.keys().cloned().collect())
+        .unwrap_or_default();
+    if kinds.is_empty() {
+        return Fundamentals {
+            status: "empty".to_owned(),
+            reason: Some("cache_has_no_kinds".to_owned()),
+            report_period: None,
+            announced_on: None,
+            batch_id: None,
+            kinds,
+        };
+    }
+    let pick = |field: &str| -> Option<String> {
+        ["Income", "Balance", "CashFlow"]
+            .iter()
+            .find_map(|kind| {
+                value
+                    .get("kinds")
+                    .and_then(|kinds| kinds.get(*kind))
+                    .and_then(|kind| kind.get(field))
+                    .and_then(|field| field.as_str())
+                    .map(str::to_owned)
+            })
+    };
+    let batch_id = value
+        .get("batch_ids")
+        .and_then(|ids| ids.as_object())
+        .and_then(|ids| ids.values().next())
+        .and_then(|id| id.as_str())
+        .map(str::to_owned);
+    let missing = value
+        .get("missing")
+        .and_then(|missing| missing.as_array())
+        .map(|missing| missing.len())
+        .unwrap_or(0);
+    Fundamentals {
+        status: "ok".to_owned(),
+        reason: if missing == 0 {
+            None
+        } else {
+            Some(format!("partial:{missing}"))
+        },
+        report_period: pick("report_period"),
+        announced_on: pick("announced_on"),
+        batch_id,
+        kinds,
     }
 }
 
@@ -339,6 +433,10 @@ mod tests {
             fundamentals: Fundamentals {
                 status: "unavailable".to_owned(),
                 reason: Some("financial_statements_not_fetched".to_owned()),
+                report_period: None,
+                announced_on: None,
+                batch_id: None,
+                kinds: Vec::new(),
             },
             filings: Filings {
                 status: "not_fetched".to_owned(),

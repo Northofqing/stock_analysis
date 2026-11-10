@@ -4534,7 +4534,7 @@ impl GrpcSource {
         let q = self
             .query_external_op(Operation::FinancialStatements, params)
             .await?;
-        convert::financial_statements(&q)
+        convert::external_financial_statements(&q)
     }
 
     /// 估值统计: codes (与本地 CompanyDataGateway::market_statistics 对齐)。

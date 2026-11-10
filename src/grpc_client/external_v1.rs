@@ -271,7 +271,7 @@ pub fn build_external_query_request(
                 .ok_or(ExternalContractError::InvalidParameters)?;
             (
                 "magic.market.financial_statements.request",
-                1,
+                2,
                 String::new(),
                 serde_json::json!({
                     "instruments": instruments,

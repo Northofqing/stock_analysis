@@ -2482,6 +2482,32 @@ pub fn financial_statements(
     })
 }
 
+/// 6.6 ExternalV1 财报：服务端按 kind 返回有界批次（complete=false），
+/// 但每条 record 是完整报告期。这里接纳 bounded batch，不把 partial 当缺失。
+pub fn external_financial_statements(
+    q: &QueryResult,
+) -> Result<GatewayBatch<FinancialStatement>, GatewayError> {
+    let capability = "FinancialStatements";
+    let ev = evidence_of(q, capability)?;
+    if q.records.is_empty() {
+        return Ok(GatewayBatch::VerifiedEmpty(ev));
+    }
+    let records: Vec<FinancialStatement> = q
+        .records
+        .iter()
+        .map(|record| {
+            let value: Value = serde_json::from_slice(&record.data)
+                .map_err(|e| err(capability, format!("FinancialStatement 记录非 JSON: {e}")))?;
+            serde_json::from_value(value)
+                .map_err(|e| err(capability, format!("FinancialStatement 反序列化失败: {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(GatewayBatch::Available {
+        records,
+        evidence: ev,
+    })
+}
+
 pub fn market_statistics(q: &QueryResult) -> Result<GatewayBatch<MarketStatistics>, GatewayError> {
     let capability = "MarketStatistics";
     let (parsed, ev) = parse_records_parts(q, capability)?;
