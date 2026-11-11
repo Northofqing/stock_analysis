@@ -3670,6 +3670,9 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   “连板”当负面或正面结论。
 - `perf_recent=false` 的时点解释：健康检查在 15:13 要求当日 performance
   snapshot，而快照尚未生成；这是收盘后启动时序，不是状态投影代码失败。
+- 17:38 二次 restart（pid 95115，release 13m58s）加载 09:25 状态过滤；
+  17:42 健康检查仍为 `degraded`，失败项同样是 `perf_recent=false`，
+  db_writable/bus_alive/strategy_registered/quote_provider 全 true。
 
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
