@@ -3616,6 +3616,8 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
 - 存量 `scripts/ticket_reopen_stale.py` 默认 dry-run：当前识别 12 张
   `stage=entry_proposed` 且提案为 `expired/invalidated` 的票；未执行
   `--apply`，避免未经确认改 stage。
+- 代码验证：触发模块 14/14；18:27 release 构建 14m59s，pid 7061 重启，
+  `[票状态][state_v1] active=60 status_conflict=1 stale5=21 open=6 blocked=45`。
 
 **2026-11-11 账户快照与成交补录（影响 T+1/持仓上下文）**：
 
