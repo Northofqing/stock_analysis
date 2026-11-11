@@ -392,7 +392,7 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
     }
 
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
-    let tickets: Vec<TicketRow> = diesel::sql_query(
+    let mut tickets: Vec<TicketRow> = diesel::sql_query(
         "SELECT id, code, source FROM ticket_lifecycle \
           WHERE close_date IS NULL AND stage = 'entry_proposed' \
           ORDER BY code, open_date DESC, id DESC",
@@ -400,36 +400,60 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
     .load(&mut conn)
     .map_err(|error| format!("entry_proposed 票查询失败: {error}"))?;
 
-    // 2026-11-11 A 方案双读：不改触发集合，只把 stage 口径与
-    // 提案事件口径的差异记到日志。视图未部署时静默跳过。
+    // 2026-11-11 A 方案读路径：状态投影先 shadow，再按开关过滤。
+    // `TICKET_STATE_FILTER=on` 时，已有终态提案事件的票不再进入触发缓存；
+    // 默认 shadow 只记日志，不改变触发集合。
     #[derive(QueryableByName)]
-    struct StateCount {
-        #[diesel(sql_type = BigInt)]
-        n: i64,
+    struct StateRow {
+        #[diesel(sql_type = Text)]
+        code: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        proposal_status: Option<String>,
     }
-    if let Ok(open) = diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM ticket_state_v1 \
-         WHERE close_date IS NULL AND stage = 'entry_proposed' \
-           AND proposal_status = 'open'",
+    let state_filter = matches!(
+        std::env::var("TICKET_STATE_FILTER").as_deref(),
+        Ok("on") | Ok("1")
+    );
+    if let Ok(states) = diesel::sql_query(
+        "SELECT code, proposal_status FROM ticket_state_v1 \
+         WHERE close_date IS NULL AND stage = 'entry_proposed'",
     )
-    .get_result::<StateCount>(&mut conn)
+    .load::<StateRow>(&mut conn)
     {
-        let blocked = diesel::sql_query(
-            "SELECT COUNT(*) AS n FROM ticket_state_v1 \
-             WHERE close_date IS NULL AND stage = 'entry_proposed' \
-               AND proposal_status IN ('triggered','invalidated','expired','superseded')",
-        )
-        .get_result::<StateCount>(&mut conn)
-        .map(|row| row.n)
-        .unwrap_or(0);
+        let blocked: HashSet<String> = states
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.proposal_status.as_deref(),
+                    Some("triggered" | "invalidated" | "expired" | "superseded")
+                )
+            })
+            .map(|row| row.code.clone())
+            .collect();
+        let open = states
+            .iter()
+            .filter(|row| row.proposal_status.as_deref() == Some("open"))
+            .count();
+        let sample = blocked.iter().take(8).cloned().collect::<Vec<_>>().join(",");
         log::info!(
-            "[触发确认][state-v1] stage_targets={} open={} blocked={}",
+            "[触发确认][state-v1] mode={} stage_targets={} open={} blocked={} sample={}",
+            if state_filter { "on" } else { "shadow" },
             tickets.len(),
-            open.n,
-            blocked
+            open,
+            blocked.len(),
+            sample
         );
+        if state_filter {
+            let before = tickets.len();
+            tickets.retain(|ticket| !blocked.contains(ticket.code.trim()));
+            log::info!(
+                "[触发确认][state-v1] filtered {} -> {}",
+                before,
+                tickets.len()
+            );
+        }
     } else {
-        log::debug!("[触发确认][state-v1] 视图不可用，跳过双读");
+        log::debug!("[触发确认][state-v1] 视图不可用，跳过状态过滤");
     }
 
     let mut cache = TriggerCache {

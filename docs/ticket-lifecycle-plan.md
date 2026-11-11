@@ -3601,6 +3601,11 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   不做自动修复。
 - `stale_days` 以最近一次提案事件或 `open_date` 起算，仅是巡检指标，不是
   淘汰规则。
+- 触发侧新增开关 `TICKET_STATE_FILTER=on|shadow`（默认 shadow）：
+  `on` 时 `stage=entry_proposed` 但有 `triggered/invalidated/expired/superseded`
+  事件的票不进入触发缓存；`shadow` 只记录将过滤的代码和数量，不改变触发。
+  当前 49 张 `entry_proposed` 中，事件口径 `open=7`、`blocked=42`；在确认
+  这 42 张都是旧提案前，不切 `on`。
 
 **2026-11-11 只读基线（CTE 兜底，视图未部署）**：
 
