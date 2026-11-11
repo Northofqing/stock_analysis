@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use diesel::prelude::*;
-use diesel::sql_types::{Nullable, Text};
+use diesel::sql_types::{Double, Nullable, Text};
 
 use crate::database::{ticket_lifecycle, DatabaseManager};
 use crate::monitor::auction_watch::AuctionRow;
@@ -272,6 +272,8 @@ pub struct EvidenceFact {
     pub position_error: Option<String>,
     /// 6.10：risk_flag 摘要（最近 5 日），写证据包并与正文同源。
     pub risk_note: Option<String>,
+    /// 6.8：触发前 3 日涨幅；>10% 正文标高位连板仅观察。
+    pub pre3_gain: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -449,6 +451,28 @@ fn median(values: &[f64]) -> Option<f64> {
     })
 }
 
+/// 6.8/6.10：触发前 3 日涨幅。取 D-1 与 D-4 收盘；不足 4 根日线返回 None，
+/// 不拿更早的日期硬凑。
+fn pre3_gain_on(conn: &mut SqliteConnection, code: &str, as_of: &str) -> Option<f64> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Double)]
+        close: f64,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT close FROM stock_daily WHERE code = ? AND date < ? \
+         ORDER BY date DESC LIMIT 4",
+    )
+    .bind::<Text, _>(code)
+    .bind::<Text, _>(as_of)
+    .load(conn)
+    .ok()?;
+    if rows.len() < 4 || rows[3].close <= 0.0 {
+        return None;
+    }
+    Some(rows[0].close / rows[3].close - 1.0)
+}
+
 /// 给情绪型活跃票算竞价买价。
 ///
 /// `rows` 由 `auction_watch::observe` 提供（活跃票 ∪ 持仓的竞价终态）。
@@ -551,6 +575,7 @@ pub fn build(
         }
         let streak = streak_src.as_ref().map(|(value, _)| *value);
         let phase = phase_src.as_ref().map(|(value, _)| *value);
+        let pre3_gain = pre3_gain_on(&mut conn, &row.code, as_of);
         let position_note = match &positions_error {
             Some(error) => format!("持仓：读取失败（{error}）"),
             None => match positions.get(&row.code) {
@@ -619,6 +644,7 @@ pub fn build(
             cost_price: positions.get(&row.code).map(|(_, cost)| *cost),
             position_error: positions_error.clone(),
             risk_note: risk_note.clone(),
+            pre3_gain,
         });
         let line = PriceLine {
             code: row.code.clone(),

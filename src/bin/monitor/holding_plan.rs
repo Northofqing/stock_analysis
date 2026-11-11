@@ -633,6 +633,7 @@ fn prepare_fresh_subset(
                                     trigger_level: None,
                                     decision_id: None,
                                     risk_note: None,
+                                    pre3_gain: None,
                                 },
                                 portfolio: stock_analysis::monitor::ticket_evidence_bundle::Portfolio {
                                     position_quantity: Some(item.quantity),

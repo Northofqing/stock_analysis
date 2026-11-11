@@ -50,6 +50,8 @@ pub struct Pricing {
     pub decision_id: Option<String>,
     /// 6.10：同日风险提示（risk_flag）；与参考价/加仓参考同时存在即冲突。
     pub risk_note: Option<String>,
+    /// 6.8：触发前 3 日涨幅；用于审计高位连板样本。
+    pub pre3_gain: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +179,7 @@ impl EvidenceBundle {
                 trigger_level: None,
                 decision_id: None,
                 risk_note: fact.risk_note.clone(),
+                pre3_gain: fact.pre3_gain,
             },
             portfolio,
             fundamentals: Fundamentals {
@@ -438,6 +441,7 @@ mod tests {
                 trigger_level: None,
                 decision_id: None,
                 risk_note: None,
+                pre3_gain: None,
             },
             portfolio: Portfolio {
                 position_quantity: Some(500),

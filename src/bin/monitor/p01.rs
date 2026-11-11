@@ -1809,6 +1809,7 @@ fn record_p01_tickets(
                         trigger_level: None,
                         decision_id: None,
                         risk_note: None,
+                        pre3_gain: None,
                     },
                     portfolio,
                     fundamentals,
