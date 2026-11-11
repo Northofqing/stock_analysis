@@ -182,11 +182,26 @@ pub fn sync_stages_from_positions(
                 .iter()
                 .filter(|state| state.stale_days.unwrap_or(0) >= 5)
                 .count();
+            let open = states
+                .iter()
+                .filter(|state| state.proposal_status.as_deref() == Some("open"))
+                .count();
+            let blocked = states
+                .iter()
+                .filter(|state| {
+                    matches!(
+                        state.proposal_status.as_deref(),
+                        Some("triggered" | "invalidated" | "expired" | "superseded")
+                    )
+                })
+                .count();
             log::info!(
-                "[票状态][state_v1] active={} status_conflict={} stale5={}",
+                "[票状态][state_v1] active={} status_conflict={} stale5={} open={} blocked={}",
                 states.len(),
                 conflicts,
-                stale
+                stale,
+                open,
+                blocked
             );
         }
         Err(error) => log::warn!("[票状态][state_v1] 双读失败: {error}"),

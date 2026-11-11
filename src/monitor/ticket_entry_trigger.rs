@@ -400,6 +400,38 @@ pub fn warm(db: &DatabaseManager, as_of: &str) -> Result<TriggerCache, String> {
     .load(&mut conn)
     .map_err(|error| format!("entry_proposed 票查询失败: {error}"))?;
 
+    // 2026-11-11 A 方案双读：不改触发集合，只把 stage 口径与
+    // 提案事件口径的差异记到日志。视图未部署时静默跳过。
+    #[derive(QueryableByName)]
+    struct StateCount {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    if let Ok(open) = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM ticket_state_v1 \
+         WHERE close_date IS NULL AND stage = 'entry_proposed' \
+           AND proposal_status = 'open'",
+    )
+    .get_result::<StateCount>(&mut conn)
+    {
+        let blocked = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM ticket_state_v1 \
+             WHERE close_date IS NULL AND stage = 'entry_proposed' \
+               AND proposal_status IN ('triggered','invalidated','expired','superseded')",
+        )
+        .get_result::<StateCount>(&mut conn)
+        .map(|row| row.n)
+        .unwrap_or(0);
+        log::info!(
+            "[触发确认][state-v1] stage_targets={} open={} blocked={}",
+            tickets.len(),
+            open.n,
+            blocked
+        );
+    } else {
+        log::debug!("[触发确认][state-v1] 视图不可用，跳过双读");
+    }
+
     let mut cache = TriggerCache {
         as_of: as_of.to_string(),
         ..Default::default()

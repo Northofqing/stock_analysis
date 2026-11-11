@@ -3602,6 +3602,28 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
 - `stale_days` 以最近一次提案事件或 `open_date` 起算，仅是巡检指标，不是
   淘汰规则。
 
+**2026-11-11 只读基线（CTE 兜底，视图未部署）**：
+
+- 活跃票 59：`entry_proposed=49`、`holding=6`、`observing=4`；
+- 提案事件口径：`triggered=33`、`expired=8`、`open=7`、`invalidated=1`、
+  无提案事件 10；
+- 事件与 decision 冲突 1 张：ticket 191（002727），事件
+  `entry_invalidated`、decision `triggered`；
+- 陈旧 ≥5 天 23 张：6 张持仓（open_date 6~10 月）+ 17 张提案/观察票；
+- 这不是“33 张触发都该买”：`entry_triggered` 只表示价格触及，是否持仓由
+  `stage`/持仓快照决定；但 `stage=entry_proposed` 与 `expired` 并存说明
+  状态投影尚未收口，不能直接拿 312 个触发事件当胜率分母。
+
+**paper 执行边界（2026-11-11 复核）**：
+
+- 当前 V2 账本 17 条事件：`Seeded` + `Marked` + `DerivedSnapshot`，仍为
+  0 条 `Executed`；`paper_trades` 2,589 条停在 2026-09-24。
+- `paper_ledger_runtime::execute` 会修改当前 `PAPER_LEDGER_ACCOUNT_BINDING`
+  的镜像账户；若直接把 ticket 建议执行进这个账户，会与真实持仓快照分叉。
+  因此 ticket 的 paper 执行必须先建独立 epoch/account，或明确只做“信号
+  结果账本”，不能复用当前镜像账户。
+- 这是 #2“paper execution ledger 纳入”的第一步决策，未拍板前不写成交。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
