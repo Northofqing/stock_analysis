@@ -3624,6 +3624,24 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   结果账本”，不能复用当前镜像账户。
 - 这是 #2“paper execution ledger 纳入”的第一步决策，未拍板前不写成交。
 
+**2026-11-11 信号结果账本 v1（旁路，未写生产）**：
+
+- 新增 `scripts/ticket_signal_execution.py`：只读回放
+  `entry_triggered` + 最近一份 `ticket_decision` + `stock_daily`，
+  写独立表 `ticket_signal_execution`；默认 dry-run，`--apply` 才建表/写库。
+- 不触碰 `paper_ledger_*`、不改 `PAPER_LEDGER_ACCOUNT_BINDING`。
+- 成交口径：一字向上/竞价高于区间上沿 3%/当日最低未触及区间 → 不成交；
+  区间内按开盘价、回落按上沿、回升按下沿；breakout 按触发位或跳空开盘；
+  无决策/无日线分别记 `no_decision` / `missing_bar`，不补值。
+- 2026-11-11 dry-run（全历史 308 个触发）：可成交 200；
+  `no_decision=48`、`unfillable_gap=30`、`missing_bar=25`、`no_touch=3`、
+  `no_trigger=2`。D+1 n=172 净胜率 65.1%、均值 +1.16%、盈亏比 2.10；
+  D+3 n=125 净胜率 72.0%、均值 +2.35%。`breakout` 196/218 可成交，
+  D+1 胜率 64.3%；`pullback` 只有 4 个可成交样本。
+- 这些数字还不能当“策略胜率”：48 个触发无 decision 上下文、25 个缺日线，
+  且 breakout 按触发位成交、区间按日线近似，未模拟盘口队列。先作为分母
+  和口径验证，不据此切 `new`。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
