@@ -360,6 +360,7 @@ pub(super) async fn run_timeframe(analyzer: &GeminiAnalyzer, slices: &DomainSlic
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::multi_agent::DomainAvailability;
 
     fn analyzer() -> GeminiAnalyzer {
         GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
