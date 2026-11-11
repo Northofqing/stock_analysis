@@ -15,6 +15,65 @@ import sys
 from collections import Counter
 
 
+def load_rows(conn: sqlite3.Connection) -> tuple[list[tuple], bool]:
+    view = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='view' AND name='ticket_state_v1'"
+    ).fetchone()
+    if view is not None:
+        return (
+            conn.execute(
+                """
+                SELECT ticket_id, code, stage, proposal_status, decision_status,
+                       decision_id, status_conflict, stale_days, latest_event_kind
+                FROM ticket_state_v1
+                WHERE close_date IS NULL
+                ORDER BY status_conflict DESC, stale_days DESC, ticket_id
+                """
+            ).fetchall(),
+            True,
+        )
+    # 视图尚未部署时用同一口径的 CTE 兜底；不写库。
+    return (
+        conn.execute(
+            """
+            WITH events AS (
+              SELECT ticket_id,
+                     CASE event_kind
+                       WHEN 'entry_proposed' THEN 'open'
+                       WHEN 'entry_triggered' THEN 'triggered'
+                       WHEN 'entry_invalidated' THEN 'invalidated'
+                       WHEN 'entry_expired' THEN 'expired'
+                       WHEN 'entry_superseded' THEN 'superseded'
+                     END AS status,
+                     event_kind, event_at,
+                     ROW_NUMBER() OVER (PARTITION BY ticket_id
+                                        ORDER BY event_at DESC, id DESC) AS rn
+              FROM ticket_event
+              WHERE event_kind IN ('entry_proposed','entry_triggered',
+                                   'entry_invalidated','entry_expired','entry_superseded')
+            ), decisions AS (
+              SELECT ticket_id, proposal_status, decision_id,
+                     ROW_NUMBER() OVER (PARTITION BY ticket_id
+                                        ORDER BY as_of DESC, created_at DESC, decision_id DESC) AS rn
+              FROM ticket_decision
+            )
+            SELECT t.id, t.code, t.stage,
+                   e.status, d.proposal_status, d.decision_id,
+                   CASE WHEN e.status IS NOT NULL AND d.proposal_status IS NOT NULL
+                              AND e.status <> d.proposal_status THEN 1 ELSE 0 END,
+                   CAST(julianday('now') - julianday(COALESCE(e.event_at, t.open_date)) AS INTEGER),
+                   e.event_kind
+            FROM ticket_lifecycle t
+            LEFT JOIN events e ON e.ticket_id=t.id AND e.rn=1
+            LEFT JOIN decisions d ON d.ticket_id=t.id AND d.rn=1
+            WHERE t.close_date IS NULL
+            ORDER BY 7 DESC, 8 DESC, t.id
+            """
+        ).fetchall(),
+        False,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", required=True)
@@ -23,22 +82,8 @@ def main() -> int:
 
     conn = sqlite3.connect(f"file:{args.database}?mode=ro", uri=True)
     try:
-        view = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='view' AND name='ticket_state_v1'"
-        ).fetchone()
-        if view is None:
-            print("ticket_state_v1 不存在：monitor 尚未用新二进制启动，未建视图")
-            return 0
-
-        rows = conn.execute(
-            """
-            SELECT ticket_id, code, stage, proposal_status, decision_status,
-                   decision_id, status_conflict, stale_days, latest_event_kind
-            FROM ticket_state_v1
-            WHERE close_date IS NULL
-            ORDER BY status_conflict DESC, stale_days DESC, ticket_id
-            """
-        ).fetchall()
+        rows, from_view = load_rows(conn)
+        print(f"数据源: {'ticket_state_v1' if from_view else 'CTE 兜底（视图未部署）'}")
         print(f"活跃票: {len(rows)}")
         stages = Counter(row[2] for row in rows)
         proposals = Counter(row[3] or "（无提案事件）" for row in rows)
