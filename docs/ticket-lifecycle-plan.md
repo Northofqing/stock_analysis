@@ -3642,6 +3642,20 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   且 breakout 按触发位成交、区间按日线近似，未模拟盘口队列。先作为分母
   和口径验证，不据此切 `new`。
 
+**2026-11-11 15:09 生产落地（signal 表 + state 视图）**：
+
+- 运行根 release 构建 14m26s，二进制 15:09；重启 pid 72027。
+- `ticket_signal_execution` 已建表并写入 287 条 attempt（截至 11-10）：
+  `filled=200`、`no_decision=48`、`unfillable_gap=30`、`missing_bar=4`、
+  `no_touch=3`、`no_trigger=2`。
+- `ticket_state_v1` 已由新二进制启动时创建，视图行数 246（含已关闭票）；
+  只读巡检：活跃 59、事件/decision 冲突 1（002727）、陈旧 ≥5 天 23。
+- 启动健康检查为 `degraded`，失败项仅 `perf_recent=false`；db_writable、
+  bus_alive、strategy_registered、quote_provider 均为 true。该时点在收盘后，
+  暂按启动期观测处理，不据此判定新状态投影失败。
+- 15:13 后尚未到下一次 `ticket_stage_sync`/09:30 触发窗口，双读日志
+  `[票状态][state_v1]` / `[触发确认][state-v1]` 还没有新样本。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
