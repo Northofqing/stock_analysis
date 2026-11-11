@@ -289,6 +289,8 @@ pub struct AuctionPriceReport {
     pub high_state_unknown: usize,
     /// 情绪高潮期被压掉的连板票（2026-10-24）
     pub skipped_phase: Vec<PriceLine>,
+    /// 最新提案已是终态、按 state_v1 不重复定价的票（shadow 只计数）。
+    pub skipped_stale: usize,
     pub errors: Vec<String>,
     pub board_heat: Vec<BoardHeat>,
     /// 每条带价决策的原始事实（6.3 证据包用）。
@@ -303,7 +305,7 @@ impl AuctionPriceReport {
             "竞价买价"
         };
         format!(
-            "[{}] emotion={} quoted={} skipped_high={} skipped_phase={} no_price={} high_state_unknown={} errors={}",
+            "[{}] emotion={} quoted={} skipped_high={} skipped_phase={} no_price={} high_state_unknown={} skipped_stale={} errors={}",
             label,
             self.emotion,
             self.quoted.len(),
@@ -311,6 +313,7 @@ impl AuctionPriceReport {
             self.skipped_phase.len(),
             self.no_price,
             self.high_state_unknown,
+            self.skipped_stale,
             self.errors.len()
         )
     }
@@ -454,6 +457,15 @@ fn median(values: &[f64]) -> Option<f64> {
     })
 }
 
+/// 6.10/state_v1：是否真的把终态提案排除出 09:25 定价。
+/// 默认 shadow：只记“将跳过”，不改变推送；`TICKET_STATE_FILTER=on` 才跳过。
+fn state_filter_enabled() -> bool {
+    matches!(
+        std::env::var("TICKET_STATE_FILTER").as_deref(),
+        Ok("on") | Ok("1")
+    )
+}
+
 /// 6.8/6.10：触发前 3 日涨幅。取 D-1 与 D-4 收盘；不足 4 根日线返回 None，
 /// 不拿更早的日期硬凑。
 fn pre3_gain_on(conn: &mut SqliteConnection, code: &str, as_of: &str) -> Option<f64> {
@@ -594,6 +606,29 @@ pub fn build(
                 continue;
             }
         };
+        // state_v1：已经 triggered/expired/invalidated/superseded 的旧提案，
+        // 09:25 不再当新提案定价。默认 shadow 只记“将跳过”。
+        if let Ok(Some(state)) = ticket_lifecycle::ticket_state(&mut conn, ticket.id) {
+            if matches!(
+                state.proposal_status.as_deref(),
+                Some("triggered" | "invalidated" | "expired" | "superseded")
+            ) {
+                report.skipped_stale += 1;
+                if state_filter_enabled() {
+                    log::info!(
+                        "[竞价买价] {} 提案状态={:?}，旧提案不重复定价",
+                        row.code,
+                        state.proposal_status
+                    );
+                    continue;
+                }
+                log::info!(
+                    "[竞价买价][state-v1] shadow 将跳过 {} 状态={:?}",
+                    row.code,
+                    state.proposal_status
+                );
+            }
+        }
         let decision =
             match ticket_regime::resolve(&mut conn, ticket.id, &row.code, &ticket.source, as_of) {
                 Ok(decision) => decision,

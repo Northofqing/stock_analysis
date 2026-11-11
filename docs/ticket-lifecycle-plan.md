@@ -3606,6 +3606,10 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   事件的票不进入触发缓存；`shadow` 只记录将过滤的代码和数量，不改变触发。
   当前 49 张 `entry_proposed` 中，事件口径 `open=7`、`blocked=42`；在确认
   这 42 张都是旧提案前，不切 `on`。
+- 09:25 定价也读取 `ticket_state_v1`：终态提案在 shadow 下记
+  `[竞价买价][state-v1] shadow 将跳过 …`，`on` 时不再当新提案给价；
+  摘要行新增 `skipped_stale` 计数。当前 51 张 `entry_proposed` 中
+  事件口径 `open=6`、`expired=11`、`triggered=33`、`invalidated=1`。
 
 **2026-11-11 只读基线（CTE 兜底，视图未部署）**：
 
