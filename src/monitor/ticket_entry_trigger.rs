@@ -806,6 +806,8 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
             decision_id: hit.decision_id.clone(),
             risk_note: None,
             pre3_gain: None,
+            fillability: None,
+            fillability_note: None,
         },
         portfolio,
         fundamentals: evidence::Fundamentals {

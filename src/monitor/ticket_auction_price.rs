@@ -272,8 +272,11 @@ pub struct EvidenceFact {
     pub position_error: Option<String>,
     /// 6.10：risk_flag 摘要（最近 5 日），写证据包并与正文同源。
     pub risk_note: Option<String>,
-    /// 6.8：触发前 3 日涨幅；>10% 正文标高位连板仅观察。
+    /// 6.8：触发前 3 日涨幅；仅作证据事实，不参与给价/趋势判断。
     pub pre3_gain: Option<f64>,
+    /// 6.9：提案可成交性；由当日竞价价与提案区间比较。
+    pub fillability: Option<String>,
+    pub fillability_note: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -473,6 +476,68 @@ fn pre3_gain_on(conn: &mut SqliteConnection, code: &str, as_of: &str) -> Option<
     Some(rows[0].close / rows[3].close - 1.0)
 }
 
+/// 6.9：用当日竞价价与提案区间算可成交性。只做事实标记，
+/// 不改变给价；`unfillable_gap` = 竞价已高于区间上沿 3% 以上。
+fn fillability_on(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    as_of: &str,
+    auction_price: f64,
+) -> (Option<String>, Option<String>) {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Nullable<Double>)]
+        price_low: Option<f64>,
+        #[diesel(sql_type = Nullable<Double>)]
+        price_high: Option<f64>,
+    }
+    let row: Option<Row> = diesel::sql_query(
+        "SELECT price_low, price_high FROM ticket_decision \
+         WHERE ticket_id = ? AND as_of = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(ticket_id)
+    .bind::<Text, _>(as_of)
+    .get_result(conn)
+    .ok();
+    let Some(row) = row else {
+        return (None, None);
+    };
+    let (Some(low), Some(high)) = (row.price_low, row.price_high) else {
+        return (None, None);
+    };
+    if high <= 0.0 {
+        return (None, None);
+    }
+    let (state, note) = classify_fillability(auction_price, low, high);
+    (Some(state), Some(note))
+}
+
+/// 纯函数：竞价价 vs 提案区间。`unfillable_gap` 表示竞价已高于
+/// 区间上沿 3% 以上，按区间挂单当天不可成交。
+fn classify_fillability(auction_price: f64, low: f64, high: f64) -> (String, String) {
+    if auction_price > high * 1.03 {
+        (
+            "unfillable_gap".to_owned(),
+            format!("竞价 {auction_price:.2} 高于区间上沿 {high:.2} 超过 3%"),
+        )
+    } else if auction_price > high {
+        (
+            "above_zone".to_owned(),
+            format!("竞价 {auction_price:.2} 高于区间上沿 {high:.2}"),
+        )
+    } else if auction_price < low {
+        (
+            "below_zone".to_owned(),
+            format!("竞价 {auction_price:.2} 低于区间下沿 {low:.2}"),
+        )
+    } else {
+        (
+            "in_zone".to_owned(),
+            format!("竞价 {auction_price:.2} 在区间 {low:.2}~{high:.2}"),
+        )
+    }
+}
+
 /// 给情绪型活跃票算竞价买价。
 ///
 /// `rows` 由 `auction_watch::observe` 提供（活跃票 ∪ 持仓的竞价终态）。
@@ -576,6 +641,8 @@ pub fn build(
         let streak = streak_src.as_ref().map(|(value, _)| *value);
         let phase = phase_src.as_ref().map(|(value, _)| *value);
         let pre3_gain = pre3_gain_on(&mut conn, &row.code, as_of);
+        let (fillability, fillability_note) =
+            fillability_on(&mut conn, ticket.id, as_of, auction_price);
         let position_note = match &positions_error {
             Some(error) => format!("持仓：读取失败（{error}）"),
             None => match positions.get(&row.code) {
@@ -645,6 +712,8 @@ pub fn build(
             position_error: positions_error.clone(),
             risk_note: risk_note.clone(),
             pre3_gain,
+            fillability,
+            fillability_note,
         });
         let line = PriceLine {
             code: row.code.clone(),
@@ -763,6 +832,17 @@ mod tests {
         assert!(text.contains("高位状态未核实"));
         assert!(text.contains("持仓：已有 500 股"));
         assert!(text.contains("动作：加仓观察"));
+    }
+
+    #[test]
+    fn fillability_marks_gap_above_zone_as_unfillable() {
+        // 601188 2026-11-10：竞价 4.61 vs 提案 3.48~3.55。
+        let (state, note) = classify_fillability(4.61, 3.48, 3.55);
+        assert_eq!(state, "unfillable_gap");
+        assert!(note.contains("超过 3%"));
+        assert_eq!(classify_fillability(3.50, 3.48, 3.55).0, "in_zone");
+        assert_eq!(classify_fillability(3.56, 3.48, 3.55).0, "above_zone");
+        assert_eq!(classify_fillability(3.40, 3.48, 3.55).0, "below_zone");
     }
 
     #[test]

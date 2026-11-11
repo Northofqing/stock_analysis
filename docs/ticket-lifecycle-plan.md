@@ -3624,11 +3624,13 @@ D+3 样本（19）不足，观察窗结束前不据此改规则。
 
 后续动作（按本方案）：
 
-- 6.3/6.9：给提案/证据包增加 `fillability`
-  （`unfillable_gap` / `limit_up_sealed` / `never_touched_zone`）；
-  当日未成交的提案不跨日继承，审计统计「不可成交却给价」。
+- 6.3/6.9：已实现 `pricing.fillability` /
+  `fillability_note`：按当日竞价价与提案区间分为 `in_zone` /
+  `above_zone` / `below_zone` / `unfillable_gap`（竞价高于区间上沿
+  3% 以上）；审计把「`unfillable_gap` 却给参考价」判 FAIL。
+  尚未实现「未成交提案次日自动失效」，旧提案仍可能跨日挂着。
 - 6.10：盘中「定向监控」涨停时改为「强度确认，当前不可成交」；
-  不把涨停播报成买入机会。
+  不把涨停播报成买入机会（未实现）。
 - 6.8：`pre3>10%` 仍只做 shadow/确认性评估；确认前不写成生产硬门，
   避免误伤强势连板。
 

@@ -1810,6 +1810,8 @@ fn record_p01_tickets(
                         decision_id: None,
                         risk_note: None,
                         pre3_gain: None,
+                        fillability: None,
+                        fillability_note: None,
                     },
                     portfolio,
                     fundamentals,

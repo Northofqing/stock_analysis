@@ -634,6 +634,8 @@ fn prepare_fresh_subset(
                                     decision_id: None,
                                     risk_note: None,
                                     pre3_gain: None,
+                                    fillability: None,
+                                    fillability_note: None,
                                 },
                                 portfolio: stock_analysis::monitor::ticket_evidence_bundle::Portfolio {
                                     position_quantity: Some(item.quantity),

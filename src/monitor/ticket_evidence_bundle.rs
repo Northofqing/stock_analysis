@@ -52,6 +52,10 @@ pub struct Pricing {
     pub risk_note: Option<String>,
     /// 6.8：触发前 3 日涨幅；用于审计高位连板样本。
     pub pre3_gain: Option<f64>,
+    /// 6.9：提案可成交性（in_zone/above_zone/below_zone/unfillable_gap）。
+    pub fillability: Option<String>,
+    /// 6.9：可成交性说明（区间/竞价价/缺口）。
+    pub fillability_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +184,8 @@ impl EvidenceBundle {
                 decision_id: None,
                 risk_note: fact.risk_note.clone(),
                 pre3_gain: fact.pre3_gain,
+                fillability: fact.fillability.clone(),
+                fillability_note: fact.fillability_note.clone(),
             },
             portfolio,
             fundamentals: Fundamentals {
@@ -442,6 +448,8 @@ mod tests {
                 decision_id: None,
                 risk_note: None,
                 pre3_gain: None,
+                fillability: None,
+                fillability_note: None,
             },
             portfolio: Portfolio {
                 position_quantity: Some(500),
