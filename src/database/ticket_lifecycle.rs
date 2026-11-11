@@ -132,6 +132,56 @@ pub fn create_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::
     )
     .execute(conn)
     .ok();
+
+    // 2026-11-11：统一状态投影。ticket_event 是追加事实，ticket_decision 是
+    // 单次决策上下文，ticket_lifecycle.stage 只是粗粒度展示。这里不新增列，
+    // 用一个只读视图把三者对齐；消费者逐步改读视图，双读期只观察差异。
+    diesel::sql_query(
+        "CREATE VIEW IF NOT EXISTS ticket_state_v1 AS \
+         SELECT base.*, \
+                CASE WHEN base.proposal_status IS NOT NULL \
+                          AND base.decision_status IS NOT NULL \
+                          AND base.proposal_status <> base.decision_status \
+                     THEN 1 ELSE 0 END AS status_conflict, \
+                CAST(julianday('now') - julianday(COALESCE(base.latest_event_at, base.open_date)) AS INTEGER) AS stale_days \
+         FROM ( \
+             SELECT t.id AS ticket_id, t.code, t.open_date, t.close_date, t.stage, t.source, \
+                    (SELECT e.event_kind FROM ticket_event e \
+                     WHERE e.ticket_id = t.id \
+                       AND e.event_kind IN ('entry_proposed','entry_triggered', \
+                                           'entry_invalidated','entry_expired','entry_superseded') \
+                     ORDER BY e.event_at DESC, e.id DESC LIMIT 1) AS latest_event_kind, \
+                    (SELECT e.event_at FROM ticket_event e \
+                     WHERE e.ticket_id = t.id \
+                       AND e.event_kind IN ('entry_proposed','entry_triggered', \
+                                           'entry_invalidated','entry_expired','entry_superseded') \
+                     ORDER BY e.event_at DESC, e.id DESC LIMIT 1) AS latest_event_at, \
+                    (SELECT CASE e.event_kind \
+                                WHEN 'entry_proposed' THEN 'open' \
+                                WHEN 'entry_triggered' THEN 'triggered' \
+                                WHEN 'entry_invalidated' THEN 'invalidated' \
+                                WHEN 'entry_expired' THEN 'expired' \
+                                WHEN 'entry_superseded' THEN 'superseded' \
+                            END \
+                     FROM ticket_event e \
+                     WHERE e.ticket_id = t.id \
+                       AND e.event_kind IN ('entry_proposed','entry_triggered', \
+                                           'entry_invalidated','entry_expired','entry_superseded') \
+                     ORDER BY e.event_at DESC, e.id DESC LIMIT 1) AS proposal_status, \
+                    (SELECT d.decision_id FROM ticket_decision d \
+                     WHERE d.ticket_id = t.id \
+                     ORDER BY d.as_of DESC, d.created_at DESC, d.decision_id DESC LIMIT 1) AS decision_id, \
+                    (SELECT d.proposal_status FROM ticket_decision d \
+                     WHERE d.ticket_id = t.id \
+                     ORDER BY d.as_of DESC, d.created_at DESC, d.decision_id DESC LIMIT 1) AS decision_status, \
+                    (SELECT d.as_of FROM ticket_decision d \
+                     WHERE d.ticket_id = t.id \
+                     ORDER BY d.as_of DESC, d.created_at DESC, d.decision_id DESC LIMIT 1) AS decision_as_of \
+             FROM ticket_lifecycle t \
+         ) AS base",
+    )
+    .execute(conn)
+    .ok();
     Ok(())
 }
 
@@ -524,6 +574,112 @@ pub fn count_active(conn: &mut SqliteConnection) -> Result<i64, String> {
         .map_err(|e| format!("ticket count failed: {e}"))
 }
 
+/// `ticket_state_v1` 的一行：事件事实、决策投影、粗粒度 stage 的同屏视图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketState {
+    pub ticket_id: i64,
+    pub code: String,
+    pub open_date: String,
+    pub close_date: Option<String>,
+    pub stage: String,
+    pub source: String,
+    pub latest_event_kind: Option<String>,
+    pub latest_event_at: Option<String>,
+    pub proposal_status: Option<String>,
+    pub decision_id: Option<String>,
+    pub decision_status: Option<String>,
+    pub decision_as_of: Option<String>,
+    pub status_conflict: bool,
+    pub stale_days: Option<i64>,
+}
+
+#[derive(QueryableByName)]
+struct TicketStateRow {
+    #[diesel(sql_type = BigInt)]
+    ticket_id: i64,
+    #[diesel(sql_type = Text)]
+    code: String,
+    #[diesel(sql_type = Text)]
+    open_date: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    close_date: Option<String>,
+    #[diesel(sql_type = Text)]
+    stage: String,
+    #[diesel(sql_type = Text)]
+    source: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    latest_event_kind: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    latest_event_at: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    proposal_status: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    decision_id: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    decision_status: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    decision_as_of: Option<String>,
+    #[diesel(sql_type = BigInt)]
+    status_conflict: i64,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    stale_days: Option<i64>,
+}
+
+impl From<TicketStateRow> for TicketState {
+    fn from(row: TicketStateRow) -> Self {
+        Self {
+            ticket_id: row.ticket_id,
+            code: row.code,
+            open_date: row.open_date,
+            close_date: row.close_date,
+            stage: row.stage,
+            source: row.source,
+            latest_event_kind: row.latest_event_kind,
+            latest_event_at: row.latest_event_at,
+            proposal_status: row.proposal_status,
+            decision_id: row.decision_id,
+            decision_status: row.decision_status,
+            decision_as_of: row.decision_as_of,
+            status_conflict: row.status_conflict != 0,
+            stale_days: row.stale_days,
+        }
+    }
+}
+
+/// 读一张票的统一状态投影；不存在返回 `None`。
+pub fn ticket_state(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+) -> Result<Option<TicketState>, String> {
+    let row: Option<TicketStateRow> = diesel::sql_query(
+        "SELECT ticket_id, code, open_date, close_date, stage, source, \
+                latest_event_kind, latest_event_at, proposal_status, \
+                decision_id, decision_status, decision_as_of, \
+                status_conflict, stale_days \
+         FROM ticket_state_v1 WHERE ticket_id = ?1",
+    )
+    .bind::<BigInt, _>(ticket_id)
+    .get_result(conn)
+    .optional()
+    .map_err(|error| format!("ticket_state_v1 查询失败: {error}"))?;
+    Ok(row.map(Into::into))
+}
+
+/// 所有未关闭票的统一投影，按 stale_days 倒序；供对账与巡检使用。
+pub fn active_ticket_states(conn: &mut SqliteConnection) -> Result<Vec<TicketState>, String> {
+    diesel::sql_query(
+        "SELECT ticket_id, code, open_date, close_date, stage, source, \
+                latest_event_kind, latest_event_at, proposal_status, \
+                decision_id, decision_status, decision_as_of, \
+                status_conflict, stale_days \
+         FROM ticket_state_v1 WHERE close_date IS NULL \
+         ORDER BY stale_days DESC, ticket_id ASC",
+    )
+    .load::<TicketStateRow>(conn)
+    .map(|rows| rows.into_iter().map(Into::into).collect())
+    .map_err(|error| format!("ticket_state_v1 活跃票查询失败: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +787,60 @@ mod tests {
             scalar(&mut conn, "SELECT COUNT(*) AS n FROM ticket_lifecycle"),
             2
         );
+    }
+
+    #[test]
+    fn ticket_state_view_exposes_event_decision_conflict() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        create_schema(&mut conn).expect("schema");
+        let ticket_id = open_ticket(
+            &mut conn,
+            "601188",
+            "2026-11-10",
+            "entry_proposed",
+            "p01_preopen",
+            None,
+        )
+        .expect("open");
+        append_event(
+            &mut conn,
+            ticket_id,
+            "2026-11-10T09:25:00+08:00",
+            "entry_proposed",
+            Some("AuctionPrice"),
+            None,
+            Some("提案"),
+        )
+        .expect("proposal event");
+        append_event(
+            &mut conn,
+            ticket_id,
+            "2026-11-10T15:00:00+08:00",
+            "entry_invalidated",
+            None,
+            None,
+            Some("未成交"),
+        )
+        .expect("invalidate event");
+        diesel::sql_query(
+            "INSERT INTO ticket_decision \
+             (decision_id, ticket_id, code, as_of, source, regime, entry_mode, \
+              proposal_status, source_health, evidence_grade, context_json, rule_version) \
+             VALUES ('d1', ?, '601188', '2026-11-10', 'p01_preopen', 'Emotion', \
+                     'AuctionReference', 'open', 'Available', 'L1', '{}', 'v1')",
+        )
+        .bind::<BigInt, _>(ticket_id)
+        .execute(&mut conn)
+        .expect("decision");
+
+        let state = ticket_state(&mut conn, ticket_id)
+            .expect("state query")
+            .expect("state row");
+        assert_eq!(state.stage, "entry_proposed");
+        assert_eq!(state.proposal_status.as_deref(), Some("invalidated"));
+        assert_eq!(state.decision_status.as_deref(), Some("open"));
+        assert!(state.status_conflict, "事件与 decision 状态应暴露冲突");
+        assert_eq!(state.latest_event_kind.as_deref(), Some("entry_invalidated"));
+        assert_eq!(active_ticket_states(&mut conn).expect("active").len(), 1);
     }
 }

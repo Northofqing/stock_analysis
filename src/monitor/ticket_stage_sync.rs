@@ -173,6 +173,25 @@ pub fn sync_stages_from_positions(
         }
     }
 
+    // 2026-11-11 A 方案双读：不改变 stage，只把三源差异摊到日志。
+    // 视图缺失/查询失败只告警，不影响持仓驱动的状态同步。
+    match ticket_lifecycle::active_ticket_states(&mut conn) {
+        Ok(states) => {
+            let conflicts = states.iter().filter(|state| state.status_conflict).count();
+            let stale = states
+                .iter()
+                .filter(|state| state.stale_days.unwrap_or(0) >= 5)
+                .count();
+            log::info!(
+                "[票状态][state_v1] active={} status_conflict={} stale5={}",
+                states.len(),
+                conflicts,
+                stale
+            );
+        }
+        Err(error) => log::warn!("[票状态][state_v1] 双读失败: {error}"),
+    }
+
     Ok(report)
 }
 

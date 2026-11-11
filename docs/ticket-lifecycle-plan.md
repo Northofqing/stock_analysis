@@ -3574,6 +3574,34 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
 之后 Quote 恢复（missing 只剩 Kline/MoneyFlow/OrderBook），但模式切换因
 `BR-116 notification unconfirmed` 保留 Unsafe，需观察 09:45 持仓动作是否被闸门挡住。
 
+### 12.4.7 统一状态投影 ticket_state_v1（2026-11-11，读路径）
+
+**决策**：采用 A 方案——`ticket_event` 是追加事实，`ticket_decision` 是单次
+决策上下文，`ticket_lifecycle.stage` 只是粗粒度展示；三者不再各自充当
+“当前状态”的权威源。
+
+**已实现**：
+
+- `ticket_lifecycle::create_schema` 新增只读视图 `ticket_state_v1`，字段包含
+  `stage`、`latest_event_kind/at`、由事件映射的 `proposal_status`、
+  最新 decision 的 `decision_id/status/as_of`、`status_conflict`、`stale_days`。
+- Rust API：`ticket_lifecycle::ticket_state`、`active_ticket_states`。
+- `scripts/ticket_state_audit.py`：只读输出活跃票、stage/提案分布、
+  事件与 decision 冲突、陈旧票；视图不存在时明确报“未部署”，不猜状态。
+- 单测：构造“事件 `entry_invalidated` + decision 仍 `open`”，确认视图暴露
+  `status_conflict=true`，且 stage 不被事件自动改写。
+
+**边界**：
+
+- 消费者尚未切到视图；`ticket_entry_proposal` / `ticket_entry_trigger` /
+  `ticket_eviction` / `holding_plan` 仍直接查 `ticket_lifecycle.stage`。
+  下一步是双读：旧查询与新视图同时执行，只记差异，不改推送；差异归零后
+  再切读路径。
+- `stage` 不改语义、不加列；`ticket_event` 不改历史。视图只是把现状摊开，
+  不做自动修复。
+- `stale_days` 以最近一次提案事件或 `open_date` 起算，仅是巡检指标，不是
+  淘汰规则。
+
 ### 12.5 批 9：预注册实验（11-09 起，只观察不改代码）
 
 1. 「前 3 日涨幅 >10% 不触发」：10 月 24 个触发样本中，前 3 日 >+10% 的 0/6 胜（均值 -2.92%），
