@@ -47,6 +47,16 @@ enum TriggerPolicyMode {
     New,
 }
 
+/// 提案失效/到期后是否把票放回 observing，让下一轮能重新提案。
+/// 默认 shadow，只记“将回收”，不改 stage；`TICKET_PROPOSAL_REOPEN=on` 才生效。
+fn proposal_reopen_enabled() -> bool {
+    matches!(
+        std::env::var("TICKET_PROPOSAL_REOPEN").as_deref(),
+        Ok("on") | Ok("1")
+    )
+}
+
+
 fn trigger_policy_mode() -> TriggerPolicyMode {
     match std::env::var("TICKET_ENTRY_POLICY")
         .unwrap_or_else(|_| "legacy".to_owned())
@@ -969,6 +979,25 @@ pub fn record(
                         .into());
                     }
                 }
+                if proposal_reopen_enabled() {
+                    let changed = ticket_lifecycle::set_stage(conn, hit.ticket_id, "observing")?;
+                    if changed > 0 {
+                        ticket_lifecycle::append_event(
+                            conn,
+                            hit.ticket_id,
+                            as_of,
+                            "proposal_reopened",
+                            None,
+                            hit.decision_id.as_deref(),
+                            Some("价格失效，回到观察池等待下一次提案"),
+                        )?;
+                    }
+                } else {
+                    log::info!(
+                        "[提案回收] shadow 将把 {} 从 entry_proposed 回 observing（原因：价格失效）",
+                        hit.code
+                    );
+                }
                 Ok(())
             })
             .map_err(|error| error.to_string())?;
@@ -1164,6 +1193,25 @@ pub fn invalidate_expired(db: &DatabaseManager, as_of: &str) -> Result<ExpiryRep
                     )
                     .into());
                 }
+            }
+            if proposal_reopen_enabled() {
+                let changed = ticket_lifecycle::set_stage(conn, ticket.id, "observing")?;
+                if changed > 0 {
+                    ticket_lifecycle::append_event(
+                        conn,
+                        ticket.id,
+                        as_of,
+                        "proposal_reopened",
+                        None,
+                        decision_id.as_deref(),
+                        Some("提案到期，回到观察池等待下一次提案"),
+                    )?;
+                }
+            } else {
+                log::info!(
+                    "[提案回收] shadow 将把 {} 从 entry_proposed 回 observing（原因：提案到期）",
+                    ticket.code
+                );
             }
             Ok(())
         });

@@ -3610,6 +3610,28 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   `[竞价买价][state-v1] shadow 将跳过 …`，`on` 时不再当新提案给价；
   摘要行新增 `skipped_stale` 计数。当前 51 张 `entry_proposed` 中
   事件口径 `open=6`、`expired=11`、`triggered=33`、`invalidated=1`。
+- 提案回收：新增 `TICKET_PROPOSAL_REOPEN=on|shadow`（默认 shadow）。
+  `on` 时价格失效/提案到期后把 stage 从 `entry_proposed` 放回 `observing`，
+  并追加 `proposal_reopened` 事件；shadow 只记日志。
+- 存量 `scripts/ticket_reopen_stale.py` 默认 dry-run：当前识别 12 张
+  `stage=entry_proposed` 且提案为 `expired/invalidated` 的票；未执行
+  `--apply`，避免未经确认改 stage。
+
+**2026-11-11 账户快照与成交补录（影响 T+1/持仓上下文）**：
+
+- 快照 `ups_v1_a2db69fa...f02e`，`effective_at=2026-11-11T15:32:33+08:00`，
+  7 条；按「库存数量」入库：001216 500、002131 500、002421 500、
+  600396 1000、600667 600、600703 500、600715 500。
+- 600396 页面 `证券数量=500/库存=1000`，600715 `证券数量=0/库存=500`；
+  按库存入库，后者为新建仓。
+- 账户汇总 `id=68`：总资产 43,329.13、市值 37,063.00、可用 6,266.03、
+  仓位 85.538%；使用券商页面口径（`--broker-assets`），与
+  11-10 收盘重算口径（市值 36,389.00/资产 42,655.03）不同。
+- `trades` 补录 3 笔（快照差分先推断、后按券商成交明细改为真实价/时间）：
+  001216 买 400 @17.35 09:34:01、600396 买 500 @10.00 09:51:57、
+  600715 买 500 @3.10 09:56:26；`stock_position` open 7 只与快照一致。
+- 这笔数据是 11-11 的 T+1 锁定来源；不计入 `ticket_signal_execution`
+  的历史胜率样本。
 
 **2026-11-11 只读基线（CTE 兜底，视图未部署）**：
 
