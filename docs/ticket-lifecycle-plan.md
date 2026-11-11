@@ -3793,3 +3793,16 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 失败只影响证据包状态，不影响已完成的推送与开票。
 仍未接线：盘中触发证据包（`intraday_sync_path`）与
 `ticket_event(kind='filing')` 逐条事件；P01 真实公告命中最快下一交易日 09:00 验收。
+
+**6.6 指标层（2026-11-10）**：`ticket_fundamentals` 现在为每只票输出
+顶层 `metrics`、`metric_reasons`、`metric_notes`，并在每个 kind 下保留
+`missing_lines` 与 `prior_year_period`。指标口径：
+`revenue_yoy`/`net_profit_yoy` = 最新报告期 / 上年同期 - 1；
+`ocf_to_net_profit` = 经营现金流净额 / 净利润（净利润<=0 时 null）；
+`receivables_to_revenue` = 期末应收账款 / 营业收入；
+`inventory_turnover` = 营业成本 / 期末存货（期间值，不年化）；
+`debt_ratio` = 负债合计 / 资产总计；`gross_margin` = (营业收入-营业成本)/营业收入。
+任一输入缺失写 null + reason，不插值、不补 0。
+2026-11-11 缓存实测 59/59 只有 metrics；7 项中 6 项 59/59 可用，
+`ocf_to_net_profit` 38/59（21 只净利润<=0，reason 已写）。
+仍未做：第二独立来源与指标差异披露。
