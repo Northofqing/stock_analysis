@@ -3741,6 +3741,20 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   “连板”当负面或正面结论。
 - `perf_recent=false` 的时点解释：健康检查在 15:13 要求当日 performance
   snapshot，而快照尚未生成；这是收盘后启动时序，不是状态投影代码失败。
+
+**2026-11-12 信号账本 v1.1（结果持久化）**：
+
+- `ticket_signal_execution` 新增 `d1_trade_date/d1_close/d1_net_pct`、
+  `d3_trade_date/d3_close/d3_net_pct`、`outcome_updated_at`；
+  旧表由脚本 `ALTER TABLE` 幂等补齐，不改 attempt 主键/唯一键。
+- 全历史回填：320 个触发、可成交 215；D+1 n=200 净胜率 65.5%、
+  均值 +1.41%、盈亏比 2.45；D+3 n=149 净胜率 71.1%、均值 +2.47%、
+  盈亏比 3.41。收益均为日线近似、双边扣 0.2%，不是盘口成交。
+- 11-11 已入账 21 条（filled=15、unfillable_gap=5、missing_bar=1）；
+  11-12 已有 12 条 attempt 因当日日线未落库暂记 `missing_bar`，
+  22:05 `ticket-signal-ledger-close` 在日线同步后重算并补结果。
+- 新指标用于扩大样本和 6.8 分母；仍不能当 confirmatory 胜率
+  （`no_decision=48`、近似成交、样本窗口未满 20 日）。
 - 17:38 二次 restart（pid 95115，release 13m58s）加载 09:25 状态过滤；
   17:42 健康检查仍为 `degraded`，失败项同样是 `perf_recent=false`，
   db_writable/bus_alive/strategy_registered/quote_provider 全 true。
