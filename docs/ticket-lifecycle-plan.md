@@ -3604,15 +3604,16 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
 - 触发侧新增开关 `TICKET_STATE_FILTER=on|shadow`（默认 shadow）：
   `on` 时 `stage=entry_proposed` 但有 `triggered/invalidated/expired/superseded`
   事件的票不进入触发缓存；`shadow` 只记录将过滤的代码和数量，不改变触发。
-  当前 49 张 `entry_proposed` 中，事件口径 `open=7`、`blocked=42`；在确认
-  这 42 张都是旧提案前，不切 `on`。
+  2026-11-12 09:03 实测 shadow 下将过滤 31 张，均为终态事件提案；
+  09:24 再实测 `skipped_stale=31`，00:06 无 `auction_unmatched`。
+  2026-11-12 已在运行根 `.env` 设为 `on`，随 15:05 重启生效。
 - 09:25 定价也读取 `ticket_state_v1`：终态提案在 shadow 下记
   `[竞价买价][state-v1] shadow 将跳过 …`，`on` 时不再当新提案给价；
-  摘要行新增 `skipped_stale` 计数。当前 51 张 `entry_proposed` 中
-  事件口径 `open=6`、`expired=11`、`triggered=33`、`invalidated=1`。
-- 提案回收：新增 `TICKET_PROPOSAL_REOPEN=on|shadow`（默认 shadow）。
+  摘要行新增 `skipped_stale` 计数。11-12 09:24 实测 `skipped_stale=31`。
+- 提案回收：`TICKET_PROPOSAL_REOPEN=on|shadow`（默认 shadow）。
   `on` 时价格失效/提案到期后把 stage 从 `entry_proposed` 放回 `observing`，
-  并追加 `proposal_reopened` 事件；shadow 只记日志。
+  并追加 `proposal_reopened` 事件；shadow 只记日志。2026-11-12 已在运行根
+  `.env` 设为 `on`，随 15:05 重启生效。
 - 存量 `scripts/ticket_reopen_stale.py` 默认 dry-run：当前识别 12 张
   `stage=entry_proposed` 且提案为 `expired/invalidated` 的票；未执行
   `--apply`，避免未经确认改 stage。
