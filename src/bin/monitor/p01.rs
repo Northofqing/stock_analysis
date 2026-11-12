@@ -1693,6 +1693,47 @@ fn record_p01_tickets(
                 ) {
                     log::warn!("[P-01][bookkeeping] ticket#{ticket_id} 记事件失败: {error}");
                 }
+                // 6.5：公告逐条落 ticket_event，供时间轴与审计使用；
+                // 同一公告同一天幂等，失败不阻断开票。
+                if let Some(filing) = filings.get(&head.code) {
+                    for item in &filing.items {
+                        let summary = format!(
+                            "公告：{}｜{}｜{}",
+                            item.title,
+                            item.published_at,
+                            item.url
+                        );
+                        match stock_analysis::database::ticket_lifecycle::event_exists_same_day(
+                            &mut conn,
+                            ticket_id,
+                            "filing",
+                            &event_at,
+                            &summary,
+                        ) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => {
+                                log::warn!(
+                                    "[P-01][bookkeeping] ticket#{ticket_id} 公告查重失败: {error}"
+                                );
+                                continue;
+                            }
+                        }
+                        if let Err(error) = stock_analysis::database::ticket_lifecycle::append_event(
+                            &mut conn,
+                            ticket_id,
+                            &event_at,
+                            "filing",
+                            Some("OfficialFiling"),
+                            Some(&item.announcement_id),
+                            Some(&summary),
+                        ) {
+                            log::warn!(
+                                "[P-01][bookkeeping] ticket#{ticket_id} 记公告事件失败: {error}"
+                            );
+                        }
+                    }
+                }
                 log::info!(
                     "[P-01][bookkeeping] opened ticket#{ticket_id} {} {} price={:?}",
                     head.code,

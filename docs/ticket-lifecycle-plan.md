@@ -3978,6 +3978,11 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 仍未接线：盘中触发证据包（`intraday_sync_path`）与
 `ticket_event(kind='filing')` 逐条事件；P01 真实公告命中最快下一交易日 09:00 验收。
 
+**6.5 P01 公告事件（2026-11-12）**：P01 开票后除 `catalyst` 外，对
+`prefetch_p01_filings` 返回的每条公告写 `ticket_event(kind='filing')`，
+`occurrence_identity=announcement_id`，summary 为「标题｜发布时间｜URL」；
+同一票同一天同公告幂等，失败只告警。09:25 与盘中路径尚未写 filing 事件。
+
 **6.6 指标层（2026-11-10）**：`ticket_fundamentals` 现在为每只票输出
 顶层 `metrics`、`metric_reasons`、`metric_notes`，并在每个 kind 下保留
 `missing_lines` 与 `prior_year_period`。指标口径：
