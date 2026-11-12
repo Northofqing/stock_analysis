@@ -264,6 +264,49 @@ def audit_events(root: Path, db: Path, bundles: list[tuple[Path, dict]]) -> tupl
     return errors, checked
 
 
+def audit_decision_coverage(
+    db: Path, dates: list[str], bundles: list[tuple[Path, dict]]
+) -> dict[str, dict[str, int]]:
+    """按 code 统计 ticket_decision 是否有同日证据包。
+
+    只对 `p01_preopen` 作为 6.3 必覆盖来源；`board_rotation*` 是
+    15:40 提案决策，当前不在 6.3 证据包范围，单独列出避免误判为丢失。
+    """
+    if not db.exists():
+        return {}
+    bundle_codes = {
+        (str(bundle.get("business_date")), str(bundle.get("code")))
+        for _, bundle in bundles
+    }
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        result: dict[str, dict[str, int]] = {}
+        for business_date in dates:
+            rows = conn.execute(
+                "SELECT source, code, COUNT(*) FROM ticket_decision "
+                "WHERE as_of=? GROUP BY source, code",
+                (business_date,),
+            ).fetchall()
+            for source, code, count in rows:
+                in_scope = source == "p01_preopen"
+                bucket = result.setdefault(
+                    business_date,
+                    {
+                        "p01_total": 0,
+                        "p01_missing": 0,
+                        "other_total": 0,
+                        "other_missing": 0,
+                    },
+                )
+                prefix = "p01" if in_scope else "other"
+                bucket[f"{prefix}_total"] += count
+                if (business_date, code) not in bundle_codes:
+                    bucket[f"{prefix}_missing"] += count
+        return result
+    finally:
+        conn.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -348,8 +391,21 @@ def main() -> int:
                 f"{business_date} {code} actions={actions}"
             )
 
+    coverage: dict[str, dict[str, int]] = {}
+    if not args.no_db:
+        coverage = audit_decision_coverage(
+            args.root / "data" / "stock_analysis.db", dates, bundles
+        )
+
     print(f"日期: {', '.join(dates) if dates else '（无）'}")
     print(f"证据包: {len(bundles)} 个；哈希对账: {event_checked} 个；跳过非 6.3 文件: {skipped} 个")
+    for business_date, bucket in sorted(coverage.items()):
+        print(
+            f"6.9 决策覆盖 {business_date}: "
+            f"P01 {bucket['p01_total']-bucket['p01_missing']}/{bucket['p01_total']}；"
+            f"其他来源无包 {bucket['other_missing']}/{bucket['other_total']}"
+            "（board_rotation 等不在 6.3 范围）"
+        )
     if risk_flagged:
         print(f"6.10 风险披露: 带 risk_note {risk_flagged} 个；其中仍给参考价的冲突 {risk_conflicts} 个")
     if fillability_counts:
@@ -389,6 +445,7 @@ def main() -> int:
             "fillability_conflicts": fillability_conflicts,
             "single_source_fundamentals": single_source_fundamentals,
             "same_day_action_conflicts": same_day_conflicts,
+            "decision_coverage": coverage,
             "missing": missing_counter,
         }
         try:
