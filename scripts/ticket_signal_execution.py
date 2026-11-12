@@ -377,6 +377,30 @@ def apply(conn: sqlite3.Connection, attempts: list[Attempt]) -> int:
                 ),
             )
             inserted += cursor.rowcount
+        # 日线可能晚于首次 attempt 落库（例如 11-12 在 21:30 前先记
+        # missing_bar）。重跑时必须把已有行从 missing_bar 修正为 filled，
+        # 否则 INSERT OR IGNORE 会永久保留错误状态。
+        for attempt in attempts:
+            conn.execute(
+                """
+                UPDATE ticket_signal_execution
+                   SET decision_id=COALESCE(?, decision_id),
+                       fill_status=?, fill_price=?, quantity=?, fees=?,
+                       fill_basis=?, source='ticket_signal_backfill',
+                       rule_version=?
+                 WHERE execution_id=?
+                """,
+                (
+                    attempt.decision_id,
+                    attempt.fill_status,
+                    attempt.fill_price,
+                    attempt.quantity,
+                    attempt.fees,
+                    attempt.fill_basis,
+                    RULE_VERSION,
+                    attempt.execution_id,
+                ),
+            )
     return inserted
 
 
