@@ -3753,6 +3753,8 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
 - 11-11 已入账 21 条（filled=15、unfillable_gap=5、missing_bar=1）；
   11-12 已有 12 条 attempt 因当日日线未落库暂记 `missing_bar`，
   22:05 `ticket-signal-ledger-close` 在日线同步后重算并补结果。
+- 回归验证：在临时库给 600238 补 11-12 日线后重跑，已有行由
+  `missing_bar` 修正为 `filled`（3.74），证明晚到日线不会留下永久错误状态。
 - 新指标用于扩大样本和 6.8 分母；仍不能当 confirmatory 胜率
   （`no_decision=48`、近似成交、样本窗口未满 20 日）。
 - 17:38 二次 restart（pid 95115，release 13m58s）加载 09:25 状态过滤；
