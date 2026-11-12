@@ -768,7 +768,12 @@ fn entry_triggered_exists(
 }
 
 /// 6.3：盘中触发的决策证据包。best-effort，失败只告警，不影响触发记账。
-fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &TriggerHit) {
+fn write_trigger_evidence(
+    conn: &mut SqliteConnection,
+    as_of: &str,
+    hit: &TriggerHit,
+    filings: Option<&crate::monitor::ticket_evidence_bundle::Filings>,
+) {
     use crate::monitor::ticket_evidence_bundle as evidence;
 
     let business_date = as_of.get(..10).unwrap_or(as_of).to_owned();
@@ -832,6 +837,9 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
         "independent_financial_source".to_owned(),
         "financial_statements".to_owned(),
     ]);
+    if filings.is_some_and(|value| value.status == "ok") {
+        missing.retain(|field| field != "official_filing");
+    }
     if streak_src.is_none() {
         missing.push("streak".to_owned());
     }
@@ -884,11 +892,11 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
             batch_id: None,
             kinds: Vec::new(),
         },
-        filings: evidence::Filings {
+        filings: filings.cloned().unwrap_or_else(|| evidence::Filings {
             status: "not_fetched".to_owned(),
             items: Vec::new(),
             reason: Some("intraday_sync_path".to_owned()),
-        },
+        }),
         holding: None,
         missing,
     };
@@ -897,6 +905,36 @@ fn write_trigger_evidence(conn: &mut SqliteConnection, as_of: &str, hit: &Trigge
     {
         log::warn!("[证据包] 盘中触发 {} 写入失败: {error}", hit.code);
     }
+    if let Some(filings) = filings {
+        for item in &filings.items {
+            let summary = format!("公告：{}｜{}｜{}", item.title, item.published_at, item.url);
+            match ticket_lifecycle::event_exists_same_day(
+                conn,
+                hit.ticket_id,
+                "filing",
+                as_of,
+                &summary,
+            ) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!("[证据包] 盘中触发 {} 公告查重失败: {error}", hit.code);
+                    continue;
+                }
+            }
+            if let Err(error) = ticket_lifecycle::append_event(
+                conn,
+                hit.ticket_id,
+                as_of,
+                "filing",
+                Some("OfficialFiling"),
+                Some(&item.announcement_id),
+                Some(&summary),
+            ) {
+                log::warn!("[证据包] 盘中触发 {} 公告事件写入失败: {error}", hit.code);
+            }
+        }
+    }
 }
 
 /// 把一次命中写进库。同日同票同动作只记一次。
@@ -904,6 +942,7 @@ pub fn record(
     db: &DatabaseManager,
     as_of: &str,
     hit: &TriggerHit,
+    filings: Option<&crate::monitor::ticket_evidence_bundle::Filings>,
 ) -> Result<RecordOutcome, String> {
     let mut conn = db.get_conn().map_err(|error| error.to_string())?;
     match hit.action {
@@ -941,7 +980,7 @@ pub fn record(
             // 事件提交成功后再写候选行；这样失败的事务不会留下孤儿候选。
             db.record_candidate_trigger(as_of, &hit.code, &hit.name, &basis)?;
             // 6.3：触发决策也留证据包（best-effort，不影响记账）。
-            write_trigger_evidence(&mut conn, as_of, hit);
+            write_trigger_evidence(&mut conn, as_of, hit, filings);
             Ok(RecordOutcome::Recorded)
         }
         HitAction::Invalidated => {

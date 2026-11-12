@@ -15771,8 +15771,24 @@ async fn watch_pool_monitor_loop() {
                 match stock_analysis::monitor::ticket_entry_trigger::evaluate(cache).await {
                     Ok(hits) => {
                         for hit in &hits {
+                            // 6.5：盘中触发时按票取公告；失败只影响证据包，
+                            // 不阻断触发记账与推送。
+                            let filings = if hit.action.as_str() == "triggered" {
+                                Some(
+                                    stock_analysis::monitor::ticket_evidence_bundle::fetch_filings(
+                                        &hit.code,
+                                        &date_text,
+                                    )
+                                    .await,
+                                )
+                            } else {
+                                None
+                            };
                             match stock_analysis::monitor::ticket_entry_trigger::record(
-                                &db, &date_text, hit,
+                                &db,
+                                &date_text,
+                                hit,
+                                filings.as_ref(),
                             ) {
                                 Ok(stock_analysis::monitor::ticket_entry_trigger::RecordOutcome::Recorded) => {
                                     log::info!(
