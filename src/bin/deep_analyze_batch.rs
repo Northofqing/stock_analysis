@@ -138,6 +138,20 @@ fn select_candidates(
     Ok(candidates)
 }
 
+fn bar_count(db_path: &Path, business_date: &str) -> Result<i64> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .with_context(|| format!("打开主库失败: {}", db_path.display()))?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM stock_daily WHERE date=?",
+        rusqlite::params![business_date],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 fn parse_composite(report: &str) -> Option<i32> {
     for line in report.lines() {
         for key in ["综合评分", "加权综合", "composite_score", "composite", "Composite"] {
@@ -224,6 +238,12 @@ fn main() -> Result<()> {
         .and_then(|index| args.get(index + 1))
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(9);
+    let min_bars = args
+        .iter()
+        .position(|arg| arg == "--min-bars")
+        .and_then(|index| args.get(index + 1))
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(800);
     let concurrency = args
         .iter()
         .position(|arg| arg == "--concurrency")
@@ -244,7 +264,21 @@ fn main() -> Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1200);
 
-    let candidates = select_candidates(&db_path, &business_date, proposal_limit, max)?;
+    let candidates = {
+        let parsed = chrono::NaiveDate::parse_from_str(&business_date, "%Y-%m-%d")
+            .with_context(|| format!("业务日期格式错误: {business_date}"))?;
+        if !stock_analysis::calendar::is_trading_day(parsed) {
+            println!("{business_date} 非交易日，跳过");
+            return Ok(());
+        }
+        let bars = bar_count(&db_path, &business_date)?;
+        if bars < min_bars {
+            anyhow::bail!(
+                "{business_date} 日线仅 {bars} 行（要求 >= {min_bars}），批次不跑，避免用旧日线冒充当日"
+            );
+        }
+        select_candidates(&db_path, &business_date, proposal_limit, max)?
+    };
     if candidates.is_empty() {
         println!("没有可分析标的（持仓 {db_path:?}，日期 {business_date}）");
         return Ok(());
