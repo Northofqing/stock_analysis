@@ -15555,6 +15555,45 @@ async fn auction_watch_loop() {
                                                 .missing
                                                 .retain(|field| field != "official_filing");
                                         }
+                                        // 6.5：09:25 取到的公告逐条落 ticket_event；
+                                        // 与 P01 同一 summary 格式，同日同公告幂等。
+                                        for item in &bundle.filings.items {
+                                            let summary = format!(
+                                                "公告：{}｜{}｜{}",
+                                                item.title, item.published_at, item.url
+                                            );
+                                            match stock_analysis::database::ticket_lifecycle::event_exists_same_day(
+                                                &mut evidence_conn,
+                                                fact.ticket_id,
+                                                "filing",
+                                                &captured_at,
+                                                &summary,
+                                            ) {
+                                                Ok(true) => continue,
+                                                Ok(false) => {}
+                                                Err(error) => {
+                                                    log::warn!(
+                                                        "[证据包] {} 公告查重失败: {error}",
+                                                        fact.code
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                            if let Err(error) = stock_analysis::database::ticket_lifecycle::append_event(
+                                                &mut evidence_conn,
+                                                fact.ticket_id,
+                                                &captured_at,
+                                                "filing",
+                                                Some("OfficialFiling"),
+                                                Some(&item.announcement_id),
+                                                Some(&summary),
+                                            ) {
+                                                log::warn!(
+                                                    "[证据包] {} 公告事件写入失败: {error}",
+                                                    fact.code
+                                                );
+                                            }
+                                        }
                                         bundle.fundamentals = stock_analysis::monitor::ticket_evidence_bundle::load_fundamentals_cache(
                                             &fact.code,
                                             &date_text,
