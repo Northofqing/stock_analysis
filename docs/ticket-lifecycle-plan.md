@@ -3936,6 +3936,19 @@ Balance/Income/CashFlow 各 1 期，报告期均为 2026-09-30，
 `financial_statements`；2026-11-11 起缺 `filings` 直接判 FAIL。
 正负例已用合成证据包验证（晚于业务日 → FAIL）。
 
+**6.9 审计补强（2026-11-12）**：`ticket_decision_evidence_audit.py` 新增：
+
+- `single_source_fundamentals`：`fundamentals.status=ok` 但当前只有单源，
+  输出 `SINGLE_SOURCE` 计数，不把它伪装成第二来源已验证；
+- `same_day_action_conflicts`：同一票同一天出现「加仓」与
+  「减仓/止损核查/risk_note」即列出冲突，不计入 FAIL，先作为审计记录；
+- 默认写 `data/audit/ticket_evidence/<date>.json`（`--no-report` 可关闭），
+  内含 errors、冲突、fillability、missing、单源计数，供独立复查。
+- 2026-11-11 实测 64 个包 PASS，`SINGLE_SOURCE=40`；
+  6.10 风险披露 10 个、其中仍给参考价的冲突 9 个；同日动作冲突 0。
+- 仍未合并两套审计脚本（WP6 事后包 + 6.9 决策包），也还没有真实
+  同日「加仓 vs 回避/卖出」样本。
+
 **6.8 评估脚本（2026-11-10）**：新增 `scripts/ticket_expert_eval.py`，
 读取运行根已签字的预注册文件（`status=signed_frozen`），按
 exploratory/confirmatory 窗口运行；样本为 `entry_triggered`，按

@@ -251,6 +251,7 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--date", default=None)
     parser.add_argument("--no-db", action="store_true")
+    parser.add_argument("--no-report", action="store_true", help="不写 data/audit 报告")
     args = parser.parse_args()
 
     base = args.root / "data" / "ticket_evidence"
@@ -267,6 +268,9 @@ def main() -> int:
     risk_conflicts = 0
     fillability_counts: dict[str, int] = {}
     fillability_conflicts = 0
+    single_source_fundamentals = 0
+    same_day_conflicts: list[str] = []
+    by_code_date: dict[tuple[str, str], list[dict]] = {}
     skipped = 0
     for date in dates:
         date_dir = base / date
@@ -284,6 +288,12 @@ def main() -> int:
                 continue
             bundles.append((path, bundle))
             pricing = bundle.get("pricing") or {}
+            by_code_date.setdefault(
+                (bundle.get("business_date", ""), bundle.get("code", "")), []
+            ).append(bundle)
+            if (bundle.get("fundamentals") or {}).get("status") == "ok":
+                # 6.6 当前只有一条财务来源；没有独立第二来源字段。
+                single_source_fundamentals += 1
             if pricing.get("risk_note"):
                 risk_flagged += 1
                 if pricing.get("quoted_price") is not None:
@@ -306,6 +316,20 @@ def main() -> int:
         )
         errors.extend(event_errors)
 
+    # 6.9：同一票同一天出现“加仓”与“风险提示/减仓/止损核查”即记录冲突。
+    for (business_date, code), group in sorted(by_code_date.items()):
+        actions = [
+            str((bundle.get("holding") or {}).get("action") or "") for bundle in group
+        ]
+        has_add = any("加仓" in action for action in actions)
+        has_avoid = any(
+            "减仓" in action or "止损" in action for action in actions
+        ) or any((bundle.get("pricing") or {}).get("risk_note") for bundle in group)
+        if has_add and has_avoid:
+            same_day_conflicts.append(
+                f"{business_date} {code} actions={actions}"
+            )
+
     print(f"日期: {', '.join(dates) if dates else '（无）'}")
     print(f"证据包: {len(bundles)} 个；哈希对账: {event_checked} 个；跳过非 6.3 文件: {skipped} 个")
     if risk_flagged:
@@ -316,11 +340,46 @@ def main() -> int:
             for key, value in sorted(fillability_counts.items(), key=lambda x: -x[1])
         )
         print(f"6.9 可成交性: {top}；其中不可成交却给价 {fillability_conflicts} 个")
+    if single_source_fundamentals:
+        print(
+            f"6.6 财务来源: SINGLE_SOURCE {single_source_fundamentals} 个"
+            "（当前无独立第二来源）"
+        )
+    if same_day_conflicts:
+        print(f"6.9 同日动作冲突: {len(same_day_conflicts)} 个")
+        for line in same_day_conflicts[:20]:
+            print(f"  - {line}")
     if missing_counter:
         top = ", ".join(
             f"{key}={value}" for key, value in sorted(missing_counter.items(), key=lambda x: -x[1])
         )
         print(f"missing 分布: {top}")
+    if not args.no_report:
+        report_dir = args.root / "data" / "audit" / "ticket_evidence"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"{args.date or 'all'}.json"
+        report = {
+            "dates": dates,
+            "bundles": len(bundles),
+            "event_checked": event_checked,
+            "skipped": skipped,
+            "status": "FAIL" if errors else "PASS",
+            "errors": errors,
+            "risk_flagged": risk_flagged,
+            "risk_conflicts": risk_conflicts,
+            "fillability": fillability_counts,
+            "fillability_conflicts": fillability_conflicts,
+            "single_source_fundamentals": single_source_fundamentals,
+            "same_day_action_conflicts": same_day_conflicts,
+            "missing": missing_counter,
+        }
+        try:
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"审计报告: {report_path}")
+        except OSError as error:
+            print(f"审计报告写入失败: {error}")
     if errors:
         print(f"FAIL: {len(errors)} 项")
         for error in errors[:50]:
