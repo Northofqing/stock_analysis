@@ -3618,6 +3618,12 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   `--apply`，避免未经确认改 stage。
 - 代码验证：触发模块 14/14；18:27 release 构建 14m59s，pid 7061 重启，
   `[票状态][state_v1] active=60 status_conflict=1 stale5=21 open=6 blocked=45`。
+- 2026-11-12 09:03 执行 `ticket_reopen_stale.py --apply`：实际回收 4 张
+  （199/001287、191/002727、242/688353、247/002246），stage 已回
+  `observing`；其余 8 张在 11-11 21:35 已被淘汰，不再回收。
+- 11-12 09:04 复核：活跃 47（`entry_proposed=33`、`holding=7`、
+  `observing=7`），提案事件 `open=6`、`triggered=27`、`expired=3`、
+  `invalidated=1`。09:25 前不改开关、不重启。
 
 **2026-11-11 账户快照与成交补录（影响 T+1/持仓上下文）**：
 
