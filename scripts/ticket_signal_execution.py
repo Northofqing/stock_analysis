@@ -312,6 +312,7 @@ def main() -> int:
     mode = "rw" if args.apply else "ro"
     conn = sqlite3.connect(f"file:{args.database}?mode={mode}", uri=True)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         attempts = load_attempts(conn, args.from_date, args.to_date)
         report(attempts, conn)

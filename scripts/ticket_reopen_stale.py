@@ -36,6 +36,7 @@ def main() -> int:
 
     conn = sqlite3.connect(f"file:{args.database}?mode={'rw' if args.apply else 'ro'}", uri=True)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         rows = load_rows(conn)
         print(f"待回收: {len(rows)}")
