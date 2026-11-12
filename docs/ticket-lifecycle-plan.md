@@ -3981,7 +3981,8 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 **6.5 P01 公告事件（2026-11-12）**：P01 开票后除 `catalyst` 外，对
 `prefetch_p01_filings` 返回的每条公告写 `ticket_event(kind='filing')`，
 `occurrence_identity=announcement_id`，summary 为「标题｜发布时间｜URL」；
-同一票同一天同公告幂等，失败只告警。09:25 与盘中路径尚未写 filing 事件。
+同一票同一天同公告幂等，失败只告警。09:25 证据包路径也已写同一事件；
+盘中触发路径仍不取公告。
 
 **6.6 指标层（2026-11-10）**：`ticket_fundamentals` 现在为每只票输出
 顶层 `metrics`、`metric_reasons`、`metric_notes`，并在每个 kind 下保留
