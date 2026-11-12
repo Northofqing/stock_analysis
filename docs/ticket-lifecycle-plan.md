@@ -1663,6 +1663,11 @@ op 61 提供的是竞价终态报价，不是完整逐笔/盘口深度；无法�
 `--code --expect-tier --expect-price` 断言；已用 001216/26.60/Bargain
 样本验证。真实文件仍待下一个交易日 09:25 生成。
 
+**2026-11-12 复放**：5 个原始文件全部可解析、无 excluded 行：
+11-06 rows=138、11-09 rows=138、11-10 rows=66、11-11 rows=59、
+11-12 rows=47；无报价行 11-06=5、11-09=1、11-10=4、11-11=4、11-12=2
+（`SkipHigh` 或价格非正）。11-03~11-05 仍无原始文件，不能事后补造。
+
 #### 6.8 P2：条件收益与样本外评估
 
 **目的**：回答“财报差的低开情绪票是否更差”“26.60 这类价位是否有正期望”，
@@ -3625,7 +3630,19 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   `observing`；其余 8 张在 11-11 21:35 已被淘汰，不再回收。
 - 11-12 09:04 复核：活跃 47（`entry_proposed=33`、`holding=7`、
   `observing=7`），提案事件 `open=6`、`triggered=27`、`expired=3`、
-  `invalidated=1`。09:25 前不改开关、不重启。
+  `invalidated=1`。
+- 2026-11-12 15:05 重启完成：pid 38078，`startup_health_check=degraded`，
+  唯一失败项 `perf_recent=false`（15:08 当日 performance snapshot 未生成，
+  非代码失败）；`.env` 已设 `TICKET_STATE_FILTER=on`、
+  `TICKET_PROPOSAL_REOPEN=on`、`TICKET_OUTPUT_CONTRACT=1`。
+- 15:35 只读巡检 `status=OK`：`entry_proposed=33`、`holding=7`、
+  `observing=7`；`proposal_reopened` 5 日 4 条；`ticket_decision` 最近
+  `as_of=2026-11-11`，11-12 尚未形成新提案。
+- 11-12 证据包审计 65 个 PASS；`official_filing=65` 是预期：09:25 运行时
+  仍是 18:27 旧二进制，新公告事件要到下一交易日 09:00/09:25 才会生效。
+- `ticket_signal_execution` 补 11-11 共 21 条（filled=15、
+  unfillable_gap=5、missing_bar=1）；11-12 待 21:30 日线后由
+  `ticket-signal-ledger-close` 任务补写。
 
 **2026-11-11 账户快照与成交补录（影响 T+1/持仓上下文）**：
 
