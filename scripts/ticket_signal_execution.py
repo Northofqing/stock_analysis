@@ -52,9 +52,26 @@ CREATE TABLE IF NOT EXISTS ticket_signal_execution (
     source TEXT NOT NULL,
     rule_version TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    d1_trade_date DATE,
+    d1_close REAL,
+    d1_net_pct REAL,
+    d3_trade_date DATE,
+    d3_close REAL,
+    d3_net_pct REAL,
+    outcome_updated_at TIMESTAMP,
     UNIQUE(decision_id, business_date, side)
 )
 """
+
+OUTCOME_COLUMNS = {
+    "d1_trade_date": "DATE",
+    "d1_close": "REAL",
+    "d1_net_pct": "REAL",
+    "d3_trade_date": "DATE",
+    "d3_close": "REAL",
+    "d3_net_pct": "REAL",
+    "outcome_updated_at": "TIMESTAMP",
+}
 
 
 @dataclass
@@ -211,6 +228,68 @@ def next_closes(conn: sqlite3.Connection, code: str, business_date: str, horizon
     return float(rows[horizon - 1]["close"])
 
 
+def next_close_row(
+    conn: sqlite3.Connection, code: str, business_date: str, horizon: int
+) -> tuple[str, float] | None:
+    rows = conn.execute(
+        "SELECT date, close FROM stock_daily WHERE code=? AND date>? AND close IS NOT NULL "
+        "ORDER BY date ASC LIMIT ?",
+        (code, business_date, horizon),
+    ).fetchall()
+    if len(rows) < horizon:
+        return None
+    row = rows[horizon - 1]
+    return str(row["date"]), float(row["close"])
+
+
+def ensure_outcome_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(ticket_signal_execution)")
+    }
+    for name, column_type in OUTCOME_COLUMNS.items():
+        if name in existing:
+            continue
+        conn.execute(
+            f"ALTER TABLE ticket_signal_execution ADD COLUMN {name} {column_type}"
+        )
+
+
+def update_outcomes(conn: sqlite3.Connection, attempts: list[Attempt]) -> int:
+    ensure_outcome_columns(conn)
+    updated = 0
+    with conn:
+        for attempt in attempts:
+            if attempt.fill_status != "filled" or not attempt.fill_price:
+                continue
+            fill_price = float(attempt.fill_price)
+            d1 = next_close_row(conn, attempt.code, attempt.business_date, 1)
+            d3 = next_close_row(conn, attempt.code, attempt.business_date, 3)
+            if d1 is None and d3 is None:
+                continue
+            d1_net = d1[1] / fill_price - 1.0 - COST_ROUND_TRIP if d1 else None
+            d3_net = d3[1] / fill_price - 1.0 - COST_ROUND_TRIP if d3 else None
+            cursor = conn.execute(
+                """
+                UPDATE ticket_signal_execution
+                   SET d1_trade_date=?, d1_close=?, d1_net_pct=?,
+                       d3_trade_date=?, d3_close=?, d3_net_pct=?,
+                       outcome_updated_at=CURRENT_TIMESTAMP
+                 WHERE execution_id=?
+                """,
+                (
+                    d1[0] if d1 else None,
+                    d1[1] if d1 else None,
+                    d1_net,
+                    d3[0] if d3 else None,
+                    d3[1] if d3 else None,
+                    d3_net,
+                    attempt.execution_id,
+                ),
+            )
+            updated += cursor.rowcount
+    return updated
+
+
 def summarize(attempts: list[Attempt], conn: sqlite3.Connection) -> dict[str, Any]:
     status_counts = Counter(a.fill_status for a in attempts)
     filled = [a for a in attempts if a.fill_status == "filled" and a.fill_price and a.fill_price > 0]
@@ -301,6 +380,12 @@ def apply(conn: sqlite3.Connection, attempts: list[Attempt]) -> int:
     return inserted
 
 
+def apply_and_update(conn: sqlite3.Connection, attempts: list[Attempt]) -> tuple[int, int]:
+    inserted = apply(conn, attempts)
+    updated = update_outcomes(conn, attempts)
+    return inserted, updated
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", required=True)
@@ -317,8 +402,9 @@ def main() -> int:
         attempts = load_attempts(conn, args.from_date, args.to_date)
         report(attempts, conn)
         if args.apply:
-            inserted = apply(conn, attempts)
+            inserted, updated = apply_and_update(conn, attempts)
             print(f"已写入 ticket_signal_execution: {inserted} 条（重复忽略）")
+            print(f"已回填 D+1/D+3 结果: {updated} 条")
         else:
             print("dry-run：未写库；确认口径后加 --apply")
         return 0
