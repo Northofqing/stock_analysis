@@ -240,6 +240,24 @@ def audit_events(root: Path, db: Path, bundles: list[tuple[Path, dict]]) -> tupl
                     event_path = root / event_path
                 if event_path.resolve() != path.resolve():
                     errors.append(f"{path.name}: 事件路径 {parts[0]} 与文件不符")
+            # 6.5：证据包宣称 filings=ok 时，每条公告都必须有对应的
+            # ticket_event(kind='filing', occurrence_identity=announcement_id)。
+            filings = bundle.get("filings") or {}
+            if filings.get("status") == "ok":
+                for item in filings.get("items") or []:
+                    announcement_id = item.get("announcement_id")
+                    if not announcement_id:
+                        errors.append(f"{path.name}: filing item 缺 announcement_id")
+                        continue
+                    filing_rows = conn.execute(
+                        "SELECT 1 FROM ticket_event WHERE ticket_id=? "
+                        "AND event_kind='filing' AND occurrence_identity=? LIMIT 1",
+                        (bundle.get("ticket_id"), announcement_id),
+                    ).fetchall()
+                    if not filing_rows:
+                        errors.append(
+                            f"{path.name}: 缺 filing 事件 {announcement_id}"
+                        )
             checked += 1
     finally:
         conn.close()
