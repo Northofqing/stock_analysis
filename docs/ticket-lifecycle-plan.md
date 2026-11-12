@@ -1773,6 +1773,11 @@ PositionContext{Held,NoPosition,Unknown}` 与 `risk_note`；参考价正文前�
 2026-11-12 已在运行根 `.env` 设 `TICKET_OUTPUT_CONTRACT=1`，随 15:05
 重启启用参考语义；09:25 与候选触发模板统一使用「参考价/参考区间」，
 不再把参考价写成「买价」或下单动作。P01 正文不含价格语义，无需切换。
+新增 `scripts/ticket_push_wording_audit.py`：按 `data/push_log/<date>/*.md`
+首行识别 09:25/候选/持仓/定向模板，`--expect reference` 时检查
+「竞价参考价」「参考区间」「非自动买入」「T+1 不可卖」，禁止「买价/低吸」。
+11-12 基线 138 个推送，09:25 仍为 legacy（20 处「买价」），
+`--expect reference` 按预期 FAIL；下一交易日 09:35 自动复验。
 
 #### 6.10.1 现有模板内容审计矩阵（2026-10-27 补）
 
