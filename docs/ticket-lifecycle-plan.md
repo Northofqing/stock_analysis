@@ -4360,6 +4360,20 @@ OrderBook 口径、T0 选项。
 - 边界：09:00 只读 `evidence_date` 的 15:40 提案；当天 15:40 之前没有新计划，
   无提案时明确写“无”，不生成临时 `buy_zone` 价位。
 
+**2026-11-13 第五批（零宽区间 / 09:25 突破语义）已部署**：
+
+- 零宽提案（`low==high`，23 个 open 里 7 个 breakout）不再渲染 `4.83~4.83`，
+  卡片/P01/09:25/定向监控统一写“触发位 X”，并省略重复的“突破确认”。
+- 09:25 对 `entry_mode=breakout` 改用 `trigger_level` 判位置：站上写
+  “竞价站上触发位（价格已触及，非成交）”，低于写“竞价低于触发位（等待）”；
+  不再把突破型误写成“高于上沿（不追）”。
+- 验证：`monitor::watch_pool_monitor` 6/6、`p01_render` 3/3 通过；`cargo check --bin monitor`
+  通过。
+- 部署：runtime release `monitor` 55,077,360 bytes；pid 65037；
+  `startup_health_check=degraded`（`perf_recent=false`，按惯例）；旧二进制备份
+  `target/release/monitor.bak-20261113-1840`。为编译 `ticket_card` 的 T+1 依赖，
+  同时同步了 `trade_ledger.rs` 的 `bought_quantities_on`（只新增函数）。
+
 **当前状态**：7.1 已实跑（2026-11-13，生产库副本只读，6 持仓 + 002205 共 7 张卡）：
 
 ```
