@@ -3671,7 +3671,12 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   「旧提案不重复定价」，没有再生成新参考价。
 - `filing` 事件仍为 0：09:25 的 Cninfo 公告请求多次返回
   `reason_code=external_query_rejected`（09:27 后才 available，但实体关联
-  `进100 → 出0`），没有形成 `filings=ok`，因此 6.5 仍受公告源阻塞，不能算完成。
+  `进100 → 出0`），没有形成 `filings=ok`。
+  根因已定位：`ExternalQueryMethod` 没有 `Announcements` 变体，按票公告的
+  ExternalV1 请求在本地路由前就被拒绝；已补 `OPERATION_ANNOUNCEMENTS`、
+  `/MarketDataService/Announcements`、local/external operation 映射、
+  response 解析和 client 调用，提交 `3d4bbca43`。待 15:05 重启后下一交易日
+  09:00/09:25 实测，当前仍不能算 6.5 完成。
 - 当日 6.9 审计：19 个证据包 PASS；`official_filing=19` 仍缺失，
   与上面的公告源状态一致。
 
