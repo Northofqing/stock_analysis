@@ -213,6 +213,7 @@ pub(crate) fn parse_external_query_response(
     let expected_external = match expected_operation {
         Operation::SecurityMetadata => ExternalOperation::SecurityMetadata,
         Operation::MarketAnnouncements => ExternalOperation::MarketAnnouncements,
+        Operation::Announcements => ExternalOperation::Announcements,
         Operation::GlobalNews => ExternalOperation::GlobalNews,
         Operation::InstrumentNews => ExternalOperation::InstrumentNews,
         Operation::FinancialStatements => ExternalOperation::FinancialStatements,

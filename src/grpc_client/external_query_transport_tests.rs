@@ -98,6 +98,22 @@ fn r08_futures_delivery_uses_external_method_identity_and_exact_rpc_path() {
 }
 
 #[test]
+fn single_instrument_announcements_use_exact_rpc_path() {
+    let method = ExternalQueryMethod::from_local_operation(
+        crate::grpc_client::pb::magic::market::v1::Operation::Announcements,
+    )
+    .expect("single-instrument announcements are routed");
+    assert_eq!(method, ExternalQueryMethod::Announcements);
+    assert!(method.matches_binding(
+        "/magic.market.v1.MarketDataService/Announcements",
+        Some(&tonic::GrpcMethod::new(
+            "magic.market.v1.MarketDataService",
+            "Announcements",
+        )),
+    ));
+}
+
+#[test]
 fn market_announcements_uses_external_method_identity_and_exact_rpc_path() {
     let method = ExternalQueryMethod::from_local_operation(
         crate::grpc_client::pb::magic::market::v1::Operation::MarketAnnouncements,

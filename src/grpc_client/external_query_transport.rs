@@ -53,6 +53,8 @@ pub(crate) enum ExternalQueryMethod {
     SecurityMetadata,
     #[serde(rename = "OPERATION_MARKET_ANNOUNCEMENTS")]
     MarketAnnouncements,
+    #[serde(rename = "OPERATION_ANNOUNCEMENTS")]
+    Announcements,
     #[serde(rename = "OPERATION_GLOBAL_NEWS")]
     GlobalNews,
     #[serde(rename = "OPERATION_INSTRUMENT_NEWS")]
@@ -98,6 +100,7 @@ impl ExternalQueryMethod {
             Self::FuturesDelivery => "FuturesDelivery",
             Self::SecurityMetadata => "SecurityMetadata",
             Self::MarketAnnouncements => "MarketAnnouncements",
+            Self::Announcements => "Announcements",
             Self::GlobalNews => "GlobalNews",
             Self::InstrumentNews => "InstrumentNews",
             Self::CurrentAuctionObservations => "CurrentAuctionObservations",
@@ -120,6 +123,7 @@ impl ExternalQueryMethod {
             Self::FuturesDelivery => "/magic.market.v1.MarketDataService/FuturesDelivery",
             Self::SecurityMetadata => "/magic.market.v1.MarketDataService/SecurityMetadata",
             Self::MarketAnnouncements => "/magic.market.v1.MarketDataService/MarketAnnouncements",
+            Self::Announcements => "/magic.market.v1.MarketDataService/Announcements",
             Self::GlobalNews => "/magic.market.v1.MarketDataService/GlobalNews",
             Self::InstrumentNews => "/magic.market.v1.MarketDataService/InstrumentNews",
             Self::CurrentAuctionObservations => {
@@ -157,6 +161,7 @@ impl ExternalQueryMethod {
         match operation {
             Operation::SecurityMetadata => Some(Self::SecurityMetadata),
             Operation::MarketAnnouncements => Some(Self::MarketAnnouncements),
+            Operation::Announcements => Some(Self::Announcements),
             Operation::GlobalNews => Some(Self::GlobalNews),
             Operation::InstrumentNews => Some(Self::InstrumentNews),
             Operation::BoardConstituents => Some(Self::BoardConstituents),
@@ -182,6 +187,7 @@ impl ExternalQueryMethod {
             Operation::OrderBooks => Some(Self::OrderBooks),
             Operation::BoardMemberships => Some(Self::BoardMemberships),
             Operation::FinancialStatements => Some(Self::FinancialStatements),
+            Operation::Announcements => Some(Self::Announcements),
             _ => None,
         }
     }
@@ -461,6 +467,7 @@ impl ExternalQueryTransport {
                 ExternalQueryMethod::MarketAnnouncements => {
                     client.market_announcements(request).await
                 }
+                ExternalQueryMethod::Announcements => client.announcements(request).await,
                 ExternalQueryMethod::GlobalNews => client.global_news(request).await,
                 ExternalQueryMethod::InstrumentNews => client.instrument_news(request).await,
                 ExternalQueryMethod::CurrentAuctionObservations => {
