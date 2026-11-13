@@ -392,6 +392,16 @@ pub(crate) fn daily_tech_before(
     Ok((compute_tech(code, &bars), compute_volume_price(code, &bars)))
 }
 
+/// 盘中定向监控用：只取量价形态，不重复算 MACD/KDJ。
+pub(crate) fn volume_price_before(
+    conn: &mut SqliteConnection,
+    code: &str,
+    before: &str,
+) -> Result<VolumePriceView, String> {
+    let bars = load_bars_at(conn, code, before, 120, false)?;
+    Ok(compute_volume_price(code, &bars))
+}
+
 fn compute_tech(code: &str, bars: &[Bar]) -> TechView {
     let mut view = TechView::default();
     let Some(last) = bars.last() else {

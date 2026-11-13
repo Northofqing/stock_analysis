@@ -27,6 +27,8 @@ use diesel::sql_types::{BigInt, Integer, Text};
 use crate::data_gateway::GatewayBatch;
 use crate::database::DatabaseManager;
 use crate::monitor::quote_coverage::QuoteCoverage;
+use crate::monitor::{ticket_card, ticket_decision};
+use crate::database::ticket_lifecycle;
 
 /// 日内涨跌幅阈值（%）
 pub const DAY_CHANGE_THRESHOLD: f64 = 3.0;
@@ -57,14 +59,32 @@ pub struct WatchAlert {
     pub change_percent: f64,
     /// 触发了哪几条规则，用"；"分隔
     pub reason: String,
+    /// 日线量价形态（放量滞涨/缩量涨停等），盘中只作参考。
+    pub volume_price_note: Option<String>,
+    /// 最新提案区间与现价位置；无提案时写原因。
+    pub plan_note: Option<String>,
+    /// 去重用的状态键（in_zone/above/below/abandon/no_plan/...）。
+    /// 状态变化时即使未满 30 分钟也应推送。
+    pub state_key: String,
 }
 
 impl WatchAlert {
     pub fn render(&self) -> String {
-        format!(
+        let mut text = format!(
             "{} {} 现价 {:.2}（{:+.2}%）— {}",
             self.code, self.name, self.price, self.change_percent, self.reason
-        )
+        );
+        let mut extras = Vec::new();
+        if let Some(note) = &self.volume_price_note {
+            extras.push(format!("量价 {note}"));
+        }
+        if let Some(note) = &self.plan_note {
+            extras.push(format!("提案 {note}"));
+        }
+        if !extras.is_empty() {
+            text.push_str(&format!("\n  {}", extras.join("｜")));
+        }
+        text
     }
 }
 
@@ -255,8 +275,13 @@ pub async fn scan(
             price: quote.price,
             change_percent: quote.change_percent,
             reason: reasons.join("；"),
+            volume_price_note: None,
+            plan_note: None,
+            state_key: "no_plan".to_string(),
         });
     }
+
+    enrich_alerts(db, &mut alerts);
 
     if !notified_news.is_empty() {
         if let Ok(mut conn) = db.get_conn() {
@@ -271,6 +296,81 @@ pub async fn scan(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(alerts)
+}
+
+/// 盘中给已触发的异动补量价/提案上下文；没有日线或提案时留空，不阻断价格告警。
+fn enrich_alerts(db: &DatabaseManager, alerts: &mut [WatchAlert]) {
+    if alerts.is_empty() {
+        return;
+    }
+    let Ok(mut conn) = db.get_conn() else {
+        return;
+    };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    for alert in alerts {
+        if let Ok(view) = ticket_card::volume_price_before(&mut conn, &alert.code, &today) {
+            if let Some(ratio) = view.ratio_5d {
+                alert.volume_price_note =
+                    Some(format!("{}｜5日量比 {ratio:.2}", view.tags.join("+")));
+            }
+        }
+        let (note, state) = plan_state_for(&mut conn, &alert.code, alert.price);
+        alert.plan_note = note;
+        alert.state_key = state;
+    }
+}
+
+fn plan_state_for(
+    conn: &mut SqliteConnection,
+    code: &str,
+    price: f64,
+) -> (Option<String>, String) {
+    let Ok(Some(ticket)) = ticket_lifecycle::find_active_ticket(conn, code) else {
+        return (None, "no_plan".to_string());
+    };
+    let Some(context) = ticket_card::latest_decision(conn, ticket.id).ok().flatten() else {
+        return (None, "no_proposal".to_string());
+    };
+    let status = ticket_decision::latest_proposal_status(conn, ticket.id)
+        .ok()
+        .flatten();
+    let terminal = matches!(
+        status.map(|value| value.as_str()),
+        Some("triggered" | "invalidated" | "expired" | "superseded")
+    );
+    let (state, mut note) = match (context.price_low, context.price_high) {
+        (Some(low), Some(high)) if high > 0.0 => {
+            classify_plan_state(price, low, high, context.abandon)
+        }
+        _ => ("no_range", "无区间".to_string()),
+    };
+    if terminal {
+        note.push_str("｜提案已终态");
+    }
+    (Some(note), state.to_string())
+}
+
+fn classify_plan_state(
+    price: f64,
+    low: f64,
+    high: f64,
+    abandon: Option<f64>,
+) -> (&'static str, String) {
+    if let Some(abandon) = abandon {
+        if price <= abandon {
+            return (
+                "abandon",
+                format!("区间 {low:.2}~{high:.2}｜跌破放弃 {abandon:.2}"),
+            );
+        }
+    }
+    if price > high {
+        ("above", format!("区间 {low:.2}~{high:.2}｜高于上沿"))
+    } else if price < low {
+        ("below", format!("区间 {low:.2}~{high:.2}｜低于下沿"))
+    } else {
+        ("in_zone", format!("区间 {low:.2}~{high:.2}｜在区间内"))
+    }
 }
 
 /// 同板块里异动的一只票。
@@ -619,11 +719,41 @@ mod tests {
             price: 10.18,
             change_percent: -3.5,
             reason: "日内 -3.50%".to_string(),
+            volume_price_note: None,
+            plan_note: None,
+            state_key: "no_plan".to_string(),
         };
         let text = alert.render();
         assert!(text.contains("600703"));
         assert!(text.contains("三安光电"));
         assert!(text.contains("-3.50%"));
+    }
+
+    #[test]
+    fn alert_render_includes_volume_and_plan_when_present() {
+        let alert = WatchAlert {
+            code: "002205".to_string(),
+            name: "国统股份".to_string(),
+            price: 10.10,
+            change_percent: -1.20,
+            reason: "较上次 -1.20%".to_string(),
+            volume_price_note: Some("缩量回调｜5日量比 0.73".to_string()),
+            plan_note: Some("区间 10.25~10.85｜低于下沿".to_string()),
+            state_key: "below".to_string(),
+        };
+        let text = alert.render();
+        assert!(text.contains("量价 缩量回调"));
+        assert!(text.contains("5日量比 0.73"));
+        assert!(text.contains("提案 区间 10.25~10.85"));
+        assert!(text.contains("低于下沿"));
+    }
+
+    #[test]
+    fn classify_plan_state_covers_zone_and_abandon() {
+        assert_eq!(classify_plan_state(10.50, 10.25, 10.85, Some(9.21)).0, "in_zone");
+        assert_eq!(classify_plan_state(10.90, 10.25, 10.85, Some(9.21)).0, "above");
+        assert_eq!(classify_plan_state(10.10, 10.25, 10.85, Some(9.21)).0, "below");
+        assert_eq!(classify_plan_state(9.10, 10.25, 10.85, Some(9.21)).0, "abandon");
     }
 
     #[test]

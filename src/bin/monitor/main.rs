@@ -15742,16 +15742,21 @@ async fn watch_pool_monitor_loop() {
             // 批 2.9（拓 2.1）事件分级：价格 ±3% 与新闻命中是 L1，即时推；
             // 「较上次急变」「同板块关联票」是 L2，只进日志（现行为）。
             let level1 = alert.reason.contains("新闻") || alert.reason.contains("日内");
-            // 去重键用 (票, 级别) 而不是 reason 全文：「日内 +3.52%」每轮数字都变，
-            // 按全文去重等于没去重，会每 30 秒推一条。方案要求 1 次/票/30 分钟。
-            let key = format!("{}|{}", alert.code, if level1 { "L1" } else { "L2" });
+            // 去重键用 (票, 级别, 状态)：同状态 30 分钟一次；进入区间/跌破放弃等
+            // 状态变化换 key，立即推——这比「价格每变一次就推」有信息量。
+            let key = format!(
+                "{}|{}|{}",
+                alert.code,
+                if level1 { "L1" } else { "L2" },
+                alert.state_key
+            );
             if let Some(previous) = alerted_at.get(&key) {
                 if (now_utc - *previous).num_minutes() < 30 {
                     continue;
                 }
             }
             alerted_at.insert(key, now_utc);
-            log::info!("[定向监控] {}", alert.render());
+            log::info!("[定向监控] state={} {}", alert.state_key, alert.render());
             if level1 {
                 let text = format!("【{} 定向监控】{}", date_text, alert.render());
                 if !crate::notify::push_wechat(&text).await {
