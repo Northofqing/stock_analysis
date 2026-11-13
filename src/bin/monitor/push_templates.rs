@@ -18320,6 +18320,16 @@ pub fn render_preopen_news_hot(p: PreopenNewsHotParams<'_>) -> String {
     s
 }
 
+fn fmt_sealed_amount(value: f64) -> String {
+    if value >= 100_000_000.0 {
+        format!("{:.2}亿", value / 100_000_000.0)
+    } else if value >= 10_000.0 {
+        format!("{:.0}万", value / 10_000.0)
+    } else {
+        format!("{value:.0}")
+    }
+}
+
 /// BR-241 source-bound P-01 renderer. Scheduled and compensation executions
 /// consume the same admitted binding; only the explicit timing label differs.
 pub fn render_bound_preopen_news_hot(
@@ -18375,6 +18385,26 @@ pub fn render_bound_preopen_news_hot(
         } else {
             text.push_str("  来源新闻: 未取得该标的有效新闻\n");
         }
+        let mut facts = Vec::new();
+        if let Some(price) = head.recommend_price {
+            facts.push(format!("昨收 {price:.2}"));
+        }
+        if let Some(streak) = head.streak {
+            facts.push(format!("连板 {streak}"));
+        }
+        if let Some(sealed) = head.sealed_amount {
+            facts.push(format!("封单 {}", fmt_sealed_amount(sealed)));
+        }
+        if let Some(breaks) = head.break_count {
+            facts.push(format!("炸板 {breaks}"));
+        }
+        if facts.is_empty() {
+            facts.push("昨收 N/A".to_string());
+        }
+        text.push_str(&format!(
+            "  价格: {}｜昨日涨停（不追高），等回踩/突破；情绪型竞价参考价见 09:25\n",
+            facts.join("｜")
+        ));
     }
     text.push_str("辅助建议, 非下单指令");
     Ok(text)
