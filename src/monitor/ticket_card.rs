@@ -25,6 +25,7 @@ struct Bar {
     high: f64,
     low: f64,
     close: f64,
+    volume: f64,
     pct_chg: Option<f64>,
     volume_ratio: Option<f64>,
 }
@@ -39,6 +40,8 @@ struct BarRow {
     low: f64,
     #[diesel(sql_type = Double)]
     close: f64,
+    #[diesel(sql_type = Double)]
+    volume: f64,
     #[diesel(sql_type = Nullable<Double>)]
     pct_chg: Option<f64>,
     #[diesel(sql_type = Nullable<Double>)]
@@ -61,6 +64,16 @@ pub struct TechView {
     pub rsi: Option<(f64, f64, f64)>,
     /// 最后一根日线是否涨停（按板分档，和 ticket_regime 同源）。
     pub limit_up: bool,
+}
+
+/// 量价形态视图（日线口径）：放量/缩量 + 涨停/滞涨/涨跌的组合。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct VolumePriceView {
+    /// 当日成交量 / 前 5 日均量（不含当日）。
+    pub ratio_5d: Option<f64>,
+    /// 当日振幅（(high-low)/前收 × 100）。
+    pub amplitude_pct: Option<f64>,
+    pub tags: Vec<&'static str>,
 }
 
 /// 进出场视图；`decision_id` 为空表示没有可用提案。
@@ -92,6 +105,7 @@ pub struct Card {
     pub shares: Option<u64>,
     pub cost: Option<f64>,
     pub tech: TechView,
+    pub volume_price: VolumePriceView,
     pub plan: PlanView,
     pub status: String,
     pub missing: Vec<String>,
@@ -176,6 +190,7 @@ pub fn build_card(
     let code = code.trim();
     let bars = load_bars(conn, code, as_of, 120)?;
     let tech = compute_tech(code, &bars);
+    let volume_price = compute_volume_price(code, &bars);
 
     let mut plan = PlanView::default();
     let mut missing = tech_missing(&tech, bars.len());
@@ -226,6 +241,7 @@ pub fn build_card(
         shares: position.map(|(_, shares)| shares),
         cost: position.map(|(cost, _)| cost),
         tech,
+        volume_price,
         plan,
         status,
         missing,
@@ -263,6 +279,19 @@ impl Card {
             fmt_triplet(self.tech.kdj),
             fmt_triplet(self.tech.skdj),
             fmt_triplet(self.tech.rsi)
+        ));
+        out.push_str(&format!(
+            "  量价: {}｜5日量比 {}｜振幅 {}\n",
+            if self.volume_price.tags.is_empty() {
+                "N/A（日线<7根）".to_owned()
+            } else {
+                self.volume_price.tags.join("+")
+            },
+            fmt_opt(self.volume_price.ratio_5d, 2),
+            match self.volume_price.amplitude_pct {
+                Some(value) => format!("{value:.1}%"),
+                None => "N/A".to_owned(),
+            }
         ));
         if self.holding {
             let stop_text = match (self.plan.stop, self.tech.close) {
@@ -311,7 +340,7 @@ fn load_bars(
     limit: i64,
 ) -> Result<Vec<Bar>, String> {
     let rows: Vec<BarRow> = diesel::sql_query(
-        "SELECT date, high, low, close, pct_chg, volume_ratio FROM stock_daily \
+        "SELECT date, high, low, close, volume, pct_chg, volume_ratio FROM stock_daily \
          WHERE code = ?1 AND date <= ?2 AND close IS NOT NULL AND close > 0 \
          ORDER BY date DESC LIMIT ?3",
     )
@@ -328,6 +357,7 @@ fn load_bars(
             high: row.high,
             low: row.low,
             close: row.close,
+            volume: row.volume,
             pct_chg: row.pct_chg,
             volume_ratio: row.volume_ratio,
         })
@@ -378,6 +408,67 @@ fn compute_tech(code: &str, bars: &[Bar]) -> TechView {
     }
     if let Some(point) = calc_rsi(&closes).last() {
         view.rsi = Some((point.rsi6, point.rsi12, point.rsi24));
+    }
+    view
+}
+
+/// 放量/缩量阈值（与 trend_analyzer 的 heavy/shrink 同量级：1.8 / 0.8）。
+const VOLUME_HEAVY_RATIO: f64 = 1.8;
+const VOLUME_SHRINK_RATIO: f64 = 0.8;
+/// 放量滞涨：涨跌幅在 ±1% 内，但振幅 ≥3%（有量无价）。
+const STALL_PCT: f64 = 1.0;
+const STALL_AMPLITUDE_PCT: f64 = 3.0;
+
+/// 日线量价形态：先判涨停（按板分档），再判放量/缩量与涨跌的组合。
+/// 阈值是定性观察口径，不是买卖信号；后续要用触发后收益校准。
+fn compute_volume_price(code: &str, bars: &[Bar]) -> VolumePriceView {
+    let mut view = VolumePriceView::default();
+    if bars.len() < 7 {
+        return view;
+    }
+    let last = &bars[bars.len() - 1];
+    let prev_close = bars[bars.len() - 2].close;
+    if prev_close <= 0.0 {
+        return view;
+    }
+    let avg5 = bars[bars.len() - 6..bars.len() - 1]
+        .iter()
+        .map(|bar| bar.volume)
+        .sum::<f64>()
+        / 5.0;
+    if avg5 <= 0.0 {
+        return view;
+    }
+    let ratio = last.volume / avg5;
+    let pct = last
+        .pct_chg
+        .unwrap_or_else(|| (last.close - prev_close) / prev_close * 100.0);
+    let amplitude = (last.high - last.low) / prev_close * 100.0;
+    view.ratio_5d = Some(ratio);
+    view.amplitude_pct = Some(amplitude);
+
+    let limit_up = pct >= ticket_regime::limit_up_pct(code);
+    if limit_up && ratio <= VOLUME_SHRINK_RATIO {
+        view.tags.push("缩量涨停");
+    } else if limit_up && ratio >= VOLUME_HEAVY_RATIO {
+        view.tags.push("放量涨停");
+    } else if limit_up {
+        view.tags.push("涨停（量能中性）");
+    } else if ratio >= VOLUME_HEAVY_RATIO
+        && pct.abs() <= STALL_PCT
+        && amplitude >= STALL_AMPLITUDE_PCT
+    {
+        view.tags.push("放量滞涨");
+    } else if ratio >= VOLUME_HEAVY_RATIO && pct > 0.0 {
+        view.tags.push("放量上涨");
+    } else if ratio >= VOLUME_HEAVY_RATIO && pct < 0.0 {
+        view.tags.push("放量下跌");
+    } else if ratio <= VOLUME_SHRINK_RATIO && pct < 0.0 {
+        view.tags.push("缩量回调");
+    } else if ratio <= VOLUME_SHRINK_RATIO && pct > 0.0 {
+        view.tags.push("缩量上涨");
+    } else {
+        view.tags.push("量价正常");
     }
     view
 }
@@ -528,6 +619,7 @@ mod tests {
                 high: 10.0 + index as f64 * 1.0,
                 low: 9.5 + index as f64 * 1.0,
                 close: 10.0 + index as f64 * 1.0,
+                volume: 1000.0,
                 pct_chg: Some(10.0),
                 volume_ratio: Some(1.2),
             })
@@ -540,5 +632,50 @@ mod tests {
         assert!(tech.rsi.is_some());
         assert!(tech.limit_up);
         assert_eq!(tech.volume_ratio, Some(1.2));
+    }
+
+    fn flat_bar(volume: f64) -> Bar {
+        Bar {
+            date: "2026-11-11".to_owned(),
+            high: 10.1,
+            low: 9.9,
+            close: 10.0,
+            volume,
+            pct_chg: Some(0.0),
+            volume_ratio: Some(1.0),
+        }
+    }
+
+    #[test]
+    fn volume_price_recognizes_shrink_limit_up_and_heavy_stall() {
+        // 前 6 根各 1000 量；最后一根 600 量 +10% → 缩量涨停（600000 为 10cm 板）。
+        let mut bars: Vec<Bar> = (0..6).map(|_| flat_bar(1000.0)).collect();
+        bars.push(Bar {
+            date: "2026-11-12".to_owned(),
+            high: 11.0,
+            low: 10.0,
+            close: 11.0,
+            volume: 600.0,
+            pct_chg: Some(10.0),
+            volume_ratio: Some(0.6),
+        });
+        let view = compute_volume_price("600000", &bars);
+        assert_eq!(view.tags, vec!["缩量涨停"]);
+        assert!((view.ratio_5d.expect("ratio") - 0.6).abs() < 1e-9);
+
+        // 最后一根 3000 量、+0.3%、振幅 5% → 放量滞涨。
+        let mut stalled: Vec<Bar> = (0..6).map(|_| flat_bar(1000.0)).collect();
+        stalled.push(Bar {
+            date: "2026-11-12".to_owned(),
+            high: 10.5,
+            low: 10.0,
+            close: 10.03,
+            volume: 3000.0,
+            pct_chg: Some(0.3),
+            volume_ratio: Some(3.0),
+        });
+        let view = compute_volume_price("600000", &stalled);
+        assert_eq!(view.tags, vec!["放量滞涨"]);
+        assert!((view.amplitude_pct.expect("amplitude") - 5.0).abs() < 1e-9);
     }
 }
