@@ -199,7 +199,7 @@ impl TriggerHit {
                         )
                     } else if self.price > self.entry_high {
                         format!(
-                            "高于参考区间上沿 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            "高于参考区间上沿 {:.2}（现价 {:.2}，{:+.2}%）；参考区间 {:.2}-{:.2}",
                             self.entry_high,
                             self.price,
                             self.change_pct,
@@ -208,7 +208,7 @@ impl TriggerHit {
                         )
                     } else {
                         format!(
-                            "低于参考区间下沿 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            "低于参考区间下沿 {:.2}（现价 {:.2}，{:+.2}%）；参考区间 {:.2}-{:.2}",
                             self.entry_low,
                             self.price,
                             self.change_pct,
@@ -220,7 +220,7 @@ impl TriggerHit {
                 EntryMode::Breakout => self.trigger_level.map_or_else(
                     || {
                         format!(
-                            "突破昨高 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            "突破昨高 {:.2}（现价 {:.2}，{:+.2}%）；参考区间 {:.2}-{:.2}",
                             self.prev_high,
                             self.price,
                             self.change_pct,
@@ -230,13 +230,13 @@ impl TriggerHit {
                     },
                     |level| {
                         format!(
-                            "站上触发位 {level:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                            "站上触发位 {level:.2}（现价 {:.2}，{:+.2}%）；参考区间 {:.2}-{:.2}",
                             self.price, self.change_pct, self.entry_low, self.entry_high
                         )
                     },
                 ),
                 EntryMode::AuctionReference | EntryMode::Unknown => format!(
-                    "突破昨高 {:.2}（现价 {:.2}，{:+.2}%）；区间 {:.2}-{:.2}",
+                    "突破昨高 {:.2}（现价 {:.2}，{:+.2}%）；参考区间 {:.2}-{:.2}",
                     self.prev_high, self.price, self.change_pct, self.entry_low, self.entry_high
                 ),
             },
@@ -253,10 +253,21 @@ impl TriggerHit {
             HitAction::Triggered => "⚡ 突破确认",
             HitAction::Invalidated => "⚠ 价格失效",
         };
+        // 名称缺失时调用方回退成代码；不要把同一个代码打印两遍。
+        let code = self.code.trim();
+        let name = self.name.trim();
+        let label = if name.is_empty() || name == code {
+            code.to_owned()
+        } else {
+            format!("{code} {name}")
+        };
+        // 触发只代表价格触及参考区间，不是成交，也不是自动买入指令（6.10）。
+        let suffix = match self.action {
+            HitAction::Triggered => "｜未核验成交，非自动买入",
+            HitAction::Invalidated => "",
+        };
         format!(
-            "{head} {} {} 现价 {:.2}（{:+.2}%）— {}｜{}",
-            self.code,
-            self.name,
+            "{head} {label} 现价 {:.2}（{:+.2}%）— {}｜{}{suffix}",
             self.price,
             self.change_pct,
             self.regime.label(),
@@ -1397,6 +1408,15 @@ mod tests {
         assert!(text.contains("突破确认"));
         assert!(text.contains("情绪型"));
         assert!(text.contains("002696"));
+        // 6.10：触发不是成交，正文必须带参考语义。
+        assert!(text.contains("未核验成交，非自动买入"));
+
+        // 名称缺失时调用方回退成代码，不应把代码打印两遍。
+        let mut fallback = hit.clone();
+        fallback.name = fallback.code.clone();
+        let text = fallback.render();
+        assert!(text.contains("⚡ 突破确认 002696 现价"));
+        assert!(!text.contains("002696 002696"));
     }
 
     #[test]

@@ -4,7 +4,9 @@
 按首行识别模板，检查参考语义与禁止词：
 - 09:25 竞价：reference 时必须有「竞价参考价」，不得有「买价」，
   且必须保留「T+1 不可卖」；
-- 候选触发：不得有「低吸参考」，必须有「参考区间」与「非自动买入」；
+- 候选触发（含 ticket 盘中 `⚡ 突破确认`）：不得有「低吸参考」，必须有
+  「参考区间」与「非自动买入」；
+- 价格失效（`⚠ 价格失效` / 候选失效）：不得出现买入语义；
 - 持仓建议：必须有「非下单指令」；
 - 定向监控：只检查不出现「保证成交/可执行」。
 当前日期是切换前/后的基线，--expect reference 才把违规作为失败。
@@ -21,8 +23,12 @@ from typing import Any
 def classify(first_line: str) -> str:
     if "09:25" in first_line and "竞价" in first_line:
         return "auction_0925"
-    if "候选触发" in first_line:
+    # ticket 盘中触发走 Hit::render()，首行是「⚡ 突破确认」；
+    # legacy 候选模板首行是「候选触发」，两者都按候选触发口径审计。
+    if "突破确认" in first_line or "候选触发" in first_line:
         return "candidate_triggered"
+    if "价格失效" in first_line or "候选失效" in first_line:
+        return "price_invalidated"
     if "持仓建议" in first_line:
         return "holding_plan"
     if "定向监控" in first_line:
@@ -47,6 +53,10 @@ def audit_text(text: str, kind: str, expect: str) -> list[str]:
             errors.append("缺少「参考区间」")
         if "非自动买入" not in text:
             errors.append("缺少「非自动买入」")
+    elif kind == "price_invalidated":
+        for word in ("买价", "低吸", "建议买入", "保证成交"):
+            if word in text:
+                errors.append(f"出现「{word}」")
     elif kind == "holding_plan":
         if "非下单指令" not in text:
             errors.append("缺少「非下单指令」")
