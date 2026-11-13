@@ -35,6 +35,56 @@ MONEY = {
 ROW = re.compile(
     r"^(\d{6})\s+(\S+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+(-?[0-9.]+)\s+(-?[0-9.]+)"
 )
+ORDER_ROW = re.compile(
+    r"^(\d{8})\s+(\d{2}:\d{2}:\d{2})\s+(\d{6})\s+(\S+)\s+(证券[买卖][入出])\s+"
+    r"([0-9.]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([0-9.]+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d{8})"
+)
+
+
+def parse_orders(text: str):
+    """解析当日委托表；只用于判断是否有未终结委托/冻结资金，不写库。"""
+    orders = []
+    for line in text.splitlines():
+        m = ORDER_ROW.match(line.strip())
+        if not m:
+            continue
+        (
+            date,
+            time,
+            code,
+            name,
+            side,
+            price,
+            order_qty,
+            order_no,
+            filled_qty,
+            filled_amount,
+            cancel_qty,
+            status,
+            flag,
+            shareholder,
+            op_date,
+        ) = m.groups()
+        orders.append(
+            {
+                "date": date,
+                "time": time,
+                "code": code,
+                "name": name,
+                "side": side,
+                "price": float(price),
+                "order_qty": int(order_qty),
+                "order_no": order_no,
+                "filled_qty": int(filled_qty),
+                "filled_amount": float(filled_amount),
+                "cancel_qty": int(cancel_qty),
+                "status": status,
+                "flag": flag,
+                "shareholder": shareholder,
+                "op_date": op_date,
+            }
+        )
+    return orders
 
 
 def parse(text: str):
@@ -82,10 +132,22 @@ def main() -> int:
         action="store_true",
         help="账户汇总用券商页面的参考市值/资产，而不是按收盘价重算",
     )
+    ap.add_argument(
+        "--allow-pending",
+        action="store_true",
+        help="存在未终结委托仍允许写库（不推荐；冻结资金可能让可用失真）",
+    )
     args = ap.parse_args()
 
     text = Path(args.text_file).read_text()
     cash, rows = parse(text)
+    orders = parse_orders(text)
+    pending = [order for order in orders if order["status"] == "已报"]
+    frozen_cash = sum(
+        max(0, order["order_qty"] - order["filled_qty"] - order["cancel_qty"]) * order["price"]
+        for order in pending
+        if order["side"].startswith("证券买")
+    )
     if not rows:
         print("未解析到持仓行", file=sys.stderr)
         return 2
@@ -154,9 +216,31 @@ def main() -> int:
     for line in warn:
         print(f"  ⚠ {line}")
 
+    if pending:
+        print("\n⚠ 未终结委托（页面可能未到收盘/结算）：")
+        for order in pending:
+            remaining = max(
+                0, order["order_qty"] - order["filled_qty"] - order["cancel_qty"]
+            )
+            print(
+                f"  {order['time']} {order['code']} {order['name']} {order['side']} "
+                f"{order['price']:.2f}×{order['order_qty']} 成交{order['filled_qty']} "
+                f"状态{order['status']}｜未成交 {remaining}"
+            )
+        if frozen_cash > 0:
+            print(
+                f"  买入冻结估算 {frozen_cash:.2f}；可用 {cash['可用']:.2f} 可能不是收盘可用"
+            )
+        if cash.get("余额") is not None:
+            print(f"  余额-可用 = {cash['余额'] - cash['可用']:.2f}")
+        print("  建议收盘结算后重导；确认已终结再加 --allow-pending")
+
     if not args.apply:
         print("\ndry-run：未写库")
         return 0
+    if pending and not args.allow_pending:
+        print("存在未终结委托，拒绝 --apply；确认后加 --allow-pending", file=sys.stderr)
+        return 3
 
     now = dt.datetime.now().astimezone().replace(microsecond=0).isoformat()
     snap = {
