@@ -379,16 +379,11 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
         Some(extra)
     };
 
-    // 拼装 news_context（消息面分析师 + 行业板块分析师读取）
+    // 拼装 news_context（消息面分析师读取：新闻 + 研报；板块原文单独进 sector 切片）
     let mut news_ctx = String::new();
     if !news_str_raw.is_empty() {
         news_ctx.push_str("【新闻舆情】\n");
         news_ctx.push_str(news_str_raw);
-        news_ctx.push_str("\n\n");
-    }
-    if !sector_str.is_empty() {
-        news_ctx.push_str("【板块/概念】\n");
-        news_ctx.push_str(sector_str);
         news_ctx.push_str("\n\n");
     }
     if !research_str.is_empty() {
@@ -414,6 +409,15 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     );
     if let Some(note) = window_note {
         slices.basics.push_str(&format!("\n{}", note));
+    }
+    // 板块原文属于板块分析师，不再塞进消息面（否则消息面会在“无新闻”时靠板块内容
+    // 拿到默认 50 分，虚增权重）。
+    if !sector_str.is_empty() {
+        slices
+            .sector
+            .push_str("\n【板块/概念原文（BoardConstituents）】\n");
+        slices.sector.push_str(sector_str);
+        slices.sector.push('\n');
     }
 
     // 5. 把财务/估值工具数据注入基本面切片
@@ -514,17 +518,54 @@ pub async fn run_multi_agent_analysis_with_seed(seed: &DeepAnalysisSeed) -> Resu
     ))
 }
 
-/// 执行深度分析并将结果写入到 `reports/details/{date}_{code}.md`。
+/// 报告文件名用「数据时点」（复盘业务日），不是运行日。
+///
+/// R-11 复盘在 T+1 的 13:10–15:43 才执行，按运行日命名会让 11-04 的复盘落成
+/// `20261105_*.md`，按业务日找不到归档（2026-11-11 报障）。尾注缺失时退回运行日。
+fn report_file_date(markdown: &str) -> String {
+    const MARKER: &str = "数据时点：";
+    if let Some(start) = markdown.find(MARKER) {
+        let candidate: String = markdown[start + MARKER.len()..].chars().take(10).collect();
+        let bytes = candidate.as_bytes();
+        if bytes.len() == 10 && bytes[4] == b'-' && bytes[7] == b'-' {
+            return candidate.replace('-', "");
+        }
+    }
+    chrono::Local::now().format("%Y%m%d").to_string()
+}
+
+/// 执行深度分析并将结果写入 `DEEP_ANALYZE_REPORT_DIR`（默认
+/// `reports/details`）下的 `{date}_{code}.md`。
 /// 返回报告文件路径。默认走方案 X（多角色）。
 pub async fn run_and_save(code: &str) -> Result<PathBuf> {
     let report = run_multi_agent_analysis(code).await?;
-    let date = chrono::Local::now().format("%Y%m%d").to_string();
-    let dir = PathBuf::from("reports/details");
+    let date = report_file_date(&report);
+    let dir = std::env::var("DEEP_ANALYZE_REPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("reports/details"));
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}_{}.md", date, code));
     std::fs::write(&path, &report)?;
     log::info!("[DeepAnalyzer] 报告已保存: {}", path.display());
     Ok(path)
+}
+
+#[cfg(test)]
+mod report_date_tests {
+    use super::report_file_date;
+
+    #[test]
+    fn report_file_date_prefers_data_time_over_run_time() {
+        let report = "## 一句话结论\n...\n\n---\n\n数据时点：2026-11-04 收盘（日线，最近交易日）\n数据源：...";
+        assert_eq!(report_file_date(report), "20261104");
+    }
+
+    #[test]
+    fn report_file_date_falls_back_when_footer_missing() {
+        let today = chrono::Local::now().format("%Y%m%d").to_string();
+        assert_eq!(report_file_date("## 一句话结论\n无尾注"), today);
+        assert_eq!(report_file_date("数据时点：not-a-date"), today);
+    }
 }
 
 #[cfg(test)]

@@ -300,8 +300,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let reports_dir = PathBuf::from("reports/details");
+    let reports_dir = std::env::var("DEEP_ANALYZE_REPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("reports/batch"));
     std::fs::create_dir_all(&reports_dir)?;
+    std::env::set_var("DEEP_ANALYZE_REPORT_DIR", &reports_dir);
     let probe_db = PathBuf::from("data/deep_analyze_batch_probe.db");
     std::env::set_var("DATABASE_PATH", &probe_db);
     stock_analysis::database::DatabaseManager::init(Some(probe_db))

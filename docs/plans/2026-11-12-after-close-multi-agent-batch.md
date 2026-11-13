@@ -17,7 +17,9 @@
   `deep_analyzer::run_and_save`（6 工具 + 6 分析师 + 辩论 + 仲裁）。
   - 并发 2，单票 90 秒（默认），总预算 1200 秒；
   - 独立 probe DB `data/deep_analyze_batch_probe.db`，不把分析审计写主库；
-  - 只写 `reports/details/{report_date}_{code}.md` 和同名 `.report.json`；
+  - 只写 `DEEP_ANALYZE_REPORT_DIR`（批次默认 `reports/batch`）下的
+    `{report_date}_{code}.md` 与同名 `.report.json`；R-11 仍用
+    `reports/details`，两者不会互相覆盖；
   - 不推送、不产生 `ticket_decision`/交易动作。
 - 选择可用 `--dry-run` 预览，不调用模型。
 
