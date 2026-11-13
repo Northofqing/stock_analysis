@@ -18406,9 +18406,17 @@ pub fn render_bound_preopen_news_hot(
             facts.join("｜")
         ));
         if let (Some(low), Some(high)) = (head.plan_low, head.plan_high) {
-            let mut plan = format!("  计划: 区间 {low:.2}~{high:.2}");
-            if let Some(trigger) = head.plan_trigger {
-                plan.push_str(&format!("｜突破 {trigger:.2}"));
+            let zero_width = (high - low).abs() < 0.005;
+            let mut plan = if zero_width {
+                let trigger = head.plan_trigger.unwrap_or(low);
+                format!("  计划: 触发位 {trigger:.2}")
+            } else {
+                format!("  计划: 区间 {low:.2}~{high:.2}")
+            };
+            if !zero_width {
+                if let Some(trigger) = head.plan_trigger {
+                    plan.push_str(&format!("｜突破 {trigger:.2}"));
+                }
             }
             if let Some(abandon) = head.plan_abandon {
                 plan.push_str(&format!("｜放弃 {abandon:.2}"));
@@ -23470,6 +23478,21 @@ mod tests {
         let text =
             render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
         assert!(text.contains("计划: 区间 10.25~10.40｜突破 10.85｜放弃 9.21（2026-08-17 提案）"));
+    }
+
+    #[test]
+    fn p01_render_marks_zero_width_plan_as_trigger_level() {
+        let mut input = crate::p01::P01InputBinding::complete_test_input();
+        let head = &mut input.heads[0];
+        head.plan_low = Some(4.83);
+        head.plan_high = Some(4.83);
+        head.plan_trigger = Some(4.83);
+        head.plan_abandon = Some(4.50);
+        head.plan_as_of = Some("2026-08-17".to_owned());
+        let text =
+            render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
+        assert!(text.contains("计划: 触发位 4.83｜放弃 4.50（2026-08-17 提案）"));
+        assert!(!text.contains("4.83~4.83"));
     }
 
     #[test]

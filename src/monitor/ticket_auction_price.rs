@@ -636,22 +636,40 @@ fn plan_note_on(
     );
     let mut note = match (context.price_low, context.price_high) {
         (Some(low), Some(high)) if high > 0.0 => {
-            let position = if auction_price > high {
+            let zero_width = (high - low).abs() < 0.005;
+            let breakout = context.entry_mode.as_str() == "breakout";
+            let breakout_trigger = context.trigger_level.unwrap_or(low);
+            let position = if breakout {
+                if auction_price >= breakout_trigger {
+                    "竞价站上触发位（价格已触及，非成交）"
+                } else {
+                    "竞价低于触发位（等待）"
+                }
+            } else if auction_price > high {
                 "竞价高于上沿（不追）"
             } else if auction_price < low {
                 "竞价低于下沿（等待）"
             } else {
                 "竞价在区间内"
             };
-            let trigger = context
-                .trigger_level
-                .map(|value| format!("｜突破 {value:.2}"))
-                .unwrap_or_default();
+            let range = if zero_width {
+                format!("触发位 {low:.2}")
+            } else {
+                format!("区间 {low:.2}~{high:.2}")
+            };
+            let trigger = if zero_width {
+                String::new()
+            } else {
+                context
+                    .trigger_level
+                    .map(|value| format!("｜突破 {value:.2}"))
+                    .unwrap_or_default()
+            };
             let abandon = context
                 .abandon
                 .map(|value| format!("｜放弃 {value:.2}"))
                 .unwrap_or_default();
-            format!("提案：区间 {low:.2}~{high:.2}{trigger}{abandon}｜{position}")
+            format!("提案：{range}{trigger}{abandon}｜{position}")
         }
         _ => format!("提案：{}（无区间）", proposal_status_label(status_text)),
     };

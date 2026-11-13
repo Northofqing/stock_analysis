@@ -347,13 +347,19 @@ impl Card {
                 out.push('\n');
             }
         } else {
+            let (entry, trigger) = match (self.plan.low, self.plan.high) {
+                (Some(low), Some(high)) if (high - low).abs() < 0.005 => {
+                    let trigger = self.plan.trigger.unwrap_or(low);
+                    (format!("触发位 {trigger:.2}"), String::new())
+                }
+                (Some(low), Some(high)) => (
+                    format!("{low:.2}-{high:.2}"),
+                    format!("｜突破确认 {}", fmt_opt(self.plan.trigger, 2)),
+                ),
+                _ => ("N/A（无活跃提案）".to_owned(), String::new()),
+            };
             out.push_str(&format!(
-                "  进: {}｜突破确认 {}｜放弃 {}\n",
-                match (self.plan.low, self.plan.high) {
-                    (Some(low), Some(high)) => format!("{low:.2}-{high:.2}"),
-                    _ => "N/A（无活跃提案）".to_owned(),
-                },
-                fmt_opt(self.plan.trigger, 2),
+                "  进: {entry}{trigger}｜放弃 {}\n",
                 fmt_opt(self.plan.abandon, 2)
             ));
             out.push_str(&format!(

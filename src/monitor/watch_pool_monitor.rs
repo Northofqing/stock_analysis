@@ -356,20 +356,33 @@ fn classify_plan_state(
     high: f64,
     abandon: Option<f64>,
 ) -> (&'static str, String) {
+    let zero_width = (high - low).abs() < 0.005;
+    let range = if zero_width {
+        format!("触发位 {low:.2}")
+    } else {
+        format!("区间 {low:.2}~{high:.2}")
+    };
     if let Some(abandon) = abandon {
         if price <= abandon {
-            return (
-                "abandon",
-                format!("区间 {low:.2}~{high:.2}｜跌破放弃 {abandon:.2}"),
-            );
+            return ("abandon", format!("{range}｜跌破放弃 {abandon:.2}"));
         }
     }
     if price > high {
-        ("above", format!("区间 {low:.2}~{high:.2}｜高于上沿"))
+        let state = if zero_width {
+            "高于触发位"
+        } else {
+            "高于上沿"
+        };
+        ("above", format!("{range}｜{state}"))
     } else if price < low {
-        ("below", format!("区间 {low:.2}~{high:.2}｜低于下沿"))
+        let state = if zero_width {
+            "低于触发位"
+        } else {
+            "低于下沿"
+        };
+        ("below", format!("{range}｜{state}"))
     } else {
-        ("in_zone", format!("区间 {low:.2}~{high:.2}｜在区间内"))
+        ("in_zone", format!("{range}｜在区间内"))
     }
 }
 
@@ -754,6 +767,13 @@ mod tests {
         assert_eq!(classify_plan_state(10.90, 10.25, 10.85, Some(9.21)).0, "above");
         assert_eq!(classify_plan_state(10.10, 10.25, 10.85, Some(9.21)).0, "below");
         assert_eq!(classify_plan_state(9.10, 10.25, 10.85, Some(9.21)).0, "abandon");
+        let (state, note) = classify_plan_state(10.50, 10.50, 10.50, Some(9.21));
+        assert_eq!(state, "in_zone");
+        assert_eq!(note, "触发位 10.50｜在区间内");
+        assert_eq!(
+            classify_plan_state(10.60, 10.50, 10.50, Some(9.21)).1,
+            "触发位 10.50｜高于触发位"
+        );
     }
 
     #[test]
