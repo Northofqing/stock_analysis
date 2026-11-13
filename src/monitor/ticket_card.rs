@@ -339,16 +339,33 @@ fn load_bars(
     as_of: &str,
     limit: i64,
 ) -> Result<Vec<Bar>, String> {
-    let rows: Vec<BarRow> = diesel::sql_query(
+    load_bars_at(conn, code, as_of, limit, true)
+}
+
+/// `inclusive=false` 用于 09:25：只取 before 之前已收盘的日线，
+/// 避免把当天尚未生成的 K 线当成信号。
+fn load_bars_at(
+    conn: &mut SqliteConnection,
+    code: &str,
+    as_of: &str,
+    limit: i64,
+    inclusive: bool,
+) -> Result<Vec<Bar>, String> {
+    let sql = if inclusive {
         "SELECT date, high, low, close, volume, pct_chg, volume_ratio FROM stock_daily \
          WHERE code = ?1 AND date <= ?2 AND close IS NOT NULL AND close > 0 \
-         ORDER BY date DESC LIMIT ?3",
-    )
-    .bind::<Text, _>(code)
-    .bind::<Text, _>(as_of)
-    .bind::<BigInt, _>(limit)
-    .load(conn)
-    .map_err(|error| format!("日线查询失败 ({code}): {error}"))?;
+         ORDER BY date DESC LIMIT ?3"
+    } else {
+        "SELECT date, high, low, close, volume, pct_chg, volume_ratio FROM stock_daily \
+         WHERE code = ?1 AND date < ?2 AND close IS NOT NULL AND close > 0 \
+         ORDER BY date DESC LIMIT ?3"
+    };
+    let rows: Vec<BarRow> = diesel::sql_query(sql)
+        .bind::<Text, _>(code)
+        .bind::<Text, _>(as_of)
+        .bind::<BigInt, _>(limit)
+        .load(conn)
+        .map_err(|error| format!("日线查询失败 ({code}): {error}"))?;
     Ok(rows
         .into_iter()
         .rev()
@@ -362,6 +379,17 @@ fn load_bars(
             volume_ratio: row.volume_ratio,
         })
         .collect())
+}
+
+/// 09:25 用：截至 `before`（不含）最后一个交易日的日线指标与量价形态。
+/// 只提供事实，不参与给价；`as_of` 为空表示日线不足 7 根。
+pub(crate) fn daily_tech_before(
+    conn: &mut SqliteConnection,
+    code: &str,
+    before: &str,
+) -> Result<(TechView, VolumePriceView), String> {
+    let bars = load_bars_at(conn, code, before, 120, false)?;
+    Ok((compute_tech(code, &bars), compute_volume_price(code, &bars)))
 }
 
 fn compute_tech(code: &str, bars: &[Bar]) -> TechView {
@@ -491,7 +519,7 @@ fn tech_missing(tech: &TechView, bar_count: usize) -> Vec<String> {
     missing
 }
 
-fn latest_decision(
+pub(crate) fn latest_decision(
     conn: &mut SqliteConnection,
     ticket_id: i64,
 ) -> Result<Option<DecisionContext>, String> {

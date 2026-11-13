@@ -27,6 +27,7 @@ use diesel::sql_types::{Double, Nullable, Text};
 
 use crate::database::{ticket_lifecycle, DatabaseManager};
 use crate::monitor::auction_watch::AuctionRow;
+use crate::monitor::ticket_card;
 use crate::monitor::ticket_regime::{self, Regime};
 
 /// Q4：保成交上浮比例（operator 可改）。
@@ -146,6 +147,12 @@ pub struct PriceLine {
     /// 6.10：同日风险提示（risk_flag，最近 5 日）；有则正文必须披露，
     /// 与给出的加仓参考同时存在时标「冲突」。
     pub risk_note: Option<String>,
+    /// 竞价量比（首段）；缺失写 N/A，不补 0。
+    pub auction_volume_ratio: Option<f64>,
+    /// 日线指标摘要（截至上一交易日收盘）；盘中不冒充分钟级。
+    pub tech_note: Option<String>,
+    /// 最新提案区间与竞价位置；终态提案只作复盘，不再当新参考。
+    pub plan_note: Option<String>,
 }
 
 impl PriceLine {
@@ -217,6 +224,12 @@ impl PriceLine {
         } else {
             format!("{base}\n  {}", self.position_note)
         };
+        if let Some(note) = &self.tech_note {
+            rendered.push_str(&format!("\n  {note}"));
+        }
+        if let Some(note) = &self.plan_note {
+            rendered.push_str(&format!("\n  {note}"));
+        }
         if matches!(kind, OutputKind::ReferencePrice) {
             if let Some(risk) = &self.risk_note {
                 let risk = risk.strip_prefix("风险提示：").unwrap_or(risk);
@@ -550,6 +563,107 @@ fn classify_fillability(auction_price: f64, low: f64, high: f64) -> (String, Str
     }
 }
 
+/// 日线指标 + 量价形态 + 竞价量比，拼成一行；09:25 只展示，不参与给价。
+fn daily_note(
+    auction_volume_ratio: Option<f64>,
+    tech: &ticket_card::TechView,
+    volume_price: &ticket_card::VolumePriceView,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push(match auction_volume_ratio {
+        Some(value) => format!("竞价量比 {value:.2}（未参与触发）"),
+        None => "竞价量比 N/A（未参与触发）".to_owned(),
+    });
+    if tech.as_of.is_empty() {
+        parts.push("日线：N/A（K线不足）".to_owned());
+    } else {
+        let date = tech.as_of.get(5..).unwrap_or(tech.as_of.as_str());
+        parts.push(format!(
+            "日线({date})：MACD {} 柱{}｜KDJ {}｜SKDJ {}｜RSI {}",
+            tech.macd_cross.unwrap_or("N/A"),
+            tech.macd_hist
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "N/A".to_owned()),
+            fmt_triplet(tech.kdj),
+            fmt_triplet(tech.skdj),
+            fmt_triplet(tech.rsi),
+        ));
+    }
+    match volume_price.ratio_5d {
+        Some(ratio) => parts.push(format!(
+            "量价 {}｜5日量比 {ratio:.2}",
+            volume_price.tags.join("+")
+        )),
+        None => parts.push("量价 N/A".to_owned()),
+    }
+    parts.join("｜")
+}
+
+fn fmt_triplet(value: Option<(f64, f64, f64)>) -> String {
+    match value {
+        Some((a, b, c)) => format!("{a:.0}/{b:.0}/{c:.0}"),
+        None => "N/A".to_owned(),
+    }
+}
+
+fn proposal_status_label(status: &str) -> &'static str {
+    match status {
+        "triggered" => "触发",
+        "invalidated" => "失效",
+        "expired" => "过期",
+        "superseded" => "被替换",
+        _ => "未定",
+    }
+}
+
+/// 最新提案区间与竞价位置；终态只作复盘，避免把旧区间当新参考。
+fn plan_note_on(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    auction_price: f64,
+) -> Option<String> {
+    let status = crate::monitor::ticket_decision::latest_proposal_status(conn, ticket_id)
+        .ok()
+        .flatten();
+    let context = ticket_card::latest_decision(conn, ticket_id).ok().flatten();
+    let Some(context) = context else {
+        return Some("提案：无有效提案".to_owned());
+    };
+    let status_text = status.map(|value| value.as_str()).unwrap_or("open");
+    let terminal = matches!(
+        status_text,
+        "triggered" | "invalidated" | "expired" | "superseded"
+    );
+    let mut note = match (context.price_low, context.price_high) {
+        (Some(low), Some(high)) if high > 0.0 => {
+            let position = if auction_price > high {
+                "竞价高于上沿（不追）"
+            } else if auction_price < low {
+                "竞价低于下沿（等待）"
+            } else {
+                "竞价在区间内"
+            };
+            let trigger = context
+                .trigger_level
+                .map(|value| format!("｜突破 {value:.2}"))
+                .unwrap_or_default();
+            let abandon = context
+                .abandon
+                .map(|value| format!("｜放弃 {value:.2}"))
+                .unwrap_or_default();
+            format!("提案：区间 {low:.2}~{high:.2}{trigger}{abandon}｜{position}")
+        }
+        _ => format!("提案：{}（无区间）", proposal_status_label(status_text)),
+    };
+    if terminal {
+        note.push_str(&format!(
+            "｜提案已{}，仅复盘",
+            proposal_status_label(status_text)
+        ));
+    }
+    Some(note)
+}
+
 /// 给情绪型活跃票算竞价买价。
 ///
 /// `rows` 由 `auction_watch::observe` 提供（活跃票 ∪ 持仓的竞价终态）。
@@ -709,6 +823,22 @@ pub fn build(
             },
         };
         let risk_note = risk_notes.get(&row.code).cloned();
+        let (daily_tech, volume_price) =
+            ticket_card::daily_tech_before(&mut conn, &row.code, as_of).unwrap_or_else(|error| {
+                report
+                    .errors
+                    .push(format!("{} 日线指标失败: {error}", row.code));
+                (
+                    ticket_card::TechView::default(),
+                    ticket_card::VolumePriceView::default(),
+                )
+            });
+        let tech_note = Some(daily_note(
+            row.auction_volume_ratio,
+            &daily_tech,
+            &volume_price,
+        ));
+        let plan_note = plan_note_on(&mut conn, ticket.id, auction_price);
         let line_for_skip = || PriceLine {
             code: row.code.clone(),
             name: row.name.clone(),
@@ -721,6 +851,9 @@ pub fn build(
             position_note: position_note.clone(),
             position: position_context,
             risk_note: risk_note.clone(),
+            auction_volume_ratio: row.auction_volume_ratio,
+            tech_note: tech_note.clone(),
+            plan_note: plan_note.clone(),
         };
         if streak.is_some_and(|value| value >= crate::monitor::market_regime::EMOTION_STREAK)
             && phase == Some(crate::monitor::market_regime::MarketPhase::Climax)
@@ -762,6 +895,9 @@ pub fn build(
             position_note,
             position: position_context,
             risk_note,
+            auction_volume_ratio: row.auction_volume_ratio,
+            tech_note,
+            plan_note,
         };
         match tier {
             Tier::SkipHigh => report.skipped_high.push(line),
@@ -816,6 +952,9 @@ mod tests {
                 position_note: "持仓：无（新买入参考）".to_string(),
                 position: PositionContext::NoPosition,
                 risk_note: None,
+                auction_volume_ratio: None,
+                tech_note: None,
+                plan_note: None,
             }],
             ..Default::default()
         };
@@ -823,6 +962,38 @@ mod tests {
         assert!(text.contains("T+1 不可卖"));
         assert!(text.contains("002696"));
         assert!(text.contains("轻仓"));
+    }
+
+    #[test]
+    fn render_includes_volume_indicators_and_plan_status() {
+        let line = PriceLine {
+            code: "002205".to_string(),
+            name: "国统股份".to_string(),
+            auction_price: 10.10,
+            auction_pct: -1.20,
+            price: Some(10.10),
+            tier: Tier::EnsureFill,
+            output_kind: OutputKind::ReferencePrice,
+            high_state_unverified: false,
+            position_note: "持仓：无（新买入参考）".to_string(),
+            position: PositionContext::NoPosition,
+            risk_note: None,
+            auction_volume_ratio: Some(1.32),
+            tech_note: Some(
+                "竞价量比 1.32｜日线(11-13)：MACD 金叉 柱0.05｜KDJ 70/60/90｜SKDJ 40/35/45｜RSI 62/55/48｜量价 放量上涨｜5日量比 2.50".to_string(),
+            ),
+            plan_note: Some(
+                "提案：区间 10.25~10.85｜突破 10.85｜放弃 9.21｜竞价低于下沿（等待）".to_string(),
+            ),
+        };
+        let text = line.render_as(OutputKind::ReferencePrice);
+        assert!(text.contains("竞价量比 1.32"));
+        assert!(text.contains("日线(11-13)"));
+        assert!(text.contains("量价 放量上涨"));
+        assert!(text.contains("提案：区间 10.25~10.85"));
+        assert!(text.contains("竞价低于下沿"));
+        assert!(!text.contains("建议买入"));
+        assert!(!text.contains("保证成交"));
     }
 
     #[test]
@@ -839,6 +1010,9 @@ mod tests {
             position_note: "持仓：无（新买入参考）".to_string(),
             position: PositionContext::NoPosition,
             risk_note: None,
+            auction_volume_ratio: None,
+            tech_note: None,
+            plan_note: None,
         };
         let text = line.render_as(OutputKind::ReferencePrice);
         assert!(text.contains("竞价参考价"));
@@ -862,6 +1036,9 @@ mod tests {
             position_note: "持仓：已有 500 股，成本 26.61，浮盈亏 -4.9%｜动作：加仓观察".to_string(),
             position: PositionContext::Held,
             risk_note: None,
+            auction_volume_ratio: None,
+            tech_note: None,
+            plan_note: None,
         };
         let text = line.render_as(OutputKind::ReferencePrice);
         assert!(text.contains("高位状态未核实"));
@@ -895,6 +1072,9 @@ mod tests {
                 .to_string(),
             position: PositionContext::Held,
             risk_note: Some("风险提示：违规减持".to_string()),
+            auction_volume_ratio: None,
+            tech_note: None,
+            plan_note: None,
         };
         let text = line.render_as(OutputKind::ReferencePrice);
         assert!(text.contains("持仓加仓参考｜"));

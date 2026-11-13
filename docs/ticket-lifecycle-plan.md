@@ -4291,6 +4291,23 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 决策点：量比（B→A）、MACD 参数（6/13/5 vs 12/26/9）、技术退出是否硬规则、
 OrderBook 口径、T0 选项。
 
+**2026-11-13 第一批实施状态**（决策：量比 B、MACD 保持、技术退出先展示）：
+
+- 09:25：`PriceLine` 已加 `auction_volume_ratio/tech_note/plan_note`；正文逐票追加
+  “竞价量比（未参与触发）｜日线(MM-DD) MACD/KDJ/SKDJ/RSI｜量价 tag｜提案区间/突破/
+  放弃/竞价位置”；终态提案标“仅复盘”。`cargo test --lib monitor::ticket_auction_price`
+  11/11 通过。
+- P01：每 head 追加“昨收/连板/封单/炸板｜昨日涨停（不追高），等回踩/突破；
+  情绪型竞价参考价见 09:25”，只用绑定里已有字段，不改 canonical hash。
+- 导入防呆：`import_broker_snapshot.py` 解析委托表；`已报` 且未成交的买单计入冻结，
+  dry-run 报警；存在未终结委托时 `--apply` 默认拒绝，需 `--allow-pending`。
+  今天这份快照实跑会报 600667 冻结 7470、600703 卖单 500 未终结。
+- 部署范围：runtime 只差 4 个文件——`ticket_auction_price.rs`（267 行/12 hunk，全是
+  本次改动）、`ticket_card.rs`（新文件）、`monitor/mod.rs`（仅 `pub mod ticket_card`）、
+  `push_templates.rs`（47 行/2 hunk，全是 P01 行）；没有夹带 11-07 以来的其他改动。
+- 验收：11-16 09:25 每条含量比/日线指标/量价/提案；P01 每票有价格行；导入 dry-run
+  先报警。
+
 **当前状态**：7.1 已实跑（2026-11-13，生产库副本只读，6 持仓 + 002205 共 7 张卡）：
 
 ```
