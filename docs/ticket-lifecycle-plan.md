@@ -3662,6 +3662,19 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   unfillable_gap=5、missing_bar=1）；11-12 待 21:30 日线后由
   `ticket-signal-ledger-close` 任务补写。
 
+**2026-11-13 09:25 开关实测**：
+
+- `TICKET_OUTPUT_CONTRACT=1` 已生效：09:25 摘要行从「竞价买价」变为
+  「竞价参考价」，正文使用 `竞价参考价`；文案审计 `--expect reference` 无失败。
+- `TICKET_STATE_FILTER=on` 已生效：摘要 `skipped_stale=29`，
+  `emotion=14 quoted=14 skipped_high=0 errors=0`；旧提案日志只记录
+  「旧提案不重复定价」，没有再生成新参考价。
+- `filing` 事件仍为 0：09:25 的 Cninfo 公告请求多次返回
+  `reason_code=external_query_rejected`（09:27 后才 available，但实体关联
+  `进100 → 出0`），没有形成 `filings=ok`，因此 6.5 仍受公告源阻塞，不能算完成。
+- 当日 6.9 审计：19 个证据包 PASS；`official_filing=19` 仍缺失，
+  与上面的公告源状态一致。
+
 **2026-11-11 账户快照与成交补录（影响 T+1/持仓上下文）**：
 
 - 快照 `ups_v1_a2db69fa...f02e`，`effective_at=2026-11-11T15:32:33+08:00`，
@@ -3763,8 +3776,9 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   均值 +1.41%、盈亏比 2.45；D+3 n=149 净胜率 71.1%、均值 +2.47%、
   盈亏比 3.41。收益均为日线近似、双边扣 0.2%，不是盘口成交。
 - 11-11 已入账 21 条（filled=15、unfillable_gap=5、missing_bar=1）；
-  11-12 已有 12 条 attempt 因当日日线未落库暂记 `missing_bar`，
-  22:05 `ticket-signal-ledger-close` 在日线同步后重算并补结果。
+  11-12 已回填 12 条（filled=9、unfillable_gap=2、missing_bar=1），
+  由 22:05 的 `ticket-signal-ledger-close` 在日线同步后重算；
+  D+1 结果要等下一交易日日线。
 - 回归验证：在临时库给 600238 补 11-12 日线后重跑，已有行由
   `missing_bar` 修正为 `filled`（3.74），证明晚到日线不会留下永久错误状态。
 - 新指标用于扩大样本和 6.8 分母；仍不能当 confirmatory 胜率
