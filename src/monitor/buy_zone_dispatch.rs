@@ -353,28 +353,17 @@ const ACTIVE_BOARD_TOP_N: i64 = 10;
 /// 观察池「仍可展示」的行：只有最新一次提案生命周期事件仍是
 /// `entry_proposed` 才保留。触发/失效/到期/被取代的票不能再以新买入候选出现；
 /// `observing` 且没有提案事件的票不受影响。
+///
+/// 2026-11-13 切读 `ticket_state_v1`：该视图就是同一套「stage + 最新 entry 事件」
+/// 投影，原先这里内联的 `latest_entry` CTE 是它的第二份实现，容易与视图漂移。
+/// 切换前用生产库对账：旧 CTE 20 行、新视图 20 行，代码/来源/入池日完全一致。
 const ACTIVE_WATCH_ROWS_SQL: &str = "\
-WITH latest_entry AS (
-    SELECT e.ticket_id, e.event_kind,
-           ROW_NUMBER() OVER (
-               PARTITION BY e.ticket_id
-               ORDER BY e.event_at DESC, e.id DESC
-           ) AS rn
-      FROM ticket_event e
-     WHERE e.event_kind IN ('entry_proposed','entry_triggered','entry_invalidated',
-                            'entry_expired','entry_superseded')
-)
-SELECT t.code, MIN(t.source) AS source, MIN(t.open_date) AS open_date
-  FROM ticket_lifecycle t
- WHERE t.close_date IS NULL
-   AND t.stage IN ('observing','entry_proposed')
-   AND NOT EXISTS (
-       SELECT 1 FROM latest_entry l
-        WHERE l.ticket_id = t.id
-          AND l.rn = 1
-          AND l.event_kind <> 'entry_proposed'
-   )
- GROUP BY t.code";
+SELECT code, MIN(source) AS source, MIN(open_date) AS open_date
+  FROM ticket_state_v1
+ WHERE close_date IS NULL
+   AND stage IN ('observing','entry_proposed')
+   AND (proposal_status IS NULL OR proposal_status = 'open')
+ GROUP BY code";
 
 /// 生成明日计划文本。空池返回提示文本（不是错误）。
 pub fn render_plan(db: &DatabaseManager, as_of: &str) -> Result<String, String> {
@@ -830,21 +819,11 @@ mod tests {
 
     #[test]
     fn active_watch_rows_exclude_non_open_proposal_states() {
+        use crate::database::ticket_lifecycle;
+
+        // 走真实 schema：候选查询读 ticket_state_v1，视图必须与表一起建出来。
         let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
-        diesel::sql_query(
-            "CREATE TABLE ticket_lifecycle (\
-                 id INTEGER PRIMARY KEY, code TEXT NOT NULL, source TEXT NOT NULL,\
-                 open_date TEXT NOT NULL, close_date TEXT, stage TEXT NOT NULL)",
-        )
-        .execute(&mut conn)
-        .unwrap();
-        diesel::sql_query(
-            "CREATE TABLE ticket_event (\
-                 id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL,\
-                 event_at TEXT NOT NULL, event_kind TEXT NOT NULL)",
-        )
-        .execute(&mut conn)
-        .unwrap();
+        ticket_lifecycle::create_schema(&mut conn).expect("ticket schema");
 
         for (id, code, close_date) in [
             (1, "A", None),

@@ -129,6 +129,24 @@ pub fn evict_stale_observations(db: &DatabaseManager, as_of: &str) -> Result<Evi
     .map(|row| row.code)
     .collect();
 
+    // 12.4.7 双读：淘汰仍按 stage + 价格/超期规则走，提案状态只计数不参与判定
+    // ——触发过的票同样可能跌出观察池，不能用终态提案挡住淘汰。
+    match ticket_lifecycle::consumer_state_dual_read(
+        &mut conn,
+        &["observing", "entry_proposed"],
+    ) {
+        Ok(summary) => log::info!(
+            "[票状态][dual] consumer=eviction rows={} open={} terminal={} none={} stale5={} sample_open={}",
+            summary.rows,
+            summary.open,
+            summary.terminal,
+            summary.none,
+            summary.stale5,
+            summary.sample_open()
+        ),
+        Err(error) => log::warn!("[票状态][dual] consumer=eviction 视图不可用: {error}"),
+    }
+
     let mut report = EvictReport {
         scanned: observing.len(),
         ..Default::default()

@@ -304,6 +304,22 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
     .map(|row| row.code)
     .collect();
 
+    // 12.4.7 双读：候选集合仍按 stage 取，只把同一批票在 ticket_state_v1 上的
+    // 提案状态计数写日志。正常应为 open=0——stage=observing 表示没有活跃提案；
+    // 若出现 open，说明 stage 与事件投影不一致，切换到视图前必须先解释。
+    match ticket_lifecycle::consumer_state_dual_read(&mut conn, &["observing"]) {
+        Ok(summary) => log::info!(
+            "[票状态][dual] consumer=proposal rows={} open={} terminal={} none={} stale5={} sample_open={}",
+            summary.rows,
+            summary.open,
+            summary.terminal,
+            summary.none,
+            summary.stale5,
+            summary.sample_open()
+        ),
+        Err(error) => log::warn!("[票状态][dual] consumer=proposal 视图不可用: {error}"),
+    }
+
     let source_health = source_health_snapshot(&mut conn, as_of);
     let shadow = decision_shadow_enabled();
 

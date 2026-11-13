@@ -3615,10 +3615,11 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
 
 **边界**：
 
-- 消费者尚未切到视图；`ticket_entry_proposal` / `ticket_entry_trigger` /
-  `ticket_eviction` / `holding_plan` 仍直接查 `ticket_lifecycle.stage`。
-  下一步是双读：旧查询与新视图同时执行，只记差异，不改推送；差异归零后
-  再切读路径。
+- 消费者进度（2026-11-13）：R-07 明日计划已切读 `ticket_state_v1`；触发侧
+  读视图并用 `TICKET_STATE_FILTER` 过滤终态提案；`ticket_entry_proposal` /
+  `ticket_eviction` 已加双读日志但仍按 `stage` 取候选；`holding_plan` 只用
+  `find_active_ticket` 取证据包上下文，不参与候选集合。下一步是双读差异
+  连续归零后切读，切换前不改推送。
 - `stage` 不改语义、不加列；`ticket_event` 不改历史。视图只是把现状摊开，
   不做自动修复。
 - `stale_days` 以最近一次提案事件或 `open_date` 起算，仅是巡检指标，不是
@@ -3680,6 +3681,23 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   待 15:05 重启后下一交易日 09:00/09:25 实测，当前仍不能算 6.5 完成。
 - 当日 6.9 审计：19 个证据包 PASS；`official_filing=19` 仍缺失，
   与上面的公告源状态一致。
+
+**2026-11-13 读路径收口（第一轮）**：
+
+- 生产库只读对账：`ticket_state_v1` 活跃 66 = `entry_proposed` 59
+  （`open` 18 / `triggered` 40 / `invalidated` 1）+ `holding` 6 + `observing` 2；
+  `status_conflict=1`（ticket 173 / 600158：最新事件 `entry_invalidated`，
+  decision 仍 `triggered`）。
+- R-07 明日计划候选查询由内联 `latest_entry` CTE 切到视图
+  （`ACTIVE_WATCH_ROWS_SQL`）：旧 CTE 与新视图在生产库同为 20 行，
+  代码/来源/入池日逐行一致；单测改用真实 schema（含视图），保留
+  A/B/G 保留、C/D/E/F 剔除、已关闭 I 剔除的原断言。
+- 双读日志：`ticket_entry_proposal`（`observing`）与 `ticket_eviction`
+  （`observing`+`entry_proposed`）新增
+  `[票状态][dual] consumer=… rows/open/terminal/none/stale5/sample_open`，
+  只计数、不改变候选集合；视图缺失降级为 warn。
+- 未做：`ticket_entry_proposal` / `ticket_eviction` 仍未切读视图；切换门槛是
+  双读连续若干交易日 `open` 异常=0、阶段与事件差异归零。
 
 **2026-11-11 账户快照与成交补录（影响 T+1/持仓上下文）**：
 

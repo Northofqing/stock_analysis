@@ -680,6 +680,56 @@ pub fn active_ticket_states(conn: &mut SqliteConnection) -> Result<Vec<TicketSta
     .map_err(|error| format!("ticket_state_v1 活跃票查询失败: {error}"))
 }
 
+/// 双读期一个消费者的投影摘要：按 `proposal_status` 分母，不改调用方行为。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConsumerStateSummary {
+    pub rows: usize,
+    pub open: usize,
+    pub terminal: usize,
+    pub none: usize,
+    pub stale5: usize,
+    /// `proposal_status='open'` 的代码样本（最多 8 个），供日志对位。
+    pub open_codes: Vec<String>,
+}
+
+impl ConsumerStateSummary {
+    pub fn sample_open(&self) -> String {
+        self.open_codes.join(",")
+    }
+}
+
+/// 双读：把一个消费者当前仍按 `stage` 取的行，投影到 `ticket_state_v1` 上计数。
+///
+/// 只读、不改变任何调用方的候选集合；视图缺失时返回 Err，由调用方降级为告警。
+/// `stages` 来自各消费者自己的常量谓词，不含外部输入。
+pub fn consumer_state_dual_read(
+    conn: &mut SqliteConnection,
+    stages: &[&str],
+) -> Result<ConsumerStateSummary, String> {
+    let states = active_ticket_states(conn)?;
+    let mut summary = ConsumerStateSummary::default();
+    for state in states
+        .iter()
+        .filter(|state| stages.contains(&state.stage.as_str()))
+    {
+        summary.rows += 1;
+        match state.proposal_status.as_deref() {
+            Some("open") => {
+                summary.open += 1;
+                if summary.open_codes.len() < 8 {
+                    summary.open_codes.push(state.code.clone());
+                }
+            }
+            Some(_) => summary.terminal += 1,
+            None => summary.none += 1,
+        }
+        if state.stale_days.unwrap_or(0) >= 5 {
+            summary.stale5 += 1;
+        }
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +892,72 @@ mod tests {
         assert!(state.status_conflict, "事件与 decision 状态应暴露冲突");
         assert_eq!(state.latest_event_kind.as_deref(), Some("entry_invalidated"));
         assert_eq!(active_ticket_states(&mut conn).expect("active").len(), 1);
+    }
+
+    #[test]
+    fn consumer_state_dual_read_counts_proposal_states() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        create_schema(&mut conn).expect("schema");
+        let open = open_ticket(
+            &mut conn,
+            "000001",
+            "2026-11-13",
+            "entry_proposed",
+            "test",
+            None,
+        )
+        .expect("open ticket");
+        append_event(
+            &mut conn,
+            open,
+            "2026-11-13T09:25:00+08:00",
+            "entry_proposed",
+            None,
+            None,
+            None,
+        )
+        .expect("proposal event");
+        let triggered = open_ticket(
+            &mut conn,
+            "000002",
+            "2026-11-13",
+            "entry_proposed",
+            "test",
+            None,
+        )
+        .expect("triggered ticket");
+        append_event(
+            &mut conn,
+            triggered,
+            "2026-11-13T10:00:00+08:00",
+            "entry_triggered",
+            None,
+            None,
+            None,
+        )
+        .expect("trigger event");
+        // observing 且没有提案事件：计入 none，样本不混进 open。
+        open_ticket(&mut conn, "000003", "2026-11-13", "observing", "test", None)
+            .expect("observing ticket");
+        // 已关闭的票不是活跃票，任何分母都不应包含它。
+        let closed = open_ticket(
+            &mut conn,
+            "000004",
+            "2026-11-13",
+            "entry_proposed",
+            "test",
+            None,
+        )
+        .expect("closed ticket");
+        close_ticket(&mut conn, closed, "2026-11-13", "exited").expect("close ticket");
+
+        let summary = consumer_state_dual_read(&mut conn, &["entry_proposed", "observing"])
+            .expect("dual read");
+        assert_eq!(summary.rows, 3);
+        assert_eq!(summary.open, 1);
+        assert_eq!(summary.terminal, 1);
+        assert_eq!(summary.none, 1);
+        assert_eq!(summary.open_codes, vec!["000001".to_string()]);
+        assert_eq!(summary.stale5, 0);
     }
 }
