@@ -239,6 +239,12 @@ pub struct P01BoundHead {
     pub turnover: Option<f64>,
     /// 炸板次数
     pub break_count: Option<u32>,
+    /// 上一交易日 15:40 提案的区间/突破/放弃（只展示，不进 canonical binding）。
+    pub plan_low: Option<f64>,
+    pub plan_high: Option<f64>,
+    pub plan_trigger: Option<f64>,
+    pub plan_abandon: Option<f64>,
+    pub plan_as_of: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -426,6 +432,11 @@ impl P01InputBinding {
                 sealed_amount: None,
                 turnover: None,
                 break_count: None,
+                plan_low: None,
+                plan_high: None,
+                plan_trigger: None,
+                plan_abandon: None,
+                plan_as_of: None,
             }],
             limit_pools: P01LimitPoolsBinding {
                 request_kind: "Upper",
@@ -643,6 +654,11 @@ pub fn bind_p01_sources(
             sealed_amount: pool.and_then(|entry| entry.sealed_amount).map(|value| value.get()),
             turnover: pool.and_then(|entry| entry.turnover).map(|value| value.get()),
             break_count: pool.and_then(|entry| entry.break_count),
+            plan_low: None,
+            plan_high: None,
+            plan_trigger: None,
+            plan_abandon: None,
+            plan_as_of: None,
         });
     }
 
@@ -1536,10 +1552,12 @@ async fn run_p01_once_with_ports<P: P01Ports>(
         Err(failure) => return failure_outcome(failure),
     }
 
-    let input = match ports.load(context, observed_at).await {
+    let mut input = match ports.load(context, observed_at).await {
         Ok(input) => input,
         Err(failure) => return failure_outcome(failure),
     };
+    // 只展示上一交易日 15:40 提案的价位；不改 binding 结构，但会进入渲染文本哈希。
+    enrich_p01_plans(&mut input);
     // 推送成功后要开票记账；input 随后会被 move 进 P01PreparedAttempt
     let bookkeeping_heads = input.heads.clone();
     let mode = render_mode(mode);
@@ -1595,6 +1613,57 @@ async fn run_p01_once_with_ports<P: P01Ports>(
         record_p01_tickets(context, &bookkeeping_heads, observed_at, &filings);
     }
     outcome.with_source_evidence_sha256(source_evidence_sha256)
+}
+
+/// 用 `evidence_date` 当天的 15:40 提案补 P01 展示价位。
+/// 只展示，不改 binding 结构；取不到就留空，不阻塞推送。
+fn enrich_p01_plans(input: &mut P01InputBinding) {
+    use diesel::RunQueryDsl;
+
+    let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+        return;
+    };
+    let Ok(mut conn) = db.get_conn() else {
+        return;
+    };
+    let as_of = input.context.evidence_date.format("%Y-%m-%d").to_string();
+    for head in &mut input.heads {
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            context_json: String,
+        }
+        let row = diesel::sql_query(
+            "SELECT context_json FROM ticket_decision \
+             WHERE code = ?1 AND as_of = ?2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&head.code)
+        .bind::<diesel::sql_types::Text, _>(&as_of)
+        .get_result::<Row>(&mut conn)
+        .ok();
+        let Some(row) = row else {
+            continue;
+        };
+        #[derive(serde::Deserialize)]
+        struct Ctx {
+            #[serde(default)]
+            price_low: Option<f64>,
+            #[serde(default)]
+            price_high: Option<f64>,
+            #[serde(default)]
+            trigger_level: Option<f64>,
+            #[serde(default)]
+            abandon: Option<f64>,
+        }
+        let Ok(ctx) = serde_json::from_str::<Ctx>(&row.context_json) else {
+            continue;
+        };
+        head.plan_low = ctx.price_low;
+        head.plan_high = ctx.price_high;
+        head.plan_trigger = ctx.trigger_level;
+        head.plan_abandon = ctx.abandon;
+        head.plan_as_of = Some(as_of.clone());
+    }
 }
 
 /// P01 证据包用公告：只在运行时已配置 ExternalV1 bundle 时拉取，

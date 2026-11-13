@@ -18405,6 +18405,22 @@ pub fn render_bound_preopen_news_hot(
             "  价格: {}｜昨日涨停（不追高），等回踩/突破；情绪型竞价参考价见 09:25\n",
             facts.join("｜")
         ));
+        if let (Some(low), Some(high)) = (head.plan_low, head.plan_high) {
+            let mut plan = format!("  计划: 区间 {low:.2}~{high:.2}");
+            if let Some(trigger) = head.plan_trigger {
+                plan.push_str(&format!("｜突破 {trigger:.2}"));
+            }
+            if let Some(abandon) = head.plan_abandon {
+                plan.push_str(&format!("｜放弃 {abandon:.2}"));
+            }
+            if let Some(as_of) = &head.plan_as_of {
+                plan.push_str(&format!("（{as_of} 提案）"));
+            }
+            text.push_str(&plan);
+            text.push('\n');
+        } else {
+            text.push_str("  计划: 无（等 15:40 生成）\n");
+        }
     }
     text.push_str("辅助建议, 非下单指令");
     Ok(text)
@@ -23438,7 +23454,22 @@ mod tests {
         assert!(text.contains("样本分类: TEST_CODE_AI_CHAIN"));
         assert!(text.contains("TEST_CODE_PROVIDER_HEADLINE"));
         assert!(text.contains("TEST_CODE_IDENTITY_NAME(TEST_CODE_000001)"));
+        assert!(text.contains("计划: 无（等 15:40 生成）"));
         assert!(text.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn p01_render_shows_evidence_date_plan_levels() {
+        let mut input = crate::p01::P01InputBinding::complete_test_input();
+        let head = &mut input.heads[0];
+        head.plan_low = Some(10.25);
+        head.plan_high = Some(10.40);
+        head.plan_trigger = Some(10.85);
+        head.plan_abandon = Some(9.21);
+        head.plan_as_of = Some("2026-08-17".to_owned());
+        let text =
+            render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
+        assert!(text.contains("计划: 区间 10.25~10.40｜突破 10.85｜放弃 9.21（2026-08-17 提案）"));
     }
 
     #[test]

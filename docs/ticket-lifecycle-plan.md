@@ -4154,28 +4154,34 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
   出（持仓止损参考线/减仓区/动作倾向）、状态（进入区间/高于区间/低于区间/
   已触发/已跌破放弃）、缺失项。指标一律日线口径并标注 `as_of`；
   没有分钟数据就不冒充盘中指标。
-- **7.2 P01 可执行化（未做）**：P01 正文逐票追加“能不能买 + 回踩区间/突破确认/
-  放弃价 + 指标摘要”；昨日涨停标“不追高”，不再把涨停票当可直接买入的推荐。
-  数据取 `ticket_decision` 最新提案 + 指标缓存（盘后算好，09:00 只读）。
+- **7.2 P01 可执行化（第一版已落 2026-11-13）**：P01 正文逐票追加价格事实
+  （昨收/连板/封单/炸板）与“昨日涨停·不追高，等回踩/突破”，并用
+  `evidence_date` 当天的 `ticket_decision` 追加“计划: 区间 lo~hi｜突破 x｜放弃 y
+  （MM-DD 提案）”；没有提案写“计划: 无（等 15:40 生成）”。
+  未做：量比/指标摘要、无提案时 `buy_zone` 临时参考。
 - **7.3 盘中感知（未做）**：09:25/定向监控/突破确认正文附一行指标与区间状态，
   仅在状态变化（进入区间/触发/失效）时推；盘中仍只叠现价/涨跌幅/量比，
   日线指标明确标注日期。
 - **7.4 分钟级指标（未做，依赖数据源）**：先评估 ExternalV1/腾讯 5 分钟线；
   没有可用源就不做盘中 MACD，不用日线值冒充。T0Evidence 恢复另见 A2。
-- **7.5 验收（未做）**：任取一个持仓/提案，卡上必须能回答“现在什么状态、
-  进价在哪、放弃/止损在哪、指标和量能什么状态”；缺数据必须出现在 missing。
+- **7.5 验收（部分已落）**：决策卡 CLI 实跑（600703）已能回答“现在什么状态、
+  进价在哪、放弃/止损在哪、指标和量能什么状态”，缺数据进 `missing`；09:25 已带
+  竞价量比/日线指标/提案状态；P01 已带价格事实＋上一交易日计划价位。
+  未覆盖：量比未参与触发（只显示）、无分钟级指标、成交回执仍缺。
 
-**7.2 P01 可执行化（设计，未实现）**：
+**7.2 P01 可执行化（已落价格计划行；量比/指标未做）**：
 
-- 每只 head 追加：能否买（昨日涨停/一字/高开帽）、回踩区间、突破确认、
-  放弃价、量比、指标摘要（MACD/KDJ/RSI 日线口径）。
-- 数据来源：优先读 15:40 的 `ticket_decision`；没有提案时用
-  `buy_zone::compute(as_of=上一交易日)` 生成**临时参考**并标 `provisional`，
-  不写成正式提案。
-- 渲染示例：`进 10.25-10.40｜突破 10.85｜放弃 9.21｜量比 1.84｜MACD 金叉 柱+0.05`；
-  昨日涨停写 `昨日涨停·不追高，等回踩/突破`，不得出现“可买/建议买入”。
-- 兼容：沿用 P01BoundHead 已有的展示字段（`recommend_price/streak/sealed_amount/
-  turnover/break_count` 已在绑定里但不进 canonical hash），不新增 source binding。
+- 已落：`P01BoundHead` 的 `recommend_price/streak/sealed_amount/turnover/break_count`
+  渲染为「价格: 昨收 x｜连板 n｜封单 x亿/万｜炸板 n」；昨日涨停写
+  「昨日涨停（不追高），等回踩/突破；情绪型竞价参考价见 09:25」。
+- 已落：`enrich_p01_plans` 按 `code + evidence_date` 读 `ticket_decision.context_json`，
+  渲染「计划: 区间 lo~hi｜突破 x｜放弃 y（MM-DD 提案）」；无提案写
+  「计划: 无（等 15:40 生成）」。价位只展示，不参与给价；计划字段不在
+  `P01CanonicalSourceBinding` 结构里，但会改变 `rendered_content_sha256`。
+- 未落：量比与 MACD/KDJ/RSI 摘要（避免 09:00 再读一遍日线；留给 7.3 复用
+  `ticket_card::daily_tech_before`）；无提案时 `buy_zone::compute(上一交易日)`
+  的 `provisional` 临时参考（当前只写“无”，不伪造）。
+- 兼容：不新增 source binding；`P01BoundHead` 新字段只用于渲染。
 
 **7.3 09:25/盘中感知（设计，未实现）**：
 
@@ -4192,21 +4198,21 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 | 优先级 | 缺口 | 证据 | 影响 | 处理 |
 |---|---|---|---|---|
 | P0 | 量比不参与决策 | `EntryPolicy::evaluate_with_trigger_level` 只判价位；`confirmation=price_only`、`missing_fields` 含 `volume_ratio`（`ticket_decision.rs:11-12,348-403`）；`buy_zone.volume_ratio` 只展示（`buy_zone.rs:421,467`） | 提案文案写“量比>1.2 才算有效”，系统实际不校验；用户看到的是未兑现的条件 | 7.3 要么把量比纳入触发，要么文案改成“量比未校验” |
-| P0 | P01 有价不显示 | `P01BoundHead` 已有 `recommend_price/streak/sealed_amount/turnover/break_count`（`p01.rs:220-242`），`render_bound_preopen_news_hot` 只用 name/code/concept/news（`push_templates.rs:18353-18373`） | 盘前热点只有故事，没有价格/买点 | 7.2 |
-| P0 | 09:25/定向监控/R-07 无量比/指标 | `PriceLine` 无 volume 字段（`ticket_auction_price.rs:128-149`）；定向监控只 render code/name/price/change（`watch_pool_monitor.rs:63-68`）；R-07 只有 trigger/lo/hi/stop/reason（`push_templates.rs:2849-2878`） | 用户“感知不到走势/量能/指标” | 7.3 |
+| P0 | P01 有价不显示 | `P01BoundHead` 已有 `recommend_price/streak/sealed_amount/turnover/break_count`（`p01.rs:220-242`），`render_bound_preopen_news_hot` 只用 name/code/concept/news（`push_templates.rs:18353-18373`） | 盘前热点只有故事，没有价格/买点 | 已落：价格行（2026-11-13） |
+| P0 | 09:25/定向监控/R-07 无量比/指标 | `PriceLine` 无 volume 字段（`ticket_auction_price.rs:128-149`）；定向监控只 render code/name/price/change（`watch_pool_monitor.rs:63-68`）；R-07 只有 trigger/lo/hi/stop/reason（`push_templates.rs:2849-2878`） | 用户“感知不到走势/量能/指标” | 09:25/定向监控已落；R-07 仍未落 |
 | P0 | 持仓只有成本止损 | `holding_plan::position_intent` 只用 `cost*0.92` 与浮盈阈值（`holding_plan.rs:36-60`），无 MA20/ATR/结构位 | 深度浮亏时“止损线”远高于现价，不可执行 | 卡已标“已跌破”；技术止损单列规则，先不擅自加 |
 | P1 | 无分钟 K | `sqlite_master` 无 minute/kline 表；TDX 5min 源不可用（A2） | 盘中 MACD/KDJ 做不了 | 7.4，先评估 ExternalV1/腾讯分钟线 |
 | P1 | `is_limit_up` 死字段 | `stock_daily` 11-10..11-12 `SUM(is_limit_up)=0`；无 `SELECT ... FROM stock_daily` 消费者；现用 `pct_chg >= limit_up_pct` 计算 | 任何依赖该列的判断都会误判 | 不使用该列；后续清理或回填 |
 | P1 | 零宽区间 | 23 个 open 提案中 4 个 `low=high`（002419/300757/002436/301366，均 breakout） | 卡片显示“4.83-4.83”，像坏数据 | 渲染改“突破触发 X”，或修 buy_zone 区间 |
-| P1 | P01 当天无入场计划 | P01 09:00 开票 `observing`，提案要等 15:40；早上只有新闻 | 热点票当天没有可执行价位 | 7.2 临时 buy_zone |
+| P1 | P01 当天无入场计划 | P01 09:00 开票 `observing`，提案要等 15:40；早上只有新闻 | 热点票当天没有可执行价位 | 已落：读 `evidence_date` 提案；无提案写“无”（临时 buy_zone 未做） |
 | P1 | 成交回执缺失 | `ticket_signal_execution` 只是信号结果账本，不是用户成交；paper 账本 0 条 `Executed`（12.8）；用户当天真实买入要等下一份快照才进持仓 | 触发了也不知道你买没买，“什么时候出”只能等快照 | 先明确“信号≠持仓”；成交回执另立（paper/券商导入） |
 | P1 | 定向监控重复、无状态机 | 今天 106 条定向监控，同一票最多 8 条（603381）；`WatchAlert` 只有价格/涨跌幅/原因，无每日每票上限、无量比/区间 | 信息密度低，真正的“进入区间/失效”被淹没 | 7.3 改成状态变化才推 + 附区间/量比 |
 | P1 | OrderBook 能力只由 T0Evidence 标记 | `mark_capability_success(Capability::OrderBook)` 唯一调用在 `grpc_source.rs:4816` 的 T0 完整批次；T0 死则 OrderBook 恒 missing | 腾讯五档可用也不被 DataMode 承认；09:25 只能写“不含承接判断” | 单独评估：是否允许 ExternalV1/腾讯五档标 OrderBook（改证据口径，需拍板） |
 | P1 | 09:25 只覆盖情绪型 | `ticket_auction_price` 只处理 `Regime::Emotion`（`ticket_auction_price.rs:19,642`） | 趋势型早上没有复核，只有前晚 R-07 | 7.2/7.3 决定是否给趋势型补一条“今日复核” |
 | P1 | 指标参数口径未确认 | MACD 6/13/5、SKDJ 40/5、KDJ 9/3/3、RSI 6/12/24（`indicators/mod.rs`） | 与你软件里的默认参数可能不同，数值会不一致 | 确认是否改用标准 MACD 12/26/9；确认后写进卡和文档 |
 | P1 | 实时账户未接入 | 09:25/持仓正文写「实时账户未接入」；成本/数量来自最新快照，盘中可用数量未知 | 盘中减仓/止损动作可能撞 T+1；浮盈亏是快照口径 | 6.4/12.10 已记录；需券商实时可用量或明确“按快照” |
-| P1 | P01 可成交性已实测为 0/3 | 0.15 实测（`9d87c0603`）：P01 alpha +5.18%，但可成交 0/3 | 与“热点涨停进不去”完全一致，不是感觉 | 7.2 改为“不追涨停，给回踩/突破/放弃” |
-| P1 | 决策卡未判 T+1 | `build_card` 调 `position_intent(price, cost, false)`，固定按未锁定；09:25 路径会读 `trade_ledger::today_bought_quantities` | 当天买入的持仓可能被建议“减仓观察”，但实际不可卖 | 卡片接入同一锁定量；盘中/推送必须复用 |
+| P1 | P01 可成交性已实测为 0/3 | 0.15 实测（`9d87c0603`）：P01 alpha +5.18%，但可成交 0/3 | 与“热点涨停进不去”完全一致，不是感觉 | 已改为“不追涨停 + 上一交易日计划价位” |
+| P1 | 决策卡未判 T+1 | `build_card` 调 `position_intent(price, cost, false)`，固定按未锁定；09:25 路径会读 `trade_ledger::today_bought_quantities` | 当天买入的持仓可能被建议“减仓观察”，但实际不可卖 | 决策卡 CLI 已落（`bought_quantities_on`）；09:25 仍按未锁定 |
 | P2 | 无跟踪止盈/技术止损 | 只有 `cost*0.92` 与浮盈阈值；无移动止盈、MA20/ATR/结构位 | 盈利回撤与趋势破坏没有退出规则 | 单独立规则，先在文档评审，不擅自加 |
 | P2 | ST 5% 涨停未识别 | `ticket_regime::limit_up_pct` 只分 20cm/10cm（`ticket_regime.rs:99-110`），ST 5% 不会被标涨停 | 卡对 ST 票的“昨日涨停”判断可能漏 | 需要 ST 标记输入（`stock_position.is_st`/名称）后再补 |
 | P2 | P-02 竞价量能有量比但无价位 | `render_auction_volume` 有逐票高开%/量比，无入场/放弃价（`push_templates.rs:2168-2212`） | 量能榜和 09:25 参考价是两条消息，没合成一张卡 | 7.3 合并或交叉引用 |
