@@ -4201,7 +4201,7 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 | 优先级 | 缺口 | 证据 | 影响 | 处理 |
 |---|---|---|---|---|
 | P0 | 量比不参与决策 | `EntryPolicy::evaluate_with_trigger_level` 只判价位；`confirmation=price_only`、`missing_fields` 含 `volume_ratio`（`ticket_decision.rs:11-12,348-403`）；`buy_zone.volume_ratio` 只展示（`buy_zone.rs:421,467`） | 提案文案写“量比>1.2 才算有效”，系统实际不校验；用户看到的是未兑现的条件 | 7.3 要么把量比纳入触发，要么文案改成“量比未校验” |
-| P0 | P01 有价不显示 | `P01BoundHead` 已有 `recommend_price/streak/sealed_amount/turnover/break_count`（`p01.rs:220-242`），`render_bound_preopen_news_hot` 只用 name/code/concept/news（`push_templates.rs:18353-18373`） | 盘前热点只有故事，没有价格/买点 | 已落：价格行（2026-11-13） |
+| P0 | P01 有价不显示 | `P01BoundHead` 已有 `recommend_price/streak/sealed_amount/turnover/break_count`（`p01.rs:220-242`），`render_bound_preopen_news_hot` 只用 name/code/concept/news（`push_templates.rs:18353-18373`） | 盘前热点只有故事，没有价格/买点 | 已落：价格行＋计划价位＋日线指标（2026-11-13） |
 | P0 | 09:25/定向监控/R-07 无量比/指标 | `PriceLine` 无 volume 字段（`ticket_auction_price.rs:128-149`）；定向监控只 render code/name/price/change（`watch_pool_monitor.rs:63-68`）；R-07 只有 trigger/lo/hi/stop/reason（`push_templates.rs:2849-2878`） | 用户“感知不到走势/量能/指标” | 09:25/定向监控已落；R-07 仍未落 |
 | P0 | 持仓只有成本止损 | `holding_plan::position_intent` 只用 `cost*0.92` 与浮盈阈值（`holding_plan.rs:36-60`），无 MA20/ATR/结构位 | 深度浮亏时“止损线”远高于现价，不可执行 | 卡已标“已跌破”；技术止损单列规则，先不擅自加 |
 | P1 | 无分钟 K | `sqlite_master` 无 minute/kline 表；TDX 5min 源不可用（A2） | 盘中 MACD/KDJ 做不了 | 7.4，先评估 ExternalV1/腾讯分钟线 |
