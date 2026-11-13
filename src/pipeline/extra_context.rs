@@ -34,7 +34,7 @@ fn compose_extra_context(
     chip_section: &str,
     chain_note: Result<Option<String>, String>,
 ) -> ExtraContext {
-    let mut section = crate::capital_flow::format_for_prompt(flow, shape);
+    let mut section = crate::capital_flow::format_for_prompt(flow, shape, None);
     if !chip_section.is_empty() {
         section.push_str(chip_section);
     }

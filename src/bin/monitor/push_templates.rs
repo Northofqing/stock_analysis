@@ -11755,7 +11755,15 @@ async fn build_review_ai_section(items: &[PositionReviewItem]) -> String {
                     secs,
                     path.display()
                 );
-                lines.push(format!("AI研判 {}({}) 详细报告已归档", item.name, code));
+                lines.push(format!(
+                    "AI研判 {}({}) 已归档（{}）",
+                    item.name,
+                    code,
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("报告文件名缺失")
+                ));
+
             }
             Ok(ReviewAiWorkerOutcome::Completed(Err(error))) => {
                 log::warn!(

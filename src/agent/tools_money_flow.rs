@@ -1,5 +1,6 @@
 use crate::agent::tool::Tool;
 use crate::capital_flow::{format_for_prompt, IntradayShape, MoneyFlowSummary};
+use crate::data_gateway::{CompanyDataGateway, GatewayBatch};
 use crate::data_provider::service::service;
 use async_trait::async_trait;
 use serde_json::json;
@@ -23,6 +24,7 @@ fn format_complete_fund_flow_context(
     code: &str,
     flow_result: anyhow::Result<Arc<MoneyFlowSummary>>,
     shape_result: anyhow::Result<Arc<IntradayShape>>,
+    float_market_cap_yuan: Option<f64>,
 ) -> anyhow::Result<String> {
     let flow = flow_result
         .map_err(|error| anyhow::anyhow!("[{code}] money-flow batch unavailable: {error:#}"))?;
@@ -39,7 +41,7 @@ fn format_complete_fund_flow_context(
         }
     };
 
-    let mut prompt = format_for_prompt(&flow, &shape);
+    let mut prompt = format_for_prompt(&flow, &shape, float_market_cap_yuan);
     if let Some(note) = shape_missing {
         prompt.push_str(&format!("\n{note}\n"));
     }
@@ -79,9 +81,22 @@ impl Tool for FetchFundFlowTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
 
         let svc = service();
-        let (flow_result, shape_result) =
-            tokio::join!(svc.get_money_flow(code, 5), svc.get_intraday_shape(code),);
-        format_complete_fund_flow_context(code, flow_result, shape_result)
+        let gateway = CompanyDataGateway::new();
+        let codes = vec![code.to_string()];
+        // 20 日窗口用于四周期（5/10/20）判断；流通市值用于“净流入占流通市值”量级归一。
+        let (flow_result, shape_result, stats_result) = tokio::join!(
+            svc.get_money_flow(code, 20),
+            svc.get_intraday_shape(code),
+            gateway.market_statistics(&codes),
+        );
+        let float_market_cap = match stats_result {
+            Ok(GatewayBatch::Available { records, .. }) => records
+                .first()
+                .and_then(|stats| stats.floating_market_cap().or_else(|| stats.total_market_cap()))
+                .map(|value| value.get()),
+            _ => None,
+        };
+        format_complete_fund_flow_context(code, flow_result, shape_result, float_market_cap)
     }
 }
 
@@ -110,12 +125,15 @@ mod tests {
             Err(anyhow::anyhow!(
                 "Magic TDX intraday-shape gateway unavailable"
             )),
+            Some(20_000_000_000.0),
         )
         .expect("real fund flow must survive a supplemental shape failure");
 
         assert!(rendered.contains("主力资金流向"));
         assert!(rendered.contains("[数据缺失: IntradayShape]"));
         assert!(rendered.contains("Magic TDX intraday-shape gateway unavailable"));
+        // 1 天 1 亿 / 流通市值 200 亿 = +0.50%
+        assert!(rendered.contains("5日 +0.50%"));
     }
 
     #[test]
@@ -147,6 +165,7 @@ mod tests {
             "TEST_CODE_600001",
             Ok(Arc::new(flow)),
             Ok(Arc::new(shape)),
+            None,
         )
         .expect("complete admitted context");
 

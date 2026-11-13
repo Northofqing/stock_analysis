@@ -118,7 +118,11 @@ pub struct IntradayShape {
     pub present: bool,
 }
 
-pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> String {
+pub fn format_for_prompt(
+    flow: &MoneyFlowSummary,
+    shape: &IntradayShape,
+    float_market_cap_yuan: Option<f64>,
+) -> String {
     let mut output = String::new();
     if !flow.is_empty() {
         output.push_str("\n【主力资金流向（真实口径，单位：亿元）】\n");
@@ -146,11 +150,40 @@ pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> Stri
                 day.big_net / 1e8,
             ));
         }
+        let days = flow.days.len();
         output.push_str(&format!(
-            "近3日主力累计净流入: {:+.2}亿 | 近5日: {:+.2}亿\n",
+            "近3日主力累计净流入: {:+.2}亿 | 近5日: {:+.2}亿 | 近10日: {:+.2}亿 | 近20日: {:+.2}亿（可用 {} 个交易日）\n",
             flow.recent_main_sum(3) / 1e8,
-            flow.recent_main_sum(5) / 1e8
+            flow.recent_main_sum(5) / 1e8,
+            flow.recent_main_sum(10) / 1e8,
+            flow.recent_main_sum(20) / 1e8,
+            days
         ));
+        let sign = |value: f64| {
+            if value > 0.0 {
+                "+"
+            } else if value < 0.0 {
+                "-"
+            } else {
+                "0"
+            }
+        };
+        output.push_str(&format!(
+            "四周期方向（当日/5日/10日/20日）: {}/{}/{}/{}\n",
+            sign(flow.recent_main_sum(1)),
+            sign(flow.recent_main_sum(5)),
+            sign(flow.recent_main_sum(10)),
+            sign(flow.recent_main_sum(20)),
+        ));
+        if let Some(cap) = float_market_cap_yuan.filter(|value| *value > 0.0) {
+            output.push_str(&format!(
+                "净流入占流通市值: 5日 {:+.2}% | 10日 {:+.2}% | 20日 {:+.2}%（流通市值 {:.1}亿；≥+1% 视为主力进攻，0.2% 只是温和）\n",
+                flow.recent_main_sum(5) / cap * 100.0,
+                flow.recent_main_sum(10) / cap * 100.0,
+                flow.recent_main_sum(20) / cap * 100.0,
+                cap / 1e8
+            ));
+        }
     }
     if shape.present {
         output.push_str("\n【日内分时形态】\n");
@@ -203,6 +236,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.days[0].pct_chg, None);
-        assert!(format_for_prompt(&summary, &IntradayShape::default()).contains("缺失"));
+        let rendered = format_for_prompt(&summary, &IntradayShape::default(), Some(2_000_000_000.0));
+        assert!(rendered.contains("缺失"));
+        // 四周期累计 + 方向 + 占流通市值归一（1 个交易日数据时，各周期都取该日）
+        assert!(rendered.contains("近10日"));
+        assert!(rendered.contains("近20日"));
+        assert!(rendered.contains("四周期方向（当日/5日/10日/20日）: +/+/+/+"));
+        assert!(rendered.contains("净流入占流通市值"));
+    }
+
+    #[test]
+    fn multi_period_sums_and_ratio_use_only_the_requested_window() {
+        let mut days = Vec::new();
+        for index in 0..20 {
+            days.push(MoneyFlowDay {
+                date: format!("2026-07-{:02}", index + 1),
+                main_net: 1e8,
+                xl_net: 0.0,
+                big_net: 0.0,
+                main_pct: 1.0,
+                pct_chg: None,
+            });
+        }
+        let summary = MoneyFlowSummary { days };
+        let rendered = format_for_prompt(&summary, &IntradayShape::default(), Some(1e10));
+        assert!(rendered.contains("近5日: +5.00亿"));
+        assert!(rendered.contains("近10日: +10.00亿"));
+        assert!(rendered.contains("近20日: +20.00亿"));
+        // 20 亿 / 100 亿流通市值 = +20%
+        assert!(rendered.contains("20日 +20.00%"));
     }
 }
