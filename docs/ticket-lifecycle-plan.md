@@ -4312,6 +4312,22 @@ OrderBook 口径、T0 选项。
   旧二进制备份 `target/release/monitor.bak-20261113-1625`。二进制字节校验含
   “竞价量比 / 未参与触发 / 日线( / 提案：区间 / 昨日涨停（不追高） / 仅复盘”。
 
+**2026-11-13 第二批（定向监控）实施状态**：
+
+- `WatchAlert` 增加 `volume_price_note / plan_note / state_key`；每条异动第二行输出
+  “量价 缩量回调｜5日量比 0.73｜提案 区间 10.25~10.85｜低于下沿”。
+- `state_key` 取 `in_zone/above/below/abandon/no_plan/no_proposal/no_range`；
+  调用方去重键改为 `(票, 级别, 状态)`：同状态仍 30 分钟一次，状态变化立即推。
+- 单测 `monitor::watch_pool_monitor` 6/6 通过（含量价/提案渲染、状态分类）。
+- 未部署；runtime 差异只有 `watch_pool_monitor.rs`（188 行/5 hunk）、`main.rs`
+  （20 行/1 hunk）、`ticket_card.rs`（+10 行）三处，均是本次改动。
+- **2026-11-13 17:24 已部署**：runtime release `monitor` 55,011,752 bytes；pid 48341；
+  `startup_health_check=degraded`（`perf_recent`，按惯例）；旧二进制备份
+  `target/release/monitor.bak-20261113-1700`。二进制校验含“量价 / 提案 / 跌破放弃 /
+  高于上沿 / 低于下沿 / 在区间内 / state=”；实盘验收看 11-16 09:30 后的定向监控。
+- 未做：降噪策略（每票每日上限、60 分钟窗）还没定；今天 106 条、单票最多 8 条是
+  30 分钟/票/级别造成的，改窗口或上限需要拍板。
+
 **当前状态**：7.1 已实跑（2026-11-13，生产库副本只读，6 持仓 + 002205 共 7 张卡）：
 
 ```
