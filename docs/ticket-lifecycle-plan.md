@@ -3675,8 +3675,9 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   根因已定位：`ExternalQueryMethod` 没有 `Announcements` 变体，按票公告的
   ExternalV1 请求在本地路由前就被拒绝；已补 `OPERATION_ANNOUNCEMENTS`、
   `/MarketDataService/Announcements`、local/external operation 映射、
-  response 解析和 client 调用，提交 `3d4bbca43`。待 15:05 重启后下一交易日
-  09:00/09:25 实测，当前仍不能算 6.5 完成。
+  response 解析和 client 调用，提交 `3d4bbca43`；路由单测
+  `single_instrument_announcements_use_exact_rpc_path` 1/1 通过。
+  待 15:05 重启后下一交易日 09:00/09:25 实测，当前仍不能算 6.5 完成。
 - 当日 6.9 审计：19 个证据包 PASS；`official_filing=19` 仍缺失，
   与上面的公告源状态一致。
 
