@@ -95,9 +95,17 @@ T0Advice 在 T0 修好前继续显式 unavailable，绝不用 stale T0 标记 Or
 - 结论修正：`服务端内部错误` 是 T0Evidence 对上游 TDX 失败的封装，不是桥接 bug。
   首选修法应从“修桥接”改为“换可用 TDX 行情源（付费/自建）”；继续修桥不会恢复做T。
 - 影响边界：RealtimeQuotes 的 Tdx 臂同样连续失败（13:32 已 213 次熔断），但有
-  Sina/Tencent 兜底；T0 在 BR-153 下无备源，所以 `T0Advice` 从 10-22 起为 0。
+  Sina/Tencent 兜底；T0 在 BR-153 下无备源，所以 `T0Advice` 在 10-22 之后为 0。
 - 待拍板（未执行）：B 换 TDX 源 / C 放开 BR-153 用腾讯五档 / D 只做持仓动作盘中提醒。
   拍板前不改 BR-153、不放宽 5s 门、不改 T0 证据口径。
+- 消失时间线（2026-11-13 复核）：最后一条做T是 10-22 13:51 的 002421，
+  当时正文已带「⚠️时间不可信（超 5s 门）」——即先退化为“拿到但陈旧”，
+  再退化为“拿不到”。10-23 monitor 盘中几乎没跑（push_log 6 条 vs 10-21/22
+  的 93/87），10-24/25 周末；10-26 起 IntradayMarket/HoldingPlan/PreopenNewsHot
+  全部恢复（push_log 286 条），只有 T0Advice 仍为 0。`data_acquisition_audit`
+  的 `OpeningLive-T0Evidence` 最后一批是 10-22T05:52Z，之后再无任何 T0 批次；
+  同窗口 `OpeningLive-GrpcBridge` 的 `no_verified_batch` 从 10-22 的 19 条
+  跳到 10-26 起每天 258~337 条。
 
 失败模式：备选盘口只有五档、深度不足，必须标“浅盘口”，不能写成完整 OrderBook。
 
