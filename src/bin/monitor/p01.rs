@@ -245,6 +245,8 @@ pub struct P01BoundHead {
     pub plan_trigger: Option<f64>,
     pub plan_abandon: Option<f64>,
     pub plan_as_of: Option<String>,
+    /// 上一交易日收盘后的日线指标摘要（只展示）。
+    pub tech_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -437,6 +439,7 @@ impl P01InputBinding {
                 plan_trigger: None,
                 plan_abandon: None,
                 plan_as_of: None,
+                tech_note: None,
             }],
             limit_pools: P01LimitPoolsBinding {
                 request_kind: "Upper",
@@ -659,6 +662,7 @@ pub fn bind_p01_sources(
             plan_trigger: None,
             plan_abandon: None,
             plan_as_of: None,
+            tech_note: None,
         });
     }
 
@@ -1627,7 +1631,15 @@ fn enrich_p01_plans(input: &mut P01InputBinding) {
         return;
     };
     let as_of = input.context.evidence_date.format("%Y-%m-%d").to_string();
+    let before = input.context.business_date.format("%Y-%m-%d").to_string();
     for head in &mut input.heads {
+        head.tech_note = stock_analysis::monitor::ticket_card::daily_note_before(
+            &mut conn,
+            &head.code,
+            &before,
+        )
+        .ok()
+        .flatten();
         #[derive(diesel::QueryableByName)]
         struct Row {
             #[diesel(sql_type = diesel::sql_types::Text)]

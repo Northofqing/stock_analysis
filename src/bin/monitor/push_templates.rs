@@ -18429,6 +18429,9 @@ pub fn render_bound_preopen_news_hot(
         } else {
             text.push_str("  计划: 无（等 15:40 生成）\n");
         }
+        if let Some(note) = &head.tech_note {
+            text.push_str(&format!("  指标: {note}\n"));
+        }
     }
     text.push_str("辅助建议, 非下单指令");
     Ok(text)
@@ -23475,9 +23478,16 @@ mod tests {
         head.plan_trigger = Some(10.85);
         head.plan_abandon = Some(9.21);
         head.plan_as_of = Some("2026-08-17".to_owned());
+        head.tech_note = Some(
+            "日线(08-17)：MACD 金叉 柱0.05｜KDJ 70/60/90｜SKDJ 40/35/45｜RSI 62/55/48｜量价 放量上涨｜5日量比 2.50"
+                .to_owned(),
+        );
         let text =
             render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
         assert!(text.contains("计划: 区间 10.25~10.40｜突破 10.85｜放弃 9.21（2026-08-17 提案）"));
+        assert!(text.contains(
+            "指标: 日线(08-17)：MACD 金叉 柱0.05｜KDJ 70/60/90｜SKDJ 40/35/45｜RSI 62/55/48｜量价 放量上涨｜5日量比 2.50"
+        ));
     }
 
     #[test]

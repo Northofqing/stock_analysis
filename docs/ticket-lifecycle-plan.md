@@ -4158,7 +4158,8 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
   （昨收/连板/封单/炸板）与“昨日涨停·不追高，等回踩/突破”，并用
   `evidence_date` 当天的 `ticket_decision` 追加“计划: 区间 lo~hi｜突破 x｜放弃 y
   （MM-DD 提案）”；没有提案写“计划: 无（等 15:40 生成）”。
-  未做：量比/指标摘要、无提案时 `buy_zone` 临时参考。
+  已落：逐票“指标: 日线(MM-DD) …”行（09:00 只读 `business_date` 前已收盘日线）。
+  未做：无提案时 `buy_zone` 临时参考。
 - **7.3 盘中感知（未做）**：09:25/定向监控/突破确认正文附一行指标与区间状态，
   仅在状态变化（进入区间/触发/失效）时推；盘中仍只叠现价/涨跌幅/量比，
   日线指标明确标注日期。
@@ -4166,10 +4167,10 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
   没有可用源就不做盘中 MACD，不用日线值冒充。T0Evidence 恢复另见 A2。
 - **7.5 验收（部分已落）**：决策卡 CLI 实跑（600703）已能回答“现在什么状态、
   进价在哪、放弃/止损在哪、指标和量能什么状态”，缺数据进 `missing`；09:25 已带
-  竞价量比/日线指标/提案状态；P01 已带价格事实＋上一交易日计划价位。
+  竞价量比/日线指标/提案状态；P01 已带价格事实＋上一交易日计划价位＋日线指标摘要。
   未覆盖：量比未参与触发（只显示）、无分钟级指标、成交回执仍缺。
 
-**7.2 P01 可执行化（已落价格计划行；量比/指标未做）**：
+**7.2 P01 可执行化（已落价格计划行＋日线指标；量比未做）**：
 
 - 已落：`P01BoundHead` 的 `recommend_price/streak/sealed_amount/turnover/break_count`
   渲染为「价格: 昨收 x｜连板 n｜封单 x亿/万｜炸板 n」；昨日涨停写
@@ -4178,9 +4179,11 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
   渲染「计划: 区间 lo~hi｜突破 x｜放弃 y（MM-DD 提案）」；无提案写
   「计划: 无（等 15:40 生成）」。价位只展示，不参与给价；计划字段不在
   `P01CanonicalSourceBinding` 结构里，但会改变 `rendered_content_sha256`。
-- 未落：量比与 MACD/KDJ/RSI 摘要（避免 09:00 再读一遍日线；留给 7.3 复用
-  `ticket_card::daily_tech_before`）；无提案时 `buy_zone::compute(上一交易日)`
-  的 `provisional` 临时参考（当前只写“无”，不伪造）。
+- 已落：`ticket_card::daily_note_before` 读 `business_date` 前已收盘日线，输出
+  “指标: 日线(MM-DD)：MACD …｜KDJ …｜SKDJ …｜RSI …｜量价 …｜5日量比 …”；
+  没有日线就不输出该行，不补 0。
+- 未落：无提案时 `buy_zone::compute(上一交易日)` 的 `provisional` 临时参考
+  （当前只写“无”，不伪造）。
 - 兼容：不新增 source binding；`P01BoundHead` 新字段只用于渲染。
 
 **7.3 09:25/盘中感知（设计，未实现）**：
@@ -4373,6 +4376,19 @@ OrderBook 口径、T0 选项。
   `startup_health_check=degraded`（`perf_recent=false`，按惯例）；旧二进制备份
   `target/release/monitor.bak-20261113-1840`。为编译 `ticket_card` 的 T+1 依赖，
   同时同步了 `trade_ledger.rs` 的 `bought_quantities_on`（只新增函数）。
+
+**2026-11-13 第六批（P01 日线指标行）已部署**：
+
+- 新增 `ticket_card::daily_note_before(conn, code, before)`：读 `before` 之前已收盘
+  日线，输出“日线(MM-DD)：MACD …｜KDJ …｜SKDJ …｜RSI …｜量价 …｜5日量比 …”；
+  无日线返回 `None`，不补 0。
+- P01 逐票在计划行后追加“指标: …”；09:00 用 `business_date` 作为不含上界，
+  因而取到 `evidence_date` 当天的收盘指标；取不到就不输出该行。
+- 验证：`monitor::ticket_card` 4/4（含新增格式化用例）、`p01_render` 3/3 通过；
+  `cargo check --bin monitor` 通过。
+- 部署：runtime release `monitor` 55,056,888 bytes；pid 94043；
+  `startup_health_check=degraded`（`perf_recent=false`，按惯例）；旧二进制备份
+  `target/release/monitor.bak-20261113-2240`。
 
 **当前状态**：7.1 已实跑（2026-11-13，生产库副本只读，6 持仓 + 002205 共 7 张卡）：
 

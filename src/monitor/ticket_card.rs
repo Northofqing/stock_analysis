@@ -444,6 +444,38 @@ pub(crate) fn volume_price_before(
     Ok(compute_volume_price(code, &bars))
 }
 
+/// P01 等盘前推送用的一行日线摘要（截至 `before`，不含）。
+/// 没有任何已入库日线时返回 `None`，不补 0、不冒充盘中指标。
+pub fn daily_note_before(
+    conn: &mut SqliteConnection,
+    code: &str,
+    before: &str,
+) -> Result<Option<String>, String> {
+    let (tech, volume_price) = daily_tech_before(conn, code, before)?;
+    Ok(format_daily_note(&tech, &volume_price))
+}
+
+fn format_daily_note(tech: &TechView, volume_price: &VolumePriceView) -> Option<String> {
+    if tech.as_of.is_empty() {
+        return None;
+    }
+    let date = tech.as_of.get(5..).unwrap_or(tech.as_of.as_str());
+    let volume = match volume_price.ratio_5d {
+        Some(ratio) => format!("量价 {}｜5日量比 {ratio:.2}", volume_price.tags.join("+")),
+        None => "量价 N/A".to_owned(),
+    };
+    Some(format!(
+        "日线({date})：MACD {} 柱{}｜KDJ {}｜SKDJ {}｜RSI {}｜{volume}",
+        tech.macd_cross.unwrap_or("N/A"),
+        tech.macd_hist
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "N/A".to_owned()),
+        fmt_triplet(tech.kdj),
+        fmt_triplet(tech.skdj),
+        fmt_triplet(tech.rsi),
+    ))
+}
+
 fn compute_tech(code: &str, bars: &[Bar]) -> TechView {
     let mut view = TechView::default();
     let Some(last) = bars.last() else {
@@ -714,6 +746,31 @@ mod tests {
             classify(Some(10.2), &PlanView::default(), false),
             "无活跃提案"
         );
+    }
+
+    #[test]
+    fn daily_note_formats_date_and_indicators() {
+        let tech = TechView {
+            as_of: "2026-11-13".to_owned(),
+            macd_cross: Some("金叉"),
+            macd_hist: Some(0.05),
+            kdj: Some((70.0, 60.0, 90.0)),
+            skdj: Some((40.0, 35.0, 45.0)),
+            rsi: Some((62.0, 55.0, 48.0)),
+            ..Default::default()
+        };
+        let volume_price = VolumePriceView {
+            ratio_5d: Some(2.5),
+            tags: vec!["放量上涨"],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_daily_note(&tech, &volume_price).as_deref(),
+            Some(
+                "日线(11-13)：MACD 金叉 柱0.05｜KDJ 70/60/90｜SKDJ 40/35/45｜RSI 62/55/48｜量价 放量上涨｜5日量比 2.50"
+            )
+        );
+        assert!(format_daily_note(&TechView::default(), &VolumePriceView::default()).is_none());
     }
 
     #[test]
