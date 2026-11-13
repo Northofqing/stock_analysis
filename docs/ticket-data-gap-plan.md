@@ -82,6 +82,23 @@ T0Advice 在 T0 修好前继续显式 unavailable，绝不用 stale T0 标记 Or
 `OrderBooks` 仍不能替代 `T0Evidence.T0Quote`，做T仍要求 T0 四项证据完整。
 详见 `docs/windows-grpc-handoff-20261103.md`。
 
+**2026-11-13 根因下钻（只读实测，未改上游）**：
+
+- 桥接 Health/Capabilities 正常；`grpc_local_readiness_probe` 对 `127.0.0.1:18082`
+  实测：Health ready、Capabilities available、RealtimeQuotes available（Sina）、
+  OrderBooks available（Tencent），唯一失败是 T0Evidence（`reason_code=internal`）。
+- `t0_lib_probe`（桥内库直连 TDX）复现：
+  `magic-tdx T0 quote unavailable: cached and 7 primary servers returned no verified
+  quote (last=国泰君安14 117.34.114.27:7709 connect failed)`。
+- `tdx_server_probe --primary`：7 台主站 5 台不可达、2 台（117.34.114.14/.18）
+  返回 `empty-quote`，0 台可过 5s 新鲜度门。
+- 结论修正：`服务端内部错误` 是 T0Evidence 对上游 TDX 失败的封装，不是桥接 bug。
+  首选修法应从“修桥接”改为“换可用 TDX 行情源（付费/自建）”；继续修桥不会恢复做T。
+- 影响边界：RealtimeQuotes 的 Tdx 臂同样连续失败（13:32 已 213 次熔断），但有
+  Sina/Tencent 兜底；T0 在 BR-153 下无备源，所以 `T0Advice` 从 10-22 起为 0。
+- 待拍板（未执行）：B 换 TDX 源 / C 放开 BR-153 用腾讯五档 / D 只做持仓动作盘中提醒。
+  拍板前不改 BR-153、不放宽 5s 门、不改 T0 证据口径。
+
 失败模式：备选盘口只有五档、深度不足，必须标“浅盘口”，不能写成完整 OrderBook。
 
 验收：T0 批次 `records>0` 且完整才标记 OrderBook；T0Advice 有记录；否则显式 unavailable。

@@ -3928,6 +3928,9 @@ DataMode（Kline/MoneyFlow/OrderBook）与 P1.1（news/mf）的根因、首选/�
 两天验证计划、恢复/仍 unavailable 清单，见
 `docs/ticket-data-gap-plan.md`。该计划不改变本方案的 ticket 批次顺序，也不把
 “数据源修好”当成“胜率提高”；胜率仍按 11-23 样本外结论单独判断。
+2026-11-13 更新：A2（`OrderBook + T0Advice 为 0`）已下钻到 TDX 公共主站
+不可达/空 quote，不是桥接服务端 bug；做T恢复需先拍板换源或放宽证据口径，
+详见该文件 A2 的 11-13 记录。
 
 ### 12.10 推送缺口（2026-11-02）
 
