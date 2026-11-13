@@ -62,6 +62,10 @@ pub struct TechView {
     pub kdj: Option<(f64, f64, f64)>,
     pub skdj: Option<(f64, f64, f64)>,
     pub rsi: Option<(f64, f64, f64)>,
+    /// 20 日均线（收盘均值）；不足 20 根为 None。
+    pub ma20: Option<f64>,
+    /// 14 日 ATR（真实波幅均值）；不足 15 根为 None。
+    pub atr14: Option<f64>,
     /// 最后一根日线是否涨停（按板分档，和 ticket_regime 同源）。
     pub limit_up: bool,
 }
@@ -104,6 +108,8 @@ pub struct Card {
     pub holding: bool,
     pub shares: Option<u64>,
     pub cost: Option<f64>,
+    /// 当日买入、T+1 锁定的股数（只读 trades）；无持仓为 None。
+    pub locked_shares: Option<u64>,
     pub tech: TechView,
     pub volume_price: VolumePriceView,
     pub plan: PlanView,
@@ -208,6 +214,18 @@ pub fn build_card(
         }
     }
 
+    let locked_shares = position.map(|(_, shares)| {
+        crate::monitor::trade_ledger::bought_quantities_on(conn, as_of)
+            .ok()
+            .and_then(|map| map.get(code).copied())
+            .unwrap_or(0)
+            .min(shares)
+    });
+    let fully_locked = match (position, locked_shares) {
+        (Some((_, shares)), Some(locked)) => shares > 0 && locked >= shares,
+        _ => false,
+    };
+
     if let Some((cost, shares)) = position {
         if cost > 0.0 {
             plan.stop = Some(cost * 0.92);
@@ -215,7 +233,7 @@ pub fn build_card(
             plan.reduce_high = Some(cost * 1.05);
             if let Some(price) = tech.close {
                 let (intent, pnl_pct) =
-                    crate::decision::holding_plan::position_intent(price, cost, false);
+                    crate::decision::holding_plan::position_intent(price, cost, fully_locked);
                 plan.position_action = Some(format!("{}（浮盈亏 {pnl_pct:+.1}%）", intent.label()));
             } else {
                 missing.push("price_for_position_action".to_owned());
@@ -240,6 +258,7 @@ pub fn build_card(
         holding: position.is_some(),
         shares: position.map(|(_, shares)| shares),
         cost: position.map(|(cost, _)| cost),
+        locked_shares,
         tech,
         volume_price,
         plan,
@@ -301,15 +320,32 @@ impl Card {
                 (Some(stop), _) => format!("止损参考 {stop:.2}"),
                 _ => "N/A".to_owned(),
             };
-            out.push_str(&format!(
-                "  动作: {}｜出: {}｜减仓参考 {}\n",
+            let mut action_line = format!(
+                "  动作: {}｜出: {}｜减仓参考 {}",
                 self.plan.position_action.as_deref().unwrap_or("无法判定"),
                 stop_text,
                 match (self.plan.reduce_low, self.plan.reduce_high) {
                     (Some(low), Some(high)) => format!("{low:.2}~{high:.2}"),
                     _ => "N/A".to_owned(),
                 }
-            ));
+            );
+            if let Some(locked) = self.locked_shares.filter(|value| *value > 0) {
+                action_line.push_str(&format!("｜今日买入锁定 {locked} 股（T+1）"));
+            }
+            out.push_str(&action_line);
+            out.push('\n');
+            if let (Some(ma20), Some(close)) = (self.tech.ma20, self.tech.close) {
+                let position = if close >= ma20 { "站上" } else { "低于" };
+                out.push_str(&format!("  技术参考: MA20 {ma20:.2}（现价{position}）"));
+                if let Some(atr) = self.tech.atr14 {
+                    out.push_str(&format!(
+                        "｜ATR14 {atr:.2}｜1×ATR 参考位 {:.2}｜2×ATR 参考位 {:.2}",
+                        close - atr,
+                        close - 2.0 * atr
+                    ));
+                }
+                out.push('\n');
+            }
         } else {
             out.push_str(&format!(
                 "  进: {}｜突破确认 {}｜放弃 {}\n",
@@ -414,6 +450,26 @@ fn compute_tech(code: &str, bars: &[Bar]) -> TechView {
     view.limit_up = last
         .pct_chg
         .is_some_and(|pct| pct >= ticket_regime::limit_up_pct(code));
+
+    if bars.len() >= 20 {
+        let sum: f64 = bars[bars.len() - 20..]
+            .iter()
+            .map(|bar| bar.close)
+            .sum();
+        view.ma20 = Some(sum / 20.0);
+    }
+    if bars.len() >= 15 {
+        let start = bars.len() - 14;
+        let mut sum = 0.0;
+        for index in start..bars.len() {
+            let previous = bars[index - 1].close;
+            let bar = &bars[index];
+            sum += (bar.high - bar.low)
+                .max((bar.high - previous).abs())
+                .max((bar.low - previous).abs());
+        }
+        view.atr14 = Some(sum / 14.0);
+    }
 
     if bars.len() < 20 {
         return view;
@@ -525,6 +581,12 @@ fn tech_missing(tech: &TechView, bar_count: usize) -> Vec<String> {
     }
     if tech.volume_ratio.is_none() {
         missing.push("volume_ratio".to_owned());
+    }
+    if tech.ma20.is_none() {
+        missing.push("ma20_bars<20".to_owned());
+    }
+    if tech.atr14.is_none() {
+        missing.push("atr14_bars<15".to_owned());
     }
     missing
 }
@@ -668,6 +730,8 @@ mod tests {
         assert!(tech.kdj.is_some());
         assert!(tech.skdj.is_some());
         assert!(tech.rsi.is_some());
+        assert!(tech.ma20.is_some());
+        assert!(tech.atr14.is_some());
         assert!(tech.limit_up);
         assert_eq!(tech.volume_ratio, Some(1.2));
     }

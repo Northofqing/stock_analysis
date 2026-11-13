@@ -334,3 +334,30 @@ pub fn today_bought_quantities(
     // 没有流水：退回快照差分（历史行为，偏保守）。
     crate::monitor::position_change_detect::t1_locked_quantities(db)
 }
+
+/// 指定日期（`traded_at` 的本地日期）的买入股数，按票汇总。
+/// 只读 `trades`，供决策卡/历史日期做 T+1 判断，不退快照差分。
+pub fn bought_quantities_on(
+    conn: &mut SqliteConnection,
+    date: &str,
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        code: String,
+        #[diesel(sql_type = BigInt)]
+        shares: i64,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT code, SUM(shares) AS shares FROM trades \
+         WHERE direction = 'buy' AND date(traded_at) = ?1 GROUP BY code",
+    )
+    .bind::<Text, _>(date)
+    .load(conn)
+    .map_err(|error| format!("查 {date} 买入失败: {error}"))?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.shares > 0)
+        .map(|row| (row.code, row.shares as u64))
+        .collect())
+}
