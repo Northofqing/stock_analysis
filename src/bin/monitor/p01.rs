@@ -245,6 +245,8 @@ pub struct P01BoundHead {
     pub plan_trigger: Option<f64>,
     pub plan_abandon: Option<f64>,
     pub plan_as_of: Option<String>,
+    /// true 表示没有正式提案，价位来自 `buy_zone` 临时参考。
+    pub plan_provisional: bool,
     /// 上一交易日收盘后的日线指标摘要（只展示）。
     pub tech_note: Option<String>,
 }
@@ -439,6 +441,7 @@ impl P01InputBinding {
                 plan_trigger: None,
                 plan_abandon: None,
                 plan_as_of: None,
+                plan_provisional: false,
                 tech_note: None,
             }],
             limit_pools: P01LimitPoolsBinding {
@@ -662,6 +665,7 @@ pub fn bind_p01_sources(
             plan_trigger: None,
             plan_abandon: None,
             plan_as_of: None,
+            plan_provisional: false,
             tech_note: None,
         });
     }
@@ -1653,28 +1657,44 @@ fn enrich_p01_plans(input: &mut P01InputBinding) {
         .bind::<diesel::sql_types::Text, _>(&as_of)
         .get_result::<Row>(&mut conn)
         .ok();
-        let Some(row) = row else {
-            continue;
-        };
-        #[derive(serde::Deserialize)]
-        struct Ctx {
-            #[serde(default)]
-            price_low: Option<f64>,
-            #[serde(default)]
-            price_high: Option<f64>,
-            #[serde(default)]
-            trigger_level: Option<f64>,
-            #[serde(default)]
-            abandon: Option<f64>,
+        let mut has_plan = false;
+        if let Some(row) = row {
+            #[derive(serde::Deserialize)]
+            struct Ctx {
+                #[serde(default)]
+                price_low: Option<f64>,
+                #[serde(default)]
+                price_high: Option<f64>,
+                #[serde(default)]
+                trigger_level: Option<f64>,
+                #[serde(default)]
+                abandon: Option<f64>,
+            }
+            if let Ok(ctx) = serde_json::from_str::<Ctx>(&row.context_json) {
+                if let (Some(low), Some(high)) = (ctx.price_low, ctx.price_high) {
+                    head.plan_low = Some(low);
+                    head.plan_high = Some(high);
+                    head.plan_trigger = ctx.trigger_level;
+                    head.plan_abandon = ctx.abandon;
+                    head.plan_as_of = Some(as_of.clone());
+                    has_plan = true;
+                }
+            }
         }
-        let Ok(ctx) = serde_json::from_str::<Ctx>(&row.context_json) else {
-            continue;
-        };
-        head.plan_low = ctx.price_low;
-        head.plan_high = ctx.price_high;
-        head.plan_trigger = ctx.trigger_level;
-        head.plan_abandon = ctx.abandon;
-        head.plan_as_of = Some(as_of.clone());
+        if !has_plan {
+            // 没有正式提案时才生成临时参考；只展示，不写成 ticket 决策。
+            if let Ok(Some(zone)) =
+                stock_analysis::monitor::buy_zone::compute(&mut conn, &head.code, &as_of)
+            {
+                if let (Some(low), Some(high)) = (zone.entry_low, zone.entry_high) {
+                    head.plan_low = Some(low);
+                    head.plan_high = Some(high);
+                    head.plan_abandon = zone.abandon;
+                    head.plan_as_of = Some(as_of.clone());
+                    head.plan_provisional = true;
+                }
+            }
+        }
     }
 }
 

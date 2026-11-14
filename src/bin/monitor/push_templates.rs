@@ -18407,11 +18407,16 @@ pub fn render_bound_preopen_news_hot(
         ));
         if let (Some(low), Some(high)) = (head.plan_low, head.plan_high) {
             let zero_width = (high - low).abs() < 0.005;
+            let prefix = if head.plan_provisional {
+                "计划: 临时参考 "
+            } else {
+                "计划: "
+            };
             let mut plan = if zero_width {
                 let trigger = head.plan_trigger.unwrap_or(low);
-                format!("  计划: 触发位 {trigger:.2}")
+                format!("  {prefix}触发位 {trigger:.2}")
             } else {
-                format!("  计划: 区间 {low:.2}~{high:.2}")
+                format!("  {prefix}区间 {low:.2}~{high:.2}")
             };
             if !zero_width {
                 if let Some(trigger) = head.plan_trigger {
@@ -18422,7 +18427,11 @@ pub fn render_bound_preopen_news_hot(
                 plan.push_str(&format!("｜放弃 {abandon:.2}"));
             }
             if let Some(as_of) = &head.plan_as_of {
-                plan.push_str(&format!("（{as_of} 提案）"));
+                if head.plan_provisional {
+                    plan.push_str(&format!("（{as_of} 无正式提案，非自动买入）"));
+                } else {
+                    plan.push_str(&format!("（{as_of} 提案）"));
+                }
             }
             text.push_str(&plan);
             text.push('\n');
@@ -23503,6 +23512,22 @@ mod tests {
             render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
         assert!(text.contains("计划: 触发位 4.83｜放弃 4.50（2026-08-17 提案）"));
         assert!(!text.contains("4.83~4.83"));
+    }
+
+    #[test]
+    fn p01_render_marks_provisional_plan_without_formal_proposal() {
+        let mut input = crate::p01::P01InputBinding::complete_test_input();
+        let head = &mut input.heads[0];
+        head.plan_low = Some(10.25);
+        head.plan_high = Some(10.40);
+        head.plan_abandon = Some(9.21);
+        head.plan_as_of = Some("2026-08-17".to_owned());
+        head.plan_provisional = true;
+        let text =
+            render_bound_preopen_news_hot(crate::p01::P01RenderMode::Scheduled, &input).unwrap();
+        assert!(text.contains(
+            "计划: 临时参考 区间 10.25~10.40｜放弃 9.21（2026-08-17 无正式提案，非自动买入）"
+        ));
     }
 
     #[test]
