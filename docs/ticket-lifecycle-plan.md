@@ -4417,6 +4417,19 @@ OrderBook 口径、T0 选项。
 - 验证：`cargo test --bin monitor r07_tomorrow_watch`（含新增 note 用例）。
 - 边界：R-07 仍以 `closing_valuation` 同日收盘价定位，日线摘要只补指标/量价事实。
 
+**2026-11-14 14:55 已部署（R-07 日线摘要 + 12.4.7 切读 + watch_pool_build 修复同批）**：
+
+- runtime 源同步 5 个文件（`push_templates.rs` / `ticket_card.rs` /
+  `ticket_entry_proposal.rs` / `ticket_eviction.rs` / `watch_pool_build.rs`），
+  同步前逐一确认 runtime 版本 == `9177f17cd`，未夹带其他改动。
+- release `monitor` 55,095,136 bytes；pid 38535；`startup_health_check=degraded`
+  （`perf_recent=false`，按惯例）；旧二进制备份
+  `target/release/monitor.bak-20261114-1455`；14:59:32 broker 启动完成。
+- 二进制字节校验：`提案候选查询失败`=1、`淘汰候选查询失败`=1、`日线摘要跳过`=2。
+- 验收：11-16 15:40 提案轮看候选数（基线 9）与无 `[dual]` 日志；
+  11-16 21:00 R-07 每票多一行“指标: 日线(…)”；若 21:00 当日日线未入库，
+  行内日期为上一交易日（11-13 实测日线行 21:34 CST 才写入）。
+
 **当前状态**：7.1 已实跑（2026-11-13，生产库副本只读，6 持仓 + 002205 共 7 张卡）：
 
 ```
