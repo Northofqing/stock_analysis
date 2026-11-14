@@ -4180,7 +4180,7 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
   「计划: 无（等 15:40 生成）」。价位只展示，不参与给价；计划字段不在
   `P01CanonicalSourceBinding` 结构里，但会改变 `rendered_content_sha256`。
 - 已落：`ticket_card::daily_note_before` 读 `business_date` 前已收盘日线，输出
-  “指标: 日线(MM-DD)：MACD …｜KDJ …｜SKDJ …｜RSI …｜量价 …｜5日量比 …”；
+  “指标: 日线(MM-DD)：MACD …｜KDJ …｜SKDJ …｜RSI …｜形态 …｜5日量比 …”；
   没有日线就不输出该行，不补 0。
 - 已落：无正式提案且 `buy_zone` 给出区间时，P01 写
   “临时参考 …（MM-DD 无正式提案，非自动买入）”；不写成 ticket 决策，也不参与给价。
@@ -4203,7 +4203,7 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 |---|---|---|---|---|
 | P0 | 量比不参与决策 | `EntryPolicy::evaluate_with_trigger_level` 只判价位；`confirmation=price_only`、`missing_fields` 含 `volume_ratio`（`ticket_decision.rs:11-12,348-403`）；`buy_zone.volume_ratio` 只展示（`buy_zone.rs:421,467`） | 提案文案写“量比>1.2 才算有效”，系统实际不校验；用户看到的是未兑现的条件 | 7.3 要么把量比纳入触发，要么文案改成“量比未校验” |
 | P0 | P01 有价不显示 | `P01BoundHead` 已有 `recommend_price/streak/sealed_amount/turnover/break_count`（`p01.rs:220-242`），`render_bound_preopen_news_hot` 只用 name/code/concept/news（`push_templates.rs:18353-18373`） | 盘前热点只有故事，没有价格/买点 | 已落：价格行＋计划价位＋日线指标（2026-11-13） |
-| P0 | 09:25/定向监控/R-07 无量比/指标 | `PriceLine` 无 volume 字段（`ticket_auction_price.rs:128-149`）；定向监控只 render code/name/price/change（`watch_pool_monitor.rs:63-68`）；R-07 只有 trigger/lo/hi/stop/reason（`push_templates.rs:2849-2878`） | 用户“感知不到走势/量能/指标” | 09:25/定向监控已落；R-07 仍未落 |
+| P0 | 09:25/定向监控/R-07 无量比/指标 | `PriceLine` 无 volume 字段（`ticket_auction_price.rs:128-149`）；定向监控只 render code/name/price/change（`watch_pool_monitor.rs:63-68`）；R-07 只有 trigger/lo/hi/stop/reason（`push_templates.rs:2849-2878`） | 用户“感知不到走势/量能/指标” | 09:25/定向监控已落；R-07 已落（2026-11-14，日线摘要行，未部署） |
 | P0 | 持仓只有成本止损 | `holding_plan::position_intent` 只用 `cost*0.92` 与浮盈阈值（`holding_plan.rs:36-60`），无 MA20/ATR/结构位 | 深度浮亏时“止损线”远高于现价，不可执行 | 卡已标“已跌破”；技术止损单列规则，先不擅自加 |
 | P1 | 无分钟 K | `sqlite_master` 无 minute/kline 表；TDX 5min 源不可用（A2） | 盘中 MACD/KDJ 做不了 | 7.4，先评估 ExternalV1/腾讯分钟线 |
 | P1 | `is_limit_up` 死字段 | `stock_daily` 11-10..11-12 `SUM(is_limit_up)=0`；无 `SELECT ... FROM stock_daily` 消费者；现用 `pct_chg >= limit_up_pct` 计算 | 任何依赖该列的判断都会误判 | 不使用该列；后续清理或回填 |
@@ -4244,8 +4244,9 @@ limit 50，单票 3s 超时）；只有运行时已初始化数据库且配置
 - 实跑（2026-11-12，65 张卡）：放量涨停 5（002205/600467/600558/600327/603366）、
   涨停量能中性 4、缩量回调 6、放量上涨 5、缩量上涨 2、放量下跌 2；本批没有
   缩量涨停/放量滞涨样本（是这批票没出现，不是没实现；单测覆盖两种形态）。
-- 未接线：09:25、定向监控、R-07、P01 尚未带这些 tag；盘中只有 f10 量比，
-  没有累计量序列，不能做严格盘中形态。
+- 接线状态（2026-11-14）：09:25（量价 tag）、定向监控（量价+5日量比）、P01（日线摘要）、
+  R-07（日线摘要）均已带这些 tag；盘中仍只有 f10 量比，没有累计量序列，
+  不能做严格盘中形态。
 
 仍缺：
 
@@ -4381,7 +4382,7 @@ OrderBook 口径、T0 选项。
 **2026-11-13 第六批（P01 日线指标行）已部署**：
 
 - 新增 `ticket_card::daily_note_before(conn, code, before)`：读 `before` 之前已收盘
-  日线，输出“日线(MM-DD)：MACD …｜KDJ …｜SKDJ …｜RSI …｜量价 …｜5日量比 …”；
+  日线，输出“日线(MM-DD)：MACD …｜KDJ …｜SKDJ …｜RSI …｜形态 …｜5日量比 …”；
   无日线返回 `None`，不补 0。
 - P01 逐票在计划行后追加“指标: …”；09:00 用 `business_date` 作为不含上界，
   因而取到 `evidence_date` 当天的收盘指标；取不到就不输出该行。
@@ -4390,6 +4391,16 @@ OrderBook 口径、T0 选项。
 - 部署：runtime release `monitor` 55,056,888 bytes；pid 94043；
   `startup_health_check=degraded`（`perf_recent=false`，按惯例）；旧二进制备份
   `target/release/monitor.bak-20261113-2240`。
+
+**2026-11-14 第七批（R-07 明日观察池日线摘要）已落（源码，未部署）**：
+
+- `WatchItem` 增加 `note`，渲染在“理由”后一行：`指标: 日线(MM-DD)：MACD …｜KDJ …｜SKDJ …｜RSI …｜形态 …｜5日量比 …`。
+- `load_r07_daily_notes` 在 dedup 后按票调 `ticket_card::daily_note_before(code, trading_date+1)`
+  （含当日；21:00 当日日线尚未入库时自然落到最近一根，行内自带日期，不用旧值冒充当日）。
+  DB 未初始化/取连接失败/单票查询失败只跳过该行，不让 R-07 失败。
+- 只读展示，不参与价位与 counted binding；正文多一行会改变 `rendered_content_sha256`。
+- 验证：`cargo test --bin monitor r07_tomorrow_watch`（含新增 note 用例）。
+- 边界：R-07 仍以 `closing_valuation` 同日收盘价定位，日线摘要只补指标/量价事实。
 
 **当前状态**：7.1 已实跑（2026-11-13，生产库副本只读，6 持仓 + 002205 共 7 张卡）：
 

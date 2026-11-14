@@ -2843,6 +2843,8 @@ pub struct WatchItem<'a> {
     pub hi: f64,
     pub stop: f64,
     pub reason: &'a str,
+    /// 逐票日线摘要（`ticket_card::daily_note_before`）；无日线时为 None，不输出该行。
+    pub note: Option<&'a str>,
 }
 
 /// v12 §14.2 R-07 TomorrowWatch 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
@@ -2865,6 +2867,9 @@ pub fn render_tomorrow_watch(date: &str, items: &[WatchItem<'_>]) -> String {
             fmt_price(it.stop),
             it.reason,
         ));
+        if let Some(note) = it.note {
+            out.push_str(&format!("\n   指标: {note}"));
+        }
         out.push_str("\n─────");
     }
     if reference {
@@ -10963,6 +10968,44 @@ async fn dispatch_tomorrow_watch_after_preflight(
     .await
 }
 
+/// R-07 逐票日线摘要：返回 `code -> 指标行`。
+/// 只读展示；数据库未初始化/取连接失败/单票查询失败都只跳过该行，不让 R-07 失败。
+async fn load_r07_daily_notes(
+    items: &[stock_analysis::review::tomorrow_watchlist::WatchItem],
+    trading_date: chrono::NaiveDate,
+) -> std::collections::HashMap<String, String> {
+    let codes: Vec<String> = items.iter().map(|item| item.code.clone()).collect();
+    // `daily_note_before` 是排他上界，+1 天表示“含当日”。21:00 当日日线尚未入库时
+    // 会自然落到最近一根，行内自带日期，不用旧值冒充当日。
+    let before = (trading_date + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut notes = std::collections::HashMap::new();
+        let Some(db) = stock_analysis::database::DatabaseManager::try_get() else {
+            log::warn!("[R-07] 日线摘要跳过: 数据库未初始化");
+            return notes;
+        };
+        let Ok(mut conn) = db.get_conn() else {
+            log::warn!("[R-07] 日线摘要跳过: 取数据库连接失败");
+            return notes;
+        };
+        for code in codes {
+            match stock_analysis::monitor::ticket_card::daily_note_before(&mut conn, &code, &before)
+            {
+                Ok(Some(note)) => {
+                    notes.insert(code, note);
+                }
+                Ok(None) => {}
+                Err(error) => log::warn!("[R-07] {code} 日线摘要失败: {error}"),
+            }
+        }
+        notes
+    })
+    .await
+    .unwrap_or_default()
+}
+
 async fn dispatch_tomorrow_watch_after_preflight_with_lhb<Loader, Future>(
     date: &str,
     backfill: bool,
@@ -11305,6 +11348,11 @@ where
         );
     }
 
+    // 2026-11-14（7.3 R-07 明日观察池）：逐票附日线摘要（指标/量价），只展示、不参与给价。
+    // R-07 21:00 时当日日线可能尚未入库，`daily_note_before` 取最近一根并自带日期，
+    // 不用旧值冒充当日；DB 不可用只是少这一行，不让 R-07 失败。
+    let daily_notes = load_r07_daily_notes(&items, trading_date).await;
+
     let mut borrowed: Vec<WatchItem<'_>> = Vec::with_capacity(items.len());
     for item in &items {
         borrowed.push(WatchItem {
@@ -11317,6 +11365,7 @@ where
             hi: item.hi_price,
             stop: item.stop,
             reason: &item.reason,
+            note: daily_notes.get(&item.code).map(String::as_str),
         });
     }
     let text = if backfill {
@@ -19533,6 +19582,7 @@ pub fn build_test_template_catalog(
                 hi: 10.0,
                 stop: 9.4,
                 reason: "TEST_CODE 多源共振",
+                note: None,
             }],
         ),
     );
@@ -23307,12 +23357,32 @@ mod tests {
             hi: 50.3,
             stop: 48.5,
             reason: "板块共振",
+            note: None,
         }];
         let s = render_tomorrow_watch("2026-07-05", &items);
         assert!(s.starts_with("📌 明日观察池（2026-07-05）"));
         assert!(s.contains("1. Y(TEST_CODE_002415) [机器人] 来源: A档未触发"));
         assert!(s.contains("触发突破50.5 | 低吸49.50~50.30 | 止损48.50"));
         assert!(s.contains("共1只 | 明日竞价后按 T-11 复核"));
+    }
+
+    #[test]
+    fn r07_tomorrow_watch_with_daily_note() {
+        let items = vec![WatchItem {
+            name: "Y",
+            code: "TEST_CODE_002415",
+            topic: "机器人",
+            source: "A档未触发",
+            trigger: "突破50.5",
+            lo: 49.5,
+            hi: 50.3,
+            stop: 48.5,
+            reason: "板块共振",
+            note: Some("日线(11-13)：MACD 金叉 柱0.41｜形态 放量上涨｜5日量比 1.84"),
+        }];
+        let s = render_tomorrow_watch("2026-07-05", &items);
+        assert!(s.contains("   理由: 板块共振\n   指标: 日线(11-13)：MACD 金叉"));
+        assert_eq!(s.matches("指标:").count(), 1);
     }
 
     // ---- R-08 事件日历 ----

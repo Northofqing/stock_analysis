@@ -444,7 +444,7 @@ pub(crate) fn volume_price_before(
     Ok(compute_volume_price(code, &bars))
 }
 
-/// P01 等盘前推送用的一行日线摘要（截至 `before`，不含）。
+/// P01/R-07 等推送用的一行日线摘要（截至 `before`，不含）。
 /// 没有任何已入库日线时返回 `None`，不补 0、不冒充盘中指标。
 pub fn daily_note_before(
     conn: &mut SqliteConnection,
@@ -461,8 +461,8 @@ fn format_daily_note(tech: &TechView, volume_price: &VolumePriceView) -> Option<
     }
     let date = tech.as_of.get(5..).unwrap_or(tech.as_of.as_str());
     let volume = match volume_price.ratio_5d {
-        Some(ratio) => format!("量价 {}｜5日量比 {ratio:.2}", volume_price.tags.join("+")),
-        None => "量价 N/A".to_owned(),
+        Some(ratio) => format!("形态 {}｜5日量比 {ratio:.2}", volume_price.tags.join("+")),
+        None => "形态 N/A".to_owned(),
     };
     Some(format!(
         "日线({date})：MACD {} 柱{}｜KDJ {}｜SKDJ {}｜RSI {}｜{volume}",
@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(
             format_daily_note(&tech, &volume_price).as_deref(),
             Some(
-                "日线(11-13)：MACD 金叉 柱0.05｜KDJ 70/60/90｜SKDJ 40/35/45｜RSI 62/55/48｜量价 放量上涨｜5日量比 2.50"
+                "日线(11-13)：MACD 金叉 柱0.05｜KDJ 70/60/90｜SKDJ 40/35/45｜RSI 62/55/48｜形态 放量上涨｜5日量比 2.50"
             )
         );
         assert!(format_daily_note(&TechView::default(), &VolumePriceView::default()).is_none());
