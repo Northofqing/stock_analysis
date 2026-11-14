@@ -286,6 +286,21 @@ fn proposal_summary(
     summary
 }
 
+/// 12.4.7：提案候选 = 活跃 `observing` 且最新事件不是 open 提案。
+/// 终态（triggered/expired/invalidated/superseded）仍在观察池，允许生成新提案；
+/// 只有 `entry_proposed` 未收尾时才跳过，避免重复定价。
+fn proposal_candidates(conn: &mut SqliteConnection) -> Result<Vec<String>, String> {
+    let rows: Vec<CodeRow> = diesel::sql_query(
+        "SELECT code FROM ticket_state_v1 \
+         WHERE close_date IS NULL AND stage = 'observing' \
+           AND COALESCE(proposal_status, '') <> 'open' \
+         ORDER BY code",
+    )
+    .load(conn)
+    .map_err(|error| format!("提案候选查询失败: {error}"))?;
+    Ok(rows.into_iter().map(|row| row.code).collect())
+}
+
 /// 给所有 `observing` 的票算一次入场参考。
 ///
 /// `as_of` 必须是交易日（`YYYY-MM-DD`），盘后调度传当天日期。
@@ -295,30 +310,11 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
         .map_err(|error| format!("as_of 非法 ({as_of}): {error}"))?;
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
 
-    let observing: Vec<String> = diesel::sql_query(
-        "SELECT code FROM ticket_lifecycle WHERE close_date IS NULL AND stage = 'observing'",
-    )
-    .load::<CodeRow>(&mut conn)
-    .map_err(|e| e.to_string())?
-    .into_iter()
-    .map(|row| row.code)
-    .collect();
-
-    // 12.4.7 双读：候选集合仍按 stage 取，只把同一批票在 ticket_state_v1 上的
-    // 提案状态计数写日志。正常应为 open=0——stage=observing 表示没有活跃提案；
-    // 若出现 open，说明 stage 与事件投影不一致，切换到视图前必须先解释。
-    match ticket_lifecycle::consumer_state_dual_read(&mut conn, &["observing"]) {
-        Ok(summary) => log::info!(
-            "[票状态][dual] consumer=proposal rows={} open={} terminal={} none={} stale5={} sample_open={}",
-            summary.rows,
-            summary.open,
-            summary.terminal,
-            summary.none,
-            summary.stale5,
-            summary.sample_open()
-        ),
-        Err(error) => log::warn!("[票状态][dual] consumer=proposal 视图不可用: {error}"),
-    }
+    // 12.4.7 切读（2026-11-14）：候选集合改读 `ticket_state_v1`。
+    // 只排除“最新事件仍是 entry_proposed（open）”的票，避免 stage 未同步时重复提案；
+    // 终态（triggered/expired/invalidated/superseded）仍留在观察池，允许生成新提案。
+    // 生产库只读比对（2026-11-14）：旧 stage 集合 9 只、新视图集合 9 只，双向 EXCEPT 为空。
+    let observing = proposal_candidates(&mut conn)?;
 
     let source_health = source_health_snapshot(&mut conn, as_of);
     let shadow = decision_shadow_enabled();
@@ -573,7 +569,7 @@ pub fn propose_for_observing(db: &DatabaseManager, as_of: &str) -> Result<Propos
 
 #[cfg(test)]
 mod tests {
-    use super::proposal_summary;
+    use super::{proposal_candidates, proposal_summary};
 
     #[test]
     fn proposal_summary_keeps_range_first_and_adds_breakout_price() {
@@ -595,5 +591,35 @@ mod tests {
         let text = proposal_summary(10.0, 10.2, "回踩 ma10", Some(9.5), None);
         assert!(text.contains("突破确认缺失（无日线）"));
         assert!(!text.contains("突破确认 0.00"));
+    }
+
+    #[test]
+    fn proposal_candidates_skip_open_but_keep_terminal_and_no_event() {
+        use crate::database::ticket_lifecycle;
+        use diesel::connection::SimpleConnection;
+        use diesel::Connection;
+        use diesel::SqliteConnection;
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        ticket_lifecycle::create_schema(&mut conn).expect("ticket schema");
+        conn.batch_execute(
+            "INSERT INTO ticket_lifecycle (id, code, open_date, stage, source) VALUES \
+               (1, '600001', '2026-11-10', 'observing', 'news'), \
+               (2, '600002', '2026-11-10', 'observing', 'news'), \
+               (3, '600003', '2026-11-10', 'observing', 'news'), \
+               (4, '600004', '2026-11-10', 'observing', 'news'), \
+               (5, '600005', '2026-11-10', 'exited', 'news');\
+             INSERT INTO ticket_event (ticket_id, event_at, event_kind) VALUES \
+               (2, '2026-11-13', 'entry_proposed'), \
+               (3, '2026-11-13', 'entry_expired');\
+             UPDATE ticket_lifecycle SET close_date = '2026-11-13' WHERE id = 5;",
+        )
+        .expect("seed tickets");
+
+        // open 提案的 600002 跳过；expired 的 600003 仍可重新提案；已关闭的 600005 不进候选。
+        assert_eq!(
+            proposal_candidates(&mut conn).expect("proposal candidates"),
+            vec!["600001", "600003", "600004"]
+        );
     }
 }

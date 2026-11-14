@@ -55,6 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &limit_up_codes,
         &leader_codes,
         &eastmoney_members,
+        // CLI 不持有实时快照；与上面的 limit_up/leader 置空保持一致，走纯离线重放。
+        None,
     )?;
     println!(
         "\n汇总: scanned={} candidates={} opened={} appended={} skipped_invalid={}{}",

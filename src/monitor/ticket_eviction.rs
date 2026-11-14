@@ -120,32 +120,19 @@ pub fn evict_stale_observations(db: &DatabaseManager, as_of: &str) -> Result<Evi
         .map_err(|error| format!("as_of 非法 ({as_of}): {error}"))?;
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
 
+    // 12.4.7 切读（2026-11-14）：候选集合改读 `ticket_state_v1`，与旧 stage 查询
+    // 逐行一致（生产库只读 EXCEPT 双向为空）。不能按 proposal_status 过滤：
+    // 触发/失效的票同样可能跌出观察池，终态提案不能挡住淘汰。
     let observing: Vec<String> = diesel::sql_query(
-        "SELECT code FROM ticket_lifecycle WHERE close_date IS NULL AND stage IN ('observing','entry_proposed')",
+        "SELECT code FROM ticket_state_v1 \
+         WHERE close_date IS NULL AND stage IN ('observing','entry_proposed') \
+         ORDER BY code",
     )
     .load::<CodeRow>(&mut conn)
-    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("淘汰候选查询失败: {e}"))?
     .into_iter()
     .map(|row| row.code)
     .collect();
-
-    // 12.4.7 双读：淘汰仍按 stage + 价格/超期规则走，提案状态只计数不参与判定
-    // ——触发过的票同样可能跌出观察池，不能用终态提案挡住淘汰。
-    match ticket_lifecycle::consumer_state_dual_read(
-        &mut conn,
-        &["observing", "entry_proposed"],
-    ) {
-        Ok(summary) => log::info!(
-            "[票状态][dual] consumer=eviction rows={} open={} terminal={} none={} stale5={} sample_open={}",
-            summary.rows,
-            summary.open,
-            summary.terminal,
-            summary.none,
-            summary.stale5,
-            summary.sample_open()
-        ),
-        Err(error) => log::warn!("[票状态][dual] consumer=eviction 视图不可用: {error}"),
-    }
 
     let mut report = EvictReport {
         scanned: observing.len(),

@@ -3632,11 +3632,11 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
 
 **边界**：
 
-- 消费者进度（2026-11-13）：R-07 明日计划已切读 `ticket_state_v1`；触发侧
+- 消费者进度（2026-11-14）：R-07 明日计划已切读 `ticket_state_v1`；触发侧
   读视图并用 `TICKET_STATE_FILTER` 过滤终态提案；`ticket_entry_proposal` /
-  `ticket_eviction` 已加双读日志但仍按 `stage` 取候选；`holding_plan` 只用
-  `find_active_ticket` 取证据包上下文，不参与候选集合。下一步是双读差异
-  连续归零后切读，切换前不改推送。
+  `ticket_eviction` 已切读视图（不再有双读日志）；`holding_plan` 只用
+  `find_active_ticket` 取证据包上下文，不参与候选集合。切读口径与证据见下方
+  “2026-11-14 读路径收口（第二轮）”。
 - `stage` 不改语义、不加列；`ticket_event` 不改历史。视图只是把现状摊开，
   不做自动修复。
 - `stale_days` 以最近一次提案事件或 `open_date` 起算，仅是巡检指标，不是
@@ -3713,10 +3713,25 @@ job 87eef2051782 / 4170c8e57d44 / 0798dc858fdb。
   （`observing`+`entry_proposed`）新增
   `[票状态][dual] consumer=… rows/open/terminal/none/stale5/sample_open`，
   只计数、不改变候选集合；视图缺失降级为 warn。
-- 未做：`ticket_entry_proposal` / `ticket_eviction` 仍未切读视图；切换门槛是
-  双读连续若干交易日 `open` 异常=0、阶段与事件差异归零。
 - 运行根 release 已重编（二进制 12:20），随 15:05 重启加载；今天 15:40
   提案轮次与 21:35 淘汰轮次起产生 `[票状态][dual]` 样本。
+
+**2026-11-14 读路径收口（第二轮）**：
+
+- 生产库只读比对（11-14）：proposal 旧 `stage='observing'` 集合 9 只；新视图
+  `stage='observing' AND COALESCE(proposal_status,'') <> 'open'` 也是 9 只，
+  双向 EXCEPT 为空。5 只 `entry_expired` 的票仍在 observing，属于正常
+  “提案收尾、票留在池里等下一次提案”，不能当成阶段冲突过滤掉。
+- `ticket_entry_proposal`：候选查询改读 `ticket_state_v1`，只排除 `open`；
+  终态提案（triggered/expired/invalidated/superseded）仍可生成新提案。
+- `ticket_eviction`：候选查询改读 `ticket_state_v1`，不做提案状态过滤；
+  与旧 stage 查询双向 EXCEPT 为空。
+- 两处 `[票状态][dual]` 日志移除；`consumer_state_dual_read` 保留为只读审计 API。
+- 单测：`monitor::ticket_entry_proposal::tests::proposal_candidates_skip_open_but_keep_terminal_and_no_event`。
+- 顺带修复 `src/bin/watch_pool_build.rs` 调用 `build_watch_pool` 少传 `live` 参数
+  （`2026-11-03-agentrunner-vs-multiagent.md` 记录的 `cargo check --all-targets` 阻断项）；
+  CLI 走 `live=None` 纯离线重放。
+- 边界：本次只切候选读取；`stage` 仍由原流程维护，不做自动修复。
 
 **2026-11-11 账户快照与成交补录（影响 T+1/持仓上下文）**：
 
@@ -4417,10 +4432,8 @@ OrderBook 口径、T0 选项。
 7.2/7.3 已接线（2026-11-13），7.4 受分钟数据源阻塞。本节不改变 12.x 的 ticket
 批次顺序，也不把“指标可算”当成“胜率提高”。
 
-**文档内仍未完成的项（2026-11-13 复核）**：
+**文档内仍未完成的项（2026-11-14 复核）**：
 
-- 12.4.7：R-07 已切读视图；`ticket_entry_proposal` / `ticket_eviction` 仅双读，
-  切读门槛是差异连续归零。
 - 6.9：两套证据审计脚本未合并；没有真实同日“加仓 vs 回避/卖出”样本。
 - 6.10：模板矩阵未逐项验收；持仓/R-07/明日计划仍只做禁止词校验。
 - 6.5/6.6：公告/财报已接线，11-16 实盘验证；第二独立财务来源仍缺。
